@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/DavidLee18/lavoisier"
+authors = ["Lavoisier contributors"]
+
+# Shared dependency versions. Crates opt in via `dep.workspace = true`.
+[workspace.dependencies]
+# Core contract deps (lvz-protocol)
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# Runtime / transport deps (adapters, agent, cli)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "fs", "process", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+
+# Internal crates
+lvz-protocol = { path = "crates/lvz-protocol" }
+lvz-anthropic = { path = "crates/lvz-anthropic" }
+lvz-xai = { path = "crates/lvz-xai" }
+lvz-tools = { path = "crates/lvz-tools" }
+lvz-agent = { path = "crates/lvz-agent" }
+lvz-context = { path = "crates/lvz-context" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

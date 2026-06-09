@@ -1,0 +1,23 @@
+[package]
+name = "lvz-cli"
+version = "0.0.0"
+description = "The lavoisier CLI — the first gateway. M1: a single non-streaming xAI turn."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "lavoisier"
+path = "src/main.rs"
+
+[dependencies]
+lvz-protocol.workspace = true
+lvz-anthropic.workspace = true
+lvz-xai.workspace = true
+lvz-agent.workspace = true
+lvz-tools.workspace = true
+tokio.workspace = true
+clap.workspace = true
+futures.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "lvz-protocol"
+version = "0.0.0"
+description = "Normalised contracts for the Lavoisier agent core: Provider, Event, Capabilities, Tool, Gateway, Tuner. Zero provider/gateway deps."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
