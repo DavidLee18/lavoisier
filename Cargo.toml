@@ -7,7 +7,7 @@ edition = "2021"
 rust-version = "1.82"
 license = "MIT"
 repository = "https://github.com/DavidLee18/lavoisier"
-authors = ["Lavoisier contributors"]
+authors = ["Jaehyun Lee"]
 
 # Shared dependency versions. Crates opt in via `dep.workspace = true`.
 [workspace.dependencies]
