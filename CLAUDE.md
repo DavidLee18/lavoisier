@@ -23,13 +23,55 @@ Crates that exist today: `lvz-protocol`, `lvz-xai`, `lvz-anthropic`, `lvz-contex
 `lvz-tools`, `lvz-agent`, `lvz-cli`. Not yet built (future milestones): `lvz-tune`,
 `lvz-gateway` + `lvz-gw-*`, `lvz-claude-cli`.
 
-**Next:** M6 efficiency hardening (model routing, history compaction, tool-result truncation
-is in place, context-budget manager), then M7 xAI gRPC, M8+ gateways/Hermes. Notes:
-`lvz-context` parses with tree-sitter (grammar/core ABI versions pinned in its `Cargo.toml` —
-bump together); the budget loop's ceilings in `tests/budget.rs` are the committed baseline,
-update them deliberately when skeleton output legitimately changes. The skeleton-radius edge
-graph is a name-based heuristic (no full name resolution) — good enough for `N`, not a
-semantic index.
+**Current state (saved 2026-06-09):** M0–M5 complete, committed and pushed to
+`origin/main` (initial commit + author/copyright set to Jaehyun Lee). 7 crates,
+**59 tests passing**, clippy clean, `cargo fmt` clean. Verified live against the real
+`XAI_API_KEY`: streaming turns, the agent tool loop, and the token-efficient
+outline→anchor→edit workflow. Anthropic path verified against a mock SSE server (no key on
+hand). Working tree clean.
+
+### What's left to do (milestone order, `RECIPE.md` §9)
+
+- **M6 — efficiency hardening (next).** Model tiering/routing (cheap model for
+  routing/summaries; `ModelTier` enum exists in `lvz-protocol` but nothing consults it yet),
+  **history compaction** (summarise old turns once over budget; `Knobs.compact_after` exists
+  but is unused), a **context-budget manager** with relevance-ranked eviction, output
+  minimisation. (Tool-result truncation already landed in M4 via `AgentConfig.truncate_bytes`.)
+- **M7 — xAI gRPC.** Vendor `xai-org/xai-proto` into `proto/`, `tonic-build` codegen, v6
+  "outputs" server-side tools. Today only the in-crate OpenAI-compat fallback exists in
+  `lvz-xai`; the gRPC path is a runtime switch beside it.
+- **M8 — gateway layer.** `lvz-gw-http` (REST + WebSocket). The `Gateway`/`AgentHandle`
+  contracts already exist in `lvz-protocol` and `Agent` implements `AgentHandle`; this is
+  about concrete gateway crates.
+- **M9 — Hermes gateways + features.** `lvz-gw-matrix`, `lvz-gw-discord`; `lvz-memory`,
+  auth/quotas, observability (OTel).
+- **M10 — Hermes deployment.** Fargate arm64, us-west-2.
+- **Optional tracks.** `lvz-tune` (ATO §6.6 — the *online* half; needs §6.4 telemetry + a
+  task-success signal wired first; ship the no-op `Tuner` path, then swap in the learner).
+  `lvz-claude-cli` (shell out to `claude -p`, no caching, off by default).
+
+### Known debts inside shipped code (pick up before/with the above)
+
+- **Tuner not consulted.** `Tuner`/`NoopTuner` are defined but `lvz-agent` does not yet call a
+  tuner; `Knobs` (`skeleton_radius`, `compact_after`, `batch_width`) are not wired into the
+  agent (only `truncate_bytes` is). Hook the agent to a `Tuner` to make these live.
+- **Telemetry (§6.4).** Usage is aggregated and the `--budget` ceiling is enforced, but there
+  is no telemetry export / cache-hit-rate surfacing — a prerequisite for ATO.
+- **Skeleton fidelity.** Python docstrings are currently elided with the body (RECIPE wants
+  them kept). The symbol-dependency graph is a name-based heuristic (no scope/name
+  resolution; same-named symbols across files merge) — fine for `N`, not a semantic index.
+  `outline_file --focus` builds a single-file graph (the multi-file graph in
+  `lvz-context::symbols` is used by the budget loop, not the tool).
+- **Multi-file batching (§6.1)** and **cache-aware repo-skeleton prefix** are not implemented;
+  caching currently marks only the system prompt + last tool def.
+
+### Gotchas
+
+- `lvz-context` parses with tree-sitter; grammar/core ABI versions are pinned in its
+  `Cargo.toml` — bump them together and re-run tests.
+- The budget loop's per-fixture ceilings in `crates/lvz-context/tests/budget.rs` are the
+  committed baseline; update them deliberately when skeleton output legitimately changes
+  (`cargo test -p lvz-context --test budget -- --nocapture` prints the trend line).
 
 ## Architecture invariants (do not violate)
 
