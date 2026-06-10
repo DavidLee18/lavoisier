@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: M0–M5 built; M6 efficiency hardening in progress
+## Status: M0–M6 built (M6 §9 deliverables complete; optional §6.3 extras remain)
 
 `RECIPE.md` is the authoritative **build blueprint** for **Lavoisier** (binary `lavoisier`,
 alias `lav`) — a modular, token-efficient CLI coding agent in Rust with a provider-agnostic
@@ -46,7 +46,11 @@ when the assembled history still exceeds it after compaction, `evict_to_fit` rep
 oldest tool-result content with a `[evicted: N bytes …]` placeholder (oldest = least relevant),
 preserving the task, the recent window, and all `tool_use`/`tool_result` pairing. Exposed on
 the CLI as `--summary-model` / `--compact-after` / `--context-limit` (agent mode).
-**61 tests passing**, clippy + fmt clean. **Compaction verified live** against Anthropic
+The tuner's `TaskContext` is now **real**, not stubbed: `classify_archetype` maps the prompt
+to an `Archetype` via a deterministic keyword heuristic (no extra round-trip), and
+`profile_repo` does a bounded, build-dir-skipping walk of `AgentConfig.repo_root` (set to cwd
+by the CLI in agent mode) for a `RepoProfile` (file count, bytes, primary language).
+**63 tests passing**, clippy + fmt clean. **Compaction verified live** against Anthropic
 (`claude-sonnet-4-6` main,
 `claude-haiku-4-5` summaries): a sequential edit task triggered a real Haiku-routed summary
 call and the reshaped history (task + summary note + recent turns) was accepted by the API —
@@ -56,13 +60,13 @@ sequential workflows that accumulate ≥3 turn-pairs.)
 
 ### What's left to do (milestone order, `RECIPE.md` §9)
 
-- **M6 — efficiency hardening (in progress).** ✅ Tuner/Knobs wired into the agent, history
-  compaction, model routing for summaries, tool-result truncation, context-budget manager
-  (relevance-ranked eviction). **Remaining:** context **deduplication** (collapse a file
-  referenced twice), output-minimisation polish, and **task classification / repo profiling**
-  to give the `Tuner` a real `TaskContext` (currently hard-coded to `Archetype::Other` + empty
-  `RepoProfile`). (`--summary-model`/`--compact-after`/`--context-limit` exposed; compaction is
-  unit-tested *and* live-verified; eviction is unit-tested.)
+- **M6 — efficiency hardening (§9 deliverables complete).** ✅ Tuner/Knobs wired into the
+  agent, history compaction (live-verified), model routing for summaries, tool-result
+  truncation, context-budget manager (relevance-ranked eviction), and task classification +
+  repo profiling feeding a real `TaskContext`. **Optional §6.3-table extras not yet done**
+  (beyond the M6 milestone line): context **deduplication** (collapse a file referenced twice)
+  and output-minimisation polish. (`--summary-model`/`--compact-after`/`--context-limit`
+  exposed; all mechanisms unit-tested, compaction also live-verified.)
 - **M7 — xAI gRPC.** Vendor `xai-org/xai-proto` into `proto/`, `tonic-build` codegen, v6
   "outputs" server-side tools. Today only the in-crate OpenAI-compat fallback exists in
   `lvz-xai`; the gRPC path is a runtime switch beside it.
@@ -78,12 +82,13 @@ sequential workflows that accumulate ≥3 turn-pairs.)
 
 ### Known debts inside shipped code (pick up before/with the above)
 
-- **Tuner partially wired.** `lvz-agent` now calls `Tuner::select`/`observe` and honours
+- **Tuner consulted; two knobs still inert.** `lvz-agent` calls `Tuner::select`/`observe` with
+  a **real** `TaskContext` (classified `Archetype` + walked `RepoProfile`) and honours
   `Knobs.compact_after` + `truncate_bytes`. Still unwired: `skeleton_radius` (the agent never
   calls `outline_file` with a tuner-chosen radius — that's the tool/model's choice today) and
-  `batch_width` (no multi-file batching yet, §6.1). The `TaskContext` is hard-coded to
-  `Archetype::Other` + empty `RepoProfile` — no task classification or repo profiling feeds
-  the tuner yet, so even an `lvz-tune` learner would see undifferentiated context.
+  `batch_width` (no multi-file batching yet, §6.1). Archetype classification is a keyword
+  heuristic, not a model call. The only tuner shipped is `NoopTuner`/`FixedTuner` (no learner
+  yet — that's the `lvz-tune` track), so the context is collected but not yet *learned from*.
 - **Telemetry (§6.4).** Usage is aggregated and the `--budget` ceiling is enforced, but there
   is no telemetry export / cache-hit-rate surfacing — a prerequisite for ATO.
 - **Skeleton fidelity.** Python docstrings are currently elided with the body (RECIPE wants

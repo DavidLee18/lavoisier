@@ -143,6 +143,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(context_limit) = cli.context_limit {
             config = config.with_context_limit(context_limit);
         }
+        // Profile the working directory so the tuner sees a real repo shape (§6.6).
+        if let Ok(cwd) = std::env::current_dir() {
+            config = config.with_repo_root(cwd);
+        }
         let mut agent = Agent::new(provider, ToolRegistry::with_builtins(), config);
         if let Some(compact_after) = cli.compact_after {
             // A fixed-knob tuner overriding only the compaction trigger (§6.3).

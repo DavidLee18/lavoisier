@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -80,6 +81,9 @@ pub struct AgentConfig {
     /// When set and exceeded even after compaction, the oldest tool-result content is evicted.
     /// Distinct from [`token_budget`](Self::token_budget), which caps the *whole task*.
     pub context_limit: Option<usize>,
+    /// Repository root to profile for the tuner's [`TaskContext`] (§6.6). `None` skips the
+    /// filesystem walk and uses an empty [`RepoProfile`] — fine for the [`NoopTuner`] default.
+    pub repo_root: Option<PathBuf>,
 }
 
 impl Default for AgentConfig {
@@ -93,6 +97,7 @@ impl Default for AgentConfig {
             model_tier: ModelTier::Balanced,
             summary_model: None,
             context_limit: None,
+            repo_root: None,
         }
     }
 }
@@ -119,6 +124,12 @@ impl AgentConfig {
     /// Set the soft per-request context-token ceiling (§6.3 context-budget manager).
     pub fn with_context_limit(mut self, limit: usize) -> Self {
         self.context_limit = Some(limit);
+        self
+    }
+
+    /// Profile this repository root to give the tuner a real [`RepoProfile`] (§6.6).
+    pub fn with_repo_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.repo_root = Some(root.into());
         self
     }
 }
@@ -205,8 +216,12 @@ async fn run_loop(
     let tool_defs = tools.defs();
     let caps = provider.capabilities();
     let ctx = TaskContext {
-        archetype: Archetype::Other,
-        repo: RepoProfile::default(),
+        archetype: classify_archetype(&input),
+        repo: config
+            .repo_root
+            .as_deref()
+            .map(profile_repo)
+            .unwrap_or_default(),
         caps,
         model: config.model_tier,
     };
@@ -476,6 +491,114 @@ fn proxy(m: &Message) -> String {
         s.push(' ');
     }
     s
+}
+
+/// Cheap keyword classifier mapping a task prompt to an [`Archetype`] prior (`RECIPE.md`
+/// §6.5/§6.6). Deterministic and free — a good-enough prior for keying tuner profiles, with
+/// no extra round-trip. Ordering is intentional: more specific intents win (a rename is a
+/// refactor, an "add" is more specific than a generic edit). A future version could route
+/// genuinely ambiguous prompts to a cheap classification model (§6.3).
+fn classify_archetype(prompt: &str) -> Archetype {
+    let p = prompt.to_lowercase();
+    let has = |kw: &str| p.contains(kw);
+    if has("rename") {
+        Archetype::Rename
+    } else if has("refactor")
+        || has("extract ")
+        || has("restructure")
+        || has("split ")
+        || has("move ")
+    {
+        Archetype::Refactor
+    } else if has("implement")
+        || has("add ")
+        || has("create ")
+        || has("new feature")
+        || has("support for")
+        || has("build ")
+    {
+        Archetype::Feature
+    } else if has("fix")
+        || has("edit")
+        || has("change")
+        || has("update")
+        || has("modify")
+        || has("rewrite")
+    {
+        Archetype::SingleFileEdit
+    } else {
+        Archetype::Other
+    }
+}
+
+/// Build a [`RepoProfile`] by a bounded walk of `root`, skipping VCS/build/dependency dirs.
+/// Counts files, sums their bytes, and picks the most common recognised source language
+/// (`RECIPE.md` §6.6 — repo shape conditions knob selection). Best-effort: unreadable entries
+/// are skipped and the walk is capped so a huge monorepo can't stall task start.
+fn profile_repo(root: &Path) -> RepoProfile {
+    const MAX_FILES: u32 = 20_000;
+    fn skip_dir(name: &str) -> bool {
+        name.starts_with('.')
+            || matches!(
+                name,
+                "target" | "node_modules" | "dist" | "build" | "vendor" | "__pycache__"
+            )
+    }
+    fn lang_of(path: &Path) -> Option<&'static str> {
+        use lvz_context::Lang::*;
+        match lvz_context::Lang::from_path(path.to_str()?) {
+            Some(Rust) => Some("rust"),
+            Some(Python) => Some("python"),
+            Some(JavaScript) => Some("javascript"),
+            Some(TypeScript) => Some("typescript"),
+            None => None,
+        }
+    }
+
+    let mut file_count = 0u32;
+    let mut total_bytes = 0u64;
+    let mut lang_counts: HashMap<&'static str, u32> = HashMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if file_count >= MAX_FILES {
+            break;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if !skip_dir(&name.to_string_lossy()) {
+                    stack.push(path);
+                }
+            } else if ft.is_file() {
+                file_count += 1;
+                if let Ok(meta) = entry.metadata() {
+                    total_bytes += meta.len();
+                }
+                if let Some(lang) = lang_of(&path) {
+                    *lang_counts.entry(lang).or_default() += 1;
+                }
+                if file_count >= MAX_FILES {
+                    break;
+                }
+            }
+        }
+    }
+    let primary_language = lang_counts
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(l, _)| l.to_string())
+        .unwrap_or_default();
+    RepoProfile {
+        file_count,
+        total_bytes,
+        primary_language,
+    }
 }
 
 /// Assemble a request, marking the stable prefix cacheable iff the provider supports caching.
@@ -805,6 +928,53 @@ mod tests {
         assert_eq!(content(8), big);
         assert_eq!(history[0].text(), "task");
         assert!(history_tokens(&history) < before);
+    }
+
+    #[test]
+    fn classify_archetype_maps_intents() {
+        use Archetype::*;
+        assert_eq!(
+            classify_archetype("Rename foo to bar across the crate"),
+            Rename
+        );
+        assert_eq!(
+            classify_archetype("Refactor the parser into modules"),
+            Refactor
+        );
+        assert_eq!(
+            classify_archetype("extract this block into a helper"),
+            Refactor
+        );
+        assert_eq!(classify_archetype("Implement a retry policy"), Feature);
+        assert_eq!(classify_archetype("add support for YAML config"), Feature);
+        assert_eq!(
+            classify_archetype("fix the off-by-one in range()"),
+            SingleFileEdit
+        );
+        assert_eq!(classify_archetype("update the docstring"), SingleFileEdit);
+        assert_eq!(classify_archetype("explain how the loop works"), Other);
+        // Specificity ordering: a rename outranks the generic "change"/"refactor" it implies.
+        assert_eq!(classify_archetype("change code: rename x to y"), Rename);
+    }
+
+    #[test]
+    fn profile_repo_counts_source_and_skips_build_dirs() {
+        let dir = std::env::temp_dir().join(format!("lvz_profile_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "fn b() {}\n").unwrap();
+        std::fs::write(dir.join("README.md"), "# hi\n").unwrap();
+        std::fs::write(dir.join("target/debug/junk.rs"), "fn junk() {}\n").unwrap(); // skipped
+
+        let profile = profile_repo(&dir);
+        // Counts a.rs, b.rs, README.md — but not anything under target/.
+        assert_eq!(profile.file_count, 3);
+        assert!(profile.total_bytes > 0);
+        assert_eq!(profile.primary_language, "rust");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A tool that returns a fixed, sizeable string — used to grow history quickly so
