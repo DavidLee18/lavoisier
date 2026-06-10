@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: M0–M6 built (M6 §9 deliverables complete; optional §6.3 extras remain)
+## Status: M0–M6 complete (efficiency hardening done; M7 xAI gRPC next)
 
 `RECIPE.md` is the authoritative **build blueprint** for **Lavoisier** (binary `lavoisier`,
 alias `lav`) — a modular, token-efficient CLI coding agent in Rust with a provider-agnostic
@@ -49,8 +49,12 @@ the CLI as `--summary-model` / `--compact-after` / `--context-limit` (agent mode
 The tuner's `TaskContext` is now **real**, not stubbed: `classify_archetype` maps the prompt
 to an `Archetype` via a deterministic keyword heuristic (no extra round-trip), and
 `profile_repo` does a bounded, build-dir-skipping walk of `AgentConfig.repo_root` (set to cwd
-by the CLI in agent mode) for a `RepoProfile` (file count, bytes, primary language).
-**63 tests passing**, clippy + fmt clean. **Compaction verified live** against Anthropic
+by the CLI in agent mode) for a `RepoProfile` (file count, bytes, primary language). The
+optional §6.3 extras also landed: **deduplication** (`dedup_tool_results` collapses
+byte-identical repeated tool results, keeping the most recent copy) and **output
+minimisation** (the system prompt now tells the model not to echo file contents/tool output
+and to let `edit_anchored`'s diff stand as the change record). **64 tests passing**, clippy +
+fmt clean. **Compaction verified live** against Anthropic
 (`claude-sonnet-4-6` main,
 `claude-haiku-4-5` summaries): a sequential edit task triggered a real Haiku-routed summary
 call and the reshaped history (task + summary note + recent turns) was accepted by the API —
@@ -60,13 +64,12 @@ sequential workflows that accumulate ≥3 turn-pairs.)
 
 ### What's left to do (milestone order, `RECIPE.md` §9)
 
-- **M6 — efficiency hardening (§9 deliverables complete).** ✅ Tuner/Knobs wired into the
-  agent, history compaction (live-verified), model routing for summaries, tool-result
-  truncation, context-budget manager (relevance-ranked eviction), and task classification +
-  repo profiling feeding a real `TaskContext`. **Optional §6.3-table extras not yet done**
-  (beyond the M6 milestone line): context **deduplication** (collapse a file referenced twice)
-  and output-minimisation polish. (`--summary-model`/`--compact-after`/`--context-limit`
-  exposed; all mechanisms unit-tested, compaction also live-verified.)
+- **M6 — efficiency hardening (complete).** ✅ Tuner/Knobs wired into the agent, history
+  compaction (live-verified), model routing for summaries, tool-result truncation,
+  context-budget manager (relevance-ranked eviction), task classification + repo profiling
+  feeding a real `TaskContext`, and the optional §6.3 extras (context deduplication + output
+  minimisation). (`--summary-model`/`--compact-after`/`--context-limit` exposed; all
+  mechanisms unit-tested, compaction also live-verified.)
 - **M7 — xAI gRPC.** Vendor `xai-org/xai-proto` into `proto/`, `tonic-build` codegen, v6
   "outputs" server-side tools. Today only the in-crate OpenAI-compat fallback exists in
   `lvz-xai`; the gRPC path is a runtime switch beside it.

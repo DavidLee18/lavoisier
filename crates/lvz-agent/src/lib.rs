@@ -23,7 +23,7 @@
 //! Token usage is summed across every round-trip — including the compaction call — which is
 //! the metric that matters (§6.4) and is enforced against an optional budget.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,7 +44,12 @@ const DEFAULT_SYSTEM: &str = "You are Lavoisier, a terse, token-efficient coding
 Use the provided tools to inspect and modify the repository. To save tokens, prefer \
 outline_file over read_file to learn a file's structure, and prefer read_anchored + \
 edit_anchored over rewriting whole files with write_file. Take minimal, targeted actions; \
-do not narrate. When the task is complete, give a one-line summary.";
+do not narrate. Do not echo file contents or tool output back in your replies; reference line \
+anchors and let edit_anchored's diff stand as the record of changes. When the task is \
+complete, give a one-line summary.";
+
+/// Tool results at or below this size are never deduplicated — the saving isn't worth churn.
+const DEDUP_MIN_BYTES: usize = 200;
 
 /// System prompt for the compaction summariser (§6.3). Terse, structured, fact-preserving.
 const COMPACTION_SYSTEM: &str = "You compress a coding agent's transcript so it can keep \
@@ -232,6 +237,11 @@ async fn run_loop(
     let mut round_trips: u32 = 0;
 
     for _step in 0..config.max_steps {
+        // Deduplication (§6.3): collapse byte-identical repeated tool results (e.g. the same
+        // file read twice with no change), keeping only the most recent copy. Cheap and
+        // lossless, so it runs before compaction/eviction to shrink their input.
+        dedup_tool_results(&mut history);
+
         // History compaction (§6.3): once the transcript outgrows the knob, summarise the
         // middle turns (routed to the cheaper summary model) before the next request. The
         // summary call's tokens count toward the task total (§6.4).
@@ -443,6 +453,33 @@ fn render_transcript(messages: &[Message]) -> String {
 /// results (which dominate size) — the trigger for compaction.
 fn history_tokens(history: &[Message]) -> usize {
     history.iter().map(|m| estimate_tokens(&proxy(m))).sum()
+}
+
+/// Context deduplication (`RECIPE.md` §6.3). Collapse byte-identical tool-result content that
+/// appears more than once — e.g. the same file outlined or read twice without change. Walking
+/// newest→oldest, the most recent copy is kept verbatim and earlier identical copies are
+/// replaced by a short pointer. Structure (so `tool_use`/`tool_result` pairing) is preserved;
+/// small results and existing placeholders are left alone.
+fn dedup_tool_results(history: &mut [Message]) {
+    let mut seen: HashSet<String> = HashSet::new();
+    for msg in history.iter_mut().rev() {
+        for block in &mut msg.content {
+            if let ContentBlock::ToolResult { content, .. } = block {
+                if content.len() < DEDUP_MIN_BYTES
+                    || content.starts_with("[evicted")
+                    || content.starts_with("[duplicate")
+                {
+                    continue;
+                }
+                if seen.contains(content) {
+                    let n = content.len();
+                    *content = format!("[duplicate of a more recent identical result, {n} bytes]");
+                } else {
+                    seen.insert(content.clone());
+                }
+            }
+        }
+    }
 }
 
 /// Relevance-ranked context eviction (`RECIPE.md` §6.3). When the assembled history still
@@ -928,6 +965,46 @@ mod tests {
         assert_eq!(content(8), big);
         assert_eq!(history[0].text(), "task");
         assert!(history_tokens(&history) < before);
+    }
+
+    #[test]
+    fn dedup_collapses_older_identical_tool_results() {
+        let big_a = "alpha beta gamma delta ".repeat(15); // >200 bytes, multi-token
+        let big_b = "one two three four five ".repeat(15);
+        let tu = |id: &str| Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "read".into(),
+                input: json!({}),
+            }],
+        };
+        let tr = |id: &str, c: &str| Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: c.to_string(),
+                is_error: false,
+            }],
+        };
+        let mut history = vec![
+            Message::user("task"),
+            tu("r1"),
+            tr("r1", &big_a), // older copy of A (index 2)
+            tu("r2"),
+            tr("r2", &big_b), // unique (index 4)
+            tu("r3"),
+            tr("r3", &big_a), // newer copy of A (index 6)
+        ];
+        dedup_tool_results(&mut history);
+
+        let content = |i: usize| match &history[i].content[0] {
+            ContentBlock::ToolResult { content, .. } => content.clone(),
+            _ => unreachable!(),
+        };
+        assert!(content(2).starts_with("[duplicate"), "older copy collapsed");
+        assert_eq!(content(6), big_a, "most recent copy kept verbatim");
+        assert_eq!(content(4), big_b, "unique result untouched");
     }
 
     #[test]
