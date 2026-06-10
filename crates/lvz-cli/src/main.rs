@@ -16,9 +16,9 @@ use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
-use lvz_agent::{Agent, AgentConfig};
+use lvz_agent::{Agent, AgentConfig, FixedTuner};
 use lvz_anthropic::AnthropicProvider;
-use lvz_protocol::{ChatRequest, Event, Message, Provider};
+use lvz_protocol::{ChatRequest, Event, Knobs, Message, Provider};
 use lvz_tools::ToolRegistry;
 use lvz_xai::XaiProvider;
 
@@ -60,6 +60,14 @@ struct Cli {
     /// Total-task token budget (--agent mode); the run aborts if exceeded.
     #[arg(long)]
     budget: Option<u64>,
+
+    /// Route history-compaction summaries to a cheaper model (--agent mode). Defaults to --model.
+    #[arg(long)]
+    summary_model: Option<String>,
+
+    /// Compact conversation history once it exceeds this many estimated tokens (--agent mode).
+    #[arg(long)]
+    compact_after: Option<usize>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -125,7 +133,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(system) = cli.system {
             config.system = system;
         }
-        let agent = Agent::new(provider, ToolRegistry::with_builtins(), config);
+        if let Some(summary_model) = cli.summary_model {
+            config = config.with_summary_model(summary_model);
+        }
+        let mut agent = Agent::new(provider, ToolRegistry::with_builtins(), config);
+        if let Some(compact_after) = cli.compact_after {
+            // A fixed-knob tuner overriding only the compaction trigger (§6.3).
+            agent = agent.with_tuner(Arc::new(FixedTuner(Knobs {
+                compact_after,
+                ..Knobs::default()
+            })));
+        }
         let mut stream = agent.run(prompt);
         while let Some(event) = stream.next().await {
             renderer.handle(event?)?;
