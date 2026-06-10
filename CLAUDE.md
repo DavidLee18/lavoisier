@@ -27,8 +27,11 @@ Crates that exist today: `lvz-protocol`, `lvz-xai`, `lvz-anthropic`, `lvz-contex
 `origin/main` (initial commit + author/copyright set to Jaehyun Lee). 7 crates,
 **59 tests passing**, clippy clean, `cargo fmt` clean. Verified live against the real
 `XAI_API_KEY`: streaming turns, the agent tool loop, and the token-efficient
-outline→anchor→edit workflow. Anthropic path verified against a mock SSE server (no key on
-hand). Working tree clean.
+outline→anchor→edit workflow. Anthropic path now **verified live** against the real
+`ANTHROPIC_API_KEY` (model `claude-sonnet-4-6`): a streaming turn plus the agent
+`read_anchored`→batched `edit_anchored` loop, with **prompt caching confirmed working**
+(non-zero `cache_read`/`cache_creation` once the system+tooldefs prefix clears the
+2048-token Sonnet cache minimum). Working tree clean.
 
 ### What's left to do (milestone order, `RECIPE.md` §9)
 
