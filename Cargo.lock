@@ -619,6 +619,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "futures",
+ "lvz-context",
  "lvz-protocol",
  "lvz-tools",
  "serde_json",

@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 lvz-protocol.workspace = true
 lvz-tools.workspace = true
+lvz-context.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 serde_json.workspace = true

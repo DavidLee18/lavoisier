@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: M0–M5 built (agent with token-efficient context tools)
+## Status: M0–M5 built; M6 efficiency hardening in progress
 
 `RECIPE.md` is the authoritative **build blueprint** for **Lavoisier** (binary `lavoisier`,
 alias `lav`) — a modular, token-efficient CLI coding agent in Rust with a provider-agnostic
@@ -33,13 +33,25 @@ outline→anchor→edit workflow. Anthropic path now **verified live** against t
 (non-zero `cache_read`/`cache_creation` once the system+tooldefs prefix clears the
 2048-token Sonnet cache minimum). Working tree clean.
 
+**M6 increment (2026-06-10):** `lvz-agent` now consults a `Tuner` (default `NoopTuner` =
+static §6.5 knobs; `FixedTuner` for explicit knobs) and reports the realised `Outcome` back,
+making `Knobs` live. **History compaction** is implemented — once estimated transcript tokens
+exceed `Knobs.compact_after`, the middle turns are summarised into one note via a **separate
+tool-less provider call routed to `AgentConfig.summary_model`** (model tiering for the
+summary workload), keeping the original task + last `KEEP_RECENT_TURNS` pairs verbatim on a
+turn boundary (never orphaning a `tool_use`/`tool_result`). The summary call's tokens count
+toward the task total/budget (§6.4). Tool-result truncation now reads `Knobs.truncate_bytes`.
+**60 tests passing**, clippy + fmt clean.
+
 ### What's left to do (milestone order, `RECIPE.md` §9)
 
-- **M6 — efficiency hardening (next).** Model tiering/routing (cheap model for
-  routing/summaries; `ModelTier` enum exists in `lvz-protocol` but nothing consults it yet),
-  **history compaction** (summarise old turns once over budget; `Knobs.compact_after` exists
-  but is unused), a **context-budget manager** with relevance-ranked eviction, output
-  minimisation. (Tool-result truncation already landed in M4 via `AgentConfig.truncate_bytes`.)
+- **M6 — efficiency hardening (in progress).** ✅ Tuner/Knobs wired into the agent, history
+  compaction, model routing for summaries, tool-result truncation. **Remaining:** a
+  **context-budget manager** with relevance-ranked eviction (hard per-request ceiling, drop
+  oldest/largest tool results — distinct from the whole-task `--budget`), context
+  **deduplication** (collapse a file referenced twice), and output-minimisation polish.
+  `--summary-model`/`--compact-after` are not yet exposed as CLI flags. Compaction is covered
+  by a unit test (`FixedTuner` + recording provider) but not yet by a live run.
 - **M7 — xAI gRPC.** Vendor `xai-org/xai-proto` into `proto/`, `tonic-build` codegen, v6
   "outputs" server-side tools. Today only the in-crate OpenAI-compat fallback exists in
   `lvz-xai`; the gRPC path is a runtime switch beside it.
@@ -55,9 +67,12 @@ outline→anchor→edit workflow. Anthropic path now **verified live** against t
 
 ### Known debts inside shipped code (pick up before/with the above)
 
-- **Tuner not consulted.** `Tuner`/`NoopTuner` are defined but `lvz-agent` does not yet call a
-  tuner; `Knobs` (`skeleton_radius`, `compact_after`, `batch_width`) are not wired into the
-  agent (only `truncate_bytes` is). Hook the agent to a `Tuner` to make these live.
+- **Tuner partially wired.** `lvz-agent` now calls `Tuner::select`/`observe` and honours
+  `Knobs.compact_after` + `truncate_bytes`. Still unwired: `skeleton_radius` (the agent never
+  calls `outline_file` with a tuner-chosen radius — that's the tool/model's choice today) and
+  `batch_width` (no multi-file batching yet, §6.1). The `TaskContext` is hard-coded to
+  `Archetype::Other` + empty `RepoProfile` — no task classification or repo profiling feeds
+  the tuner yet, so even an `lvz-tune` learner would see undifferentiated context.
 - **Telemetry (§6.4).** Usage is aggregated and the `--budget` ceiling is enforced, but there
   is no telemetry export / cache-hit-rate surfacing — a prerequisite for ATO.
 - **Skeleton fidelity.** Python docstrings are currently elided with the body (RECIPE wants
