@@ -41,7 +41,13 @@ tool-less provider call routed to `AgentConfig.summary_model`** (model tiering f
 summary workload), keeping the original task + last `KEEP_RECENT_TURNS` pairs verbatim on a
 turn boundary (never orphaning a `tool_use`/`tool_result`). The summary call's tokens count
 toward the task total/budget (§6.4). Tool-result truncation now reads `Knobs.truncate_bytes`.
-**60 tests passing**, clippy + fmt clean.
+Exposed on the CLI as `--summary-model` / `--compact-after` (agent mode). **60 tests passing**,
+clippy + fmt clean. **Compaction verified live** against Anthropic (`claude-sonnet-4-6` main,
+`claude-haiku-4-5` summaries): a sequential edit task triggered a real Haiku-routed summary
+call and the reshaped history (task + summary note + recent turns) was accepted by the API —
+the agent compacted, continued, and finished cleanly. (Note observed live: the model batches
+independent tool calls into one parallel turn, so compaction only fires on genuinely
+sequential workflows that accumulate ≥3 turn-pairs.)
 
 ### What's left to do (milestone order, `RECIPE.md` §9)
 
@@ -50,8 +56,8 @@ toward the task total/budget (§6.4). Tool-result truncation now reads `Knobs.tr
   **context-budget manager** with relevance-ranked eviction (hard per-request ceiling, drop
   oldest/largest tool results — distinct from the whole-task `--budget`), context
   **deduplication** (collapse a file referenced twice), and output-minimisation polish.
-  `--summary-model`/`--compact-after` are not yet exposed as CLI flags. Compaction is covered
-  by a unit test (`FixedTuner` + recording provider) but not yet by a live run.
+  (`--summary-model`/`--compact-after` are exposed; compaction is unit-tested *and*
+  live-verified.)
 - **M7 — xAI gRPC.** Vendor `xai-org/xai-proto` into `proto/`, `tonic-build` codegen, v6
   "outputs" server-side tools. Today only the in-crate OpenAI-compat fallback exists in
   `lvz-xai`; the gRPC path is a runtime switch beside it.
