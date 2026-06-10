@@ -41,8 +41,13 @@ tool-less provider call routed to `AgentConfig.summary_model`** (model tiering f
 summary workload), keeping the original task + last `KEEP_RECENT_TURNS` pairs verbatim on a
 turn boundary (never orphaning a `tool_use`/`tool_result`). The summary call's tokens count
 toward the task total/budget (§6.4). Tool-result truncation now reads `Knobs.truncate_bytes`.
-Exposed on the CLI as `--summary-model` / `--compact-after` (agent mode). **60 tests passing**,
-clippy + fmt clean. **Compaction verified live** against Anthropic (`claude-sonnet-4-6` main,
+A **context-budget manager** (`AgentConfig.context_limit`) adds a soft *per-request* ceiling:
+when the assembled history still exceeds it after compaction, `evict_to_fit` replaces the
+oldest tool-result content with a `[evicted: N bytes …]` placeholder (oldest = least relevant),
+preserving the task, the recent window, and all `tool_use`/`tool_result` pairing. Exposed on
+the CLI as `--summary-model` / `--compact-after` / `--context-limit` (agent mode).
+**61 tests passing**, clippy + fmt clean. **Compaction verified live** against Anthropic
+(`claude-sonnet-4-6` main,
 `claude-haiku-4-5` summaries): a sequential edit task triggered a real Haiku-routed summary
 call and the reshaped history (task + summary note + recent turns) was accepted by the API —
 the agent compacted, continued, and finished cleanly. (Note observed live: the model batches
@@ -52,12 +57,12 @@ sequential workflows that accumulate ≥3 turn-pairs.)
 ### What's left to do (milestone order, `RECIPE.md` §9)
 
 - **M6 — efficiency hardening (in progress).** ✅ Tuner/Knobs wired into the agent, history
-  compaction, model routing for summaries, tool-result truncation. **Remaining:** a
-  **context-budget manager** with relevance-ranked eviction (hard per-request ceiling, drop
-  oldest/largest tool results — distinct from the whole-task `--budget`), context
-  **deduplication** (collapse a file referenced twice), and output-minimisation polish.
-  (`--summary-model`/`--compact-after` are exposed; compaction is unit-tested *and*
-  live-verified.)
+  compaction, model routing for summaries, tool-result truncation, context-budget manager
+  (relevance-ranked eviction). **Remaining:** context **deduplication** (collapse a file
+  referenced twice), output-minimisation polish, and **task classification / repo profiling**
+  to give the `Tuner` a real `TaskContext` (currently hard-coded to `Archetype::Other` + empty
+  `RepoProfile`). (`--summary-model`/`--compact-after`/`--context-limit` exposed; compaction is
+  unit-tested *and* live-verified; eviction is unit-tested.)
 - **M7 — xAI gRPC.** Vendor `xai-org/xai-proto` into `proto/`, `tonic-build` codegen, v6
   "outputs" server-side tools. Today only the in-crate OpenAI-compat fallback exists in
   `lvz-xai`; the gRPC path is a runtime switch beside it.

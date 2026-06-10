@@ -76,6 +76,10 @@ pub struct AgentConfig {
     /// Cheaper model id used for history-compaction summaries (§6.3 model routing). When
     /// `None`, summaries reuse [`model`](Self::model).
     pub summary_model: Option<String>,
+    /// Soft per-request ceiling on estimated context tokens (§6.3 context-budget manager).
+    /// When set and exceeded even after compaction, the oldest tool-result content is evicted.
+    /// Distinct from [`token_budget`](Self::token_budget), which caps the *whole task*.
+    pub context_limit: Option<usize>,
 }
 
 impl Default for AgentConfig {
@@ -88,6 +92,7 @@ impl Default for AgentConfig {
             token_budget: None,
             model_tier: ModelTier::Balanced,
             summary_model: None,
+            context_limit: None,
         }
     }
 }
@@ -108,6 +113,12 @@ impl AgentConfig {
     /// Route history-compaction summaries to a cheaper model (§6.3 model tiering).
     pub fn with_summary_model(mut self, model: impl Into<String>) -> Self {
         self.summary_model = Some(model.into());
+        self
+    }
+
+    /// Set the soft per-request context-token ceiling (§6.3 context-budget manager).
+    pub fn with_context_limit(mut self, limit: usize) -> Self {
+        self.context_limit = Some(limit);
         self
     }
 }
@@ -214,6 +225,13 @@ async fn run_loop(
                 total.accumulate(&compacted.usage);
                 history = compacted.history;
             }
+        }
+
+        // Context-budget manager (§6.3): if the request would still blow the per-request
+        // ceiling (e.g. a single huge recent tool result that compaction can't touch), evict
+        // the oldest tool-result content until it fits.
+        if let Some(limit) = config.context_limit {
+            evict_to_fit(&mut history, limit);
         }
 
         let req = build_request(&config, &tool_defs, &caps, &history);
@@ -410,6 +428,37 @@ fn render_transcript(messages: &[Message]) -> String {
 /// results (which dominate size) — the trigger for compaction.
 fn history_tokens(history: &[Message]) -> usize {
     history.iter().map(|m| estimate_tokens(&proxy(m))).sum()
+}
+
+/// Relevance-ranked context eviction (`RECIPE.md` §6.3). When the assembled history still
+/// exceeds the per-request `limit` — typically because a single recent tool result is huge and
+/// compaction can't summarise the protected recent window — replace the *content* of the
+/// oldest tool-result blocks (oldest = least relevant) with a short placeholder, working
+/// forward until the estimate is under `limit` or nothing more is evictable. The task message,
+/// the last [`KEEP_RECENT_TURNS`] turns, and all message structure (so `tool_use`/`tool_result`
+/// pairing stays intact) are preserved.
+fn evict_to_fit(history: &mut [Message], limit: usize) {
+    if history_tokens(history) <= limit {
+        return;
+    }
+    let protected = 2 * KEEP_RECENT_TURNS;
+    let evictable_end = history.len().saturating_sub(protected);
+    for i in 1..evictable_end {
+        let mut changed = false;
+        for block in &mut history[i].content {
+            if let ContentBlock::ToolResult { content, .. } = block {
+                if !content.starts_with("[evicted") {
+                    let n = content.len();
+                    *content = format!("[evicted: {n} bytes of older tool output]");
+                    changed = true;
+                }
+            }
+        }
+        // Re-estimate only after a change; the mutable borrow above has ended.
+        if changed && history_tokens(history) <= limit {
+            return;
+        }
+    }
 }
 
 /// A token-estimation proxy for a message: all text plus tool names/args/results.
@@ -705,6 +754,57 @@ mod tests {
         assert!(out.starts_with('a'));
         assert!(out.contains("truncated"));
         assert!(out.len() < s.len() + 40);
+    }
+
+    #[test]
+    fn evict_to_fit_drops_oldest_tool_results_and_keeps_recent() {
+        // Realistic tool output: many whitespace-separated tokens (a single unbroken run
+        // would estimate as ~1 token, unlike real file/shell output).
+        let big = "lorem ipsum dolor sit amet ".repeat(160);
+        let tu = |id: &str| Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "big".into(),
+                input: json!({}),
+            }],
+        };
+        let tr = |id: &str| Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: big.clone(),
+                is_error: false,
+            }],
+        };
+        // task + 4 (assistant, result) pairs = 9 messages; KEEP_RECENT_TURNS=2 protects the
+        // last 4, so the results at indices 2 and 4 are evictable; 6 and 8 are protected.
+        let mut history = vec![
+            Message::user("task"),
+            tu("a"),
+            tr("a"),
+            tu("b"),
+            tr("b"),
+            tu("c"),
+            tr("c"),
+            tu("d"),
+            tr("d"),
+        ];
+        let before = history_tokens(&history);
+        evict_to_fit(&mut history, 10); // tiny limit forces eviction of all evictable results
+
+        let content = |i: usize| match &history[i].content[0] {
+            ContentBlock::ToolResult { content, .. } => content.clone(),
+            _ => unreachable!("expected tool result at {i}"),
+        };
+        // Oldest two evicted...
+        assert!(content(2).starts_with("[evicted"));
+        assert!(content(4).starts_with("[evicted"));
+        // ...recent two preserved verbatim, and the task untouched.
+        assert_eq!(content(6), big);
+        assert_eq!(content(8), big);
+        assert_eq!(history[0].text(), "task");
+        assert!(history_tokens(&history) < before);
     }
 
     /// A tool that returns a fixed, sizeable string — used to grow history quickly so

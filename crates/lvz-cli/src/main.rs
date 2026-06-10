@@ -68,6 +68,10 @@ struct Cli {
     /// Compact conversation history once it exceeds this many estimated tokens (--agent mode).
     #[arg(long)]
     compact_after: Option<usize>,
+
+    /// Soft per-request context-token ceiling (--agent mode); evict oldest tool output to fit.
+    #[arg(long)]
+    context_limit: Option<usize>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -135,6 +139,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(summary_model) = cli.summary_model {
             config = config.with_summary_model(summary_model);
+        }
+        if let Some(context_limit) = cli.context_limit {
+            config = config.with_context_limit(context_limit);
         }
         let mut agent = Agent::new(provider, ToolRegistry::with_builtins(), config);
         if let Some(compact_after) = cli.compact_after {
