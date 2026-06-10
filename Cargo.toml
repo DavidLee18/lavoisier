@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88" # floor set by the tonic 0.14 gRPC stack (M7)
 license = "MIT"
 repository = "https://github.com/DavidLee18/lavoisier"
 authors = ["Jaehyun Lee"]
@@ -23,6 +23,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
+
+# gRPC stack (lvz-xai primary transport; codegen from vendored proto/). Client-only:
+# default tonic features pull in the server/router (axum, h2) which we don't need.
+tonic = { version = "0.14", default-features = false, features = ["codegen", "channel", "tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+tonic-prost-build = "0.14"
 
 # Internal crates
 lvz-protocol = { path = "crates/lvz-protocol" }

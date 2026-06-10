@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: M0–M6 complete (efficiency hardening done; M7 xAI gRPC next)
+## Status: M0–M6 complete; M7 (xAI gRPC) started — protos vendored + codegen working
 
 `RECIPE.md` is the authoritative **build blueprint** for **Lavoisier** (binary `lavoisier`,
 alias `lav`) — a modular, token-efficient CLI coding agent in Rust with a provider-agnostic
@@ -70,9 +70,26 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   feeding a real `TaskContext`, and the optional §6.3 extras (context deduplication + output
   minimisation). (`--summary-model`/`--compact-after`/`--context-limit` exposed; all
   mechanisms unit-tested, compaction also live-verified.)
-- **M7 — xAI gRPC.** Vendor `xai-org/xai-proto` into `proto/`, `tonic-build` codegen, v6
-  "outputs" server-side tools. Today only the in-crate OpenAI-compat fallback exists in
-  `lvz-xai`; the gRPC path is a runtime switch beside it.
+- **M7 — xAI gRPC (in progress, paused 2026-06-10).** Done so far: `xai-org/xai-proto`
+  vendored into `proto/` at pinned commit `543b901d` (Apache-2.0; provenance + update
+  procedure in `proto/VENDOR.md`), and `tonic-prost-build` codegen wired in
+  `crates/lvz-xai/build.rs` — **builds clean** (client-only tonic 0.14 stack:
+  `tonic`/`tonic-prost`/`prost`/`prost-types` workspace deps; **requires `protoc`** on the
+  build machine, e.g. `brew install protobuf`; workspace **MSRV bumped 1.82 → 1.88** for
+  tonic 0.14). The generated `xai_api` module is **not yet consumed** — no
+  `include_proto!` in `lvz-xai/src` yet. **Next steps:** (1) `mod pb` via
+  `tonic::include_proto!("xai_api")`; (2) gRPC transport: `Chat.GetCompletionChunk` streaming
+  to `api.x.ai:443` with `Authorization: Bearer`, mapping `ChatRequest`→`GetCompletionsRequest`
+  (system→`ROLE_SYSTEM` message, `ToolUse`→assistant `tool_calls`, `ToolResult`→`ROLE_TOOL`
+  message with `tool_call_id`, tooldefs→`Tool{function: Function{parameters: JSON-string}}`)
+  and chunk `Delta{content, reasoning_content, tool_calls}`→`Event` (text/thinking/tool),
+  `SamplingUsage`→`Usage` (`cached_prompt_text_tokens`→`cache_read_tokens`),
+  `FinishReason`→`StopReason` (STOP→EndTurn, MAX_LEN/MAX_CONTEXT→MaxTokens,
+  TOOL_CALLS→ToolUse); (3) runtime switch (`XAI_TRANSPORT=grpc|http`, default stays http
+  until gRPC is live-verified) with `Capabilities.server_side_tools=true` on gRPC;
+  (4) unit tests + live verify with `XAI_API_KEY`, then update this file. Note: the protos'
+  current package is `xai_api` (path `xai/api/v1`) — this *is* the "outputs"-style API RECIPE
+  calls "proto v6" (`repeated CompletionOutput(Chunk) outputs`).
 - **M8 — gateway layer.** `lvz-gw-http` (REST + WebSocket). The `Gateway`/`AgentHandle`
   contracts already exist in `lvz-protocol` and `Agent` implements `AgentHandle`; this is
   about concrete gateway crates.
@@ -104,6 +121,9 @@ sequential workflows that accumulate ≥3 turn-pairs.)
 
 ### Gotchas
 
+- **Building `lvz-xai` requires `protoc`** (`brew install protobuf`) — `build.rs` compiles the
+  vendored `proto/xai/api/v1/chat.proto` via `tonic-prost-build`. Pinned upstream commit and
+  update procedure live in `proto/VENDOR.md`.
 - `lvz-context` parses with tree-sitter; grammar/core ABI versions are pinned in its
   `Cargo.toml` — bump them together and re-run tests.
 - The budget loop's per-fixture ceilings in `crates/lvz-context/tests/budget.rs` are the
