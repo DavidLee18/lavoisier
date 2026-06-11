@@ -177,16 +177,38 @@ works" — the quantity we compare.
 Find-or-insert the `used` candidate for the key; `trials += 1`; on `out.success`,
 `successes += 1` and `success_tokens += out.total_tokens`.
 
-**Safe counterfactual crediting (truncate).** `observe` then credits the *provably-equivalent*
-cheaper truncate settings without a live trial. If `out.max_tool_result_bytes` (the largest
-untruncated tool result the task produced) is `≤ used.truncate_bytes` — i.e. truncation never
-actually fired — then every grid value `b` with `max_tool_result_bytes ≤ b < used.truncate_bytes`
-would have produced a **byte-identical transcript**: same tokens, same success. Each such `b` is
-folded in with the *same* outcome. This is exact, not a monotonicity assumption — the transcript
-is literally unchanged — so it can never falsely credit a starved setting (one that *would* have
-truncated). Its effect: tighter truncate limits build trust quickly, and the tie-break above then
-selects them over the (equal-cost) default. The crediting only runs when truncation didn't fire;
-if it did, a different limit changes the transcript and no counterfactual is sound.
+There are **two counterfactual mechanisms**, on opposite ends of the soundness/impact trade-off:
+one is exact-but-modest and always on; the other is impactful-but-unsound and opt-in.
+
+**(a) Truncate counterfactual — exact, always on.** `observe` (inside `LearningTuner`) credits the
+*provably-equivalent* cheaper truncate settings without a live trial. If `out.max_tool_result_bytes`
+(the largest untruncated tool result the task produced) is `≤ used.truncate_bytes` — i.e.
+truncation never actually fired — then every grid value `b` with
+`max_tool_result_bytes ≤ b < used.truncate_bytes` would have produced a **byte-identical
+transcript**: same tokens, same success. Each such `b` is folded in with the *same* outcome. This
+is exact, not a monotonicity assumption — the transcript is literally unchanged — so it can never
+falsely credit a starved setting (one that *would* have truncated). Its effect: tighter truncate
+limits build trust quickly, and the tie-break above then selects them over the (equal-cost)
+default. It only runs when truncation didn't fire; if it did, a different limit changes the
+transcript and no counterfactual is sound. Because the credited transcript is identical, this is
+**not an immediate token win** — it proves *equivalence*, and the saving only materialises later,
+on a task where the (now-trusted, tighter) limit actually bites.
+
+**(b) Radius counterfactual — estimated, opt-in (`--radius-counterfactual`).** Unlike (a), this
+one *does* estimate a real token saving on the same task — and pays for it with soundness. When
+enabled, the agent snapshots every knob-governed `outline_file` skeleton (a `focus` with no
+model-supplied radius, so the tuner's radius was injected). After the task, for each radius `t`
+below the one used, it **re-extracts those skeletons at `t`** (`skeleton_with_radius` +
+`estimate_tokens`), sums the tokens that smaller radius would have saved, and credits
+`Knobs { skeleton_radius: t, .. }` with `(realised.total − saving, realised.success)`. The token
+delta is real; the **success bit is optimistically transferred** — we cannot prove the model
+wouldn't have failed with less dependency context, so this *can* falsely credit a starved radius.
+That is the whole reason it is off by default and behind a flag. It accelerates discovery of
+smaller radii at the cost of (a)'s safety guarantee. (`max_tool_result_bytes` is cleared on these
+synthetic outcomes so they don't compound with mechanism (a).) Snapshots are taken at outline time
+because the agent may edit the file later in the same task. Lives in `lvz-agent` — it needs
+`lvz-context` to re-extract, which the minimal-deps `lvz-tune` learner deliberately doesn't pull
+in; the learner just records the synthetic observations the agent emits.
 
 ### Defaults (`TuneConfig`)
 
@@ -255,11 +277,13 @@ pair the two for a production-grade signal.
 - **A real success signal** (§8) — `--verify-cmd` gates `Outcome.success` on an exit code (tests
   / type-check / lint), the quality gate §6.6 requires; coarse "completed without error" remains
   the fallback.
-- **Counterfactual learning** (§6) — the *exact* byte-identical truncate counterfactual: when
-  truncation never fired, every cheaper truncate grid value still ≥ the largest result is credited
-  with the same outcome, no live trial. Sound (the transcript is literally unchanged), so it can't
-  mislabel a starved setting. (A radius/cost-estimate counterfactual from full traces remains
-  future work — it needs token-cost re-simulation, not just an equality check.)
+- **Counterfactual learning** (§6) — *both* mechanisms now ship. (a) The **exact** byte-identical
+  truncate counterfactual (always on): when truncation never fired, every cheaper truncate grid
+  value still ≥ the largest result is credited with the same outcome, no live trial — sound, can't
+  mislabel a starved setting. (b) The **estimated** radius counterfactual (opt-in,
+  `--radius-counterfactual`): re-extracts snapshotted skeletons at smaller radii to estimate the
+  token saving and credits those radii with the optimistically-transferred success bit — impactful
+  but unsound, hence flag-gated and off by default.
 - **Non-stationarity / model-version keying** (§3) — `ContextKey` now carries the concrete
   `model_id`, so a model upgrade starts a fresh profile instead of averaging a shifted optimum.
 - **Profile persistence** (§9) — `--tune-state <path>` saves/loads profiles + PRNG across restarts.
@@ -268,9 +292,10 @@ pair the two for a production-grade signal.
 
 **Still deferred.**
 
-- **Trace-based radius counterfactuals & per-repo profiles** — recompute a different
-  `skeleton_radius`'s token cost from a logged trace (needs re-simulation), and key profiles by
-  repo as well as archetype. Decay of stale observations on model change (beyond fresh keying).
+- **Per-repo profiles & observation decay** — key profiles by repo as well as archetype, and decay
+  stale observations on a model change (beyond the fresh `model_id` keying). The radius
+  counterfactual could also estimate *downstream* token effects (it currently models only the
+  skeleton-input delta, not the model's altered subsequent turns).
 - **Bayesian optimisation** over the knob vector — deferred until the data justifies it; the
   simple ε-greedy hill-climb is expected to suffice (`RECIPE.md` §6.6, ≈0.65).
 

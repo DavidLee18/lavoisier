@@ -20,10 +20,11 @@
 //! its `select`/`observe` are synchronous, matching the trait.
 //!
 //! Now wired (see `docs/ATO.md`): a real success signal (`--verify-cmd`), model-version keying
-//! (`ContextKey` carries `model_id`), the exact byte-identical truncate counterfactual, and
-//! profile persistence (`save`/`load`). Still deferred: trace-based radius-cost counterfactuals,
-//! per-repo profiles, and Bayesian optimisation. The success signal is only as good as what the
-//! agent reports — pair `--tune` with `--verify-cmd` for a real quality gate in production.
+//! (`ContextKey` carries `model_id`), the exact byte-identical truncate counterfactual, the
+//! opt-in estimated radius counterfactual (emitted by `lvz-agent`; this learner just records the
+//! synthetic observations), and profile persistence (`save`/`load`). Still deferred: per-repo
+//! profiles, observation decay, and Bayesian optimisation. The success signal is only as good as
+//! what the agent reports — pair `--tune` with `--verify-cmd` for a real quality gate in production.
 
 use std::collections::HashMap;
 use std::path::Path;

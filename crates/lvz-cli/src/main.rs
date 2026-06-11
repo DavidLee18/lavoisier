@@ -138,6 +138,14 @@ struct Cli {
     /// cold), saved after each completed turn. Lets ATO keep what it learned across restarts.
     #[arg(long, value_name = "PATH")]
     tune_state: Option<String>,
+
+    /// Enable the experimental, **unsound** skeleton-radius counterfactual (`docs/ATO.md` §6):
+    /// after each task, estimate what smaller --tune skeleton radii would have cost and credit
+    /// them with the realised success bit (optimistically — it can't prove less context wouldn't
+    /// have failed). Off by default; only meaningful with `--tune`. The truncate counterfactual
+    /// (exact, sound) is always on and needs no flag.
+    #[arg(long)]
+    radius_counterfactual: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -292,6 +300,9 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
     }
     if let Some(verify_cmd) = &cli.verify_cmd {
         config = config.with_verify_command(verify_cmd.clone());
+    }
+    if cli.radius_counterfactual {
+        config = config.with_radius_counterfactual(true);
     }
     // Profile the working directory so the tuner sees a real repo shape (§6.6).
     if let Ok(cwd) = std::env::current_dir() {

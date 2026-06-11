@@ -194,15 +194,21 @@ sequential workflows that accumulate ≥3 turn-pairs.)
     a post-task shell gate (e.g. `cargo test`); exit 0 ⇒ `Outcome.success`, else the coarse
     "completed without error" fallback; **(2) all four knobs now bite** — `skeleton_radius` is
     injected into focused `outline_file` calls, `batch_width` drives a parallel-tool-use
-    system-prompt hint (alongside the already-live `compact_after`/`truncate_bytes`); **(3) safe
-    counterfactual crediting** — when truncation never fired, cheaper truncate-grid values still ≥
-    the largest tool result are credited with the identical (byte-for-byte) outcome, no live
-    trial (`Outcome.max_tool_result_bytes` carries the signal); **(4) model-version keying** —
-    `TaskContext.model_id` in the `ContextKey` so a model upgrade starts a fresh profile; **(5)
-    persistence** — `--tune-state <path>` (JSON save/load of profiles + PRNG across restarts via
-    a `PersistentTuner` wrapper). Still deferred: trace-based radius-cost counterfactuals, per-repo
-    profiles, Bayesian optimisation. Pair `--tune` with `--verify-cmd` for a production-grade
-    signal; `--tune` alone stays experimental.
+    system-prompt hint (alongside the already-live `compact_after`/`truncate_bytes`); **(3) two
+    counterfactuals** — (a) the **exact** truncate one (always on): when truncation never fired,
+    cheaper truncate-grid values still ≥ the largest tool result are credited with the identical
+    (byte-for-byte) outcome, no live trial (`Outcome.max_tool_result_bytes` carries the signal);
+    (b) the **estimated** radius one (opt-in `--radius-counterfactual`, off by default, *unsound*):
+    `lvz-agent` snapshots knob-governed `outline_file` skeletons and, post-task, re-extracts them
+    at smaller radii to estimate the saving and credits those radii with the optimistically-
+    transferred success bit; **(4) model-version keying** — `TaskContext.model_id` in the
+    `ContextKey` so a model upgrade starts a fresh profile; **(5) persistence** — `--tune-state
+    <path>` (JSON save/load of profiles + PRNG across restarts via a `PersistentTuner` wrapper).
+    Live-verified vs Anthropic: `--verify-cmd` exit-code gating (pass→successes 1, fail→0) and the
+    radius counterfactual (a `skeleton_radius:0` row credited alongside the realised `:1`). Still
+    deferred: per-repo profiles, observation decay, Bayesian optimisation. Pair `--tune` with
+    `--verify-cmd` for a production-grade signal; `--tune` alone (and `--radius-counterfactual`)
+    stay experimental.
   - **`lvz-claude-cli` — built, off by default.** A `Provider` shelling out to `claude -p`
     (`--output-format stream-json`), stream-json → `Event`; `Capabilities` all false (no
     caching). Selected only via `--provider claude-cli` (default model `sonnet`; `CLAUDE_CLI_BIN`
@@ -226,8 +232,8 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   parallel-tool-use system-prompt hint). The success signal is real when `--verify-cmd` is set
   (post-task exit-code gate), else the coarse completion fallback. The default tuner is still
   `NoopTuner` (ATO is opt-in via `--tune`); archetype classification is still a keyword heuristic,
-  not a model call. Remaining ATO gaps are narrow: trace-based radius-cost counterfactuals,
-  per-repo profile keying, Bayesian optimisation (see `docs/ATO.md` §10).
+  not a model call. Remaining ATO gaps are narrow: per-repo profile keying, observation decay,
+  downstream-effect modelling in the radius counterfactual, Bayesian optimisation (`docs/ATO.md` §10).
 - **Telemetry (§6.4).** Usage is aggregated, the `--budget` ceiling is enforced, and the
   **HTTP gateway now exports Prometheus `/metrics`** (tokens, cache read/creation, turns,
   errors, summed latency). The per-task ATO success signal now exists (`--verify-cmd`). Still
@@ -315,9 +321,10 @@ in-memory), `--serve-matrix` (Matrix gateway), `--api-key <KEY>` (repeatable) / 
 <N per 60s>` (gateway auth/quota), `--provider xai|anthropic|claude-cli`, `--model`,
 `--max-tokens`, `--system`, `--budget` (total-task token ceiling),
 `--summary-model`/`--compact-after`/`--context-limit` (agent efficiency knobs), `--tune`
-(ATO learner) with `--verify-cmd <cmd>` (post-task success gate) and `--tune-state <path>`
-(persist learned profiles), `--cheap-model`/`--escalate-after` (cheap-model-first) and
-`--advisor-model` (advisor+executor split) for §8 cost reduction. Gateway HTTP
+(ATO learner) with `--verify-cmd <cmd>` (post-task success gate), `--tune-state <path>`
+(persist learned profiles) and `--radius-counterfactual` (opt-in, unsound radius counterfactual),
+`--cheap-model`/`--escalate-after` (cheap-model-first) and `--advisor-model` (advisor+executor
+split) for §8 cost reduction. Gateway HTTP
 routes: `GET /health`, `GET /metrics` (Prometheus), `POST /v1/turns` (SSE), `GET /v1/ws`
 (WebSocket). Env: `XAI_API_KEY`/`XAI_BASE_URL`/`XAI_GRPC_ENDPOINT`, **`XAI_TRANSPORT=grpc|http`
 (default `grpc`)**, `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`,

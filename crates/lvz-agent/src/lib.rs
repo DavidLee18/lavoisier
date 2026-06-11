@@ -31,7 +31,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::channel::mpsc;
 use futures::stream::{BoxStream, StreamExt};
+use lvz_context::symbols::skeleton_with_radius;
 use lvz_context::tokens::estimate_tokens;
+use lvz_context::Lang;
 use lvz_protocol::{
     AgentError, AgentHandle, Archetype, Capabilities, ChatRequest, ContentBlock, Event, Knobs,
     Message, ModelTier, NoopTuner, Outcome, Provider, RepoProfile, Role, StopReason, SystemPrompt,
@@ -116,6 +118,14 @@ pub struct AgentConfig {
     /// falls back to the coarse "completed without error" signal. Only run on otherwise-clean
     /// completion (not after a provider error / budget overrun / step-cap).
     pub verify_command: Option<String>,
+    /// Enable the **trace-based skeleton-radius counterfactual** (`docs/ATO.md` §6, §10).
+    /// **Off by default and unsound** — unlike the always-on truncate counterfactual (which is
+    /// exact), this *estimates* the tokens a smaller [`skeleton_radius`](Knobs::skeleton_radius)
+    /// would have cost (by re-extracting the captured skeletons at each smaller radius) and
+    /// **optimistically transfers the realised success bit** to those cheaper radii — it cannot
+    /// prove the model wouldn't have failed with less context. It lets ATO discover smaller radii
+    /// faster, at the risk of crediting a starved setting. Only meaningful with a learning tuner.
+    pub radius_counterfactual: bool,
 }
 
 impl Default for AgentConfig {
@@ -134,6 +144,7 @@ impl Default for AgentConfig {
             escalate_after: 2,
             advisor_model: None,
             verify_command: None,
+            radius_counterfactual: false,
         }
     }
 }
@@ -193,6 +204,13 @@ impl AgentConfig {
     /// clean completion marks the task successful; non-zero marks it failed.
     pub fn with_verify_command(mut self, cmd: impl Into<String>) -> Self {
         self.verify_command = Some(cmd.into());
+        self
+    }
+
+    /// Enable the unsound, estimate-based skeleton-radius counterfactual (off by default; see
+    /// [`radius_counterfactual`](Self::radius_counterfactual)).
+    pub fn with_radius_counterfactual(mut self, enabled: bool) -> Self {
+        self.radius_counterfactual = enabled;
         self
     }
 }
@@ -308,6 +326,9 @@ async fn run_loop(
     // Largest untruncated tool-result seen, for the learner's safe counterfactual crediting
     // (§6.6 / `docs/ATO.md` §3). `None` until the first tool runs.
     let mut max_result_bytes: Option<usize> = None;
+    // Captured outline skeletons for the (opt-in, unsound) radius counterfactual (§6). Empty
+    // unless `config.radius_counterfactual` is set.
+    let mut radius_traces: Vec<RadiusTrace> = Vec::new();
 
     // Advisor pre-pass (§8 advisor+executor split): a smarter, more expensive model drafts a
     // plan that seeds the cheaper executor (the main `model`), so the expensive model is paid
@@ -362,6 +383,7 @@ async fn run_loop(
                     round_trips,
                     false,
                     max_result_bytes,
+                    &radius_traces,
                 );
                 let _ = tx.unbounded_send(Err(AgentError::Provider(e.to_string())));
                 return;
@@ -385,6 +407,7 @@ async fn run_loop(
                         round_trips,
                         false,
                         max_result_bytes,
+                        &radius_traces,
                     );
                     let _ = tx.unbounded_send(Err(AgentError::Provider(e.to_string())));
                     return;
@@ -405,6 +428,7 @@ async fn run_loop(
                     round_trips,
                     false,
                     max_result_bytes,
+                    &radius_traces,
                 );
                 let _ = tx.unbounded_send(Err(AgentError::BudgetExceeded));
                 return;
@@ -425,6 +449,7 @@ async fn run_loop(
                 round_trips,
                 success,
                 max_result_bytes,
+                &radius_traces,
             );
             let _ = tx.unbounded_send(Ok(Event::Usage(total)));
             let _ = tx.unbounded_send(Ok(Event::Done(stop)));
@@ -438,7 +463,14 @@ async fn run_loop(
         for call in &turn.tool_calls {
             // Wire the skeleton-radius knob (§6.6): when the model outlines a focus symbol but
             // doesn't pick a radius, supply the tuner-chosen one so ATO's choice takes effect.
-            let args = apply_skeleton_radius(&call.name, call.parsed_args(), knobs.skeleton_radius);
+            let original_args = call.parsed_args();
+            // Snapshot the skeleton (pre-injection args) for the radius counterfactual, if on.
+            if config.radius_counterfactual {
+                if let Some(trace) = capture_radius_trace(&call.name, &original_args).await {
+                    radius_traces.push(trace);
+                }
+            }
+            let args = apply_skeleton_radius(&call.name, original_args, knobs.skeleton_radius);
             let block = match tools.invoke(&call.name, args).await {
                 Ok(out) => {
                     // Record the pre-truncation size for counterfactual truncate-knob crediting.
@@ -473,12 +505,17 @@ async fn run_loop(
         round_trips,
         false,
         max_result_bytes,
+        &radius_traces,
     );
     let _ = tx.unbounded_send(Ok(Event::Usage(total)));
     let _ = tx.unbounded_send(Ok(Event::Done(StopReason::Other("max_steps".into()))));
 }
 
-/// Report the realised task outcome to the tuner so it can adapt knobs (`RECIPE.md` §6.6).
+/// Report the realised task outcome to the tuner so it can adapt knobs (`RECIPE.md` §6.6), then
+/// emit any opt-in radius counterfactuals.
+// The arguments are a single cohesive observation (the realised outcome's parts + the trace);
+// bundling them into a struct would be ceremony for one internal call shape.
+#[allow(clippy::too_many_arguments)]
 fn observe(
     tuner: &Arc<dyn Tuner>,
     ctx: &TaskContext,
@@ -487,18 +524,57 @@ fn observe(
     round_trips: u32,
     success: bool,
     max_tool_result_bytes: Option<usize>,
+    radius_traces: &[RadiusTrace],
 ) {
-    tuner.observe(
-        ctx,
-        knobs,
-        &Outcome {
-            total_tokens: total.total(),
-            round_trips,
-            cache_hit_rate: total.cache_hit_rate(),
-            success,
-            max_tool_result_bytes,
-        },
-    );
+    let realised = Outcome {
+        total_tokens: total.total(),
+        round_trips,
+        cache_hit_rate: total.cache_hit_rate(),
+        success,
+        max_tool_result_bytes,
+    };
+    tuner.observe(ctx, knobs, &realised);
+    emit_radius_counterfactuals(tuner, ctx, knobs, &realised, radius_traces);
+}
+
+/// Emit the **unsound, estimate-based** skeleton-radius counterfactual (`docs/ATO.md` §6, §10).
+///
+/// For each radius `t` strictly below the one used, re-extract every captured outline skeleton at
+/// `t`, sum how many tokens that would have saved versus the radius actually used, and credit
+/// `Knobs { skeleton_radius: t, .. }` with `(realised.total − saving, realised.success)`. The
+/// token estimate is real (re-extracted from the snapshot); the **success bit is optimistically
+/// transferred** — we cannot prove the model would have succeeded with less context, which is
+/// exactly why this is opt-in. `max_tool_result_bytes` is cleared so it doesn't compound with the
+/// learner's (exact) truncate counterfactual. No-op when no traces were captured or radius is 0.
+fn emit_radius_counterfactuals(
+    tuner: &Arc<dyn Tuner>,
+    ctx: &TaskContext,
+    knobs: &Knobs,
+    realised: &Outcome,
+    radius_traces: &[RadiusTrace],
+) {
+    let used = knobs.skeleton_radius;
+    if radius_traces.is_empty() || used == 0 {
+        return;
+    }
+    for t in 0..used {
+        let saving: u64 = radius_traces
+            .iter()
+            .map(|tr| tr.tokens_at(used).saturating_sub(tr.tokens_at(t)))
+            .sum();
+        let cf_knobs = Knobs {
+            skeleton_radius: t,
+            ..*knobs
+        };
+        let cf = Outcome {
+            total_tokens: realised.total_tokens.saturating_sub(saving),
+            round_trips: realised.round_trips,
+            cache_hit_rate: realised.cache_hit_rate,
+            success: realised.success,
+            max_tool_result_bytes: None,
+        };
+        tuner.observe(ctx, &cf_knobs, &cf);
+    }
 }
 
 /// Run the optional post-task verification command (the real ATO success signal, §6.6).
@@ -554,6 +630,48 @@ fn apply_skeleton_radius(tool: &str, mut args: Value, radius: u8) -> Value {
         }
     }
     args
+}
+
+/// A captured `outline_file` skeleton, kept (only when the radius counterfactual is enabled) so
+/// the realised skeleton can be re-extracted at *smaller* radii after the task to estimate what
+/// a tighter [`skeleton_radius`](Knobs::skeleton_radius) would have cost (`docs/ATO.md` §6). The
+/// source is snapshotted at outline time because the agent may edit the file later in the task.
+struct RadiusTrace {
+    source: String,
+    lang: Lang,
+    focus: String,
+}
+
+impl RadiusTrace {
+    /// Estimated tokens this skeleton would occupy at `radius` (re-extracted from the snapshot).
+    fn tokens_at(&self, radius: u8) -> u64 {
+        let skel = skeleton_with_radius(&self.source, self.lang, &self.focus, radius);
+        estimate_tokens(&skel) as u64
+    }
+}
+
+/// Capture a [`RadiusTrace`] for an `outline_file` call **iff** it is the knob-governed kind:
+/// the model asked to `focus` a symbol but left `radius` unset (so the tuner's radius was
+/// injected by [`apply_skeleton_radius`]). Calls where the model pinned an explicit radius are
+/// its own choice, not the knob's, and are skipped. Returns `None` for anything else, or if the
+/// file can't be read or its language isn't supported.
+async fn capture_radius_trace(tool: &str, args: &Value) -> Option<RadiusTrace> {
+    if tool != "outline_file" {
+        return None;
+    }
+    let obj = args.as_object()?;
+    if obj.contains_key("radius") {
+        return None; // model pinned the radius — not the knob's call
+    }
+    let focus = obj.get("focus")?.as_str()?.to_string();
+    let path = obj.get("path")?.as_str()?;
+    let lang = Lang::from_path(path)?;
+    let source = tokio::fs::read_to_string(path).await.ok()?;
+    Some(RadiusTrace {
+        source,
+        lang,
+        focus,
+    })
 }
 
 /// The result of a successful compaction: a shrunken history and the tokens it cost.
@@ -1200,6 +1318,95 @@ mod tests {
         // Non-zero exit → failure.
         let bad = AgentConfig::default().with_verify_command("exit 1");
         assert!(!run_verify(&bad).await);
+    }
+
+    /// A tuner that records every `observe(knobs, outcome)` it receives, for asserting on the
+    /// counterfactual observations the agent emits. `select` always returns the default.
+    #[derive(Default)]
+    struct RecordingTuner {
+        seen: Mutex<Vec<(Knobs, Outcome)>>,
+    }
+
+    impl Tuner for RecordingTuner {
+        fn select(&self, _ctx: &TaskContext) -> Knobs {
+            Knobs::default()
+        }
+        fn observe(&self, _ctx: &TaskContext, used: &Knobs, out: &Outcome) {
+            self.seen.lock().unwrap().push((*used, *out));
+        }
+    }
+
+    fn test_ctx() -> TaskContext {
+        TaskContext {
+            archetype: Archetype::Other,
+            repo: RepoProfile::default(),
+            caps: Capabilities::default(),
+            model: ModelTier::Balanced,
+            model_id: "test".into(),
+        }
+    }
+
+    #[test]
+    fn radius_counterfactual_credits_cheaper_radii_with_estimated_cost_and_transferred_success() {
+        // A Rust source where a focus symbol pulls in a dependency body, so a larger radius
+        // genuinely includes more tokens than a smaller one.
+        let source = "\
+fn helper() -> u32 { let a = 1; let b = 2; a + b + 3 + 4 + 5 }
+fn target() -> u32 { helper() + 10 }
+"
+        .to_string();
+        let trace = RadiusTrace {
+            source,
+            lang: Lang::Rust,
+            focus: "target".into(),
+        };
+        // Sanity: radius 1 (pulls helper's body) estimates more tokens than radius 0.
+        assert!(trace.tokens_at(1) >= trace.tokens_at(0));
+
+        let rec = Arc::new(RecordingTuner::default());
+        let tuner: Arc<dyn Tuner> = rec.clone();
+        let ctx = test_ctx();
+        let used = Knobs::default(); // skeleton_radius = 1
+        let realised = Outcome {
+            total_tokens: 1000,
+            round_trips: 3,
+            cache_hit_rate: 0.0,
+            success: true,
+            max_tool_result_bytes: None,
+        };
+        emit_radius_counterfactuals(&tuner, &ctx, &used, &realised, std::slice::from_ref(&trace));
+
+        let seen = rec.seen.lock().unwrap();
+        // radius used = 1 → exactly one counterfactual (t = 0).
+        assert_eq!(seen.len(), 1);
+        let (cf_knobs, cf_out) = &seen[0];
+        assert_eq!(cf_knobs.skeleton_radius, 0);
+        // Token estimate reduced by the re-extracted saving; success optimistically transferred.
+        assert!(cf_out.total_tokens <= realised.total_tokens);
+        assert!(cf_out.success);
+        assert!(cf_out.max_tool_result_bytes.is_none());
+    }
+
+    #[test]
+    fn radius_counterfactual_is_noop_without_traces_or_at_radius_zero() {
+        let rec = Arc::new(RecordingTuner::default());
+        let tuner: Arc<dyn Tuner> = rec.clone();
+        let ctx = test_ctx();
+        let realised = Outcome::default();
+        // No traces → nothing emitted.
+        emit_radius_counterfactuals(&tuner, &ctx, &Knobs::default(), &realised, &[]);
+        // Radius 0 → no smaller radius to credit, even with a trace.
+        let trace = RadiusTrace {
+            source: "fn a() {}".into(),
+            lang: Lang::Rust,
+            focus: "a".into(),
+        };
+        let r0 = Knobs {
+            skeleton_radius: 0,
+            ..Knobs::default()
+        };
+        emit_radius_counterfactuals(&tuner, &ctx, &r0, &realised, std::slice::from_ref(&trace));
+        assert!(rec.seen.lock().unwrap().is_empty());
     }
 
     #[test]
