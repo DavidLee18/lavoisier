@@ -6,8 +6,8 @@
 //! normalised [`Event`] stream; each is the *only* place its wire format is known.
 //!
 //! [`XaiProvider`] is a thin dispatcher over the two. [`XaiProvider::from_env`] honours the
-//! `XAI_TRANSPORT` switch (`grpc` | `http`), defaulting to `http` until the gRPC path is
-//! live-verified.
+//! `XAI_TRANSPORT` switch (`grpc` | `http`); gRPC is the default (RECIPE §8 "primary
+//! transport", live-verified against `api.x.ai`), with `http` available as a fallback.
 
 mod grpc;
 mod http;
@@ -40,12 +40,12 @@ impl XaiProvider {
     }
 
     /// Construct from the environment. `XAI_API_KEY` is required. `XAI_TRANSPORT` selects the
-    /// transport (`grpc` | `http`, default `http`). `XAI_BASE_URL` overrides the REST base
+    /// transport (`grpc` | `http`, default `grpc`). `XAI_BASE_URL` overrides the REST base
     /// (HTTP); `XAI_GRPC_ENDPOINT` overrides the gRPC endpoint.
     pub fn from_env() -> Result<Self, ProviderError> {
         let api_key = std::env::var("XAI_API_KEY")
             .map_err(|_| ProviderError::Config("XAI_API_KEY is not set".into()))?;
-        let transport = std::env::var("XAI_TRANSPORT").unwrap_or_else(|_| "http".into());
+        let transport = std::env::var("XAI_TRANSPORT").unwrap_or_else(|_| "grpc".into());
         match transport.trim().to_ascii_lowercase().as_str() {
             "grpc" => {
                 let endpoint = std::env::var("XAI_GRPC_ENDPOINT")

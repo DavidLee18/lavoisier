@@ -24,6 +24,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 
+# HTTP/WebSocket gateway (lvz-gw-http). axum brings its own hyper 1 server + WS support.
+axum = { version = "0.8", features = ["ws"] }
+
 # gRPC stack (lvz-xai primary transport; codegen from vendored proto/). Client-only:
 # default tonic features pull in the server/router (axum, h2) which we don't need.
 tonic = { version = "0.14", default-features = false, features = ["codegen", "channel", "tls-ring", "tls-webpki-roots"] }
@@ -39,6 +42,7 @@ lvz-xai = { path = "crates/lvz-xai" }
 lvz-tools = { path = "crates/lvz-tools" }
 lvz-agent = { path = "crates/lvz-agent" }
 lvz-context = { path = "crates/lvz-context" }
+lvz-gw-http = { path = "crates/lvz-gw-http" }
 
 [profile.release]
 lto = "thin"

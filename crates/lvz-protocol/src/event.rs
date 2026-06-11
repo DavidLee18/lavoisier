@@ -8,8 +8,12 @@
 use serde::{Deserialize, Serialize};
 
 /// A single normalised event in a streamed model turn.
+///
+/// Adjacently tagged (`{"kind": …, "data": …}`) so every variant — including the newtype
+/// variants wrapping a primitive ([`TextDelta`](Event::TextDelta), [`Done`](Event::Done)) —
+/// round-trips through JSON. This is the on-the-wire shape gateways stream to their channels.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Event {
     /// Incremental assistant text.
     TextDelta(String),
@@ -77,4 +81,48 @@ pub enum StopReason {
     StopSequence,
     /// Anything provider-specific not captured above.
     Other(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_event_variant_roundtrips_through_json() {
+        let events = vec![
+            Event::TextDelta("hello".into()),
+            Event::Thinking("hmm".into()),
+            Event::ToolUseStart {
+                id: "call_1".into(),
+                name: "shell".into(),
+            },
+            Event::ToolUseDelta {
+                id: "call_1".into(),
+                json: "{\"cmd\":\"ls\"}".into(),
+            },
+            Event::ToolUseEnd {
+                id: "call_1".into(),
+            },
+            Event::Usage(Usage {
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_creation_tokens: 3,
+                cache_read_tokens: 4,
+            }),
+            Event::Done(StopReason::EndTurn),
+            Event::Done(StopReason::Other("time_limit".into())),
+        ];
+        for ev in events {
+            let json = serde_json::to_string(&ev).expect("serialize");
+            let back: Event = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(ev, back, "roundtrip mismatch for {json}");
+        }
+    }
+
+    #[test]
+    fn text_delta_has_the_adjacently_tagged_wire_shape() {
+        let json = serde_json::to_value(Event::TextDelta("hi".into())).unwrap();
+        assert_eq!(json["kind"], "text_delta");
+        assert_eq!(json["data"], "hi");
+    }
 }

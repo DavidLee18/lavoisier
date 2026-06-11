@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: M0–M7 complete — xAI gRPC transport live-verified against api.x.ai
+## Status: M0–M8 complete — xAI gRPC default + live-verified; `lvz-gw-http` HTTP/WS gateway live-verified
 
 `RECIPE.md` is the authoritative **build blueprint** for **Lavoisier** (binary `lavoisier`,
 alias `lav`) — a modular, token-efficient CLI coding agent in Rust with a provider-agnostic
@@ -20,7 +20,7 @@ CI loop (§6.5)** (`tests/budget.rs`, committed per-archetype token ceilings). S
 agent as `outline_file` (with optional `focus`/`radius`), `read_anchored`, `edit_anchored`.
 
 Crates that exist today: `lvz-protocol`, `lvz-xai`, `lvz-anthropic`, `lvz-context`,
-`lvz-tools`, `lvz-agent`, `lvz-cli`. Not yet built (future milestones): `lvz-tune`,
+`lvz-tools`, `lvz-agent`, `lvz-gw-http`, `lvz-cli`. Not yet built (future milestones): `lvz-tune`,
 `lvz-gateway` + `lvz-gw-*`, `lvz-claude-cli`.
 
 **Current state (saved 2026-06-09):** M0–M5 complete, committed and pushed to
@@ -100,16 +100,34 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   reachable over gRPC — a streaming turn produced text + reasoning(thinking) deltas, a
   populated `cache_read` usage (xAI returned cached prompt tokens), and a clean
   `Done(EndTurn)`; and the agent tool loop ran a `shell` call over gRPC (ToolUse args JSON
-  reassembled, `ROLE_TOOL` result fed back, final answer) end-to-end. **Default transport
-  stays `http`** (conservative — flip via `XAI_TRANSPORT=grpc`, or change the `from_env`
-  default to make gRPC primary per RECIPE §8 now that it's verified). Possible follow-up: a
+  reassembled, `ROLE_TOOL` result fed back, final answer) end-to-end. **gRPC is now the
+  default transport** (`from_env` defaults `XAI_TRANSPORT` to `grpc`, per RECIPE §8 "primary
+  transport"); set `XAI_TRANSPORT=http` for the OpenAI-compat fallback. Possible follow-up: a
   `--xai-transport` CLI flag (today it's env-only). Note: the protos' package is `xai_api`
   (path `xai/api/v1`) — the "outputs"-style API RECIPE calls "proto v6"
   (`repeated CompletionOutputChunk outputs`).
-- **M8 — gateway layer.** `lvz-gw-http` (REST + WebSocket). The `Gateway`/`AgentHandle`
-  contracts already exist in `lvz-protocol` and `Agent` implements `AgentHandle`; this is
-  about concrete gateway crates.
-- **M9 — Hermes gateways + features.** `lvz-gw-matrix`, `lvz-gw-discord`; `lvz-memory`,
+- **M8 — gateway layer (complete, live-verified 2026-06-11).** `lvz-gw-http` is the first
+  concrete `Gateway`: an axum 0.8 HTTP server fronting the shared agent via `AgentHandle`,
+  depending **only** on `lvz-protocol` (not on any provider or on `lvz-agent` internals).
+  Surface: `GET /health`, `POST /v1/turns` (`{session?, input}` → the `Event` stream as
+  **SSE**, one JSON event per `data:` frame), `GET /v1/ws` (a **WebSocket**: one turn JSON
+  per message, events streamed back as JSON text frames, socket stays open for more turns).
+  The wire format required making `Event` serializable: it was **internally** tagged
+  (`#[serde(tag="kind")]`), which *errors at runtime* for newtype variants wrapping a
+  primitive (`TextDelta(String)`, `Done(StopReason)`) — switched to **adjacent tagging**
+  (`#[serde(tag="kind", content="data")]` → `{"kind":"text_delta","data":"hi"}`), with a
+  per-variant round-trip test in `event.rs`. The CLI gained **`--serve <host:port>`** (builds
+  the same tool-using agent as `--agent` via a shared `build_agent`, then runs the gateway;
+  no prompt needed). **Live-verified**: `lavoisier --serve` over the default xAI gRPC
+  transport answered a real `POST /v1/turns` with a correct SSE stream (thinking + text
+  deltas, usage incl. `cache_read`, `done`). 78 tests pass (6 new in `lvz-gw-http`: unit
+  encoders + a real-listener HTTP/SSE integration test against a stub `AgentHandle`), clippy +
+  fmt clean. **Note:** the agent is still per-turn stateless — `submit` ignores `turn.session`
+  (no persisted multi-session history yet; that's M9 `lvz-memory` + session isolation). No
+  auth/quotas yet (M9). A `lvz-gateway` registry crate was *not* needed (the `Gateway` trait
+  already lives in `lvz-protocol`).
+- **M9 — Hermes gateways + features.** `lvz-gw-matrix`, `lvz-gw-discord`; `lvz-memory`
+  (+ per-session history so the gateway's `session` field becomes load-bearing),
   auth/quotas, observability (OTel).
 - **M10 — Hermes deployment.** Fargate arm64, us-west-2.
 - **Optional tracks.** `lvz-tune` (ATO §6.6 — the *online* half; needs §6.4 telemetry + a
@@ -193,18 +211,21 @@ cargo clippy --all-targets           # lints (keep zero-warning)
 cargo fmt                            # format
 
 # Run the CLI (the `lavoisier` binary lives in lvz-cli):
-XAI_API_KEY=… cargo run -p lvz-cli -- "your prompt"                 # one streaming turn (xAI)
+XAI_API_KEY=… cargo run -p lvz-cli -- "your prompt"                 # one streaming turn (xAI, gRPC default)
 ANTHROPIC_API_KEY=… cargo run -p lvz-cli -- --provider anthropic "…"  # Anthropic native
 XAI_API_KEY=… cargo run -p lvz-cli -- --agent "edit task here"      # M4 tool-using agent loop
+XAI_API_KEY=… cargo run -p lvz-cli -- --serve 127.0.0.1:8080        # M8 HTTP/WS gateway (POST /v1/turns, GET /v1/ws)
 ```
 
-CLI flags: `--agent` (tool loop), `--provider xai|anthropic`, `--model`, `--max-tokens`,
-`--system`, `--budget` (total-task token ceiling). Env: `XAI_API_KEY`/`XAI_BASE_URL`,
-`ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`, `LVZ_PROVIDER`, `LVZ_MODEL`. A local SSE mock can
-be pointed at via `*_BASE_URL` to test without a live key.
+CLI flags: `--agent` (tool loop), `--serve <host:port>` (HTTP/WS gateway), `--provider
+xai|anthropic`, `--model`, `--max-tokens`, `--system`, `--budget` (total-task token ceiling),
+`--summary-model`/`--compact-after`/`--context-limit` (agent efficiency knobs). Env:
+`XAI_API_KEY`/`XAI_BASE_URL`/`XAI_GRPC_ENDPOINT`, **`XAI_TRANSPORT=grpc|http` (default
+`grpc`)**, `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`, `LVZ_PROVIDER`, `LVZ_MODEL`. A local SSE
+mock can be pointed at via `*_BASE_URL` to test the HTTP path without a live key.
 
-Continue building in `RECIPE.md` §9 milestone order (next is M5: context engine +
-budget-fixture CI).
+Continue building in `RECIPE.md` §9 milestone order (next is M9: Hermes gateways
+`lvz-gw-matrix`/`lvz-gw-discord` + `lvz-memory` per-session history + auth/quotas).
 
 ## Conventions
 

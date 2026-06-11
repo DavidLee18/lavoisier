@@ -18,6 +18,7 @@ lvz-anthropic.workspace = true
 lvz-xai.workspace = true
 lvz-agent.workspace = true
 lvz-tools.workspace = true
+lvz-gw-http.workspace = true
 tokio.workspace = true
 clap.workspace = true
 futures.workspace = true

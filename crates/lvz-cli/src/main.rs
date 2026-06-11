@@ -18,7 +18,8 @@ use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use lvz_agent::{Agent, AgentConfig, FixedTuner};
 use lvz_anthropic::AnthropicProvider;
-use lvz_protocol::{ChatRequest, Event, Knobs, Message, Provider};
+use lvz_gw_http::HttpGateway;
+use lvz_protocol::{AgentHandle, ChatRequest, Event, Gateway, Knobs, Message, Provider};
 use lvz_tools::ToolRegistry;
 use lvz_xai::XaiProvider;
 
@@ -72,6 +73,11 @@ struct Cli {
     /// Soft per-request context-token ceiling (--agent mode); evict oldest tool output to fit.
     #[arg(long)]
     context_limit: Option<usize>,
+
+    /// Serve the agent as an HTTP/WebSocket gateway on this `host:port` (e.g. `127.0.0.1:8080`)
+    /// instead of running a one-shot turn. Implies the agent tool loop. No prompt is required.
+    #[arg(long, value_name = "ADDR")]
+    serve: Option<String>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -110,6 +116,24 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
+    let provider = cli.provider.build()?;
+    let model = cli
+        .model
+        .clone()
+        .unwrap_or_else(|| cli.provider.default_model().to_string());
+
+    // Gateway mode: run the HTTP/WebSocket server over the shared agent and never return until
+    // shutdown. No prompt is consumed.
+    if let Some(addr) = cli.serve.clone() {
+        let agent: Arc<dyn AgentHandle> = Arc::new(build_agent(provider, model, &cli));
+        let gateway = Arc::new(HttpGateway::bind(&addr)?);
+        eprintln!(
+            "lavoisier: HTTP gateway listening on http://{addr} (POST /v1/turns, GET /v1/ws)"
+        );
+        gateway.serve(agent).await?;
+        return Ok(());
+    }
+
     let prompt = if cli.prompt.is_empty() {
         let mut buf = String::new();
         std::io::stdin().read_to_string(&mut buf)?;
@@ -121,40 +145,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("empty prompt (pass it as an argument or on stdin)".into());
     }
 
-    let provider = cli.provider.build()?;
-    let model = cli
-        .model
-        .clone()
-        .unwrap_or_else(|| cli.provider.default_model().to_string());
     let mut renderer = Renderer::new();
 
     if cli.agent {
-        let mut config = AgentConfig::default().with_model(model);
-        config.max_tokens = cli.max_tokens;
-        if let Some(budget) = cli.budget {
-            config = config.with_budget(budget);
-        }
-        if let Some(system) = cli.system {
-            config.system = system;
-        }
-        if let Some(summary_model) = cli.summary_model {
-            config = config.with_summary_model(summary_model);
-        }
-        if let Some(context_limit) = cli.context_limit {
-            config = config.with_context_limit(context_limit);
-        }
-        // Profile the working directory so the tuner sees a real repo shape (§6.6).
-        if let Ok(cwd) = std::env::current_dir() {
-            config = config.with_repo_root(cwd);
-        }
-        let mut agent = Agent::new(provider, ToolRegistry::with_builtins(), config);
-        if let Some(compact_after) = cli.compact_after {
-            // A fixed-knob tuner overriding only the compaction trigger (§6.3).
-            agent = agent.with_tuner(Arc::new(FixedTuner(Knobs {
-                compact_after,
-                ..Knobs::default()
-            })));
-        }
+        let agent = build_agent(provider, model, &cli);
         let mut stream = agent.run(prompt);
         while let Some(event) = stream.next().await {
             renderer.handle(event?)?;
@@ -176,6 +170,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Build the tool-using [`Agent`] from the CLI config. Shared by `--agent` (one-shot) and
+/// `--serve` (gateway) so both drive an identically-configured agent core.
+fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
+    let mut config = AgentConfig::default().with_model(model);
+    config.max_tokens = cli.max_tokens;
+    if let Some(budget) = cli.budget {
+        config = config.with_budget(budget);
+    }
+    if let Some(system) = &cli.system {
+        config.system = system.clone();
+    }
+    if let Some(summary_model) = &cli.summary_model {
+        config = config.with_summary_model(summary_model.clone());
+    }
+    if let Some(context_limit) = cli.context_limit {
+        config = config.with_context_limit(context_limit);
+    }
+    // Profile the working directory so the tuner sees a real repo shape (§6.6).
+    if let Ok(cwd) = std::env::current_dir() {
+        config = config.with_repo_root(cwd);
+    }
+    let mut agent = Agent::new(provider, ToolRegistry::with_builtins(), config);
+    if let Some(compact_after) = cli.compact_after {
+        // A fixed-knob tuner overriding only the compaction trigger (§6.3).
+        agent = agent.with_tuner(Arc::new(FixedTuner(Knobs {
+            compact_after,
+            ..Knobs::default()
+        })));
+    }
+    agent
 }
 
 /// Renders the normalised event stream to the terminal, keeping answer text (stdout) cleanly
