@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: M0–M8 complete — xAI gRPC default + live-verified; `lvz-gw-http` HTTP/WS gateway live-verified
+## Status: M0–M9 complete (Discord deferred) — gateways + session memory + auth/quotas + /metrics
 
 `RECIPE.md` is the authoritative **build blueprint** for **Lavoisier** (binary `lavoisier`,
 alias `lav`) — a modular, token-efficient CLI coding agent in Rust with a provider-agnostic
@@ -20,8 +20,8 @@ CI loop (§6.5)** (`tests/budget.rs`, committed per-archetype token ceilings). S
 agent as `outline_file` (with optional `focus`/`radius`), `read_anchored`, `edit_anchored`.
 
 Crates that exist today: `lvz-protocol`, `lvz-xai`, `lvz-anthropic`, `lvz-context`,
-`lvz-tools`, `lvz-agent`, `lvz-gw-http`, `lvz-cli`. Not yet built (future milestones): `lvz-tune`,
-`lvz-gateway` + `lvz-gw-*`, `lvz-claude-cli`.
+`lvz-tools`, `lvz-agent`, `lvz-memory`, `lvz-gw-http`, `lvz-gw-matrix`, `lvz-cli`. Not yet
+built (future milestones): `lvz-gw-discord` (deferred), `lvz-tune`, `lvz-claude-cli`.
 
 **Current state (saved 2026-06-09):** M0–M5 complete, committed and pushed to
 `origin/main` (initial commit + author/copyright set to Jaehyun Lee). 7 crates,
@@ -126,9 +126,36 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   (no persisted multi-session history yet; that's M9 `lvz-memory` + session isolation). No
   auth/quotas yet (M9). A `lvz-gateway` registry crate was *not* needed (the `Gateway` trait
   already lives in `lvz-protocol`).
-- **M9 — Hermes gateways + features.** `lvz-gw-matrix`, `lvz-gw-discord`; `lvz-memory`
-  (+ per-session history so the gateway's `session` field becomes load-bearing),
-  auth/quotas, observability (OTel).
+- **M9 — Hermes gateways + features (complete except Discord, 2026-06-11).** Four units,
+  each committed separately:
+  - **`lvz-memory` (session continuity).** `Agent::run_seeded(Vec<Message>)` lets a caller
+    seed a turn with prior history (`run` delegates to it; `run_loop` classifies against the
+    latest user turn). New feature crate over `lvz-agent` + `lvz-protocol`: a `SessionStore`
+    trait + `InMemoryStore`, and `SessionAgent` — an `AgentHandle` that loads a session's
+    transcript, seeds the turn, runs, and (on clean `Done`) appends the assistant answer and
+    persists. Transcript stays a clean user/assistant turn list (no intra-task tool blocks).
+    `--serve` wraps the agent in `SessionAgent`+`InMemoryStore`, so `turn.session` is finally
+    load-bearing. **Live-verified** over the HTTP gateway: same session recalled a fact across
+    turns; a different session stayed isolated.
+  - **Auth + quotas (`lvz-gw-http`).** `GatewayConfig{api_keys, rate_limit}` + a `route_layer`
+    guard on `/v1/turns`+`/v1/ws`: API-key auth (`Authorization: Bearer`; empty set = open)
+    then a per-principal fixed-window rate limiter (429 past quota). `/health`+`/metrics`
+    stay open. CLI `--api-key` (repeatable) / `--rate-limit <N per 60s>`.
+  - **Observability (`lvz-gw-http`).** A `Metrics` recorder (atomic counters: turns, errors,
+    input/output tokens, cache read/creation, summed latency) fed by a per-turn stream tap
+    (records the agent's single terminal `Usage`, last-wins). `GET /metrics` exposes
+    Prometheus text (v0.0.4) — scrape directly or bridge to OTLP at the collector, no heavy
+    exporter dep. *(This closes the §6.4 "no telemetry export" debt for the gateway path.)*
+  - **`lvz-gw-matrix` (Matrix gateway).** A **thin reqwest** client over the Matrix
+    client-server REST API (login + `/sync` long-poll + `m.room.message` send) — *not*
+    `matrix-sdk` (chosen to honour the minimal-deps convention; **unencrypted rooms only, no
+    E2EE**). Each inbound `m.text` from another user runs a turn with `session = room id`
+    (per-room continuity via `lvz-memory`); the answer posts back. Depends only on
+    `lvz-protocol`. CLI `--serve-matrix` (env `MATRIX_HOMESERVER`/`MATRIX_USER`/
+    `MATRIX_PASSWORD`). **Not live-verified** (needs a homeserver + bot account); the wire
+    mapping (sync→messages, self/non-text skipping, room-id encoding) is unit-tested.
+  - **Skipped:** `lvz-gw-discord` (deferred at the user's request).
+  86 tests pass; clippy + fmt clean.
 - **M10 — Hermes deployment.** Fargate arm64, us-west-2.
 - **Optional tracks.** `lvz-tune` (ATO §6.6 — the *online* half; needs §6.4 telemetry + a
   task-success signal wired first; ship the no-op `Tuner` path, then swap in the learner).
@@ -143,8 +170,12 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   `batch_width` (no multi-file batching yet, §6.1). Archetype classification is a keyword
   heuristic, not a model call. The only tuner shipped is `NoopTuner`/`FixedTuner` (no learner
   yet — that's the `lvz-tune` track), so the context is collected but not yet *learned from*.
-- **Telemetry (§6.4).** Usage is aggregated and the `--budget` ceiling is enforced, but there
-  is no telemetry export / cache-hit-rate surfacing — a prerequisite for ATO.
+- **Telemetry (§6.4).** Usage is aggregated, the `--budget` ceiling is enforced, and the
+  **HTTP gateway now exports Prometheus `/metrics`** (tokens, cache read/creation, turns,
+  errors, summed latency). Still missing for ATO: a per-task success signal and an in-process
+  telemetry hook on the CLI/agent path (the `/metrics` recorder lives in `lvz-gw-http`, so
+  one-shot `--agent` runs aren't yet counted); cache-hit-rate is derivable from the exported
+  counters but not surfaced as its own gauge.
 - **Skeleton fidelity.** Python docstrings are currently elided with the body (RECIPE wants
   them kept). The symbol-dependency graph is a name-based heuristic (no scope/name
   resolution; same-named symbols across files merge) — fine for `N`, not a semantic index.
@@ -214,18 +245,24 @@ cargo fmt                            # format
 XAI_API_KEY=… cargo run -p lvz-cli -- "your prompt"                 # one streaming turn (xAI, gRPC default)
 ANTHROPIC_API_KEY=… cargo run -p lvz-cli -- --provider anthropic "…"  # Anthropic native
 XAI_API_KEY=… cargo run -p lvz-cli -- --agent "edit task here"      # M4 tool-using agent loop
-XAI_API_KEY=… cargo run -p lvz-cli -- --serve 127.0.0.1:8080        # M8 HTTP/WS gateway (POST /v1/turns, GET /v1/ws)
+XAI_API_KEY=… cargo run -p lvz-cli -- --serve 127.0.0.1:8080        # M8/M9 HTTP/WS gateway (+ session memory)
+MATRIX_HOMESERVER=… MATRIX_USER=… MATRIX_PASSWORD=… \
+  XAI_API_KEY=… cargo run -p lvz-cli -- --serve-matrix              # M9 Matrix gateway (one room per session)
 ```
 
-CLI flags: `--agent` (tool loop), `--serve <host:port>` (HTTP/WS gateway), `--provider
-xai|anthropic`, `--model`, `--max-tokens`, `--system`, `--budget` (total-task token ceiling),
-`--summary-model`/`--compact-after`/`--context-limit` (agent efficiency knobs). Env:
-`XAI_API_KEY`/`XAI_BASE_URL`/`XAI_GRPC_ENDPOINT`, **`XAI_TRANSPORT=grpc|http` (default
-`grpc`)**, `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`, `LVZ_PROVIDER`, `LVZ_MODEL`. A local SSE
+CLI flags: `--agent` (tool loop), `--serve <host:port>` (HTTP/WS gateway; sessions persisted
+in-memory), `--serve-matrix` (Matrix gateway), `--api-key <KEY>` (repeatable) / `--rate-limit
+<N per 60s>` (gateway auth/quota), `--provider xai|anthropic`, `--model`, `--max-tokens`,
+`--system`, `--budget` (total-task token ceiling),
+`--summary-model`/`--compact-after`/`--context-limit` (agent efficiency knobs). Gateway HTTP
+routes: `GET /health`, `GET /metrics` (Prometheus), `POST /v1/turns` (SSE), `GET /v1/ws`
+(WebSocket). Env: `XAI_API_KEY`/`XAI_BASE_URL`/`XAI_GRPC_ENDPOINT`, **`XAI_TRANSPORT=grpc|http`
+(default `grpc`)**, `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`,
+`MATRIX_HOMESERVER`/`MATRIX_USER`/`MATRIX_PASSWORD`, `LVZ_PROVIDER`, `LVZ_MODEL`. A local SSE
 mock can be pointed at via `*_BASE_URL` to test the HTTP path without a live key.
 
-Continue building in `RECIPE.md` §9 milestone order (next is M9: Hermes gateways
-`lvz-gw-matrix`/`lvz-gw-discord` + `lvz-memory` per-session history + auth/quotas).
+Continue building in `RECIPE.md` §9 milestone order (next is M10: Hermes deployment — Fargate
+arm64, us-west-2; optional tracks: `lvz-tune` ATO learner, `lvz-gw-discord`, `lvz-claude-cli`).
 
 ## Conventions
 
