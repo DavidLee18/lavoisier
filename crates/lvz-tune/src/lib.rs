@@ -19,15 +19,18 @@
 //! controller is pure in-memory bookkeeping (no extra dependencies, negligible overhead) and
 //! its `select`/`observe` are synchronous, matching the trait.
 //!
-//! Deferred (RECIPE notes these as "later"): counterfactual updates from logged traces,
-//! model-version keying for non-stationarity, and Bayesian optimisation. Also note the success
-//! signal is only as good as what the agent reports — wire a real quality gate (tests pass /
-//! diff accepted) before trusting ATO in production.
+//! Now wired (see `docs/ATO.md`): a real success signal (`--verify-cmd`), model-version keying
+//! (`ContextKey` carries `model_id`), the exact byte-identical truncate counterfactual, and
+//! profile persistence (`save`/`load`). Still deferred: trace-based radius-cost counterfactuals,
+//! per-repo profiles, and Bayesian optimisation. The success signal is only as good as what the
+//! agent reports — pair `--tune` with `--verify-cmd` for a real quality gate in production.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 
 use lvz_protocol::{Archetype, Knobs, ModelTier, Outcome, TaskContext, Tuner};
+use serde::{Deserialize, Serialize};
 
 /// Tuning hyper-parameters.
 #[derive(Debug, Clone, Copy)]
@@ -51,12 +54,15 @@ impl Default for TuneConfig {
 }
 
 /// Profile key: the context features knob optima depend on. Caching is carried explicitly
-/// because it is the dominant confounder (`RECIPE.md` §6.6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// because it is the dominant confounder (`RECIPE.md` §6.6); the concrete `model_id` is keyed
+/// alongside the coarse tier so a model upgrade (non-stationarity, §6.6) starts a fresh profile
+/// rather than averaging a shifted optimum into the old one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct ContextKey {
     archetype: Archetype,
     caching: bool,
     model: ModelTier,
+    model_id: String,
 }
 
 impl ContextKey {
@@ -65,12 +71,13 @@ impl ContextKey {
             archetype: ctx.archetype,
             caching: ctx.caps.prompt_caching,
             model: ctx.model,
+            model_id: ctx.model_id.clone(),
         }
     }
 }
 
 /// Running stats for one knob vector under one context.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 struct Stats {
     trials: u32,
     successes: u32,
@@ -130,6 +137,75 @@ impl Default for LearningTuner {
     }
 }
 
+/// One learned `(context, knobs) → stats` row in a serialised snapshot. The nested in-memory
+/// maps are flattened to a list because their keys are structs, which can't be JSON object keys.
+#[derive(Serialize, Deserialize)]
+struct Row {
+    key: ContextKey,
+    knobs: Knobs,
+    stats: Stats,
+}
+
+/// The persisted learner state (profiles + PRNG cursor) — see [`LearningTuner::save`]/[`load`].
+#[derive(Serialize, Deserialize, Default)]
+struct Snapshot {
+    rows: Vec<Row>,
+    rng: u64,
+}
+
+impl LearningTuner {
+    /// Serialise the learned profiles (and PRNG cursor) to `path` as JSON, so a long-running or
+    /// restarted gateway keeps what it learned (`docs/ATO.md` §10 profile persistence).
+    pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let guard = self.state.lock().expect("tuner state poisoned");
+        let rows = guard
+            .profiles
+            .iter()
+            .flat_map(|(key, candidates)| {
+                candidates.iter().map(move |(knobs, stats)| Row {
+                    key: key.clone(),
+                    knobs: *knobs,
+                    stats: *stats,
+                })
+            })
+            .collect();
+        let snapshot = Snapshot {
+            rows,
+            rng: guard.rng,
+        };
+        let json = serde_json::to_string_pretty(&snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, json)
+    }
+
+    /// Build a tuner pre-loaded from a [`save`](Self::save)d snapshot. A missing file yields a
+    /// cold tuner (first run), so callers can pass a path unconditionally.
+    pub fn load(path: impl AsRef<Path>, cfg: TuneConfig) -> std::io::Result<Self> {
+        let tuner = Self::with_config(cfg);
+        let json = match std::fs::read_to_string(path) {
+            Ok(j) => j,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(tuner),
+            Err(e) => return Err(e),
+        };
+        let snapshot: Snapshot = serde_json::from_str(&json)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        {
+            let mut guard = tuner.state.lock().expect("tuner state poisoned");
+            for row in snapshot.rows {
+                guard
+                    .profiles
+                    .entry(row.key)
+                    .or_default()
+                    .insert(row.knobs, row.stats);
+            }
+            if snapshot.rng != 0 {
+                guard.rng = snapshot.rng; // keep exploration non-repeating across restarts
+            }
+        }
+        Ok(tuner)
+    }
+}
+
 impl Tuner for LearningTuner {
     fn select(&self, ctx: &TaskContext) -> Knobs {
         let key = ContextKey::of(ctx);
@@ -137,7 +213,7 @@ impl Tuner for LearningTuner {
         let st = &mut *guard;
 
         // The baseline is always a live candidate, so "best" can never be worse than it.
-        let candidates = st.profiles.entry(key).or_default();
+        let candidates = st.profiles.entry(key.clone()).or_default();
         candidates.entry(Knobs::default()).or_default();
 
         let best = best_candidate(candidates, &self.cfg).unwrap_or_default();
@@ -161,29 +237,66 @@ impl Tuner for LearningTuner {
     fn observe(&self, ctx: &TaskContext, used: &Knobs, out: &Outcome) {
         let key = ContextKey::of(ctx);
         let mut guard = self.state.lock().expect("tuner state poisoned");
-        let stats = guard
-            .profiles
-            .entry(key)
-            .or_default()
-            .entry(*used)
-            .or_default();
-        stats.trials += 1;
-        if out.success {
-            stats.successes += 1;
-            stats.success_tokens += out.total_tokens;
+        let candidates = guard.profiles.entry(key).or_default();
+
+        record(candidates.entry(*used).or_default(), out);
+
+        // Safe counterfactual (§6.6 / `docs/ATO.md` §3): if nothing in the task exceeded the
+        // truncate limit actually used, then every *cheaper* grid value that still ≥ the largest
+        // result would have produced a byte-identical transcript — identical tokens, identical
+        // success. Credit those provably-equivalent vectors so the learner discovers cheaper
+        // truncate settings without ever risking a starved live trial. (Only sound when the live
+        // run didn't truncate; if it did, a different limit changes the transcript.)
+        if let Some(max_bytes) = out.max_tool_result_bytes {
+            if max_bytes <= used.truncate_bytes {
+                for &b in TRUNCATE_GRID {
+                    if b >= max_bytes && b < used.truncate_bytes {
+                        let cf = Knobs {
+                            truncate_bytes: b,
+                            ..*used
+                        };
+                        record(candidates.entry(cf).or_default(), out);
+                    }
+                }
+            }
         }
+    }
+}
+
+/// Fold one realised (or counterfactual) outcome into a candidate's running stats.
+fn record(stats: &mut Stats, out: &Outcome) {
+    stats.trials += 1;
+    if out.success {
+        stats.successes += 1;
+        stats.success_tokens += out.total_tokens;
     }
 }
 
 /// The cheapest trusted candidate (lowest mean tokens among those meeting the success
 /// constraint), or `None` if nothing is trusted yet.
+///
+/// Ties on mean tokens are broken toward the **least context carried** (smaller `truncate_bytes`,
+/// then `skeleton_radius`, then `compact_after`). This is what makes safe counterfactual
+/// crediting (§3) actually bite: when a tighter truncate limit is proven byte-identical — same
+/// cost, same success — the tie-breaker selects it, since carrying less context is weakly better
+/// for cache/overrun pressure and never worse on the measured objective. It also makes selection
+/// deterministic (independent of hash-map order).
 fn best_candidate(candidates: &HashMap<Knobs, Stats>, cfg: &TuneConfig) -> Option<Knobs> {
     candidates
         .iter()
         .filter(|(_, s)| s.trusted(cfg))
         .filter_map(|(k, s)| s.mean_tokens().map(|m| (*k, m)))
-        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .min_by(|a, b| {
+            a.1.total_cmp(&b.1)
+                .then_with(|| context_footprint(&a.0).cmp(&context_footprint(&b.0)))
+        })
         .map(|(k, _)| k)
+}
+
+/// Tie-break key: the context a knob vector carries, smaller = preferred. Ordered by the dials
+/// that grow the prompt — truncate ceiling, then skeleton radius, then compaction threshold.
+fn context_footprint(k: &Knobs) -> (usize, u8, usize) {
+    (k.truncate_bytes, k.skeleton_radius, k.compact_after)
 }
 
 // --- discrete knob grids (centred on Knobs::default), and one-step neighbour moves ---
@@ -246,6 +359,7 @@ mod tests {
             repo: RepoProfile::default(),
             caps: Capabilities::default(),
             model: ModelTier::Balanced,
+            model_id: "test-model".to_string(),
         }
     }
 
@@ -255,6 +369,7 @@ mod tests {
             round_trips: 1,
             cache_hit_rate: 0.0,
             success,
+            max_tool_result_bytes: None,
         }
     }
 
@@ -350,5 +465,97 @@ mod tests {
         // The uncached profile learned nothing → baseline; the cached profile → its winner.
         assert_eq!(t.select(&uncached), Knobs::default());
         assert_eq!(t.select(&cached), cheaper);
+    }
+
+    #[test]
+    fn model_id_keys_profiles_apart() {
+        let t = LearningTuner::with_config(TuneConfig {
+            epsilon: 0.0,
+            success_target: 0.9,
+            min_trials: 2,
+        });
+        let mut v1 = ctx();
+        v1.model_id = "model-v1".to_string();
+        let mut v2 = ctx();
+        v2.model_id = "model-v2".to_string();
+
+        let cheaper = Knobs {
+            batch_width: 8,
+            ..Knobs::default()
+        };
+        for _ in 0..2 {
+            t.observe(&v1, &cheaper, &outcome(500, true));
+        }
+        // The upgraded model id starts a fresh profile (non-stationarity), not the old optimum.
+        assert_eq!(t.select(&v1), cheaper);
+        assert_eq!(t.select(&v2), Knobs::default());
+    }
+
+    #[test]
+    fn counterfactual_credits_provably_equivalent_cheaper_truncate() {
+        let t = LearningTuner::with_config(TuneConfig {
+            epsilon: 0.0,
+            success_target: 0.9,
+            min_trials: 3,
+        });
+        let c = ctx();
+        // Three successful runs at the default truncate (8192) where the largest tool result was
+        // only 1500 bytes — so 2048 and 4096 would have been byte-identical (and cheaper).
+        let mut out = outcome(1000, true);
+        out.max_tool_result_bytes = Some(1500);
+        for _ in 0..3 {
+            t.observe(&c, &Knobs::default(), &out);
+        }
+        // Both 2048 and 4096 are ≥ 1500, so both were credited as byte-identical at the same
+        // cost and are now trusted — learned without a single live trial at either. The tuner
+        // picks one of those provably-cheaper-context values over the default 8192.
+        let chosen = t.select(&c).truncate_bytes;
+        assert!(
+            chosen == 2048 || chosen == 4096,
+            "expected a counterfactually-credited value, got {chosen}"
+        );
+        assert!(chosen < Knobs::default().truncate_bytes);
+    }
+
+    #[test]
+    fn save_and_load_round_trips_profiles() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("lvz-tune-test-{}.json", std::process::id()));
+
+        let t = LearningTuner::with_config(TuneConfig {
+            epsilon: 0.0,
+            success_target: 0.9,
+            min_trials: 3,
+        });
+        let c = ctx();
+        let cheaper = Knobs {
+            skeleton_radius: 0,
+            ..Knobs::default()
+        };
+        for _ in 0..3 {
+            t.observe(&c, &Knobs::default(), &outcome(1000, true));
+            t.observe(&c, &cheaper, &outcome(600, true));
+        }
+        assert_eq!(t.select(&c), cheaper);
+        t.save(&path).expect("save");
+
+        // A fresh tuner loaded from the snapshot picks the same learned winner.
+        let reloaded = LearningTuner::load(
+            &path,
+            TuneConfig {
+                epsilon: 0.0,
+                success_target: 0.9,
+                min_trials: 3,
+            },
+        )
+        .expect("load");
+        assert_eq!(reloaded.select(&c), cheaper);
+
+        // A missing file loads cold (baseline), not an error.
+        let missing = dir.join("lvz-tune-does-not-exist-xyz.json");
+        let cold = LearningTuner::load(&missing, TuneConfig::default()).expect("cold load");
+        assert_eq!(cold.select(&c), Knobs::default());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

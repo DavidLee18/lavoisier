@@ -110,6 +110,12 @@ pub struct AgentConfig {
     /// paid for *once* (a short planning call) while the cheap model does the many execution
     /// turns. `None` disables the pre-pass. E.g. advisor = Opus, executor `model` = Sonnet.
     pub advisor_model: Option<String>,
+    /// Optional shell command run (in [`repo_root`](Self::repo_root)) after a task completes
+    /// normally; exit 0 means the change is good. This is the real ATO **success signal**
+    /// (`RECIPE.md` §6.6, `docs/ATO.md`) — e.g. `"cargo test --quiet"`. When `None`, success
+    /// falls back to the coarse "completed without error" signal. Only run on otherwise-clean
+    /// completion (not after a provider error / budget overrun / step-cap).
+    pub verify_command: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -127,6 +133,7 @@ impl Default for AgentConfig {
             cheap_model: None,
             escalate_after: 2,
             advisor_model: None,
+            verify_command: None,
         }
     }
 }
@@ -179,6 +186,13 @@ impl AgentConfig {
     /// executor (the main `model`) then carries it out (§8). E.g. advisor Opus, executor Sonnet.
     pub fn with_advisor_model(mut self, model: impl Into<String>) -> Self {
         self.advisor_model = Some(model.into());
+        self
+    }
+
+    /// Set the post-task verification command — the real ATO success signal (§6.6). Exit 0 on a
+    /// clean completion marks the task successful; non-zero marks it failed.
+    pub fn with_verify_command(mut self, cmd: impl Into<String>) -> Self {
+        self.verify_command = Some(cmd.into());
         self
     }
 }
@@ -285,11 +299,15 @@ async fn run_loop(
             .unwrap_or_default(),
         caps,
         model: config.model_tier,
+        model_id: config.model.clone(),
     };
     let knobs = tuner.select(&ctx);
 
     let mut total = Usage::default();
     let mut round_trips: u32 = 0;
+    // Largest untruncated tool-result seen, for the learner's safe counterfactual crediting
+    // (§6.6 / `docs/ATO.md` §3). `None` until the first tool runs.
+    let mut max_result_bytes: Option<usize> = None;
 
     // Advisor pre-pass (§8 advisor+executor split): a smarter, more expensive model drafts a
     // plan that seeds the cheaper executor (the main `model`), so the expensive model is paid
@@ -332,11 +350,19 @@ async fn run_loop(
             _ => config.model.as_str(),
         };
 
-        let req = build_request(&config, active_model, &tool_defs, &caps, &history);
+        let req = build_request(&config, active_model, &tool_defs, &caps, &knobs, &history);
         let mut stream = match provider.stream(req).await {
             Ok(s) => s,
             Err(e) => {
-                observe(&tuner, &ctx, &knobs, &total, round_trips, false);
+                observe(
+                    &tuner,
+                    &ctx,
+                    &knobs,
+                    &total,
+                    round_trips,
+                    false,
+                    max_result_bytes,
+                );
                 let _ = tx.unbounded_send(Err(AgentError::Provider(e.to_string())));
                 return;
             }
@@ -351,7 +377,15 @@ async fn run_loop(
                     }
                 }
                 Err(e) => {
-                    observe(&tuner, &ctx, &knobs, &total, round_trips, false);
+                    observe(
+                        &tuner,
+                        &ctx,
+                        &knobs,
+                        &total,
+                        round_trips,
+                        false,
+                        max_result_bytes,
+                    );
                     let _ = tx.unbounded_send(Err(AgentError::Provider(e.to_string())));
                     return;
                 }
@@ -363,7 +397,15 @@ async fn run_loop(
 
         if let Some(budget) = config.token_budget {
             if total.total() > budget {
-                observe(&tuner, &ctx, &knobs, &total, round_trips, false);
+                observe(
+                    &tuner,
+                    &ctx,
+                    &knobs,
+                    &total,
+                    round_trips,
+                    false,
+                    max_result_bytes,
+                );
                 let _ = tx.unbounded_send(Err(AgentError::BudgetExceeded));
                 return;
             }
@@ -371,7 +413,19 @@ async fn run_loop(
 
         if turn.tool_calls.is_empty() {
             let stop = turn.stop.unwrap_or(StopReason::EndTurn);
-            observe(&tuner, &ctx, &knobs, &total, round_trips, true);
+            // Real ATO success signal (§6.6): a clean completion is only counted successful if
+            // the optional verify command also passes (exit 0). With no command set this is the
+            // coarse "completed without erroring" fallback.
+            let success = run_verify(&config).await;
+            observe(
+                &tuner,
+                &ctx,
+                &knobs,
+                &total,
+                round_trips,
+                success,
+                max_result_bytes,
+            );
             let _ = tx.unbounded_send(Ok(Event::Usage(total)));
             let _ = tx.unbounded_send(Ok(Event::Done(stop)));
             return;
@@ -382,12 +436,20 @@ async fn run_loop(
 
         let mut results = Vec::with_capacity(turn.tool_calls.len());
         for call in &turn.tool_calls {
-            let block = match tools.invoke(&call.name, call.parsed_args()).await {
-                Ok(out) => ContentBlock::ToolResult {
-                    tool_use_id: call.id.clone(),
-                    content: truncate(&out.content, knobs.truncate_bytes),
-                    is_error: out.is_error,
-                },
+            // Wire the skeleton-radius knob (§6.6): when the model outlines a focus symbol but
+            // doesn't pick a radius, supply the tuner-chosen one so ATO's choice takes effect.
+            let args = apply_skeleton_radius(&call.name, call.parsed_args(), knobs.skeleton_radius);
+            let block = match tools.invoke(&call.name, args).await {
+                Ok(out) => {
+                    // Record the pre-truncation size for counterfactual truncate-knob crediting.
+                    let len = out.content.len();
+                    max_result_bytes = Some(max_result_bytes.map_or(len, |m| m.max(len)));
+                    ContentBlock::ToolResult {
+                        tool_use_id: call.id.clone(),
+                        content: truncate(&out.content, knobs.truncate_bytes),
+                        is_error: out.is_error,
+                    }
+                }
                 Err(e) => ContentBlock::ToolResult {
                     tool_use_id: call.id.clone(),
                     content: format!("tool error: {e}"),
@@ -403,7 +465,15 @@ async fn run_loop(
     }
 
     // Ran out of steps without a final answer.
-    observe(&tuner, &ctx, &knobs, &total, round_trips, false);
+    observe(
+        &tuner,
+        &ctx,
+        &knobs,
+        &total,
+        round_trips,
+        false,
+        max_result_bytes,
+    );
     let _ = tx.unbounded_send(Ok(Event::Usage(total)));
     let _ = tx.unbounded_send(Ok(Event::Done(StopReason::Other("max_steps".into()))));
 }
@@ -416,6 +486,7 @@ fn observe(
     total: &Usage,
     round_trips: u32,
     success: bool,
+    max_tool_result_bytes: Option<usize>,
 ) {
     tuner.observe(
         ctx,
@@ -425,8 +496,64 @@ fn observe(
             round_trips,
             cache_hit_rate: total.cache_hit_rate(),
             success,
+            max_tool_result_bytes,
         },
     );
+}
+
+/// Run the optional post-task verification command (the real ATO success signal, §6.6).
+///
+/// Returns `true` when no command is configured (the coarse "completed without erroring"
+/// fallback) or when the command exits 0; `false` on a non-zero exit or a spawn failure. The
+/// command runs via `sh -c` in [`AgentConfig::repo_root`](AgentConfig::repo_root) (cwd otherwise)
+/// with stdio discarded — its tokens never touch the transcript.
+async fn run_verify(config: &AgentConfig) -> bool {
+    let Some(cmd) = &config.verify_command else {
+        return true;
+    };
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(root) = &config.repo_root {
+        command.current_dir(root);
+    }
+    matches!(command.status().await, Ok(status) if status.success())
+}
+
+/// Append knob-derived behavioural guidance to the system prompt. Today this carries the
+/// [`batch_width`](Knobs::batch_width) knob (§6.1/§6.6): when the provider can run tools in
+/// parallel and the knob allows batching, the model is told to issue independent reads/edits
+/// together (fewer round-trips → fewer cached-prefix re-sends). The suffix is stable for the
+/// whole task (knobs are selected once), so it stays inside the cacheable prefix.
+fn system_with_knobs(base: &str, knobs: &Knobs, caps: &Capabilities) -> String {
+    if caps.parallel_tool_use && knobs.batch_width > 1 {
+        format!(
+            "{base}\nWhen multiple independent files need reading or editing, issue up to {} \
+             tool calls in a single turn rather than one at a time.",
+            knobs.batch_width
+        )
+    } else {
+        base.to_string()
+    }
+}
+
+/// Apply the [`skeleton_radius`](Knobs::skeleton_radius) knob to an `outline_file` call: when
+/// the model supplied a `focus` but left `radius` unset, inject the tuner-chosen radius so the
+/// knob actually governs how much dependency context the skeleton includes (§6.6). Any other
+/// tool, or a call that already pins `radius`, is passed through untouched.
+fn apply_skeleton_radius(tool: &str, mut args: Value, radius: u8) -> Value {
+    if tool == "outline_file" {
+        if let Some(obj) = args.as_object_mut() {
+            if obj.contains_key("focus") && !obj.contains_key("radius") {
+                obj.insert("radius".to_string(), json!(radius));
+            }
+        }
+    }
+    args
 }
 
 /// The result of a successful compaction: a shrunken history and the tokens it cost.
@@ -748,11 +875,12 @@ fn build_request(
     model: &str,
     tool_defs: &[ToolDef],
     caps: &Capabilities,
+    knobs: &Knobs,
     history: &[Message],
 ) -> ChatRequest {
     let mut req = ChatRequest::new(model.to_string()).max_tokens(config.max_tokens);
     req.system = Some(SystemPrompt {
-        text: config.system.clone(),
+        text: system_with_knobs(&config.system, knobs, caps),
         cache: caps.prompt_caching,
     });
     let mut defs = tool_defs.to_vec();
@@ -1019,6 +1147,59 @@ mod tests {
         assert!(out.starts_with('a'));
         assert!(out.contains("truncated"));
         assert!(out.len() < s.len() + 40);
+    }
+
+    #[test]
+    fn skeleton_radius_injected_only_for_focused_outline_without_radius() {
+        // outline_file with a focus and no radius → the knob's radius is injected.
+        let got = apply_skeleton_radius("outline_file", json!({"path": "a.rs", "focus": "f"}), 3);
+        assert_eq!(got["radius"], json!(3));
+        // A radius the model already set is left alone.
+        let got = apply_skeleton_radius("outline_file", json!({"focus": "f", "radius": 1}), 3);
+        assert_eq!(got["radius"], json!(1));
+        // No focus → nothing to expand, no radius added.
+        let got = apply_skeleton_radius("outline_file", json!({"path": "a.rs"}), 3);
+        assert!(got.get("radius").is_none());
+        // A different tool is untouched.
+        let got = apply_skeleton_radius("read_file", json!({"path": "a.rs"}), 3);
+        assert!(got.get("radius").is_none());
+    }
+
+    #[test]
+    fn batch_width_hint_gated_on_capability_and_knob() {
+        let base = "BASE";
+        let parallel = Capabilities {
+            parallel_tool_use: true,
+            ..Capabilities::default()
+        };
+        // Parallel-capable + batch_width > 1 → the hint is appended with the width.
+        let s = system_with_knobs(base, &Knobs::default(), &parallel);
+        assert!(s.starts_with(base));
+        assert!(s.contains("up to 4"));
+        // batch_width == 1 → no hint.
+        let one = Knobs {
+            batch_width: 1,
+            ..Knobs::default()
+        };
+        assert_eq!(system_with_knobs(base, &one, &parallel), base);
+        // No parallel tool use → no hint regardless of the knob.
+        assert_eq!(
+            system_with_knobs(base, &Knobs::default(), &Capabilities::default()),
+            base
+        );
+    }
+
+    #[tokio::test]
+    async fn run_verify_reflects_command_exit_status() {
+        // No command configured → coarse success fallback (true).
+        let none = AgentConfig::default();
+        assert!(run_verify(&none).await);
+        // Exit 0 → success.
+        let ok = AgentConfig::default().with_verify_command("exit 0");
+        assert!(run_verify(&ok).await);
+        // Non-zero exit → failure.
+        let bad = AgentConfig::default().with_verify_command("exit 1");
+        assert!(!run_verify(&bad).await);
     }
 
     #[test]

@@ -48,6 +48,11 @@ pub struct TaskContext {
     pub repo: RepoProfile,
     pub caps: Capabilities,
     pub model: ModelTier,
+    /// The concrete model id (e.g. `"claude-sonnet-4-6"`). Keyed by the learner *alongside* the
+    /// coarse [`model`](Self::model) tier so a model upgrade (which shifts the knob optimum,
+    /// `RECIPE.md` §6.6 non-stationarity) starts a fresh profile instead of polluting the old
+    /// one. Empty string when unknown.
+    pub model_id: String,
 }
 
 /// The efficiency dials tuned per context. [`Default`] returns the static §6.5 baseline,
@@ -87,6 +92,12 @@ pub struct Outcome {
     pub cache_hit_rate: f32,
     /// The constraint: compile/tests pass, diff accepted, no correction turn needed.
     pub success: bool,
+    /// Largest *untruncated* tool-result size (bytes) seen during the task, when known. Enables
+    /// the learner's safe **counterfactual** crediting (`docs/ATO.md` §3, §10): if nothing in the
+    /// task exceeded the [`truncate_bytes`](Knobs::truncate_bytes) used, then any cheaper truncate
+    /// value still ≥ this size would have produced a byte-identical transcript — the same outcome
+    /// at the same cost — so the learner can credit it without a live trial. `None` = not tracked.
+    pub max_tool_result_bytes: Option<usize>,
 }
 
 impl Default for Outcome {
@@ -96,6 +107,7 @@ impl Default for Outcome {
             round_trips: 0,
             cache_hit_rate: 0.0,
             success: true,
+            max_tool_result_bytes: None,
         }
     }
 }

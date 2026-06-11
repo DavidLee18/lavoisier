@@ -960,6 +960,8 @@ name = "lvz-tune"
 version = "0.0.0"
 dependencies = [
  "lvz-protocol",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

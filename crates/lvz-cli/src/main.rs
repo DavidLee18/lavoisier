@@ -22,10 +22,13 @@ use lvz_claude_cli::ClaudeCliProvider;
 use lvz_gw_http::{GatewayConfig, HttpGateway};
 use lvz_gw_matrix::MatrixGateway;
 use lvz_memory::{InMemoryStore, SessionAgent};
-use lvz_protocol::{AgentHandle, ChatRequest, Event, Gateway, Knobs, Message, Provider};
+use lvz_protocol::{
+    AgentHandle, ChatRequest, Event, Gateway, Knobs, Message, Outcome, Provider, TaskContext, Tuner,
+};
 use lvz_tools::ToolRegistry;
-use lvz_tune::LearningTuner;
+use lvz_tune::{LearningTuner, TuneConfig};
 use lvz_xai::XaiProvider;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
@@ -120,10 +123,21 @@ struct Cli {
 
     /// Enable adaptive token optimisation (ATO, experimental): an online tuner that learns
     /// per-archetype knob settings from realised outcomes (most useful in a long-running
-    /// `--serve` process). The success signal is the agent's coarse "completed without error"
-    /// flag, not a verified quality gate — keep opt-in until a real signal is wired (§6.6).
+    /// `--serve` process). Pair with `--verify-cmd` for a real quality-gated success signal,
+    /// and `--tune-state` to persist what it learns across restarts (§6.6, `docs/ATO.md`).
     #[arg(long)]
     tune: bool,
+
+    /// Shell command run after each task to gate ATO success (the real §6.6 signal): exit 0 ⇒
+    /// the change is good, non-zero ⇒ failed. Runs in the working dir, e.g. `cargo test --quiet`.
+    /// Without it, success falls back to the coarse "completed without error" flag.
+    #[arg(long, value_name = "CMD")]
+    verify_cmd: Option<String>,
+
+    /// Persist the `--tune` learner's profiles to this JSON file: loaded at start (missing ⇒
+    /// cold), saved after each completed turn. Lets ATO keep what it learned across restarts.
+    #[arg(long, value_name = "PATH")]
+    tune_state: Option<String>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -276,14 +290,22 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
     if let Some(advisor_model) = &cli.advisor_model {
         config = config.with_advisor_model(advisor_model.clone());
     }
+    if let Some(verify_cmd) = &cli.verify_cmd {
+        config = config.with_verify_command(verify_cmd.clone());
+    }
     // Profile the working directory so the tuner sees a real repo shape (§6.6).
     if let Ok(cwd) = std::env::current_dir() {
         config = config.with_repo_root(cwd);
     }
     let mut agent = Agent::new(provider, ToolRegistry::with_builtins(), config);
     if cli.tune {
-        // The online ATO learner (§6.6); takes precedence over a fixed --compact-after.
-        agent = agent.with_tuner(Arc::new(LearningTuner::new()));
+        // The online ATO learner (§6.6); takes precedence over a fixed --compact-after. When a
+        // state path is given, load prior profiles (missing ⇒ cold) and persist on drop.
+        let tuner = match &cli.tune_state {
+            Some(path) => PersistentTuner::load(path).into_arc(),
+            None => Arc::new(LearningTuner::new()),
+        };
+        agent = agent.with_tuner(tuner);
     } else if let Some(compact_after) = cli.compact_after {
         // A fixed-knob tuner overriding only the compaction trigger (§6.3).
         agent = agent.with_tuner(Arc::new(FixedTuner(Knobs {
@@ -292,6 +314,45 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
         })));
     }
     agent
+}
+
+/// A [`LearningTuner`] that persists its profiles to disk after every observation, so what ATO
+/// learns survives across process restarts (`docs/ATO.md` §10 profile persistence). Selected by
+/// `--tune --tune-state <path>`.
+struct PersistentTuner {
+    inner: LearningTuner,
+    path: PathBuf,
+}
+
+impl PersistentTuner {
+    /// Load profiles from `path` (a missing file starts cold), keyed to persist back there.
+    fn load(path: &str) -> Self {
+        let inner = LearningTuner::load(path, TuneConfig::default()).unwrap_or_else(|e| {
+            eprintln!("tune-state: could not load {path}: {e}; starting cold");
+            LearningTuner::new()
+        });
+        Self {
+            inner,
+            path: path.into(),
+        }
+    }
+
+    fn into_arc(self) -> Arc<dyn Tuner> {
+        Arc::new(self)
+    }
+}
+
+impl Tuner for PersistentTuner {
+    fn select(&self, ctx: &TaskContext) -> Knobs {
+        self.inner.select(ctx)
+    }
+
+    fn observe(&self, ctx: &TaskContext, used: &Knobs, out: &Outcome) {
+        self.inner.observe(ctx, used, out);
+        if let Err(e) = self.inner.save(&self.path) {
+            eprintln!("tune-state: could not save {}: {e}", self.path.display());
+        }
+    }
 }
 
 /// Renders the normalised event stream to the terminal, keeping answer text (stdout) cleanly

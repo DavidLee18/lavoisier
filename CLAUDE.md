@@ -184,14 +184,25 @@ sequential workflows that accumulate ≥3 turn-pairs.)
     to AWS (no creds/spend here) — the runbook drives that. HTTP gateway only; Matrix deploy
     deferred (no inbound port; separate service).
 - **Optional tracks (done; live AWS apply + live Matrix still pending).**
-  - **`lvz-tune` (ATO §6.6) — built.** `LearningTuner`: an ε-greedy hill-climb bandit over
-    `Knobs`, keyed by `(archetype, caching, model-tier)`, exploiting the cheapest *trusted*
-    (success-rate ≥ target) vector and exploring one-step neighbours on a discrete grid
-    centred on `Knobs::default()` (the floor it can't regress below). No deps (hand-rolled
-    xorshift). CLI `--tune` swaps it in (precedence over `--compact-after`). **Full mechanism
-    in `docs/ATO.md`.** **Caveat:** the success signal is still the agent's coarse "completed
-    without error" flag, not a verified quality gate — `--tune` is experimental until a real
-    test/diff signal is wired.
+  - **`lvz-tune` (ATO §6.6) — built, full roadmap landed except Bayesian opt.** `LearningTuner`:
+    an ε-greedy hill-climb bandit over `Knobs`, keyed by `(archetype, caching, model-tier,
+    model_id)`, exploiting the cheapest *trusted* (success-rate ≥ target) vector — ties broken
+    toward least context carried — and exploring one-step neighbours on a discrete grid centred
+    on `Knobs::default()` (the floor it can't regress below). CLI `--tune` swaps it in (precedence
+    over `--compact-after`). **Full mechanism in `docs/ATO.md`.** The 2026-06-11 ATO-roadmap
+    increment wired the deferred items: **(1) a real success signal** — `--verify-cmd <cmd>` runs
+    a post-task shell gate (e.g. `cargo test`); exit 0 ⇒ `Outcome.success`, else the coarse
+    "completed without error" fallback; **(2) all four knobs now bite** — `skeleton_radius` is
+    injected into focused `outline_file` calls, `batch_width` drives a parallel-tool-use
+    system-prompt hint (alongside the already-live `compact_after`/`truncate_bytes`); **(3) safe
+    counterfactual crediting** — when truncation never fired, cheaper truncate-grid values still ≥
+    the largest tool result are credited with the identical (byte-for-byte) outcome, no live
+    trial (`Outcome.max_tool_result_bytes` carries the signal); **(4) model-version keying** —
+    `TaskContext.model_id` in the `ContextKey` so a model upgrade starts a fresh profile; **(5)
+    persistence** — `--tune-state <path>` (JSON save/load of profiles + PRNG across restarts via
+    a `PersistentTuner` wrapper). Still deferred: trace-based radius-cost counterfactuals, per-repo
+    profiles, Bayesian optimisation. Pair `--tune` with `--verify-cmd` for a production-grade
+    signal; `--tune` alone stays experimental.
   - **`lvz-claude-cli` — built, off by default.** A `Provider` shelling out to `claude -p`
     (`--output-format stream-json`), stream-json → `Event`; `Capabilities` all false (no
     caching). Selected only via `--provider claude-cli` (default model `sonnet`; `CLAUDE_CLI_BIN`
@@ -208,27 +219,30 @@ sequential workflows that accumulate ≥3 turn-pairs.)
 
 ### Known debts inside shipped code (pick up before/with the above)
 
-- **Tuner consulted; two knobs still inert.** `lvz-agent` calls `Tuner::select`/`observe` with
-  a **real** `TaskContext` (classified `Archetype` + walked `RepoProfile`) and honours
-  `Knobs.compact_after` + `truncate_bytes`. Still unwired: `skeleton_radius` (the agent never
-  calls `outline_file` with a tuner-chosen radius — that's the tool/model's choice today) and
-  `batch_width` (no multi-file batching yet, §6.1). Archetype classification is a keyword
-  heuristic, not a model call. A learner now exists (`lvz-tune`'s `LearningTuner`, opt-in via
-  `--tune`), but the default is still `NoopTuner` and the success signal feeding `observe` is
-  coarse (completion, not a verified quality gate), so ATO stays experimental.
+- **Tuner: all four knobs now wired; success signal can now be real.** `lvz-agent` calls
+  `Tuner::select`/`observe` with a **real** `TaskContext` (classified `Archetype` + walked
+  `RepoProfile` + `model_id`) and honours all of `compact_after`, `truncate_bytes`,
+  `skeleton_radius` (injected into focused `outline_file` calls), and `batch_width` (a
+  parallel-tool-use system-prompt hint). The success signal is real when `--verify-cmd` is set
+  (post-task exit-code gate), else the coarse completion fallback. The default tuner is still
+  `NoopTuner` (ATO is opt-in via `--tune`); archetype classification is still a keyword heuristic,
+  not a model call. Remaining ATO gaps are narrow: trace-based radius-cost counterfactuals,
+  per-repo profile keying, Bayesian optimisation (see `docs/ATO.md` §10).
 - **Telemetry (§6.4).** Usage is aggregated, the `--budget` ceiling is enforced, and the
   **HTTP gateway now exports Prometheus `/metrics`** (tokens, cache read/creation, turns,
-  errors, summed latency). Still missing for ATO: a per-task success signal and an in-process
-  telemetry hook on the CLI/agent path (the `/metrics` recorder lives in `lvz-gw-http`, so
-  one-shot `--agent` runs aren't yet counted); cache-hit-rate is derivable from the exported
-  counters but not surfaced as its own gauge.
+  errors, summed latency). The per-task ATO success signal now exists (`--verify-cmd`). Still
+  missing: an in-process telemetry hook on the CLI/agent path (the `/metrics` recorder lives in
+  `lvz-gw-http`, so one-shot `--agent` runs aren't yet counted); cache-hit-rate is derivable from
+  the exported counters but not surfaced as its own gauge.
 - **Skeleton fidelity.** Python docstrings are currently elided with the body (RECIPE wants
   them kept). The symbol-dependency graph is a name-based heuristic (no scope/name
   resolution; same-named symbols across files merge) — fine for `N`, not a semantic index.
   `outline_file --focus` builds a single-file graph (the multi-file graph in
   `lvz-context::symbols` is used by the budget loop, not the tool).
-- **Multi-file batching (§6.1)** and **cache-aware repo-skeleton prefix** are not implemented;
-  caching currently marks only the system prompt + last tool def.
+- **Multi-file batching (§6.1)** is encouraged via the `batch_width` system-prompt hint (the
+  model is asked to issue independent reads/edits in one parallel turn) but there's no dedicated
+  batching tool/infrastructure; **cache-aware repo-skeleton prefix** is not implemented — caching
+  currently marks only the system prompt + last tool def.
 
 ### Gotchas
 
@@ -301,7 +315,8 @@ in-memory), `--serve-matrix` (Matrix gateway), `--api-key <KEY>` (repeatable) / 
 <N per 60s>` (gateway auth/quota), `--provider xai|anthropic|claude-cli`, `--model`,
 `--max-tokens`, `--system`, `--budget` (total-task token ceiling),
 `--summary-model`/`--compact-after`/`--context-limit` (agent efficiency knobs), `--tune`
-(experimental ATO learner), `--cheap-model`/`--escalate-after` (cheap-model-first) and
+(ATO learner) with `--verify-cmd <cmd>` (post-task success gate) and `--tune-state <path>`
+(persist learned profiles), `--cheap-model`/`--escalate-after` (cheap-model-first) and
 `--advisor-model` (advisor+executor split) for §8 cost reduction. Gateway HTTP
 routes: `GET /health`, `GET /metrics` (Prometheus), `POST /v1/turns` (SSE), `GET /v1/ws`
 (WebSocket). Env: `XAI_API_KEY`/`XAI_BASE_URL`/`XAI_GRPC_ENDPOINT`, **`XAI_TRANSPORT=grpc|http`
@@ -316,9 +331,12 @@ podman build --platform linux/arm64 -f Containerfile -t lavoisier:dev .   # arm6
 ./infra/scripts/build-and-push.zsh dev   # push to ECR   ./infra/scripts/deploy.zsh   # terraform apply
 ```
 
-All M0–M10 milestones are complete (Discord deferred). Remaining optional tracks: `lvz-tune`
-ATO learner (§6.6), `lvz-gw-discord`, `lvz-claude-cli`; and the M10 AWS apply itself (artifacts
-ship local-verified — run `infra/README.md` against a real account).
+All M0–M10 milestones are complete (Discord deferred). The optional tracks are built:
+`lvz-tune` (ATO; full §10 roadmap landed bar Bayesian optimisation), `lvz-claude-cli`, and
+advisor mode. Remaining: `lvz-gw-discord`; live verification of `lvz-claude-cli` (needs a
+subscription) and the Matrix gateway (needs a homeserver); the M10 AWS apply itself (artifacts
+ship local-verified — run `infra/README.md` against a real account); and ATO's last deferred
+items (trace-based radius counterfactuals, per-repo profiles, Bayesian opt).
 
 ## Conventions
 

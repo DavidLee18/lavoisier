@@ -64,11 +64,15 @@ Knob optima differ by context, so each context is its own little learning proble
 | `archetype` | `SingleFileEdit \| Refactor \| Rename \| Feature \| Other` (classified from the latest user turn by a keyword heuristic) | **yes** |
 | `caps.prompt_caching` | whether the provider caches the prefix | **yes** — the dominant confounder |
 | `model` (`ModelTier`) | `Fast \| Balanced \| Deep` | **yes** |
+| `model_id` | the concrete model id (e.g. `"claude-sonnet-4-6"`) | **yes** — non-stationarity guard |
 | `repo` (`RepoProfile`) | file count, bytes, primary language | carried, not yet keyed |
 
-`LearningTuner` keys profiles on `ContextKey { archetype, caching, model }`. **Caching is keyed
-explicitly** because it dominates token economics: the cheapest knobs with a warm cache are not
-the cheapest without one, so the two must not be averaged together (`RECIPE.md` §6.6).
+`LearningTuner` keys profiles on `ContextKey { archetype, caching, model, model_id }`. **Caching
+is keyed explicitly** because it dominates token economics: the cheapest knobs with a warm cache
+are not the cheapest without one, so the two must not be averaged together (`RECIPE.md` §6.6).
+The concrete **`model_id` is keyed alongside the coarse tier** so a model upgrade — which shifts
+the knob optimum (non-stationarity, §6.6) — starts a fresh profile instead of polluting the old
+model's learned optimum. Same model, same key; new model, new key.
 
 ---
 
@@ -99,10 +103,12 @@ learning stays tractable:
 A neighbour move steps **one** knob to an adjacent grid cell (clamped at the ends). Exploration
 can therefore never leave this envelope — that is the hard bound.
 
-> Honest state: of these four, the agent today actually honours `compact_after` and
-> `truncate_bytes`. `skeleton_radius` and `batch_width` are selected and learned-over but not yet
-> consumed by the tool/loop (a known debt). ATO will tune them the moment they're wired — no
-> change to the learner is needed.
+> State: all four knobs are now consumed by the loop. `compact_after` and `truncate_bytes` gate
+> compaction and tool-result truncation directly. `skeleton_radius` is injected into focused
+> `outline_file` calls when the model leaves the radius unset (so ATO's choice governs how much
+> dependency context a skeleton carries). `batch_width` is surfaced as a system-prompt hint
+> (only when the provider advertises `parallel_tool_use` and the width > 1) telling the model to
+> issue independent reads/edits together, collapsing round-trips.
 
 ---
 
@@ -156,7 +162,11 @@ works" — the quantity we compare.
 1. Look up the key's candidate map; **ensure `Knobs::default()` is always present** as a
    candidate.
 2. `best` = the **cheapest trusted** candidate (lowest `mean_tokens()` among those meeting the
-   constraint), or `Knobs::default()` if nothing is trusted yet.
+   constraint), or `Knobs::default()` if nothing is trusted yet. **Ties on mean tokens break
+   toward the least context carried** (smaller `truncate_bytes`, then `skeleton_radius`, then
+   `compact_after`) — carrying less context is weakly better for cache/overrun pressure and never
+   worse on the measured objective, and it makes selection deterministic (independent of hash-map
+   order). This tie-break is what lets counterfactual crediting (below) actually change the pick.
 3. Draw `r ∈ [0, 1)` from the PRNG:
    - **Exploit** (`r ≥ epsilon`): return `best`.
    - **Explore** (`r < epsilon`): pick a random knob and direction, step `best` one grid cell,
@@ -166,6 +176,17 @@ works" — the quantity we compare.
 
 Find-or-insert the `used` candidate for the key; `trials += 1`; on `out.success`,
 `successes += 1` and `success_tokens += out.total_tokens`.
+
+**Safe counterfactual crediting (truncate).** `observe` then credits the *provably-equivalent*
+cheaper truncate settings without a live trial. If `out.max_tool_result_bytes` (the largest
+untruncated tool result the task produced) is `≤ used.truncate_bytes` — i.e. truncation never
+actually fired — then every grid value `b` with `max_tool_result_bytes ≤ b < used.truncate_bytes`
+would have produced a **byte-identical transcript**: same tokens, same success. Each such `b` is
+folded in with the *same* outcome. This is exact, not a monotonicity assumption — the transcript
+is literally unchanged — so it can never falsely credit a starved setting (one that *would* have
+truncated). Its effect: tighter truncate limits build trust quickly, and the tie-break above then
+selects them over the (equal-cost) default. The crediting only runs when truncation didn't fire;
+if it did, a different limit changes the transcript and no counterfactual is sound.
 
 ### Defaults (`TuneConfig`)
 
@@ -185,21 +206,24 @@ Find-or-insert the `used` candidate for the key; `trials += 1`; on `out.success`
 
 ---
 
-## 8. The success signal — the keystone (and the current gap)
+## 8. The success signal — the keystone
 
 ATO is only as safe as the `success` bit it learns from. RECIPE §6.6 is blunt: **"Without a
 quality signal, do not enable ATO."** For a coding agent the *right* signal is cheap and strong
 — compile/tests pass, the diff is accepted, no correction turn was needed.
 
-**Today** `lvz-agent` reports a coarser signal: `success = true` on a clean finish (the model
-ended its turn with no further tool calls), and `false` on a provider error, a budget overrun,
-or hitting the step cap. That is "**completed without erroring**", *not* "produced a correct
-change". It is a reasonable placeholder but it does **not** satisfy the §6.6 bar.
+**The real signal: a verify command.** `AgentConfig.verify_command` (CLI `--verify-cmd`) is a
+shell command run **after a task completes normally** — `cargo test --quiet`, a type-check, a
+lint — in the agent's `repo_root`, stdio discarded. Its exit status *is* `Outcome.success`: exit
+0 ⇒ the change is good, non-zero ⇒ failed. This is the quality gate §6.6 demands. It runs **only
+on an otherwise-clean completion** (the model ended without tool calls); a provider error, budget
+overrun, or step-cap is `success = false` regardless, and the verify command is not run.
 
-**Consequence:** `--tune` is shipped **experimental / opt-in**. Before trusting ATO in
-production, wire a real quality gate into `Outcome.success` — e.g. run the repo's tests or a
-type-check after the task and feed pass/fail in, or detect a follow-up correction turn. The
-learner needs no change; only the signal does.
+**Fallback.** With no `verify_command` set, `success` falls back to the coarse "**completed
+without erroring**" flag (clean finish ⇒ true; error/overrun/step-cap ⇒ false). That's a
+reasonable placeholder but it does *not* satisfy the §6.6 bar — it doesn't check the change is
+*correct*. So `--tune` remains **opt-in**, and `--tune` without `--verify-cmd` stays experimental;
+pair the two for a production-grade signal.
 
 ---
 
@@ -208,8 +232,12 @@ learner needs no change; only the signal does.
 - **Enabling.** CLI `--tune` swaps `NoopTuner` → `LearningTuner` (it takes precedence over a
   fixed `--compact-after`). Most useful in a long-running `--serve` gateway, which accrues many
   tasks; a one-shot CLI run starts cold and mostly just returns the baseline.
-- **Persistence.** Profiles are **process-local** (an in-memory `HashMap`). They are lost on
-  restart — persisting/loading them is deferred (see §10).
+- **Persistence.** `--tune-state <path>` loads profiles at start (a missing file ⇒ cold) and
+  saves the full snapshot (profiles + PRNG cursor) as JSON after every observation, so a
+  restarted or redeployed gateway keeps what it learned. `LearningTuner::save`/`load` flatten the
+  struct-keyed maps to a row list (struct keys can't be JSON object keys); the PRNG cursor is
+  persisted too so exploration doesn't replay the same sequence after a restart. Without the
+  flag, profiles stay **process-local** and are lost on exit.
 - **Concurrency.** State sits behind a `Mutex`; `select`/`observe` are synchronous and safe
   under concurrent gateway sessions.
 - **Determinism.** A fixed-seed xorshift64 PRNG (`0x9E37_79B9_7F4A_7C15`) drives ε-exploration,
@@ -220,19 +248,29 @@ learner needs no change; only the signal does.
 
 ---
 
-## 10. Deliberately deferred (roadmap)
+## 10. Roadmap
 
-RECIPE flags these as "later"; none are implemented yet:
+**Implemented (this iteration).**
 
-- **A real success signal** (§8) — the prerequisite for trusting ATO at all.
-- **Counterfactual learning.** From a logged trace, recompute what a different `skeleton_radius`
-  *would* have included and estimate its token cost offline — update without a live A/B on real
-  tasks. De-risks exploration; preferred over live experiments once tracing exists.
-- **Non-stationarity / model-version keying.** A model upgrade shifts the optimum; key profiles
-  by model *version* (not just tier) or decay old observations on change.
-- **Profile persistence** across restarts (and per-repo profiles).
-- **Wiring the inert knobs** (`skeleton_radius`, `batch_width`) into the tool/loop so ATO's
-  choices for them take effect.
+- **A real success signal** (§8) — `--verify-cmd` gates `Outcome.success` on an exit code (tests
+  / type-check / lint), the quality gate §6.6 requires; coarse "completed without error" remains
+  the fallback.
+- **Counterfactual learning** (§6) — the *exact* byte-identical truncate counterfactual: when
+  truncation never fired, every cheaper truncate grid value still ≥ the largest result is credited
+  with the same outcome, no live trial. Sound (the transcript is literally unchanged), so it can't
+  mislabel a starved setting. (A radius/cost-estimate counterfactual from full traces remains
+  future work — it needs token-cost re-simulation, not just an equality check.)
+- **Non-stationarity / model-version keying** (§3) — `ContextKey` now carries the concrete
+  `model_id`, so a model upgrade starts a fresh profile instead of averaging a shifted optimum.
+- **Profile persistence** (§9) — `--tune-state <path>` saves/loads profiles + PRNG across restarts.
+- **Wiring the inert knobs** (§4) — `skeleton_radius` is injected into focused `outline_file`
+  calls; `batch_width` drives a parallel-tool-use system-prompt hint. All four knobs now bite.
+
+**Still deferred.**
+
+- **Trace-based radius counterfactuals & per-repo profiles** — recompute a different
+  `skeleton_radius`'s token cost from a logged trace (needs re-simulation), and key profiles by
+  repo as well as archetype. Decay of stale observations on model change (beyond fresh keying).
 - **Bayesian optimisation** over the knob vector — deferred until the data justifies it; the
   simple ε-greedy hill-climb is expected to suffice (`RECIPE.md` §6.6, ≈0.65).
 
