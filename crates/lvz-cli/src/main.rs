@@ -78,6 +78,20 @@ struct Cli {
     #[arg(long)]
     context_limit: Option<usize>,
 
+    /// Cheap model to run the first turns on, escalating to --model after --escalate-after
+    /// round-trips (--agent/--serve; §8 cost reduction, e.g. claude-haiku-4-5 → claude-sonnet-4-6).
+    #[arg(long, value_name = "MODEL")]
+    cheap_model: Option<String>,
+
+    /// Round-trips on --cheap-model before escalating to --model (default 2).
+    #[arg(long, value_name = "N")]
+    escalate_after: Option<usize>,
+
+    /// Cheap advisor model that drafts a plan before the loop to seed the executor (--agent/
+    /// --serve; §8 advisor+executor split). Reduces the strong model's exploration turns.
+    #[arg(long, value_name = "MODEL")]
+    advisor_model: Option<String>,
+
     /// Serve the agent as an HTTP/WebSocket gateway on this `host:port` (e.g. `127.0.0.1:8080`)
     /// instead of running a one-shot turn. Implies the agent tool loop. No prompt is required.
     #[arg(long, value_name = "ADDR", env = "LVZ_SERVE_ADDR")]
@@ -251,6 +265,15 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
     }
     if let Some(context_limit) = cli.context_limit {
         config = config.with_context_limit(context_limit);
+    }
+    if let Some(cheap_model) = &cli.cheap_model {
+        config = config.with_cheap_model(cheap_model.clone());
+    }
+    if let Some(escalate_after) = cli.escalate_after {
+        config = config.with_escalate_after(escalate_after);
+    }
+    if let Some(advisor_model) = &cli.advisor_model {
+        config = config.with_advisor_model(advisor_model.clone());
     }
     // Profile the working directory so the tuner sees a real repo shape (§6.6).
     if let Ok(cwd) = std::env::current_dir() {

@@ -60,6 +60,14 @@ bullet lines. Omit pleasantries and reasoning narration. Output only the note.";
 /// Generation ceiling for a compaction summary — summaries are meant to be short.
 const SUMMARY_MAX_TOKENS: u32 = 512;
 
+/// System prompt for the advisor pre-pass (§8 advisor+executor split). Terse plan, no code.
+const ADVISOR_SYSTEM: &str = "You are a planning advisor for a coding agent. Given the task, \
+output a short, concrete plan: which files or areas to inspect, the edits likely required, and \
+the order of steps. Terse bullet lines only — no prose, no code, no narration.";
+
+/// Generation ceiling for the advisor plan — plans are meant to be short.
+const ADVISOR_MAX_TOKENS: u32 = 512;
+
 /// Number of trailing (assistant, tool-result) turn-pairs kept verbatim when compacting.
 const KEEP_RECENT_TURNS: usize = 2;
 
@@ -89,6 +97,17 @@ pub struct AgentConfig {
     /// Repository root to profile for the tuner's [`TaskContext`] (§6.6). `None` skips the
     /// filesystem walk and uses an empty [`RepoProfile`] — fine for the [`NoopTuner`] default.
     pub repo_root: Option<PathBuf>,
+    /// Optional cheaper model used for the *first* turns; the loop escalates to
+    /// [`model`](Self::model) after [`escalate_after`](Self::escalate_after) round-trips
+    /// (cheap-model-first cost reduction, §8). `None` runs every turn on [`model`](Self::model).
+    pub cheap_model: Option<String>,
+    /// Round-trips to run on [`cheap_model`](Self::cheap_model) before escalating to the strong
+    /// model. Ignored when `cheap_model` is `None`.
+    pub escalate_after: usize,
+    /// Optional cheap "advisor" model that drafts a plan in one tool-less call before the loop
+    /// (advisor+executor split, §8). The plan seeds the (stronger) executor, cutting its
+    /// exploration round-trips. `None` disables the pre-pass.
+    pub advisor_model: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -103,6 +122,9 @@ impl Default for AgentConfig {
             summary_model: None,
             context_limit: None,
             repo_root: None,
+            cheap_model: None,
+            escalate_after: 2,
+            advisor_model: None,
         }
     }
 }
@@ -135,6 +157,25 @@ impl AgentConfig {
     /// Profile this repository root to give the tuner a real [`RepoProfile`] (§6.6).
     pub fn with_repo_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.repo_root = Some(root.into());
+        self
+    }
+
+    /// Run the first turns on a cheaper model, escalating to [`model`](Self::model) after
+    /// [`escalate_after`](Self::escalate_after) round-trips (§8 cheap-model-first).
+    pub fn with_cheap_model(mut self, model: impl Into<String>) -> Self {
+        self.cheap_model = Some(model.into());
+        self
+    }
+
+    /// Number of cheap-model round-trips before escalating (used only with `cheap_model`).
+    pub fn with_escalate_after(mut self, round_trips: usize) -> Self {
+        self.escalate_after = round_trips;
+        self
+    }
+
+    /// Draft a plan with a cheap advisor model before the loop, seeding the executor (§8).
+    pub fn with_advisor_model(mut self, model: impl Into<String>) -> Self {
+        self.advisor_model = Some(model.into());
         self
     }
 }
@@ -247,6 +288,16 @@ async fn run_loop(
     let mut total = Usage::default();
     let mut round_trips: u32 = 0;
 
+    // Advisor pre-pass (§8 advisor+executor split): a cheap model drafts a plan that seeds the
+    // (stronger) executor, cutting its exploration round-trips. Disabled unless advisor_model
+    // is set. The plan becomes the assistant's opening move, so the loop continues from it.
+    if config.advisor_model.is_some() {
+        if let Some(advice) = advise(&provider, &config, &task_text).await {
+            total.accumulate(&advice.usage);
+            history.push(Message::assistant(format!("Plan:\n{}", advice.plan)));
+        }
+    }
+
     for _step in 0..config.max_steps {
         // Deduplication (§6.3): collapse byte-identical repeated tool results (e.g. the same
         // file read twice with no change), keeping only the most recent copy. Cheap and
@@ -270,7 +321,14 @@ async fn run_loop(
             evict_to_fit(&mut history, limit);
         }
 
-        let req = build_request(&config, &tool_defs, &caps, &history);
+        // Cheap-model-first (§8): run the early round-trips on the cheap model, then escalate
+        // to the strong model once the easy turns are spent. No-op unless cheap_model is set.
+        let active_model = match &config.cheap_model {
+            Some(cheap) if (round_trips as usize) < config.escalate_after => cheap.as_str(),
+            _ => config.model.as_str(),
+        };
+
+        let req = build_request(&config, active_model, &tool_defs, &caps, &history);
         let mut stream = match provider.stream(req).await {
             Ok(s) => s,
             Err(e) => {
@@ -380,6 +438,36 @@ struct Compacted {
 /// The original task (`history[0]`) and the last [`KEEP_RECENT_TURNS`] turn-pairs are kept
 /// verbatim; the slice between them is replaced by a single user note. The cut lands on a
 /// turn boundary so assistant `tool_use` blocks are never separated from their `tool_result`.
+/// A plan drafted by the advisor pre-pass and the tokens it cost.
+struct Advice {
+    plan: String,
+    usage: Usage,
+}
+
+/// Advisor pre-pass (§8): one tool-less call to the cheap `advisor_model` that drafts a plan
+/// for `task`. Its tokens count toward the task total (§6.4). Returns `None` when the advisor
+/// is disabled, the call fails, or the plan is empty.
+async fn advise(provider: &Arc<dyn Provider>, config: &AgentConfig, task: &str) -> Option<Advice> {
+    let model = config.advisor_model.clone()?;
+    let req = ChatRequest::new(model)
+        .max_tokens(ADVISOR_MAX_TOKENS)
+        .system(ADVISOR_SYSTEM)
+        .push(Message::user(task.to_string()));
+
+    let mut stream = provider.stream(req).await.ok()?;
+    let mut plan = String::new();
+    let mut usage = Usage::default();
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(Event::TextDelta(t)) => plan.push_str(&t),
+            Ok(Event::Usage(u)) => usage = u,
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    (!plan.trim().is_empty()).then_some(Advice { plan, usage })
+}
+
 async fn compact_history(
     provider: &Arc<dyn Provider>,
     config: &AgentConfig,
@@ -652,11 +740,12 @@ fn profile_repo(root: &Path) -> RepoProfile {
 /// Assemble a request, marking the stable prefix cacheable iff the provider supports caching.
 fn build_request(
     config: &AgentConfig,
+    model: &str,
     tool_defs: &[ToolDef],
     caps: &Capabilities,
     history: &[Message],
 ) -> ChatRequest {
-    let mut req = ChatRequest::new(config.model.clone()).max_tokens(config.max_tokens);
+    let mut req = ChatRequest::new(model.to_string()).max_tokens(config.max_tokens);
     req.system = Some(SystemPrompt {
         text: config.system.clone(),
         cache: caps.prompt_caching,
@@ -1218,5 +1307,107 @@ mod tests {
         let (model, _, system) = summary_calls[0];
         assert_eq!(model, "haiku-cheap");
         assert!(system.contains("compress"), "compaction system prompt used");
+    }
+
+    #[tokio::test]
+    async fn escalates_from_cheap_to_strong_after_n_round_trips() {
+        // Two tool turns then a final answer: 3 executor requests in all.
+        let main = vec![
+            big_tool_turn("a"),
+            big_tool_turn("b"),
+            vec![
+                Event::TextDelta("done".into()),
+                Event::Usage(Usage::default()),
+                Event::Done(StopReason::EndTurn),
+            ],
+        ];
+        let provider = RecordingProvider::new(main);
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(BigTool));
+
+        let config = AgentConfig::default()
+            .with_model("strong")
+            .with_cheap_model("cheap")
+            .with_escalate_after(2);
+        let agent = Agent::new(provider.clone(), registry, config);
+
+        let _ = collect(agent.run("multi-step task")).await;
+
+        let seen = provider.seen.lock().unwrap();
+        let models: Vec<&str> = seen.iter().map(|(m, _, _)| m.as_str()).collect();
+        // First two round-trips on the cheap model, then escalate to the strong model.
+        assert_eq!(models, vec!["cheap", "cheap", "strong"]);
+    }
+
+    /// Records each request's (model, system, message-count) and answers in one turn.
+    struct AdvisorRecorder {
+        seen: Mutex<Vec<(String, String, usize)>>,
+    }
+
+    #[async_trait]
+    impl Provider for AdvisorRecorder {
+        async fn stream(
+            &self,
+            req: ChatRequest,
+        ) -> Result<
+            BoxStream<'static, Result<Event, lvz_protocol::ProviderError>>,
+            lvz_protocol::ProviderError,
+        > {
+            let system = req
+                .system
+                .as_ref()
+                .map(|s| s.text.clone())
+                .unwrap_or_default();
+            let has_tools = !req.tools.is_empty();
+            self.seen
+                .lock()
+                .unwrap()
+                .push((req.model.clone(), system, req.messages.len()));
+            // Tool-less = the advisor plan; tool-bearing = the executor finishing immediately.
+            let text = if has_tools {
+                "done"
+            } else {
+                "- inspect foo.rs\n- edit bar"
+            };
+            Ok(stream::iter(
+                vec![
+                    Event::TextDelta(text.into()),
+                    Event::Usage(Usage::default()),
+                    Event::Done(StopReason::EndTurn),
+                ]
+                .into_iter()
+                .map(Ok),
+            )
+            .boxed())
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn advisor_prepass_routes_to_advisor_model_and_seeds_the_plan() {
+        let provider = Arc::new(AdvisorRecorder {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(BigTool)); // executor requests advertise tools
+
+        let config = AgentConfig::default()
+            .with_model("strong")
+            .with_advisor_model("advisor");
+        let agent = Agent::new(provider.clone(), registry, config);
+
+        let _ = collect(agent.run("implement X")).await;
+
+        let seen = provider.seen.lock().unwrap();
+        // First call = advisor pre-pass: cheap advisor model, advisor prompt, sees just the task.
+        assert_eq!(seen[0].0, "advisor");
+        assert!(seen[0].1.to_lowercase().contains("advisor"));
+        assert_eq!(seen[0].2, 1);
+        // Second call = executor on the strong model, seeded with task + plan (2 messages).
+        assert_eq!(seen[1].0, "strong");
+        assert_eq!(seen[1].2, 2);
     }
 }
