@@ -119,6 +119,56 @@ async fn submit_failure_is_reported_as_an_sse_error() {
 }
 
 #[tokio::test]
+async fn metrics_endpoint_reports_turn_telemetry() {
+    let base = spawn(Arc::new(EchoAgent)).await;
+    let client = reqwest::Client::new();
+
+    // Fresh gateway: counters start at zero.
+    let before = reqwest::get(format!("{base}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        before.contains("lavoisier_turns_total 0"),
+        "metrics:\n{before}"
+    );
+
+    // Run a turn and drain it fully (so the per-turn tap records before we scrape).
+    let body = client
+        .post(format!("{base}/v1/turns"))
+        .json(&serde_json::json!({ "input": "ping" }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("echo:ping"));
+
+    let after = reqwest::get(format!("{base}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // EchoAgent reports input=3, output=1 for the turn.
+    assert!(
+        after.contains("lavoisier_turns_total 1"),
+        "metrics:\n{after}"
+    );
+    assert!(
+        after.contains("lavoisier_input_tokens_total 3"),
+        "metrics:\n{after}"
+    );
+    assert!(
+        after.contains("lavoisier_output_tokens_total 1"),
+        "metrics:\n{after}"
+    );
+}
+
+#[tokio::test]
 async fn api_key_auth_gates_protected_routes() {
     let config = GatewayConfig::default().with_api_keys(["sk-test".to_string()]);
     let base = spawn_with(Arc::new(EchoAgent), config).await;

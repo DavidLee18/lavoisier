@@ -15,6 +15,7 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,7 +25,10 @@ use axum::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
         Request, State,
     },
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        HeaderMap, StatusCode,
+    },
     middleware::{self, Next},
     response::{
         sse::{Event as SseEvent, Sse},
@@ -103,17 +107,32 @@ impl HttpGateway {
         Self::router_with(agent, GatewayConfig::default())
     }
 
-    /// Build the router with an explicit auth/quota policy. `/health` is always unauthenticated;
-    /// `/v1/turns` and `/v1/ws` sit behind the [`GatewayConfig`] guard.
+    /// Build the router with an explicit auth/quota policy. `/health` and `/metrics` are
+    /// always open; `/v1/turns` and `/v1/ws` sit behind the [`GatewayConfig`] guard.
     pub fn router_with(agent: SharedAgent, config: GatewayConfig) -> Router {
+        let state = Arc::new(AppState {
+            agent,
+            metrics: Arc::new(Metrics::default()),
+        });
         let guard = Arc::new(Guard::new(config));
         let protected = Router::new()
             .route("/v1/turns", post(post_turn))
             .route("/v1/ws", get(ws_upgrade))
             .route_layer(middleware::from_fn_with_state(guard, guard_request))
-            .with_state(agent);
-        Router::new().route("/health", get(health)).merge(protected)
+            .with_state(state.clone());
+        Router::new()
+            .route("/health", get(health))
+            .route("/metrics", get(metrics))
+            .with_state(state)
+            .merge(protected)
     }
+}
+
+/// Shared handler state: the agent plus the cross-cutting telemetry recorder (`RECIPE.md`
+/// §6.4, §7.3).
+struct AppState {
+    agent: SharedAgent,
+    metrics: Arc<Metrics>,
 }
 
 #[async_trait]
@@ -227,6 +246,145 @@ async fn guard_request(
     next.run(request).await
 }
 
+// --- telemetry (RECIPE §6.4): tokens, cache hits, latency, per-turn counts ---
+
+/// Process-wide counters, exported in Prometheus text format at `GET /metrics`. The agent
+/// emits exactly one terminal [`Usage`] per turn (the task total across round-trips), so the
+/// per-turn tap records that single total — never double-counting.
+#[derive(Default)]
+struct Metrics {
+    turns_total: AtomicU64,
+    errors_total: AtomicU64,
+    input_tokens_total: AtomicU64,
+    output_tokens_total: AtomicU64,
+    cache_read_tokens_total: AtomicU64,
+    cache_creation_tokens_total: AtomicU64,
+    turn_duration_micros_total: AtomicU64,
+}
+
+impl Metrics {
+    fn record_turn(&self, usage: &lvz_protocol::Usage, elapsed: Duration, errored: bool) {
+        self.turns_total.fetch_add(1, Ordering::Relaxed);
+        if errored {
+            self.errors_total.fetch_add(1, Ordering::Relaxed);
+        }
+        self.input_tokens_total
+            .fetch_add(usage.input_tokens, Ordering::Relaxed);
+        self.output_tokens_total
+            .fetch_add(usage.output_tokens, Ordering::Relaxed);
+        self.cache_read_tokens_total
+            .fetch_add(usage.cache_read_tokens, Ordering::Relaxed);
+        self.cache_creation_tokens_total
+            .fetch_add(usage.cache_creation_tokens, Ordering::Relaxed);
+        self.turn_duration_micros_total
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Render the Prometheus text exposition format (v0.0.4). Operators scrape this directly,
+    /// or bridge it to OTLP at the collector — keeping the gateway free of a heavy exporter.
+    fn render_prometheus(&self) -> String {
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let mut s = String::new();
+        let mut counter = |name: &str, help: &str, value: u64| {
+            s.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"
+            ));
+        };
+        counter(
+            "lavoisier_turns_total",
+            "Agent turns completed.",
+            g(&self.turns_total),
+        );
+        counter(
+            "lavoisier_turn_errors_total",
+            "Turns that ended in an error.",
+            g(&self.errors_total),
+        );
+        counter(
+            "lavoisier_input_tokens_total",
+            "Billed input tokens across all turns.",
+            g(&self.input_tokens_total),
+        );
+        counter(
+            "lavoisier_output_tokens_total",
+            "Generated output tokens across all turns.",
+            g(&self.output_tokens_total),
+        );
+        counter(
+            "lavoisier_cache_read_tokens_total",
+            "Prompt tokens served from cache.",
+            g(&self.cache_read_tokens_total),
+        );
+        counter(
+            "lavoisier_cache_creation_tokens_total",
+            "Prompt tokens written to cache.",
+            g(&self.cache_creation_tokens_total),
+        );
+        counter(
+            "lavoisier_turn_duration_micros_total",
+            "Summed wall-clock turn latency, microseconds.",
+            g(&self.turn_duration_micros_total),
+        );
+        s
+    }
+}
+
+/// Wrap an agent's per-turn event stream to record telemetry on completion: accumulate the
+/// last [`Usage`] (last-wins) and, on the terminal `Done` or stream end, record the turn.
+fn instrument(
+    inner: BoxStream<'static, Result<Event, AgentError>>,
+    metrics: Arc<Metrics>,
+) -> BoxStream<'static, Result<Event, AgentError>> {
+    let tap = MetricTap {
+        inner,
+        metrics,
+        start: Instant::now(),
+        usage: lvz_protocol::Usage::default(),
+        errored: false,
+        recorded: false,
+    };
+    stream::unfold(tap, |mut tap| async move {
+        match tap.inner.next().await {
+            Some(item) => {
+                match &item {
+                    Ok(Event::Usage(u)) => tap.usage = *u,
+                    Err(_) => tap.errored = true,
+                    _ => {}
+                }
+                if matches!(item, Ok(Event::Done(_))) {
+                    tap.record();
+                }
+                Some((item, tap))
+            }
+            None => {
+                tap.record();
+                None
+            }
+        }
+    })
+    .boxed()
+}
+
+struct MetricTap {
+    inner: BoxStream<'static, Result<Event, AgentError>>,
+    metrics: Arc<Metrics>,
+    start: Instant,
+    usage: lvz_protocol::Usage,
+    errored: bool,
+    recorded: bool,
+}
+
+impl MetricTap {
+    fn record(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        self.metrics
+            .record_turn(&self.usage, self.start.elapsed(), self.errored);
+    }
+}
+
 /// Inbound turn payload. `session` defaults so a single-session client can omit it.
 #[derive(Deserialize)]
 struct TurnDto {
@@ -243,27 +401,43 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// `GET /metrics` — Prometheus text exposition of the cross-cutting telemetry.
+async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.metrics.render_prometheus(),
+    )
+}
+
 /// `POST /v1/turns` — run one turn and stream its events as SSE.
 async fn post_turn(
-    State(agent): State<SharedAgent>,
+    State(state): State<Arc<AppState>>,
     Json(dto): Json<TurnDto>,
 ) -> Sse<BoxStream<'static, Result<SseEvent, Infallible>>> {
     let turn = TurnRequest::new(dto.session, dto.input);
-    let body: BoxStream<'static, Result<SseEvent, Infallible>> = match agent.submit(turn).await {
-        Ok(events) => events.map(|item| Ok(to_sse(item))).boxed(),
-        Err(e) => stream::once(async move { Ok(error_sse(&e)) }).boxed(),
-    };
+    let body: BoxStream<'static, Result<SseEvent, Infallible>> =
+        match state.agent.submit(turn).await {
+            Ok(events) => instrument(events, state.metrics.clone())
+                .map(|item| Ok(to_sse(item)))
+                .boxed(),
+            Err(e) => {
+                state
+                    .metrics
+                    .record_turn(&lvz_protocol::Usage::default(), Duration::ZERO, true);
+                stream::once(async move { Ok(error_sse(&e)) }).boxed()
+            }
+        };
     Sse::new(body)
 }
 
 /// `GET /v1/ws` — upgrade to a WebSocket and serve turns on it.
-async fn ws_upgrade(State(agent): State<SharedAgent>, ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| ws_loop(socket, agent))
+async fn ws_upgrade(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| ws_loop(socket, state))
 }
 
 /// One WebSocket connection: each inbound text frame is a [`TurnDto`]; the agent's events for
 /// that turn stream back as JSON text frames before the next inbound frame is read.
-async fn ws_loop(mut socket: WebSocket, agent: SharedAgent) {
+async fn ws_loop(mut socket: WebSocket, state: Arc<AppState>) {
     while let Some(Ok(msg)) = socket.recv().await {
         let text = match msg {
             WsMessage::Text(t) => t,
@@ -284,8 +458,9 @@ async fn ws_loop(mut socket: WebSocket, agent: SharedAgent) {
             }
         };
         let turn = TurnRequest::new(dto.session, dto.input);
-        match agent.submit(turn).await {
-            Ok(mut events) => {
+        match state.agent.submit(turn).await {
+            Ok(events) => {
+                let mut events = instrument(events, state.metrics.clone());
                 while let Some(item) = events.next().await {
                     if send_text(&mut socket, to_json(item)).await.is_err() {
                         return;
@@ -293,6 +468,9 @@ async fn ws_loop(mut socket: WebSocket, agent: SharedAgent) {
                 }
             }
             Err(e) => {
+                state
+                    .metrics
+                    .record_turn(&lvz_protocol::Usage::default(), Duration::ZERO, true);
                 if send_text(&mut socket, error_json(&e.to_string()))
                     .await
                     .is_err()
