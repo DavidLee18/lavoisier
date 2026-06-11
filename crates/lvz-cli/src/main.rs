@@ -18,6 +18,7 @@ use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use lvz_agent::{Agent, AgentConfig, FixedTuner};
 use lvz_anthropic::AnthropicProvider;
+use lvz_claude_cli::ClaudeCliProvider;
 use lvz_gw_http::{GatewayConfig, HttpGateway};
 use lvz_gw_matrix::MatrixGateway;
 use lvz_memory::{InMemoryStore, SessionAgent};
@@ -114,6 +115,8 @@ struct Cli {
 enum ProviderKind {
     Xai,
     Anthropic,
+    /// Rides Claude Code `claude -p` (subscription, no caching) — personal/low-volume only (§8).
+    ClaudeCli,
 }
 
 impl ProviderKind {
@@ -121,6 +124,7 @@ impl ProviderKind {
         match self {
             ProviderKind::Xai => "grok-4",
             ProviderKind::Anthropic => "claude-sonnet-4-6",
+            ProviderKind::ClaudeCli => "sonnet",
         }
     }
 
@@ -128,6 +132,7 @@ impl ProviderKind {
         Ok(match self {
             ProviderKind::Xai => Arc::new(XaiProvider::from_env()?),
             ProviderKind::Anthropic => Arc::new(AnthropicProvider::from_env()?),
+            ProviderKind::ClaudeCli => Arc::new(ClaudeCliProvider::from_env()?),
         })
     }
 }
