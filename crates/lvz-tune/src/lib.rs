@@ -19,12 +19,13 @@
 //! controller is pure in-memory bookkeeping (no extra dependencies, negligible overhead) and
 //! its `select`/`observe` are synchronous, matching the trait.
 //!
-//! Now wired (see `docs/ATO.md`): a real success signal (`--verify-cmd`), model-version keying
-//! (`ContextKey` carries `model_id`), the exact byte-identical truncate counterfactual, the
-//! opt-in estimated radius counterfactual (emitted by `lvz-agent`; this learner just records the
-//! synthetic observations), and profile persistence (`save`/`load`). Still deferred: per-repo
-//! profiles, observation decay, and Bayesian optimisation. The success signal is only as good as
-//! what the agent reports — pair `--tune` with `--verify-cmd` for a real quality gate in production.
+//! Now wired (see `docs/ATO.md`): a real success signal (`--verify-cmd`), model-version + per-repo
+//! keying (`ContextKey` carries `model_id` and `repo_id`), observation decay (`TuneConfig.decay`,
+//! an EWMA for non-stationarity), the exact byte-identical truncate counterfactual, the opt-in
+//! estimated radius counterfactual with a downstream-residency model (emitted by `lvz-agent`; this
+//! learner just records the synthetic observations), and profile persistence (`save`/`load`). Still
+//! deferred: Bayesian optimisation. The success signal is only as good as what the agent reports —
+//! pair `--tune` with `--verify-cmd` for a real quality gate in production.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -42,6 +43,11 @@ pub struct TuneConfig {
     pub success_target: f32,
     /// Minimum trials before a candidate is trusted (avoids chasing lucky one-offs).
     pub min_trials: u32,
+    /// Per-observation decay in `(0, 1]` for **non-stationarity** (`docs/ATO.md` §6.6): before a
+    /// candidate folds in a new sample, its accumulated stats are multiplied by this factor, so
+    /// recent outcomes weigh more and a stale optimum (e.g. after a model/codebase shift) fades.
+    /// `1.0` = no decay (plain running totals); `0.9` ≈ a soft ~10-sample memory.
+    pub decay: f64,
 }
 
 impl Default for TuneConfig {
@@ -50,6 +56,7 @@ impl Default for TuneConfig {
             epsilon: 0.1,
             success_target: 0.9,
             min_trials: 3,
+            decay: 1.0,
         }
     }
 }
@@ -64,6 +71,7 @@ struct ContextKey {
     caching: bool,
     model: ModelTier,
     model_id: String,
+    repo_id: String,
 }
 
 impl ContextKey {
@@ -73,34 +81,37 @@ impl ContextKey {
             caching: ctx.caps.prompt_caching,
             model: ctx.model,
             model_id: ctx.model_id.clone(),
+            repo_id: ctx.repo_id.clone(),
         }
     }
 }
 
-/// Running stats for one knob vector under one context.
+/// Running (optionally decayed) stats for one knob vector under one context. Fields are `f64`
+/// so a `< 1.0` decay factor can down-weight old samples (an EWMA); with `decay == 1.0` they are
+/// exact running totals.
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 struct Stats {
-    trials: u32,
-    successes: u32,
-    /// Summed tokens over *successful* runs (cost-when-it-works).
-    success_tokens: u64,
+    trials: f64,
+    successes: f64,
+    /// (Decay-weighted) summed tokens over *successful* runs (cost-when-it-works).
+    success_tokens: f64,
 }
 
 impl Stats {
     fn success_rate(&self) -> f32 {
-        if self.trials == 0 {
+        if self.trials == 0.0 {
             0.0
         } else {
-            self.successes as f32 / self.trials as f32
+            (self.successes / self.trials) as f32
         }
     }
 
     fn mean_tokens(&self) -> Option<f64> {
-        (self.successes > 0).then(|| self.success_tokens as f64 / self.successes as f64)
+        (self.successes > 0.0).then(|| self.success_tokens / self.successes)
     }
 
     fn trusted(&self, cfg: &TuneConfig) -> bool {
-        self.trials >= cfg.min_trials && self.success_rate() >= cfg.success_target
+        self.trials >= cfg.min_trials as f64 && self.success_rate() >= cfg.success_target
     }
 }
 
@@ -240,7 +251,8 @@ impl Tuner for LearningTuner {
         let mut guard = self.state.lock().expect("tuner state poisoned");
         let candidates = guard.profiles.entry(key).or_default();
 
-        record(candidates.entry(*used).or_default(), out);
+        let decay = self.cfg.decay;
+        record(candidates.entry(*used).or_default(), out, decay);
 
         // Safe counterfactual (§6.6 / `docs/ATO.md` §3): if nothing in the task exceeded the
         // truncate limit actually used, then every *cheaper* grid value that still ≥ the largest
@@ -256,7 +268,7 @@ impl Tuner for LearningTuner {
                             truncate_bytes: b,
                             ..*used
                         };
-                        record(candidates.entry(cf).or_default(), out);
+                        record(candidates.entry(cf).or_default(), out, decay);
                     }
                 }
             }
@@ -264,12 +276,17 @@ impl Tuner for LearningTuner {
     }
 }
 
-/// Fold one realised (or counterfactual) outcome into a candidate's running stats.
-fn record(stats: &mut Stats, out: &Outcome) {
-    stats.trials += 1;
+/// Fold one realised (or counterfactual) outcome into a candidate's running stats, first decaying
+/// the prior totals by `decay` (an EWMA when `decay < 1.0`; plain accumulation at `1.0`).
+fn record(stats: &mut Stats, out: &Outcome, decay: f64) {
+    stats.trials = stats.trials * decay + 1.0;
     if out.success {
-        stats.successes += 1;
-        stats.success_tokens += out.total_tokens;
+        stats.successes = stats.successes * decay + 1.0;
+        stats.success_tokens = stats.success_tokens * decay + out.total_tokens as f64;
+    } else {
+        // Decay the success side too, so a run of failures fades past success evidence.
+        stats.successes *= decay;
+        stats.success_tokens *= decay;
     }
 }
 
@@ -361,6 +378,7 @@ mod tests {
             caps: Capabilities::default(),
             model: ModelTier::Balanced,
             model_id: "test-model".to_string(),
+            repo_id: "test-repo".to_string(),
         }
     }
 
@@ -389,6 +407,7 @@ mod tests {
             epsilon: 0.0,
             success_target: 0.9,
             min_trials: 3,
+            decay: 1.0,
         });
         let c = ctx();
         for _ in 0..3 {
@@ -410,6 +429,7 @@ mod tests {
             epsilon: 0.0,
             success_target: 0.9,
             min_trials: 3,
+            decay: 1.0,
         });
         let c = ctx();
         for _ in 0..4 {
@@ -450,6 +470,7 @@ mod tests {
             epsilon: 0.0,
             success_target: 0.9,
             min_trials: 2,
+            decay: 1.0,
         });
         let mut cached = ctx();
         cached.caps.prompt_caching = true;
@@ -474,6 +495,7 @@ mod tests {
             epsilon: 0.0,
             success_target: 0.9,
             min_trials: 2,
+            decay: 1.0,
         });
         let mut v1 = ctx();
         v1.model_id = "model-v1".to_string();
@@ -493,11 +515,71 @@ mod tests {
     }
 
     #[test]
+    fn decay_lets_recent_failures_dethrone_a_stale_winner() {
+        // Same history — 30 successes then 3 failures on the cheaper vector — under decay vs not.
+        let run = |decay: f64| {
+            let t = LearningTuner::with_config(TuneConfig {
+                epsilon: 0.0,
+                success_target: 0.9,
+                min_trials: 2,
+                decay,
+            });
+            let c = ctx();
+            let cheaper = Knobs {
+                skeleton_radius: 0,
+                ..Knobs::default()
+            };
+            for _ in 0..30 {
+                t.observe(&c, &cheaper, &outcome(600, true));
+            }
+            for _ in 0..3 {
+                t.observe(&c, &cheaper, &outcome(600, false));
+            }
+            t.select(&c)
+        };
+        let cheaper = Knobs {
+            skeleton_radius: 0,
+            ..Knobs::default()
+        };
+        // No decay: 30/33 ≈ 0.909 ≥ target, so the cheaper vector is still trusted.
+        assert_eq!(run(1.0), cheaper);
+        // With decay: the 3 recent failures dominate the EWMA, dropping success rate below
+        // target → the once-trusted winner is abandoned, falling back to the baseline.
+        assert_eq!(run(0.9), Knobs::default());
+    }
+
+    #[test]
+    fn repo_id_keys_profiles_apart() {
+        let t = LearningTuner::with_config(TuneConfig {
+            epsilon: 0.0,
+            success_target: 0.9,
+            min_trials: 2,
+            decay: 1.0,
+        });
+        let mut repo_a = ctx();
+        repo_a.repo_id = "/work/a".to_string();
+        let mut repo_b = ctx();
+        repo_b.repo_id = "/work/b".to_string();
+
+        let cheaper = Knobs {
+            batch_width: 8,
+            ..Knobs::default()
+        };
+        for _ in 0..2 {
+            t.observe(&repo_a, &cheaper, &outcome(500, true));
+        }
+        // Repo A learned its winner; repo B has its own (cold) profile.
+        assert_eq!(t.select(&repo_a), cheaper);
+        assert_eq!(t.select(&repo_b), Knobs::default());
+    }
+
+    #[test]
     fn counterfactual_credits_provably_equivalent_cheaper_truncate() {
         let t = LearningTuner::with_config(TuneConfig {
             epsilon: 0.0,
             success_target: 0.9,
             min_trials: 3,
+            decay: 1.0,
         });
         let c = ctx();
         // Three successful runs at the default truncate (8192) where the largest tool result was
@@ -527,6 +609,7 @@ mod tests {
             epsilon: 0.0,
             success_target: 0.9,
             min_trials: 3,
+            decay: 1.0,
         });
         let c = ctx();
         let cheaper = Knobs {
@@ -547,6 +630,7 @@ mod tests {
                 epsilon: 0.0,
                 success_target: 0.9,
                 min_trials: 3,
+                decay: 1.0,
             },
         )
         .expect("load");

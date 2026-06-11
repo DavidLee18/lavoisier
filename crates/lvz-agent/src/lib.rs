@@ -357,6 +357,11 @@ async fn run_loop(
         caps,
         model: config.model_tier,
         model_id: config.model.clone(),
+        repo_id: config
+            .repo_root
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
     };
     let knobs = tuner.select(&ctx);
     let obs = Observation {
@@ -482,7 +487,13 @@ async fn run_loop(
             // Snapshot the skeleton (pre-injection args) for the radius counterfactual, if on.
             if config.radius_counterfactual {
                 radius_traces.extend(
-                    capture_radius_traces(&call.name, &original_args, knobs.batch_width).await,
+                    capture_radius_traces(
+                        &call.name,
+                        &original_args,
+                        knobs.batch_width,
+                        round_trips,
+                    )
+                    .await,
                 );
             }
             let args = apply_knobs_to_args(&call.name, original_args, &knobs);
@@ -549,7 +560,15 @@ impl Observation<'_> {
             max_tool_result_bytes,
         };
         self.tuner.observe(self.ctx, self.knobs, &realised);
-        emit_radius_counterfactuals(self.tuner, self.ctx, self.knobs, &realised, radius_traces);
+        emit_radius_counterfactuals(
+            self.tuner,
+            self.ctx,
+            self.knobs,
+            &realised,
+            radius_traces,
+            round_trips,
+            self.ctx.caps.prompt_caching,
+        );
         if let Some(sink) = self.telemetry {
             sink.record(&TaskTelemetry {
                 archetype: self.ctx.archetype,
@@ -568,18 +587,26 @@ impl Observation<'_> {
 /// Emit the **unsound, estimate-based** skeleton-radius counterfactual (`docs/ATO.md` §6, §10).
 ///
 /// For each radius `t` strictly below the one used, re-extract every captured outline skeleton at
-/// `t`, sum how many tokens that would have saved versus the radius actually used, and credit
-/// `Knobs { skeleton_radius: t, .. }` with `(realised.total − saving, realised.success)`. The
-/// token estimate is real (re-extracted from the snapshot); the **success bit is optimistically
-/// transferred** — we cannot prove the model would have succeeded with less context, which is
-/// exactly why this is opt-in. `max_tool_result_bytes` is cleared so it doesn't compound with the
-/// learner's (exact) truncate counterfactual. No-op when no traces were captured or radius is 0.
+/// `t` and sum how many tokens a smaller radius would have saved versus the radius actually used,
+/// then credit `Knobs { skeleton_radius: t, .. }` with `(realised.total − saving, realised.success)`.
+///
+/// **Downstream-effect model (`docs/ATO.md` §6).** A skeleton injected into history is re-sent on
+/// every later round-trip until compaction, so its per-skeleton delta recurs. Without prompt
+/// caching each resend is fresh input, so the saving is scaled by the skeleton's *residency* (how
+/// many round-trips from its capture to task end). With caching those resends are `cache_read`, not
+/// new `total_tokens`, so residency collapses to 1 — modelling that the smaller skeleton only saves
+/// on its single cache-creation send. The estimate is real (re-extracted); the **success bit is
+/// optimistically transferred** (we can't prove less context wouldn't have failed), which is why
+/// this is opt-in. `max_tool_result_bytes` is cleared so it doesn't compound with the learner's
+/// (exact) truncate counterfactual. No-op when no traces were captured or radius is 0.
 fn emit_radius_counterfactuals(
     tuner: &Arc<dyn Tuner>,
     ctx: &TaskContext,
     knobs: &Knobs,
     realised: &Outcome,
     radius_traces: &[RadiusTrace],
+    final_round: u32,
+    caching: bool,
 ) {
     let used = knobs.skeleton_radius;
     if radius_traces.is_empty() || used == 0 {
@@ -588,7 +615,10 @@ fn emit_radius_counterfactuals(
     for t in 0..used {
         let saving: u64 = radius_traces
             .iter()
-            .map(|tr| tr.tokens_at(used).saturating_sub(tr.tokens_at(t)))
+            .map(|tr| {
+                let per_send = tr.tokens_at(used).saturating_sub(tr.tokens_at(t));
+                per_send * tr.residency(final_round, caching)
+            })
             .sum();
         let cf_knobs = Knobs {
             skeleton_radius: t,
@@ -680,6 +710,9 @@ struct RadiusTrace {
     source: String,
     lang: Lang,
     focus: String,
+    /// Round-trip index at which this skeleton entered history. Used to estimate how many later
+    /// round-trips re-sent it (its *residency*) for the downstream-effect model (`docs/ATO.md` §6).
+    captured_at_round: u32,
 }
 
 impl RadiusTrace {
@@ -688,6 +721,17 @@ impl RadiusTrace {
         let skel = skeleton_with_radius(&self.source, self.lang, &self.focus, radius);
         estimate_tokens(&skel) as u64
     }
+
+    /// How many request assemblies still carried this skeleton from its capture to task end —
+    /// at least 1 (the turn it was produced for). With prompt caching those resends are
+    /// `cache_read`, not new `total_tokens`, so the downstream model collapses residency to 1.
+    fn residency(&self, final_round: u32, caching: bool) -> u64 {
+        if caching {
+            1
+        } else {
+            final_round.saturating_sub(self.captured_at_round).max(1) as u64
+        }
+    }
 }
 
 /// Capture [`RadiusTrace`]s for a knob-governed outline call (`outline_file` → one path,
@@ -695,8 +739,14 @@ impl RadiusTrace {
 /// unset — so the tuner's radius was injected by [`apply_knobs_to_args`]. Calls that pin an
 /// explicit radius are the model's choice, not the knob's, and yield nothing; ditto unsupported
 /// languages or unreadable files. The `paths` are capped to `batch_width` to mirror the actual
-/// invocation (the over-long tail never runs, so it must not be credited).
-async fn capture_radius_traces(tool: &str, args: &Value, batch_width: u8) -> Vec<RadiusTrace> {
+/// invocation (the over-long tail never runs, so it must not be credited). `captured_at_round` is
+/// stamped on each trace for the downstream-residency model.
+async fn capture_radius_traces(
+    tool: &str,
+    args: &Value,
+    batch_width: u8,
+    captured_at_round: u32,
+) -> Vec<RadiusTrace> {
     let Some(obj) = args.as_object() else {
         return Vec::new();
     };
@@ -726,6 +776,7 @@ async fn capture_radius_traces(tool: &str, args: &Value, batch_width: u8) -> Vec
                 source,
                 lang,
                 focus: focus.to_string(),
+                captured_at_round,
             });
         }
     }
@@ -1540,6 +1591,7 @@ mod tests {
             caps: Capabilities::default(),
             model: ModelTier::Balanced,
             model_id: "test".into(),
+            repo_id: "test-repo".into(),
         }
     }
 
@@ -1556,6 +1608,7 @@ fn target() -> u32 { helper() + 10 }
             source,
             lang: Lang::Rust,
             focus: "target".into(),
+            captured_at_round: 0,
         };
         // Sanity: radius 1 (pulls helper's body) estimates more tokens than radius 0.
         assert!(trace.tokens_at(1) >= trace.tokens_at(0));
@@ -1571,17 +1624,52 @@ fn target() -> u32 { helper() + 10 }
             success: true,
             max_tool_result_bytes: None,
         };
-        emit_radius_counterfactuals(&tuner, &ctx, &used, &realised, std::slice::from_ref(&trace));
+        // Uncached, 4 round-trips: the skeleton (captured at round 0) has residency 4, so the
+        // saving is scaled by it — a larger downstream estimate than a single send.
+        emit_radius_counterfactuals(
+            &tuner,
+            &ctx,
+            &used,
+            &realised,
+            std::slice::from_ref(&trace),
+            4,
+            false,
+        );
 
         let seen = rec.seen.lock().unwrap();
         // radius used = 1 → exactly one counterfactual (t = 0).
         assert_eq!(seen.len(), 1);
         let (cf_knobs, cf_out) = &seen[0];
         assert_eq!(cf_knobs.skeleton_radius, 0);
-        // Token estimate reduced by the re-extracted saving; success optimistically transferred.
-        assert!(cf_out.total_tokens <= realised.total_tokens);
+        // Token estimate reduced by the re-extracted (residency-scaled) saving; success transferred.
+        let per_send = trace.tokens_at(1) - trace.tokens_at(0);
+        assert_eq!(cf_out.total_tokens, 1000 - per_send * 4);
         assert!(cf_out.success);
         assert!(cf_out.max_tool_result_bytes.is_none());
+    }
+
+    #[test]
+    fn radius_residency_collapses_to_one_under_caching() {
+        let trace = RadiusTrace {
+            source: "fn helper() -> u32 { 1 + 2 + 3 }\nfn target() -> u32 { helper() }\n".into(),
+            lang: Lang::Rust,
+            focus: "target".into(),
+            captured_at_round: 0,
+        };
+        // Uncached residency follows the round span; cached collapses to 1.
+        assert_eq!(trace.residency(5, false), 5);
+        assert_eq!(trace.residency(5, true), 1);
+        // At least 1 even when captured on the final round.
+        let late = RadiusTrace {
+            captured_at_round: 5,
+            ..RadiusTrace {
+                source: trace.source.clone(),
+                lang: Lang::Rust,
+                focus: "target".into(),
+                captured_at_round: 0,
+            }
+        };
+        assert_eq!(late.residency(5, false), 1);
     }
 
     #[test]
@@ -1591,18 +1679,27 @@ fn target() -> u32 { helper() + 10 }
         let ctx = test_ctx();
         let realised = Outcome::default();
         // No traces → nothing emitted.
-        emit_radius_counterfactuals(&tuner, &ctx, &Knobs::default(), &realised, &[]);
+        emit_radius_counterfactuals(&tuner, &ctx, &Knobs::default(), &realised, &[], 1, false);
         // Radius 0 → no smaller radius to credit, even with a trace.
         let trace = RadiusTrace {
             source: "fn a() {}".into(),
             lang: Lang::Rust,
             focus: "a".into(),
+            captured_at_round: 0,
         };
         let r0 = Knobs {
             skeleton_radius: 0,
             ..Knobs::default()
         };
-        emit_radius_counterfactuals(&tuner, &ctx, &r0, &realised, std::slice::from_ref(&trace));
+        emit_radius_counterfactuals(
+            &tuner,
+            &ctx,
+            &r0,
+            &realised,
+            std::slice::from_ref(&trace),
+            1,
+            false,
+        );
         assert!(rec.seen.lock().unwrap().is_empty());
     }
 

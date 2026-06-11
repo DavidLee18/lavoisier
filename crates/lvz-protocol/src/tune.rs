@@ -53,6 +53,11 @@ pub struct TaskContext {
     /// `RECIPE.md` §6.6 non-stationarity) starts a fresh profile instead of polluting the old
     /// one. Empty string when unknown.
     pub model_id: String,
+    /// Stable identity of the repository the task runs against (the agent uses the repo root
+    /// path). Keyed by the learner so per-repo knob optima don't average together (`RECIPE.md`
+    /// §6.6). Empty string when there's no repo context — then all tasks share one repo profile,
+    /// so single-repo use sees no key fragmentation.
+    pub repo_id: String,
 }
 
 /// The efficiency dials tuned per context. [`Default`] returns the static §6.5 baseline,

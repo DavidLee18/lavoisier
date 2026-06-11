@@ -57,6 +57,7 @@ mod tests {
             caps: Capabilities::default(),
             model: ModelTier::Balanced,
             model_id: "test-model".to_string(),
+            repo_id: String::new(),
         };
         let knobs = tuner.select(&ctx);
         assert_eq!(knobs, Knobs::default());

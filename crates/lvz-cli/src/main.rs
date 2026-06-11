@@ -140,6 +140,12 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     tune_state: Option<String>,
 
+    /// Per-observation decay in (0,1] for the `--tune` learner (non-stationarity): <1.0 makes
+    /// recent outcomes weigh more so a stale optimum fades after a model/codebase shift. Default
+    /// 1.0 (no decay). Keep it above 1−1/min_trials (≈0.67) so candidates can still become trusted.
+    #[arg(long, value_name = "F")]
+    tune_decay: Option<f64>,
+
     /// Enable the experimental, **unsound** skeleton-radius counterfactual (`docs/ATO.md` §6):
     /// after each task, estimate what smaller --tune skeleton radii would have cost and credit
     /// them with the realised success bit (optimistically — it can't prove less context wouldn't
@@ -331,9 +337,13 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
     if cli.tune {
         // The online ATO learner (§6.6); takes precedence over a fixed --compact-after. When a
         // state path is given, load prior profiles (missing ⇒ cold) and persist on drop.
+        let mut tune_cfg = TuneConfig::default();
+        if let Some(decay) = cli.tune_decay {
+            tune_cfg.decay = decay;
+        }
         let tuner = match &cli.tune_state {
-            Some(path) => PersistentTuner::load(path).into_arc(),
-            None => Arc::new(LearningTuner::new()),
+            Some(path) => PersistentTuner::load(path, tune_cfg).into_arc(),
+            None => Arc::new(LearningTuner::with_config(tune_cfg)),
         };
         agent = agent.with_tuner(tuner);
     } else if let Some(compact_after) = cli.compact_after {
@@ -355,11 +365,11 @@ struct PersistentTuner {
 }
 
 impl PersistentTuner {
-    /// Load profiles from `path` (a missing file starts cold), keyed to persist back there.
-    fn load(path: &str) -> Self {
-        let inner = LearningTuner::load(path, TuneConfig::default()).unwrap_or_else(|e| {
+    /// Load profiles from `path` (a missing file starts cold) under `cfg`, keyed to persist back.
+    fn load(path: &str, cfg: TuneConfig) -> Self {
+        let inner = LearningTuner::load(path, cfg).unwrap_or_else(|e| {
             eprintln!("tune-state: could not load {path}: {e}; starting cold");
-            LearningTuner::new()
+            LearningTuner::with_config(cfg)
         });
         Self {
             inner,
