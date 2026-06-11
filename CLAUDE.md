@@ -227,12 +227,14 @@ sequential workflows that accumulate ≥3 turn-pairs.)
 - **Tuner: all four knobs now wired; success signal can now be real.** `lvz-agent` calls
   `Tuner::select`/`observe` with a **real** `TaskContext` (classified `Archetype` + walked
   `RepoProfile` + `model_id`) and honours all of `compact_after`, `truncate_bytes`,
-  `skeleton_radius` (injected into focused `outline_file` calls), and `batch_width` (a
-  parallel-tool-use system-prompt hint). The success signal is real when `--verify-cmd` is set
-  (post-task exit-code gate), else the coarse completion fallback. The default tuner is still
-  `NoopTuner` (ATO is opt-in via `--tune`); archetype classification is still a keyword heuristic,
-  not a model call. Remaining ATO gaps are narrow: per-repo profile keying, observation decay,
-  downstream-effect modelling in the radius counterfactual, Bayesian optimisation (`docs/ATO.md` §10).
+  `skeleton_radius` (injected into focused `outline_file`/`outline_files` calls), and
+  `batch_width` (caps the `read_files`/`outline_files` `paths` array + steers the prompt). The
+  success signal is real when `--verify-cmd` is set (post-task exit-code gate), else the coarse
+  completion fallback. Archetype classification defaults to the keyword heuristic but can use a
+  model call (`--classify-with-model`, opt-in, routed to `--summary-model`). The default tuner is
+  still `NoopTuner` (ATO is opt-in via `--tune`). Remaining ATO gaps are narrow: per-repo profile
+  keying, observation decay, downstream-effect modelling in the radius counterfactual, Bayesian
+  optimisation (`docs/ATO.md` §10).
 - **Telemetry (§6.4).** Usage is aggregated, the `--budget` ceiling is enforced, and the
   **HTTP gateway now exports Prometheus `/metrics`** (tokens, cache read/creation, turns,
   errors, summed latency). The per-task ATO success signal now exists (`--verify-cmd`). Still

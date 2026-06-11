@@ -153,6 +153,12 @@ struct Cli {
     /// `/metrics` (`RECIPE.md` §6.4).
     #[arg(long)]
     telemetry: bool,
+
+    /// Classify the task archetype with a model call instead of the free keyword heuristic
+    /// (`RECIPE.md` §6.3). Costs one extra tool-less round-trip (routed to --summary-model when
+    /// set); falls back to the heuristic on failure. Mainly useful paired with `--tune`.
+    #[arg(long)]
+    classify_with_model: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -313,6 +319,9 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
     }
     if cli.radius_counterfactual {
         config = config.with_radius_counterfactual(true);
+    }
+    if cli.classify_with_model {
+        config = config.with_model_classification(true);
     }
     // Profile the working directory so the tuner sees a real repo shape (§6.6).
     if let Ok(cwd) = std::env::current_dir() {

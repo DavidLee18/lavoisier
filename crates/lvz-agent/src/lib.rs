@@ -118,6 +118,12 @@ pub struct AgentConfig {
     /// falls back to the coarse "completed without error" signal. Only run on otherwise-clean
     /// completion (not after a provider error / budget overrun / step-cap).
     pub verify_command: Option<String>,
+    /// Classify the task [`Archetype`] with a **model call** instead of the free keyword
+    /// heuristic (`RECIPE.md` §6.3/§6.5). Off by default — it costs one extra tool-less round-trip
+    /// (routed to [`summary_model`](Self::summary_model) when set, else [`model`](Self::model);
+    /// its tokens count toward the task total). On a parse failure it falls back to the heuristic.
+    /// Only worth enabling with a learning tuner, where a sharper archetype key helps.
+    pub classify_with_model: bool,
     /// Enable the **trace-based skeleton-radius counterfactual** (`docs/ATO.md` §6, §10).
     /// **Off by default and unsound** — unlike the always-on truncate counterfactual (which is
     /// exact), this *estimates* the tokens a smaller [`skeleton_radius`](Knobs::skeleton_radius)
@@ -144,6 +150,7 @@ impl Default for AgentConfig {
             escalate_after: 2,
             advisor_model: None,
             verify_command: None,
+            classify_with_model: false,
             radius_counterfactual: false,
         }
     }
@@ -211,6 +218,13 @@ impl AgentConfig {
     /// [`radius_counterfactual`](Self::radius_counterfactual)).
     pub fn with_radius_counterfactual(mut self, enabled: bool) -> Self {
         self.radius_counterfactual = enabled;
+        self
+    }
+
+    /// Classify the task archetype with a model call rather than the keyword heuristic (off by
+    /// default; see [`classify_with_model`](Self::classify_with_model)).
+    pub fn with_model_classification(mut self, enabled: bool) -> Self {
+        self.classify_with_model = enabled;
         self
     }
 }
@@ -318,10 +332,23 @@ async fn run_loop(
     let started = std::time::Instant::now();
     let tool_defs = tools.defs();
     let caps = provider.capabilities();
+    let mut total = Usage::default();
     // Classify against the latest user turn (the task); earlier seeded turns are context.
     let task_text = history.last().map(|m| m.text()).unwrap_or_default();
+    // Archetype prior: a model call when enabled (its tokens count toward the task total),
+    // otherwise the free keyword heuristic; the model path falls back to the heuristic.
+    let archetype = match config.classify_with_model {
+        true => match classify_archetype_via_model(&provider, &config, &task_text).await {
+            Some((a, usage)) => {
+                total.accumulate(&usage);
+                a
+            }
+            None => classify_archetype(&task_text),
+        },
+        false => classify_archetype(&task_text),
+    };
     let ctx = TaskContext {
-        archetype: classify_archetype(&task_text),
+        archetype,
         repo: config
             .repo_root
             .as_deref()
@@ -340,8 +367,6 @@ async fn run_loop(
         config: &config,
         started,
     };
-
-    let mut total = Usage::default();
     let mut round_trips: u32 = 0;
     // Largest untruncated tool-result seen, for the learner's safe counterfactual crediting
     // (§6.6 / `docs/ATO.md` §3). `None` until the first tool runs.
@@ -948,6 +973,65 @@ fn classify_archetype(prompt: &str) -> Archetype {
     } else {
         Archetype::Other
     }
+}
+
+/// System prompt for the optional model archetype classifier. One label, nothing else.
+const CLASSIFY_SYSTEM: &str = "Classify the coding task into exactly one label from this set: \
+single_file_edit, refactor, rename, feature, other. Reply with only the single label — no \
+punctuation, no explanation.";
+
+/// Generation ceiling for the classifier — it returns one short label.
+const CLASSIFY_MAX_TOKENS: u32 = 16;
+
+/// Map a model's free-text label back to an [`Archetype`]. Lenient: takes the first token and
+/// strips non-identifier chars, so `"Single_File_Edit."` and `"refactor"` both parse. `None` when
+/// nothing recognisable is found (the caller then falls back to the keyword heuristic).
+fn parse_archetype(label: &str) -> Option<Archetype> {
+    let word: String = label
+        .trim()
+        .to_lowercase()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    Some(match word.as_str() {
+        "single_file_edit" | "singlefileedit" | "edit" => Archetype::SingleFileEdit,
+        "refactor" => Archetype::Refactor,
+        "rename" => Archetype::Rename,
+        "feature" => Archetype::Feature,
+        "other" => Archetype::Other,
+        _ => return None,
+    })
+}
+
+/// Classify the task with a tool-less model call (`RECIPE.md` §6.3), routed to the cheap
+/// [`summary_model`](AgentConfig::summary_model) when set. Returns the parsed [`Archetype`] and
+/// the call's [`Usage`] (so the caller can bill it to the task total). `None` on a provider error
+/// or an unparseable reply — the caller then uses the free keyword heuristic.
+async fn classify_archetype_via_model(
+    provider: &Arc<dyn Provider>,
+    config: &AgentConfig,
+    task: &str,
+) -> Option<(Archetype, Usage)> {
+    let model = config
+        .summary_model
+        .clone()
+        .unwrap_or_else(|| config.model.clone());
+    let req = ChatRequest::new(model)
+        .max_tokens(CLASSIFY_MAX_TOKENS)
+        .system(CLASSIFY_SYSTEM)
+        .push(Message::user(task.to_string()));
+    let mut stream = provider.stream(req).await.ok()?;
+    let mut text = String::new();
+    let mut usage = Usage::default();
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(Event::TextDelta(t)) => text.push_str(&t),
+            Ok(Event::Usage(u)) => usage = u,
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    parse_archetype(&text).map(|a| (a, usage))
 }
 
 /// Build a [`RepoProfile`] by a bounded walk of `root`, skipping VCS/build/dependency dirs.
@@ -1638,6 +1722,22 @@ fn target() -> u32 { helper() + 10 }
         assert_eq!(classify_archetype("explain how the loop works"), Other);
         // Specificity ordering: a rename outranks the generic "change"/"refactor" it implies.
         assert_eq!(classify_archetype("change code: rename x to y"), Rename);
+    }
+
+    #[test]
+    fn parse_archetype_is_lenient_about_model_labels() {
+        use Archetype::*;
+        assert_eq!(parse_archetype("refactor"), Some(Refactor));
+        assert_eq!(
+            parse_archetype("  Single_File_Edit.\n"),
+            Some(SingleFileEdit)
+        );
+        assert_eq!(parse_archetype("feature — adds a thing"), Some(Feature));
+        assert_eq!(parse_archetype("rename"), Some(Rename));
+        assert_eq!(parse_archetype("other"), Some(Other));
+        // Unrecognised → None, so the caller falls back to the heuristic.
+        assert_eq!(parse_archetype("i think it is a bugfix"), None);
+        assert_eq!(parse_archetype(""), None);
     }
 
     #[test]
