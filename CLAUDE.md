@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: M0–M9 complete (Discord deferred) — gateways + session memory + auth/quotas + /metrics
+## Status: M0–M10 complete (Discord deferred) — Fargate deploy artifacts shipped (Terraform + Containerfile)
 
 `RECIPE.md` is the authoritative **build blueprint** for **Lavoisier** (binary `lavoisier`,
 alias `lav`) — a modular, token-efficient CLI coding agent in Rust with a provider-agnostic
@@ -156,7 +156,33 @@ sequential workflows that accumulate ≥3 turn-pairs.)
     mapping (sync→messages, self/non-text skipping, room-id encoding) is unit-tested.
   - **Skipped:** `lvz-gw-discord` (deferred at the user's request).
   86 tests pass; clippy + fmt clean.
-- **M10 — Hermes deployment.** Fargate arm64, us-west-2.
+- **M10 — Hermes deployment (artifacts complete, local-verified 2026-06-11; AWS apply pending
+  the user).** Packaging + IaC for the HTTP gateway on **AWS Fargate, arm64, us-west-2**, per
+  RECIPE §10 (Podman not Docker; secrets via Secrets Manager). Deliverables:
+  - **`Containerfile`** (+ `.containerignore`): multi-stage `linux/arm64`. Builder
+    `rust:1.88-bookworm` installs `protoc` (needed by `lvz-xai/build.rs`) and `cargo build
+    --release -p lvz-cli`; runtime `distroless/cc-debian12:nonroot` (glibc/libgcc for `ring`,
+    CA certs, no shell; rustls/webpki so no OpenSSL), `CMD ["--serve","0.0.0.0:8080"]`.
+  - **`infra/terraform/`** (Terraform ≥1.5, AWS provider ~5): ECR repo; minimal public-subnet
+    VPC (2 AZs, IGW, no NAT — tasks get public IPs for egress); internet-facing ALB → target
+    group on :8080 with `/health` checks (WS upgrades pass through); ECS Fargate cluster +
+    task def with `runtime_platform.cpu_architecture = "ARM64"`, `awslogs`, env
+    (`XAI_TRANSPORT=grpc`, `LVZ_RATE_LIMIT`) + **secrets from Secrets Manager**
+    (`XAI_API_KEY`, `LVZ_API_KEYS`); service with `assign_public_ip`; locked SGs (ALB→task
+    only); IAM execution role with scoped `secretsmanager:GetSecretValue`. `terraform validate`
+    passes; `outputs` give the ALB DNS + ECR URL.
+  - **`infra/scripts/`**: `build-and-push.zsh` (`podman build --platform linux/arm64` + ECR
+    push) and `deploy.zsh` (`terraform apply` + force a fresh ECS deployment). **`infra/README.md`**
+    is the runbook (create secrets → `apply -target` ECR → build/push → deploy → smoke-test →
+    teardown), with cost + `/metrics`-exposure caveats.
+  - **Code:** `--api-key`/`--rate-limit`/`--serve` gained clap `env=`
+    (`LVZ_API_KEYS` comma-split / `LVZ_RATE_LIMIT` / `LVZ_SERVE_ADDR`) so Secrets Manager
+    injects via env, not the task command line.
+  - **Verified locally:** cargo build/test/clippy/fmt green (86 tests); `terraform fmt` +
+    `validate` clean; the arm64 image builds with Podman and `--serve` answers a real
+    `POST /v1/turns` over xAI gRPC (`/health`, `/metrics`, 401/429 all correct). **Not** applied
+    to AWS (no creds/spend here) — the runbook drives that. HTTP gateway only; Matrix deploy
+    deferred (no inbound port; separate service).
 - **Optional tracks.** `lvz-tune` (ATO §6.6 — the *online* half; needs §6.4 telemetry + a
   task-success signal wired first; ship the no-op `Tuner` path, then swap in the learner).
   `lvz-claude-cli` (shell out to `claude -p`, no caching, off by default).
@@ -258,11 +284,19 @@ in-memory), `--serve-matrix` (Matrix gateway), `--api-key <KEY>` (repeatable) / 
 routes: `GET /health`, `GET /metrics` (Prometheus), `POST /v1/turns` (SSE), `GET /v1/ws`
 (WebSocket). Env: `XAI_API_KEY`/`XAI_BASE_URL`/`XAI_GRPC_ENDPOINT`, **`XAI_TRANSPORT=grpc|http`
 (default `grpc`)**, `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`,
-`MATRIX_HOMESERVER`/`MATRIX_USER`/`MATRIX_PASSWORD`, `LVZ_PROVIDER`, `LVZ_MODEL`. A local SSE
+`MATRIX_HOMESERVER`/`MATRIX_USER`/`MATRIX_PASSWORD`, `LVZ_PROVIDER`, `LVZ_MODEL`,
+`LVZ_API_KEYS` (comma-separated gateway keys) / `LVZ_RATE_LIMIT` / `LVZ_SERVE_ADDR`. A local SSE
 mock can be pointed at via `*_BASE_URL` to test the HTTP path without a live key.
 
-Continue building in `RECIPE.md` §9 milestone order (next is M10: Hermes deployment — Fargate
-arm64, us-west-2; optional tracks: `lvz-tune` ATO learner, `lvz-gw-discord`, `lvz-claude-cli`).
+```sh
+# Deploy (M10 — AWS Fargate arm64, us-west-2; see infra/README.md for the full runbook):
+podman build --platform linux/arm64 -f Containerfile -t lavoisier:dev .   # arm64 image (Podman)
+./infra/scripts/build-and-push.zsh dev   # push to ECR   ./infra/scripts/deploy.zsh   # terraform apply
+```
+
+All M0–M10 milestones are complete (Discord deferred). Remaining optional tracks: `lvz-tune`
+ATO learner (§6.6), `lvz-gw-discord`, `lvz-claude-cli`; and the M10 AWS apply itself (artifacts
+ship local-verified — run `infra/README.md` against a real account).
 
 ## Conventions
 

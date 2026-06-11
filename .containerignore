@@ -1,0 +1,9 @@
+# Keep the build context small and secret-free (RECIPE §10).
+target/
+.git/
+infra/
+.github/
+*.md
+.DS_Store
+.env
+.env.*

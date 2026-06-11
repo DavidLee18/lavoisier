@@ -78,16 +78,22 @@ struct Cli {
 
     /// Serve the agent as an HTTP/WebSocket gateway on this `host:port` (e.g. `127.0.0.1:8080`)
     /// instead of running a one-shot turn. Implies the agent tool loop. No prompt is required.
-    #[arg(long, value_name = "ADDR")]
+    #[arg(long, value_name = "ADDR", env = "LVZ_SERVE_ADDR")]
     serve: Option<String>,
 
     /// Require this API key on the gateway's protected routes (--serve; repeatable). Sent by
-    /// clients as `Authorization: Bearer <key>`. If unset, the gateway is open.
-    #[arg(long = "api-key", value_name = "KEY")]
+    /// clients as `Authorization: Bearer <key>`. If unset, the gateway is open. The
+    /// `LVZ_API_KEYS` env var accepts a comma-separated list (for Secrets Manager injection).
+    #[arg(
+        long = "api-key",
+        value_name = "KEY",
+        env = "LVZ_API_KEYS",
+        value_delimiter = ','
+    )]
     api_key: Vec<String>,
 
     /// Per-principal request quota for the gateway (--serve): max requests per 60s window.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", env = "LVZ_RATE_LIMIT")]
     rate_limit: Option<u32>,
 
     /// Serve as a Matrix gateway (one room per session) instead of a one-shot turn. Reads

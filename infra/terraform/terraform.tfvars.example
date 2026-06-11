@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars and fill in. The two secret ARNs are required; create the secrets
+# first (see infra/README.md):
+#   aws secretsmanager create-secret --name lavoisier/xai-api-key \
+#     --secret-string "$XAI_API_KEY" --region us-west-2
+#   aws secretsmanager create-secret --name lavoisier/gateway-api-keys \
+#     --secret-string "pick-a-strong-key" --region us-west-2
+
+xai_api_key_secret_arn      = "arn:aws:secretsmanager:us-west-2:ACCOUNT_ID:secret:lavoisier/xai-api-key-XXXXXX"
+gateway_api_keys_secret_arn = "arn:aws:secretsmanager:us-west-2:ACCOUNT_ID:secret:lavoisier/gateway-api-keys-XXXXXX"
+
+# Optional overrides (defaults shown):
+# region             = "us-west-2"
+# image_tag          = "dev"
+# task_cpu           = 512
+# task_memory        = 1024
+# desired_count      = 1
+# rate_limit_per_min = 60

@@ -1,0 +1,11 @@
+# Terraform local state + provider cache (never commit state — it can hold secret values).
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Per-environment variable file with secret ARNs.
+terraform.tfvars
+
+# Keep .terraform.lock.hcl committed for reproducible provider versions.
