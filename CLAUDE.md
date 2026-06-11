@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: M0–M10 complete + optional tracks (lvz-tune ATO learner, lvz-claude-cli, advisor mode); Discord deferred
+## Status: M0–M10 complete + optional tracks (lvz-tune ATO learner, lvz-claude-cli, advisor mode)
 
 `RECIPE.md` is the authoritative **build blueprint** for **Lavoisier** (binary `lavoisier`,
 alias `lav`) — a modular, token-efficient CLI coding agent in Rust with a provider-agnostic
@@ -21,7 +21,7 @@ agent as `outline_file` (with optional `focus`/`radius`), `read_anchored`, `edit
 
 Crates that exist today: `lvz-protocol`, `lvz-xai`, `lvz-anthropic`, `lvz-claude-cli`,
 `lvz-context`, `lvz-tools`, `lvz-agent`, `lvz-memory`, `lvz-tune`, `lvz-gw-http`,
-`lvz-gw-matrix`, `lvz-cli`. Not yet built: `lvz-gw-discord` (deferred at user request).
+`lvz-gw-matrix`, `lvz-cli`. (A Discord gateway was considered and dropped — out of scope.)
 
 **Current state (saved 2026-06-09):** M0–M5 complete, committed and pushed to
 `origin/main` (initial commit + author/copyright set to Jaehyun Lee). 7 crates,
@@ -126,7 +126,7 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   (no persisted multi-session history yet; that's M9 `lvz-memory` + session isolation). No
   auth/quotas yet (M9). A `lvz-gateway` registry crate was *not* needed (the `Gateway` trait
   already lives in `lvz-protocol`).
-- **M9 — Hermes gateways + features (complete except Discord, 2026-06-11).** Four units,
+- **M9 — Hermes gateways + features (complete, 2026-06-11).** Four units,
   each committed separately:
   - **`lvz-memory` (session continuity).** `Agent::run_seeded(Vec<Message>)` lets a caller
     seed a turn with prior history (`run` delegates to it; `run_loop` classifies against the
@@ -154,7 +154,6 @@ sequential workflows that accumulate ≥3 turn-pairs.)
     `lvz-protocol`. CLI `--serve-matrix` (env `MATRIX_HOMESERVER`/`MATRIX_USER`/
     `MATRIX_PASSWORD`). **Not live-verified** (needs a homeserver + bot account); the wire
     mapping (sync→messages, self/non-text skipping, room-id encoding) is unit-tested.
-  - **Skipped:** `lvz-gw-discord` (deferred at the user's request).
   86 tests pass; clippy + fmt clean.
 - **M10 — Hermes deployment (artifacts complete, local-verified 2026-06-11; AWS apply pending
   the user).** Packaging + IaC for the HTTP gateway on **AWS Fargate, arm64, us-west-2**, per
@@ -338,12 +337,13 @@ podman build --platform linux/arm64 -f Containerfile -t lavoisier:dev .   # arm6
 ./infra/scripts/build-and-push.zsh dev   # push to ECR   ./infra/scripts/deploy.zsh   # terraform apply
 ```
 
-All M0–M10 milestones are complete (Discord deferred). The optional tracks are built:
-`lvz-tune` (ATO; full §10 roadmap landed bar Bayesian optimisation), `lvz-claude-cli`, and
-advisor mode. Remaining: `lvz-gw-discord`; live verification of `lvz-claude-cli` (needs a
-subscription) and the Matrix gateway (needs a homeserver); the M10 AWS apply itself (artifacts
-ship local-verified — run `infra/README.md` against a real account); and ATO's last deferred
-items (trace-based radius counterfactuals, per-repo profiles, Bayesian opt).
+All M0–M10 milestones are complete. The optional tracks are built: `lvz-tune` (ATO; full §10
+roadmap landed, both counterfactuals shipped), `lvz-claude-cli`, and advisor mode. A Discord
+gateway is **out of scope** (dropped at user request — do not build it). Remaining: live
+verification of `lvz-claude-cli` (needs a subscription) and the Matrix gateway (needs a
+homeserver); the M10 AWS apply itself (artifacts ship local-verified — run `infra/README.md`
+against a real account); and the deferred polish (Python docstring fidelity, ATO per-repo
+profiles / observation decay / Bayesian opt).
 
 ## Conventions
 

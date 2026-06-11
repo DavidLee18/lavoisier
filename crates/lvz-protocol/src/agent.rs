@@ -1,6 +1,6 @@
 //! The gateway-facing facade over `lvz-agent`. A [`Gateway`](crate::Gateway) submits a turn
 //! and consumes the resulting [`Event`] stream; it never touches a [`Provider`](crate::Provider)
-//! or the agent's internals. The CLI, HTTP, Matrix, and Discord gateways all drive the same
+//! or the agent's internals. The CLI, HTTP, and Matrix gateways all drive the same
 //! agent through this handle (`RECIPE.md` §5.5).
 
 use async_trait::async_trait;

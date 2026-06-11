@@ -89,7 +89,6 @@ lavoisier/
 │  ├─ lvz-gateway/       # Gateway trait + registry. Frontends/channels. [Hermes tier]
 │  ├─ lvz-gw-http/       # HTTP/REST + WebSocket gateway
 │  ├─ lvz-gw-matrix/     # Matrix (Continuwuity) gateway
-│  ├─ lvz-gw-discord/    # Discord gateway
 │  └─ lvz-cli/           # thin binary `lavoisier` (the first gateway)
 └─ proto/                # vendored xai-proto (git submodule or pinned copy)
 ```
@@ -97,9 +96,9 @@ lavoisier/
 Dependency direction (only inward → core); `lvz-tune` is an optional advisor feeding `lvz-agent`:
 
 ```
-            ┌──────────── gateways (peers) ────────────┐
-  lvz-cli   lvz-gw-http   lvz-gw-matrix   lvz-gw-discord
-     └──────────┴───────────┬───────────────┘
+            ┌──────── gateways (peers) ────────┐
+  lvz-cli   lvz-gw-http   lvz-gw-matrix
+     └──────────┴───────────┬──────────┘
                             ▼
    lvz-tune  ⇄  lvz-agent ──► lvz-protocol ◄── lvz-anthropic
    [optional]      │              ▲     ▲ ◄── lvz-xai
@@ -142,7 +141,7 @@ runs fine without it.
   headless browser. Extensible: web search, memory, PiKVM, OBS — each a new `Tool`.
 - **`lvz-gateway`** — `Gateway` trait + registry. A gateway is a frontend/channel that
   drives the same agent core. [Hermes tier]
-- **`lvz-gw-*`** — concrete gateways (HTTP/WebSocket, Matrix/Continuwuity, Discord, …).
+- **`lvz-gw-*`** — concrete gateways (HTTP/WebSocket, Matrix/Continuwuity, …).
   Each depends only on `lvz-agent` + `lvz-protocol`.
 - **`lvz-cli`** — the first gateway: argument parsing, config resolution, terminal
   rendering. Thin; one frontend among several.
@@ -229,7 +228,7 @@ pub trait Gateway: Send + Sync {
 ```
 
 `AgentHandle` is the gateway-facing facade over `lvz-agent`: submit a session/turn, receive
-an `Event` stream. CLI, HTTP, Matrix, and Discord all implement `Gateway` over the *same*
+an `Event` stream. CLI, HTTP, and Matrix all implement `Gateway` over the *same*
 agent. The core stays unaware of any gateway.
 
 ### 5.6 Tuner  [adaptive token optimisation — §6.6]
@@ -388,7 +387,6 @@ Adding a channel = one new `lvz-gw-*` crate implementing `Gateway`; the core is 
 | CLI | `lvz-cli` | First frontend; terminal rendering |
 | HTTP / REST + WebSocket | `lvz-gw-http` | API surface; streaming over WS/SSE |
 | Matrix (Continuwuity) | `lvz-gw-matrix` | Chat-driven agent on your homeserver |
-| Discord | `lvz-gw-discord` | Bot frontend (migration target) |
 | Webhook / scheduled | `lvz-gw-cron` | Triggered/automated runs |
 
 ### 7.3 Hermes-tier features
@@ -462,7 +460,7 @@ Lavoisier CLI and the Hermes multi-gateway agent share one brain.
    truncation, budget manager, CI token-budget assertions (§6.3–6.5).
 8. **M7 — xAI gRPC.** `lvz-xai` via `tonic-build` from vendored protos; v6 outputs.
 9. **M8 — gateway layer.** `lvz-gateway` trait + `lvz-gw-http` (REST + WebSocket).
-10. **M9 — Hermes gateways + features.** `lvz-gw-matrix`, `lvz-gw-discord`; `lvz-memory`,
+10. **M9 — Hermes gateways + features.** `lvz-gw-matrix`; `lvz-memory`,
     auth/quotas, observability.
 11. **M10 — Hermes deployment.** Validate the shared core on Fargate (arm64, us-west-2)
     behind multiple gateways.
