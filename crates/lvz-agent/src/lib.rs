@@ -37,7 +37,7 @@ use lvz_context::Lang;
 use lvz_protocol::{
     AgentError, AgentHandle, Archetype, Capabilities, ChatRequest, ContentBlock, Event, Knobs,
     Message, ModelTier, NoopTuner, Outcome, Provider, RepoProfile, Role, StopReason, SystemPrompt,
-    TaskContext, ToolDef, Tuner, TurnRequest, Usage,
+    TaskContext, TaskTelemetry, TelemetrySink, ToolDef, Tuner, TurnRequest, Usage,
 };
 use lvz_tools::ToolRegistry;
 use serde_json::{json, Value};
@@ -234,6 +234,7 @@ pub struct Agent {
     tools: ToolRegistry,
     config: AgentConfig,
     tuner: Arc<dyn Tuner>,
+    telemetry: Option<Arc<dyn TelemetrySink>>,
 }
 
 impl Agent {
@@ -243,6 +244,7 @@ impl Agent {
             tools,
             config,
             tuner: Arc::new(NoopTuner),
+            telemetry: None,
         }
     }
 
@@ -250,6 +252,13 @@ impl Agent {
     /// default [`NoopTuner`].
     pub fn with_tuner(mut self, tuner: Arc<dyn Tuner>) -> Self {
         self.tuner = tuner;
+        self
+    }
+
+    /// Install a [`TelemetrySink`] that receives one [`TaskTelemetry`] record per completed task
+    /// (`RECIPE.md` §6.4). Without one, no telemetry is emitted.
+    pub fn with_telemetry(mut self, sink: Arc<dyn TelemetrySink>) -> Self {
+        self.telemetry = Some(sink);
         self
     }
 
@@ -274,9 +283,10 @@ impl Agent {
         let tools = self.tools.clone();
         let config = self.config.clone();
         let tuner = self.tuner.clone();
+        let telemetry = self.telemetry.clone();
 
         tokio::spawn(async move {
-            run_loop(provider, tools, config, tuner, history, &tx).await;
+            run_loop(provider, tools, config, tuner, telemetry, history, &tx).await;
             // tx drops here, closing the stream.
         });
 
@@ -301,9 +311,11 @@ async fn run_loop(
     tools: ToolRegistry,
     config: AgentConfig,
     tuner: Arc<dyn Tuner>,
+    telemetry: Option<Arc<dyn TelemetrySink>>,
     mut history: Vec<Message>,
     tx: &Sink,
 ) {
+    let started = std::time::Instant::now();
     let tool_defs = tools.defs();
     let caps = provider.capabilities();
     // Classify against the latest user turn (the task); earlier seeded turns are context.
@@ -320,6 +332,14 @@ async fn run_loop(
         model_id: config.model.clone(),
     };
     let knobs = tuner.select(&ctx);
+    let obs = Observation {
+        tuner: &tuner,
+        telemetry: &telemetry,
+        ctx: &ctx,
+        knobs: &knobs,
+        config: &config,
+        started,
+    };
 
     let mut total = Usage::default();
     let mut round_trips: u32 = 0;
@@ -375,16 +395,7 @@ async fn run_loop(
         let mut stream = match provider.stream(req).await {
             Ok(s) => s,
             Err(e) => {
-                observe(
-                    &tuner,
-                    &ctx,
-                    &knobs,
-                    &total,
-                    round_trips,
-                    false,
-                    max_result_bytes,
-                    &radius_traces,
-                );
+                obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
                 let _ = tx.unbounded_send(Err(AgentError::Provider(e.to_string())));
                 return;
             }
@@ -399,16 +410,7 @@ async fn run_loop(
                     }
                 }
                 Err(e) => {
-                    observe(
-                        &tuner,
-                        &ctx,
-                        &knobs,
-                        &total,
-                        round_trips,
-                        false,
-                        max_result_bytes,
-                        &radius_traces,
-                    );
+                    obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
                     let _ = tx.unbounded_send(Err(AgentError::Provider(e.to_string())));
                     return;
                 }
@@ -420,16 +422,7 @@ async fn run_loop(
 
         if let Some(budget) = config.token_budget {
             if total.total() > budget {
-                observe(
-                    &tuner,
-                    &ctx,
-                    &knobs,
-                    &total,
-                    round_trips,
-                    false,
-                    max_result_bytes,
-                    &radius_traces,
-                );
+                obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
                 let _ = tx.unbounded_send(Err(AgentError::BudgetExceeded));
                 return;
             }
@@ -441,10 +434,7 @@ async fn run_loop(
             // the optional verify command also passes (exit 0). With no command set this is the
             // coarse "completed without erroring" fallback.
             let success = run_verify(&config).await;
-            observe(
-                &tuner,
-                &ctx,
-                &knobs,
+            obs.record(
                 &total,
                 round_trips,
                 success,
@@ -497,44 +487,57 @@ async fn run_loop(
     }
 
     // Ran out of steps without a final answer.
-    observe(
-        &tuner,
-        &ctx,
-        &knobs,
-        &total,
-        round_trips,
-        false,
-        max_result_bytes,
-        &radius_traces,
-    );
+    obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
     let _ = tx.unbounded_send(Ok(Event::Usage(total)));
     let _ = tx.unbounded_send(Ok(Event::Done(StopReason::Other("max_steps".into()))));
 }
 
-/// Report the realised task outcome to the tuner so it can adapt knobs (`RECIPE.md` §6.6), then
-/// emit any opt-in radius counterfactuals.
-// The arguments are a single cohesive observation (the realised outcome's parts + the trace);
-// bundling them into a struct would be ceremony for one internal call shape.
-#[allow(clippy::too_many_arguments)]
-fn observe(
-    tuner: &Arc<dyn Tuner>,
-    ctx: &TaskContext,
-    knobs: &Knobs,
-    total: &Usage,
-    round_trips: u32,
-    success: bool,
-    max_tool_result_bytes: Option<usize>,
-    radius_traces: &[RadiusTrace],
-) {
-    let realised = Outcome {
-        total_tokens: total.total(),
-        round_trips,
-        cache_hit_rate: total.cache_hit_rate(),
-        success,
-        max_tool_result_bytes,
-    };
-    tuner.observe(ctx, knobs, &realised);
-    emit_radius_counterfactuals(tuner, ctx, knobs, &realised, radius_traces);
+/// The stable per-task references needed to report an outcome at any exit point. Built once after
+/// knob selection; [`record`](Self::record) is then called from every exit (success, error,
+/// budget, step-cap) with the realised counters. Centralising this keeps tuner observation,
+/// radius counterfactuals, and telemetry export in one place.
+struct Observation<'a> {
+    tuner: &'a Arc<dyn Tuner>,
+    telemetry: &'a Option<Arc<dyn TelemetrySink>>,
+    ctx: &'a TaskContext,
+    knobs: &'a Knobs,
+    config: &'a AgentConfig,
+    started: std::time::Instant,
+}
+
+impl Observation<'_> {
+    /// Report the realised task outcome to the tuner (`RECIPE.md` §6.6), emit any opt-in radius
+    /// counterfactuals, and push a [`TaskTelemetry`] record to the sink if one is installed.
+    fn record(
+        &self,
+        total: &Usage,
+        round_trips: u32,
+        success: bool,
+        max_tool_result_bytes: Option<usize>,
+        radius_traces: &[RadiusTrace],
+    ) {
+        let realised = Outcome {
+            total_tokens: total.total(),
+            round_trips,
+            cache_hit_rate: total.cache_hit_rate(),
+            success,
+            max_tool_result_bytes,
+        };
+        self.tuner.observe(self.ctx, self.knobs, &realised);
+        emit_radius_counterfactuals(self.tuner, self.ctx, self.knobs, &realised, radius_traces);
+        if let Some(sink) = self.telemetry {
+            sink.record(&TaskTelemetry {
+                archetype: self.ctx.archetype,
+                model: self.config.model.clone(),
+                model_tier: self.config.model_tier,
+                knobs: *self.knobs,
+                usage: *total,
+                round_trips,
+                success,
+                elapsed: self.started.elapsed(),
+            });
+        }
+    }
 }
 
 /// Emit the **unsound, estimate-based** skeleton-radius counterfactual (`docs/ATO.md` §6, §10).
@@ -1318,6 +1321,66 @@ mod tests {
         // Non-zero exit → failure.
         let bad = AgentConfig::default().with_verify_command("exit 1");
         assert!(!run_verify(&bad).await);
+    }
+
+    /// A telemetry sink that records every [`TaskTelemetry`] it receives.
+    #[derive(Default)]
+    struct RecordingTelemetry {
+        seen: Mutex<Vec<TaskTelemetry>>,
+    }
+
+    impl TelemetrySink for RecordingTelemetry {
+        fn record(&self, t: &TaskTelemetry) {
+            self.seen.lock().unwrap().push(t.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn telemetry_sink_receives_one_record_per_task() {
+        // One tool call then a final answer, with usage on each turn.
+        let scripts = vec![
+            vec![
+                Event::ToolUseStart {
+                    id: "t1".into(),
+                    name: "shell".into(),
+                },
+                Event::ToolUseEnd { id: "t1".into() },
+                Event::Usage(Usage {
+                    input_tokens: 40,
+                    output_tokens: 6,
+                    ..Default::default()
+                }),
+                Event::Done(StopReason::ToolUse),
+            ],
+            vec![
+                Event::TextDelta("ok".into()),
+                Event::Usage(Usage {
+                    input_tokens: 30,
+                    output_tokens: 4,
+                    ..Default::default()
+                }),
+                Event::Done(StopReason::EndTurn),
+            ],
+        ];
+        let provider = ScriptedProvider::new(scripts);
+        let sink = Arc::new(RecordingTelemetry::default());
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::with_builtins(),
+            AgentConfig::default(),
+        )
+        .with_telemetry(sink.clone());
+
+        let _ = collect(agent.run("echo via shell, no args needed")).await;
+
+        let seen = sink.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one telemetry record per task");
+        let t = &seen[0];
+        assert!(t.success);
+        assert_eq!(t.round_trips, 2);
+        // Tokens summed across both round-trips: in 40+30=70, out 6+4=10.
+        assert_eq!(t.usage.total(), 80);
+        assert_eq!(t.knobs, Knobs::default());
     }
 
     /// A tuner that records every `observe(knobs, outcome)` it receives, for asserting on the

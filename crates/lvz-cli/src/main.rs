@@ -23,7 +23,8 @@ use lvz_gw_http::{GatewayConfig, HttpGateway};
 use lvz_gw_matrix::MatrixGateway;
 use lvz_memory::{InMemoryStore, SessionAgent};
 use lvz_protocol::{
-    AgentHandle, ChatRequest, Event, Gateway, Knobs, Message, Outcome, Provider, TaskContext, Tuner,
+    AgentHandle, ChatRequest, Event, Gateway, Knobs, Message, Outcome, Provider, TaskContext,
+    TaskTelemetry, TelemetrySink, Tuner,
 };
 use lvz_tools::ToolRegistry;
 use lvz_tune::{LearningTuner, TuneConfig};
@@ -146,6 +147,12 @@ struct Cli {
     /// (exact, sound) is always on and needs no flag.
     #[arg(long)]
     radius_counterfactual: bool,
+
+    /// Print a per-task telemetry line to stderr after an `--agent` run (tokens, cache-hit rate,
+    /// round-trips, success, latency, chosen knobs) — the one-shot equivalent of the gateway's
+    /// `/metrics` (`RECIPE.md` §6.4).
+    #[arg(long)]
+    telemetry: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -248,7 +255,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut renderer = Renderer::new();
 
     if cli.agent {
-        let agent = build_agent(provider, model, &cli);
+        let mut agent = build_agent(provider, model, &cli);
+        if cli.telemetry {
+            agent = agent.with_telemetry(Arc::new(StderrTelemetry));
+        }
         let mut stream = agent.run(prompt);
         while let Some(event) = stream.next().await {
             renderer.handle(event?)?;
@@ -363,6 +373,34 @@ impl Tuner for PersistentTuner {
         if let Err(e) = self.inner.save(&self.path) {
             eprintln!("tune-state: could not save {}: {e}", self.path.display());
         }
+    }
+}
+
+/// A [`TelemetrySink`] that prints one per-task summary line to stderr (the one-shot equivalent
+/// of the gateway's `/metrics`). Installed by `--telemetry` on the `--agent` path.
+struct StderrTelemetry;
+
+impl TelemetrySink for StderrTelemetry {
+    fn record(&self, t: &TaskTelemetry) {
+        eprintln!(
+            "[telemetry] archetype={:?} model={} tokens={} (in={} out={} cache_read={} cache_creation={}) \
+cache_hit={:.0}% round_trips={} success={} elapsed={}ms radius={} truncate={} compact_after={} batch={}",
+            t.archetype,
+            t.model,
+            t.usage.total(),
+            t.usage.input_tokens,
+            t.usage.output_tokens,
+            t.usage.cache_read_tokens,
+            t.usage.cache_creation_tokens,
+            t.cache_hit_rate() * 100.0,
+            t.round_trips,
+            t.success,
+            t.elapsed.as_millis(),
+            t.knobs.skeleton_radius,
+            t.knobs.truncate_bytes,
+            t.knobs.compact_after,
+            t.knobs.batch_width,
+        );
     }
 }
 
