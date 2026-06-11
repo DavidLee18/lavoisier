@@ -44,6 +44,7 @@ lvz-agent = { path = "crates/lvz-agent" }
 lvz-context = { path = "crates/lvz-context" }
 lvz-memory = { path = "crates/lvz-memory" }
 lvz-gw-http = { path = "crates/lvz-gw-http" }
+lvz-gw-matrix = { path = "crates/lvz-gw-matrix" }
 
 [profile.release]
 lto = "thin"

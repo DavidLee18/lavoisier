@@ -19,6 +19,7 @@ use futures::StreamExt;
 use lvz_agent::{Agent, AgentConfig, FixedTuner};
 use lvz_anthropic::AnthropicProvider;
 use lvz_gw_http::{GatewayConfig, HttpGateway};
+use lvz_gw_matrix::MatrixGateway;
 use lvz_memory::{InMemoryStore, SessionAgent};
 use lvz_protocol::{AgentHandle, ChatRequest, Event, Gateway, Knobs, Message, Provider};
 use lvz_tools::ToolRegistry;
@@ -88,6 +89,11 @@ struct Cli {
     /// Per-principal request quota for the gateway (--serve): max requests per 60s window.
     #[arg(long, value_name = "N")]
     rate_limit: Option<u32>,
+
+    /// Serve as a Matrix gateway (one room per session) instead of a one-shot turn. Reads
+    /// `MATRIX_HOMESERVER`, `MATRIX_USER`, `MATRIX_PASSWORD` from the environment.
+    #[arg(long)]
+    serve_matrix: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -158,6 +164,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "lavoisier: HTTP gateway listening on http://{addr} ({auth}; POST /v1/turns, GET /v1/ws)"
         );
+        gateway.serve(agent).await?;
+        return Ok(());
+    }
+
+    // Matrix gateway mode: drive the shared agent from a homeserver, one room per session.
+    if cli.serve_matrix {
+        let inner = Arc::new(build_agent(provider, model, &cli));
+        let agent: Arc<dyn AgentHandle> =
+            Arc::new(SessionAgent::new(inner, Arc::new(InMemoryStore::new())));
+        let gateway = Arc::new(MatrixGateway::from_env()?);
         gateway.serve(agent).await?;
         return Ok(());
     }

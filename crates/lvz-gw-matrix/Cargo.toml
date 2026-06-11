@@ -1,0 +1,21 @@
+[package]
+name = "lvz-gw-matrix"
+version = "0.0.0"
+description = "Matrix gateway for Lavoisier (RECIPE.md §7.2): a thin reqwest client-server API client (login + /sync long-poll + m.room.message send) that drives the shared agent, one room per session. No E2EE — targets unencrypted rooms."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+lvz-protocol.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

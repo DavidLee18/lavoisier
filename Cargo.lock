@@ -858,6 +858,7 @@ dependencies = [
  "lvz-agent",
  "lvz-anthropic",
  "lvz-gw-http",
+ "lvz-gw-matrix",
  "lvz-memory",
  "lvz-protocol",
  "lvz-tools",
@@ -883,6 +884,19 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "axum",
+ "futures",
+ "lvz-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "lvz-gw-matrix"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
  "futures",
  "lvz-protocol",
  "reqwest",
