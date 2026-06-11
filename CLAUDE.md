@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: M0–M10 complete (Discord deferred) — Fargate deploy artifacts shipped (Terraform + Containerfile)
+## Status: M0–M10 complete + optional tracks (lvz-tune ATO learner, lvz-claude-cli, advisor mode); Discord deferred
 
 `RECIPE.md` is the authoritative **build blueprint** for **Lavoisier** (binary `lavoisier`,
 alias `lav`) — a modular, token-efficient CLI coding agent in Rust with a provider-agnostic
@@ -19,9 +19,9 @@ skeleton-radius knob `N`, hash-anchored edits, token-efficient diffs, plus the *
 CI loop (§6.5)** (`tests/budget.rs`, committed per-archetype token ceilings). Surfaced to the
 agent as `outline_file` (with optional `focus`/`radius`), `read_anchored`, `edit_anchored`.
 
-Crates that exist today: `lvz-protocol`, `lvz-xai`, `lvz-anthropic`, `lvz-context`,
-`lvz-tools`, `lvz-agent`, `lvz-memory`, `lvz-gw-http`, `lvz-gw-matrix`, `lvz-cli`. Not yet
-built (future milestones): `lvz-gw-discord` (deferred), `lvz-tune`, `lvz-claude-cli`.
+Crates that exist today: `lvz-protocol`, `lvz-xai`, `lvz-anthropic`, `lvz-claude-cli`,
+`lvz-context`, `lvz-tools`, `lvz-agent`, `lvz-memory`, `lvz-tune`, `lvz-gw-http`,
+`lvz-gw-matrix`, `lvz-cli`. Not yet built: `lvz-gw-discord` (deferred at user request).
 
 **Current state (saved 2026-06-09):** M0–M5 complete, committed and pushed to
 `origin/main` (initial commit + author/copyright set to Jaehyun Lee). 7 crates,
@@ -183,9 +183,26 @@ sequential workflows that accumulate ≥3 turn-pairs.)
     `POST /v1/turns` over xAI gRPC (`/health`, `/metrics`, 401/429 all correct). **Not** applied
     to AWS (no creds/spend here) — the runbook drives that. HTTP gateway only; Matrix deploy
     deferred (no inbound port; separate service).
-- **Optional tracks.** `lvz-tune` (ATO §6.6 — the *online* half; needs §6.4 telemetry + a
-  task-success signal wired first; ship the no-op `Tuner` path, then swap in the learner).
-  `lvz-claude-cli` (shell out to `claude -p`, no caching, off by default).
+- **Optional tracks (done; live AWS apply + live Matrix still pending).**
+  - **`lvz-tune` (ATO §6.6) — built.** `LearningTuner`: an ε-greedy hill-climb bandit over
+    `Knobs`, keyed by `(archetype, caching, model-tier)`, exploiting the cheapest *trusted*
+    (success-rate ≥ target) vector and exploring one-step neighbours on a discrete grid
+    centred on `Knobs::default()` (the floor it can't regress below). No deps (hand-rolled
+    xorshift). CLI `--tune` swaps it in (precedence over `--compact-after`). **Caveat:** the
+    success signal is still the agent's coarse "completed without error" flag, not a verified
+    quality gate — `--tune` is experimental until a real test/diff signal is wired.
+  - **`lvz-claude-cli` — built, off by default.** A `Provider` shelling out to `claude -p`
+    (`--output-format stream-json`), stream-json → `Event`; `Capabilities` all false (no
+    caching). Selected only via `--provider claude-cli` (default model `sonnet`; `CLAUDE_CLI_BIN`
+    overrides). Personal/low-volume only (Agent SDK credit cap, policy-fragile). Wire mapping
+    unit-tested; not live-verified (needs a `claude` install + subscription).
+  - **Advisor mode (§8 cost levers in `lvz-agent`) — built, live-verified vs Anthropic.**
+    *Cheap-model-first* (`cheap_model` + `escalate_after`): the loop runs the first N
+    round-trips on a cheap model, then escalates to `model`. *Advisor+executor split*
+    (`advisor_model`): a tool-less pre-pass on a cheap model drafts a plan that seeds the
+    executor's opening move, cutting its exploration turns (tokens count toward the task
+    total). Provider-agnostic (model ids only). CLI `--cheap-model` / `--escalate-after` /
+    `--advisor-model`, composable, opt-in.
 
 ### Known debts inside shipped code (pick up before/with the above)
 
@@ -194,8 +211,9 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   `Knobs.compact_after` + `truncate_bytes`. Still unwired: `skeleton_radius` (the agent never
   calls `outline_file` with a tuner-chosen radius — that's the tool/model's choice today) and
   `batch_width` (no multi-file batching yet, §6.1). Archetype classification is a keyword
-  heuristic, not a model call. The only tuner shipped is `NoopTuner`/`FixedTuner` (no learner
-  yet — that's the `lvz-tune` track), so the context is collected but not yet *learned from*.
+  heuristic, not a model call. A learner now exists (`lvz-tune`'s `LearningTuner`, opt-in via
+  `--tune`), but the default is still `NoopTuner` and the success signal feeding `observe` is
+  coarse (completion, not a verified quality gate), so ATO stays experimental.
 - **Telemetry (§6.4).** Usage is aggregated, the `--budget` ceiling is enforced, and the
   **HTTP gateway now exports Prometheus `/metrics`** (tokens, cache read/creation, turns,
   errors, summed latency). Still missing for ATO: a per-task success signal and an in-process
@@ -278,9 +296,11 @@ MATRIX_HOMESERVER=… MATRIX_USER=… MATRIX_PASSWORD=… \
 
 CLI flags: `--agent` (tool loop), `--serve <host:port>` (HTTP/WS gateway; sessions persisted
 in-memory), `--serve-matrix` (Matrix gateway), `--api-key <KEY>` (repeatable) / `--rate-limit
-<N per 60s>` (gateway auth/quota), `--provider xai|anthropic`, `--model`, `--max-tokens`,
-`--system`, `--budget` (total-task token ceiling),
-`--summary-model`/`--compact-after`/`--context-limit` (agent efficiency knobs). Gateway HTTP
+<N per 60s>` (gateway auth/quota), `--provider xai|anthropic|claude-cli`, `--model`,
+`--max-tokens`, `--system`, `--budget` (total-task token ceiling),
+`--summary-model`/`--compact-after`/`--context-limit` (agent efficiency knobs), `--tune`
+(experimental ATO learner), `--cheap-model`/`--escalate-after` (cheap-model-first) and
+`--advisor-model` (advisor+executor split) for §8 cost reduction. Gateway HTTP
 routes: `GET /health`, `GET /metrics` (Prometheus), `POST /v1/turns` (SSE), `GET /v1/ws`
 (WebSocket). Env: `XAI_API_KEY`/`XAI_BASE_URL`/`XAI_GRPC_ENDPOINT`, **`XAI_TRANSPORT=grpc|http`
 (default `grpc`)**, `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`,
