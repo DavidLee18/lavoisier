@@ -18,7 +18,7 @@ use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use lvz_agent::{Agent, AgentConfig, FixedTuner};
 use lvz_anthropic::AnthropicProvider;
-use lvz_gw_http::HttpGateway;
+use lvz_gw_http::{GatewayConfig, HttpGateway};
 use lvz_memory::{InMemoryStore, SessionAgent};
 use lvz_protocol::{AgentHandle, ChatRequest, Event, Gateway, Knobs, Message, Provider};
 use lvz_tools::ToolRegistry;
@@ -79,6 +79,15 @@ struct Cli {
     /// instead of running a one-shot turn. Implies the agent tool loop. No prompt is required.
     #[arg(long, value_name = "ADDR")]
     serve: Option<String>,
+
+    /// Require this API key on the gateway's protected routes (--serve; repeatable). Sent by
+    /// clients as `Authorization: Bearer <key>`. If unset, the gateway is open.
+    #[arg(long = "api-key", value_name = "KEY")]
+    api_key: Vec<String>,
+
+    /// Per-principal request quota for the gateway (--serve): max requests per 60s window.
+    #[arg(long, value_name = "N")]
+    rate_limit: Option<u32>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -131,9 +140,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let inner = Arc::new(build_agent(provider, model, &cli));
         let agent: Arc<dyn AgentHandle> =
             Arc::new(SessionAgent::new(inner, Arc::new(InMemoryStore::new())));
-        let gateway = Arc::new(HttpGateway::bind(&addr)?);
+
+        let mut gw_config = GatewayConfig::default();
+        if !cli.api_key.is_empty() {
+            gw_config = gw_config.with_api_keys(cli.api_key.clone());
+        }
+        if let Some(n) = cli.rate_limit {
+            gw_config = gw_config.with_rate_limit(n, std::time::Duration::from_secs(60));
+        }
+        let gateway = Arc::new(HttpGateway::bind(&addr)?.with_config(gw_config));
+
+        let auth = if cli.api_key.is_empty() {
+            "open"
+        } else {
+            "API-key required"
+        };
         eprintln!(
-            "lavoisier: HTTP gateway listening on http://{addr} (POST /v1/turns, GET /v1/ws)"
+            "lavoisier: HTTP gateway listening on http://{addr} ({auth}; POST /v1/turns, GET /v1/ws)"
         );
         gateway.serve(agent).await?;
         return Ok(());

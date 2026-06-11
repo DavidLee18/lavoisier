@@ -12,19 +12,23 @@
 //! - `GET  /v1/ws`    — a **WebSocket**: send a turn JSON per message, receive the event
 //!   stream as JSON text frames; the socket stays open for further turns.
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::{
     extract::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
-        State,
+        Request, State,
     },
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event as SseEvent, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     routing::{get, post},
     Json, Router,
@@ -36,16 +40,46 @@ use serde::Deserialize;
 /// The shared agent, as every handler sees it.
 type SharedAgent = Arc<dyn AgentHandle>;
 
-/// The HTTP/WebSocket gateway. Construct with a bind address, then [`Gateway::serve`] it
-/// with an [`AgentHandle`].
+/// Auth + quota policy for the protected routes (`RECIPE.md` §7.3). Defaults are wide open
+/// (no keys required, no rate limit) — suitable for local use; lock down for exposed deploys.
+#[derive(Clone, Default)]
+pub struct GatewayConfig {
+    /// Accepted API keys. Empty ⇒ no auth (open access).
+    api_keys: HashSet<String>,
+    /// Optional fixed-window per-principal request quota.
+    rate_limit: Option<(u32, Duration)>,
+}
+
+impl GatewayConfig {
+    /// Require one of these API keys (sent as `Authorization: Bearer <key>`) on protected
+    /// routes. An empty set leaves the gateway open.
+    pub fn with_api_keys<I: IntoIterator<Item = String>>(mut self, keys: I) -> Self {
+        self.api_keys = keys.into_iter().collect();
+        self
+    }
+
+    /// Cap each principal (API key, or all anonymous callers together) to `max_requests`
+    /// protected requests per `window`.
+    pub fn with_rate_limit(mut self, max_requests: u32, window: Duration) -> Self {
+        self.rate_limit = Some((max_requests, window));
+        self
+    }
+}
+
+/// The HTTP/WebSocket gateway. Construct with a bind address (+ optional [`GatewayConfig`]),
+/// then [`Gateway::serve`] it with an [`AgentHandle`].
 pub struct HttpGateway {
     addr: SocketAddr,
+    config: GatewayConfig,
 }
 
 impl HttpGateway {
-    /// Bind-address constructor.
+    /// Bind-address constructor with an open (no-auth) policy.
     pub fn new(addr: SocketAddr) -> Self {
-        Self { addr }
+        Self {
+            addr,
+            config: GatewayConfig::default(),
+        }
     }
 
     /// Parse a `host:port` string into a gateway, surfacing a [`GatewayError::Bind`] on a
@@ -57,14 +91,28 @@ impl HttpGateway {
         Ok(Self::new(addr))
     }
 
-    /// Build the router for a given agent. Exposed so callers (and tests) can mount it on
-    /// their own listener.
+    /// Apply an auth/quota policy to the protected routes.
+    pub fn with_config(mut self, config: GatewayConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Build the router for a given agent with an open policy. Exposed so callers (and tests)
+    /// can mount it on their own listener.
     pub fn router(agent: SharedAgent) -> Router {
-        Router::new()
-            .route("/health", get(health))
+        Self::router_with(agent, GatewayConfig::default())
+    }
+
+    /// Build the router with an explicit auth/quota policy. `/health` is always unauthenticated;
+    /// `/v1/turns` and `/v1/ws` sit behind the [`GatewayConfig`] guard.
+    pub fn router_with(agent: SharedAgent, config: GatewayConfig) -> Router {
+        let guard = Arc::new(Guard::new(config));
+        let protected = Router::new()
             .route("/v1/turns", post(post_turn))
             .route("/v1/ws", get(ws_upgrade))
-            .with_state(agent)
+            .route_layer(middleware::from_fn_with_state(guard, guard_request))
+            .with_state(agent);
+        Router::new().route("/health", get(health)).merge(protected)
     }
 }
 
@@ -75,7 +123,7 @@ impl Gateway for HttpGateway {
     }
 
     async fn serve(self: Arc<Self>, agent: SharedAgent) -> Result<(), GatewayError> {
-        let app = HttpGateway::router(agent);
+        let app = HttpGateway::router_with(agent, self.config.clone());
         let listener = tokio::net::TcpListener::bind(self.addr)
             .await
             .map_err(|e| GatewayError::Bind(e.to_string()))?;
@@ -83,6 +131,100 @@ impl Gateway for HttpGateway {
             .await
             .map_err(|e| GatewayError::Io(e.to_string()))
     }
+}
+
+// --- auth + quota middleware ---
+
+/// Runtime guard state behind the protected routes.
+struct Guard {
+    api_keys: HashSet<String>,
+    limiter: Option<Limiter>,
+}
+
+impl Guard {
+    fn new(config: GatewayConfig) -> Self {
+        Self {
+            api_keys: config.api_keys,
+            limiter: config
+                .rate_limit
+                .map(|(max, window)| Limiter::new(max, window)),
+        }
+    }
+}
+
+/// A fixed-window request counter keyed by principal.
+struct Limiter {
+    max: u32,
+    window: Duration,
+    windows: Mutex<std::collections::HashMap<String, Window>>,
+}
+
+struct Window {
+    start: Instant,
+    count: u32,
+}
+
+impl Limiter {
+    fn new(max: u32, window: Duration) -> Self {
+        Self {
+            max,
+            window,
+            windows: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Record a request for `principal`; `false` once it exceeds `max` within the window.
+    fn allow(&self, principal: &str) -> bool {
+        let now = Instant::now();
+        let mut windows = self.windows.lock().unwrap();
+        let w = windows.entry(principal.to_string()).or_insert(Window {
+            start: now,
+            count: 0,
+        });
+        if now.duration_since(w.start) >= self.window {
+            w.start = now;
+            w.count = 0;
+        }
+        if w.count >= self.max {
+            false
+        } else {
+            w.count += 1;
+            true
+        }
+    }
+}
+
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+}
+
+/// Authenticate (if keys are configured) then rate-limit (if configured) before the handler.
+async fn guard_request(
+    State(guard): State<Arc<Guard>>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Identify the principal: a valid API key, or "anon" when auth is disabled.
+    let principal = if guard.api_keys.is_empty() {
+        "anon".to_string()
+    } else {
+        match bearer(&headers) {
+            Some(key) if guard.api_keys.contains(key) => key.to_string(),
+            _ => return (StatusCode::UNAUTHORIZED, "missing or invalid API key").into_response(),
+        }
+    };
+    if let Some(limiter) = &guard.limiter {
+        if !limiter.allow(&principal) {
+            return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+        }
+    }
+    next.run(request).await
 }
 
 /// Inbound turn payload. `session` defaults so a single-session client can omit it.

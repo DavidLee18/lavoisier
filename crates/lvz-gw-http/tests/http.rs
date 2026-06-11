@@ -3,9 +3,11 @@
 
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
-use lvz_gw_http::HttpGateway;
+use lvz_gw_http::{GatewayConfig, HttpGateway};
 use lvz_protocol::{AgentError, AgentHandle, Event, StopReason, TurnRequest, Usage};
 
 /// An agent that echoes a fixed event stream, prefixed with the turn's input so tests can
@@ -45,9 +47,13 @@ impl AgentHandle for FailingAgent {
 }
 
 async fn spawn(agent: Arc<dyn AgentHandle>) -> String {
+    spawn_with(agent, GatewayConfig::default()).await
+}
+
+async fn spawn_with(agent: Arc<dyn AgentHandle>, config: GatewayConfig) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = HttpGateway::router(agent);
+    let app = HttpGateway::router_with(agent, config);
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -110,4 +116,70 @@ async fn submit_failure_is_reported_as_an_sse_error() {
         "body was: {body}"
     );
     assert!(body.contains("budget"), "body was: {body}");
+}
+
+#[tokio::test]
+async fn api_key_auth_gates_protected_routes() {
+    let config = GatewayConfig::default().with_api_keys(["sk-test".to_string()]);
+    let base = spawn_with(Arc::new(EchoAgent), config).await;
+    let client = reqwest::Client::new();
+
+    // /health is always open.
+    let health = reqwest::get(format!("{base}/health")).await.unwrap();
+    assert!(health.status().is_success());
+
+    let body = serde_json::json!({ "input": "ping" });
+
+    // No key → 401.
+    let no_key = client
+        .post(format!("{base}/v1/turns"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_key.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Wrong key → 401.
+    let wrong = client
+        .post(format!("{base}/v1/turns"))
+        .bearer_auth("nope")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Correct key → 200 and the stream flows.
+    let ok = client
+        .post(format!("{base}/v1/turns"))
+        .bearer_auth("sk-test")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert!(ok.status().is_success());
+    assert!(ok.text().await.unwrap().contains("echo:ping"));
+}
+
+#[tokio::test]
+async fn rate_limit_returns_429_past_the_quota() {
+    let config = GatewayConfig::default().with_rate_limit(2, Duration::from_secs(60));
+    let base = spawn_with(Arc::new(EchoAgent), config).await;
+    let client = reqwest::Client::new();
+    let turn = serde_json::json!({ "input": "x" });
+
+    let post = || client.post(format!("{base}/v1/turns")).json(&turn).send();
+    assert!(post().await.unwrap().status().is_success());
+    assert!(post().await.unwrap().status().is_success());
+    assert_eq!(
+        post().await.unwrap().status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // /health is not a protected route, so it is never rate-limited.
+    assert!(reqwest::get(format!("{base}/health"))
+        .await
+        .unwrap()
+        .status()
+        .is_success());
 }
