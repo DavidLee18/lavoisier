@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: M0–M6 complete; M7 (xAI gRPC) started — protos vendored + codegen working
+## Status: M0–M7 complete — xAI gRPC transport live-verified against api.x.ai
 
 `RECIPE.md` is the authoritative **build blueprint** for **Lavoisier** (binary `lavoisier`,
 alias `lav`) — a modular, token-efficient CLI coding agent in Rust with a provider-agnostic
@@ -70,26 +70,42 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   feeding a real `TaskContext`, and the optional §6.3 extras (context deduplication + output
   minimisation). (`--summary-model`/`--compact-after`/`--context-limit` exposed; all
   mechanisms unit-tested, compaction also live-verified.)
-- **M7 — xAI gRPC (in progress, paused 2026-06-10).** Done so far: `xai-org/xai-proto`
-  vendored into `proto/` at pinned commit `543b901d` (Apache-2.0; provenance + update
-  procedure in `proto/VENDOR.md`), and `tonic-prost-build` codegen wired in
-  `crates/lvz-xai/build.rs` — **builds clean** (client-only tonic 0.14 stack:
-  `tonic`/`tonic-prost`/`prost`/`prost-types` workspace deps; **requires `protoc`** on the
-  build machine, e.g. `brew install protobuf`; workspace **MSRV bumped 1.82 → 1.88** for
-  tonic 0.14). The generated `xai_api` module is **not yet consumed** — no
-  `include_proto!` in `lvz-xai/src` yet. **Next steps:** (1) `mod pb` via
-  `tonic::include_proto!("xai_api")`; (2) gRPC transport: `Chat.GetCompletionChunk` streaming
-  to `api.x.ai:443` with `Authorization: Bearer`, mapping `ChatRequest`→`GetCompletionsRequest`
-  (system→`ROLE_SYSTEM` message, `ToolUse`→assistant `tool_calls`, `ToolResult`→`ROLE_TOOL`
-  message with `tool_call_id`, tooldefs→`Tool{function: Function{parameters: JSON-string}}`)
-  and chunk `Delta{content, reasoning_content, tool_calls}`→`Event` (text/thinking/tool),
-  `SamplingUsage`→`Usage` (`cached_prompt_text_tokens`→`cache_read_tokens`),
-  `FinishReason`→`StopReason` (STOP→EndTurn, MAX_LEN/MAX_CONTEXT→MaxTokens,
-  TOOL_CALLS→ToolUse); (3) runtime switch (`XAI_TRANSPORT=grpc|http`, default stays http
-  until gRPC is live-verified) with `Capabilities.server_side_tools=true` on gRPC;
-  (4) unit tests + live verify with `XAI_API_KEY`, then update this file. Note: the protos'
-  current package is `xai_api` (path `xai/api/v1`) — this *is* the "outputs"-style API RECIPE
-  calls "proto v6" (`repeated CompletionOutput(Chunk) outputs`).
+- **M7 — xAI gRPC (complete, live-verified 2026-06-11).**
+  Done: `xai-org/xai-proto` vendored into `proto/` at pinned commit `543b901d` (Apache-2.0;
+  provenance + update procedure in `proto/VENDOR.md`); `tonic-prost-build` codegen in
+  `crates/lvz-xai/build.rs` (client-only tonic 0.14 stack:
+  `tonic`/`tonic-prost`/`prost`/`prost-types` workspace deps; **requires `protoc`**, e.g.
+  `brew install protobuf`; workspace **MSRV 1.88** for tonic 0.14); and the **gRPC transport
+  itself**. `lvz-xai` is now split into modules: `grpc.rs` (native path + `pub mod pb {
+  include_proto!("xai_api") }`), `http.rs` (the OpenAI-compat fallback, formerly `lib.rs`),
+  and a thin `lib.rs` dispatcher. `XaiProvider` is an `enum { Grpc(GrpcTransport),
+  Http(HttpTransport) }`; `from_env` reads **`XAI_TRANSPORT` (`grpc`|`http`, default `http`)**
+  plus `XAI_GRPC_ENDPOINT` (default `https://api.x.ai`) / `XAI_BASE_URL`. The gRPC path opens
+  a TLS `Channel` (`ClientTlsConfig::new().with_webpki_roots()`), calls server-streaming
+  `Chat.GetCompletionChunk` with a per-request `authorization: Bearer` metadata header, and a
+  `Decoder` normalises each `GetChatCompletionChunk`: `Delta{content}`→`TextDelta`,
+  `reasoning_content`→`Thinking`, `tool_calls` (correlated by id; arg-only chunks attach to
+  the last open id)→`ToolUseStart/Delta/End`, per-chunk cumulative `SamplingUsage`→`Usage`
+  (`cached_prompt_text_tokens`→`cache_read_tokens`; `input_tokens = prompt − cached`; agent
+  takes last-wins), `FinishReason`→`StopReason` (STOP→EndTurn, MAX_LEN/MAX_CONTEXT→MaxTokens,
+  TOOL_CALLS→ToolUse, TIME_LIMIT→Other). Request mapping: system→`ROLE_SYSTEM`,
+  assistant `ToolUse`→`tool_calls{FunctionCall}`, user `ToolResult`→`ROLE_TOOL` msg with
+  `tool_call_id`, tooldefs→`Tool{Function{parameters: JSON-string}}`. `Capabilities` on the
+  gRPC path: `server_side_tools=true`, `parallel_tool_use=true`, caching/thinking `false`
+  (xAI caches automatically; we don't echo request-side cache markers or thinking blocks).
+  **70 tests pass** (5 new gRPC mapping/decoder tests in `grpc.rs`), clippy + fmt clean; the
+  generated `pb` module carries `#[allow(clippy::all, dead_code, rustdoc::all)]` (full service
+  surface generated, only `Chat` streaming consumed). **Live-verified** against the real
+  `XAI_API_KEY` with `XAI_TRANSPORT=grpc` (model `grok-4`): `api.x.ai` **is** publicly
+  reachable over gRPC — a streaming turn produced text + reasoning(thinking) deltas, a
+  populated `cache_read` usage (xAI returned cached prompt tokens), and a clean
+  `Done(EndTurn)`; and the agent tool loop ran a `shell` call over gRPC (ToolUse args JSON
+  reassembled, `ROLE_TOOL` result fed back, final answer) end-to-end. **Default transport
+  stays `http`** (conservative — flip via `XAI_TRANSPORT=grpc`, or change the `from_env`
+  default to make gRPC primary per RECIPE §8 now that it's verified). Possible follow-up: a
+  `--xai-transport` CLI flag (today it's env-only). Note: the protos' package is `xai_api`
+  (path `xai/api/v1`) — the "outputs"-style API RECIPE calls "proto v6"
+  (`repeated CompletionOutputChunk outputs`).
 - **M8 — gateway layer.** `lvz-gw-http` (REST + WebSocket). The `Gateway`/`AgentHandle`
   contracts already exist in `lvz-protocol` and `Agent` implements `AgentHandle`; this is
   about concrete gateway crates.
