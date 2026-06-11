@@ -87,8 +87,9 @@ struct Cli {
     #[arg(long, value_name = "N")]
     escalate_after: Option<usize>,
 
-    /// Cheap advisor model that drafts a plan before the loop to seed the executor (--agent/
-    /// --serve; §8 advisor+executor split). Reduces the strong model's exploration turns.
+    /// Smarter, more expensive advisor model that drafts a plan before the loop; the cheaper
+    /// --model executor then carries it out (--agent/--serve; §8 advisor+executor split). The
+    /// expensive model is paid for once, e.g. an Opus advisor planning for a Sonnet executor.
     #[arg(long, value_name = "MODEL")]
     advisor_model: Option<String>,
 

@@ -188,9 +188,10 @@ sequential workflows that accumulate ≥3 turn-pairs.)
     `Knobs`, keyed by `(archetype, caching, model-tier)`, exploiting the cheapest *trusted*
     (success-rate ≥ target) vector and exploring one-step neighbours on a discrete grid
     centred on `Knobs::default()` (the floor it can't regress below). No deps (hand-rolled
-    xorshift). CLI `--tune` swaps it in (precedence over `--compact-after`). **Caveat:** the
-    success signal is still the agent's coarse "completed without error" flag, not a verified
-    quality gate — `--tune` is experimental until a real test/diff signal is wired.
+    xorshift). CLI `--tune` swaps it in (precedence over `--compact-after`). **Full mechanism
+    in `docs/ATO.md`.** **Caveat:** the success signal is still the agent's coarse "completed
+    without error" flag, not a verified quality gate — `--tune` is experimental until a real
+    test/diff signal is wired.
   - **`lvz-claude-cli` — built, off by default.** A `Provider` shelling out to `claude -p`
     (`--output-format stream-json`), stream-json → `Event`; `Capabilities` all false (no
     caching). Selected only via `--provider claude-cli` (default model `sonnet`; `CLAUDE_CLI_BIN`
@@ -199,10 +200,11 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   - **Advisor mode (§8 cost levers in `lvz-agent`) — built, live-verified vs Anthropic.**
     *Cheap-model-first* (`cheap_model` + `escalate_after`): the loop runs the first N
     round-trips on a cheap model, then escalates to `model`. *Advisor+executor split*
-    (`advisor_model`): a tool-less pre-pass on a cheap model drafts a plan that seeds the
-    executor's opening move, cutting its exploration turns (tokens count toward the task
-    total). Provider-agnostic (model ids only). CLI `--cheap-model` / `--escalate-after` /
-    `--advisor-model`, composable, opt-in.
+    (`advisor_model`): a tool-less pre-pass on a **smarter, more expensive** model (e.g. Opus)
+    drafts a plan that seeds the **cheaper** executor (the main `model`, e.g. Sonnet) as its
+    opening move — the expensive model is paid for once while the cheap model runs the many
+    execution turns (advisor tokens count toward the task total). Provider-agnostic (model ids
+    only). CLI `--cheap-model` / `--escalate-after` / `--advisor-model`, composable, opt-in.
 
 ### Known debts inside shipped code (pick up before/with the above)
 

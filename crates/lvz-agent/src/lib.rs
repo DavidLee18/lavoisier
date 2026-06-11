@@ -104,9 +104,11 @@ pub struct AgentConfig {
     /// Round-trips to run on [`cheap_model`](Self::cheap_model) before escalating to the strong
     /// model. Ignored when `cheap_model` is `None`.
     pub escalate_after: usize,
-    /// Optional cheap "advisor" model that drafts a plan in one tool-less call before the loop
-    /// (advisor+executor split, §8). The plan seeds the (stronger) executor, cutting its
-    /// exploration round-trips. `None` disables the pre-pass.
+    /// Optional **smarter, more expensive** "advisor" model that drafts a plan in one tool-less
+    /// call before the loop (advisor+executor split, §8). The plan seeds the **cheaper**
+    /// executor — the main [`model`](Self::model) that runs the loop — so the expensive model is
+    /// paid for *once* (a short planning call) while the cheap model does the many execution
+    /// turns. `None` disables the pre-pass. E.g. advisor = Opus, executor `model` = Sonnet.
     pub advisor_model: Option<String>,
 }
 
@@ -173,7 +175,8 @@ impl AgentConfig {
         self
     }
 
-    /// Draft a plan with a cheap advisor model before the loop, seeding the executor (§8).
+    /// Draft a plan with a smarter, more expensive advisor model before the loop; the cheaper
+    /// executor (the main `model`) then carries it out (§8). E.g. advisor Opus, executor Sonnet.
     pub fn with_advisor_model(mut self, model: impl Into<String>) -> Self {
         self.advisor_model = Some(model.into());
         self
@@ -288,9 +291,10 @@ async fn run_loop(
     let mut total = Usage::default();
     let mut round_trips: u32 = 0;
 
-    // Advisor pre-pass (§8 advisor+executor split): a cheap model drafts a plan that seeds the
-    // (stronger) executor, cutting its exploration round-trips. Disabled unless advisor_model
-    // is set. The plan becomes the assistant's opening move, so the loop continues from it.
+    // Advisor pre-pass (§8 advisor+executor split): a smarter, more expensive model drafts a
+    // plan that seeds the cheaper executor (the main `model`), so the expensive model is paid
+    // for once while the cheap model runs the many execution turns. Disabled unless
+    // advisor_model is set. The plan becomes the assistant's opening move.
     if config.advisor_model.is_some() {
         if let Some(advice) = advise(&provider, &config, &task_text).await {
             total.accumulate(&advice.usage);
@@ -444,9 +448,10 @@ struct Advice {
     usage: Usage,
 }
 
-/// Advisor pre-pass (§8): one tool-less call to the cheap `advisor_model` that drafts a plan
-/// for `task`. Its tokens count toward the task total (§6.4). Returns `None` when the advisor
-/// is disabled, the call fails, or the plan is empty.
+/// Advisor pre-pass (§8): one tool-less call to the smarter, more expensive `advisor_model`
+/// that drafts a plan for `task`; the plan then seeds the cheaper executor loop. Its tokens
+/// count toward the task total (§6.4). Returns `None` when the advisor is disabled, the call
+/// fails, or the plan is empty.
 async fn advise(provider: &Arc<dyn Provider>, config: &AgentConfig, task: &str) -> Option<Advice> {
     let model = config.advisor_model.clone()?;
     let req = ChatRequest::new(model)
@@ -1395,19 +1400,20 @@ mod tests {
         registry.register(Arc::new(BigTool)); // executor requests advertise tools
 
         let config = AgentConfig::default()
-            .with_model("strong")
-            .with_advisor_model("advisor");
+            .with_model("cheap-executor")
+            .with_advisor_model("smart-advisor");
         let agent = Agent::new(provider.clone(), registry, config);
 
         let _ = collect(agent.run("implement X")).await;
 
         let seen = provider.seen.lock().unwrap();
-        // First call = advisor pre-pass: cheap advisor model, advisor prompt, sees just the task.
-        assert_eq!(seen[0].0, "advisor");
+        // First call = advisor pre-pass: the smart/expensive advisor model, advisor prompt,
+        // sees just the task.
+        assert_eq!(seen[0].0, "smart-advisor");
         assert!(seen[0].1.to_lowercase().contains("advisor"));
         assert_eq!(seen[0].2, 1);
-        // Second call = executor on the strong model, seeded with task + plan (2 messages).
-        assert_eq!(seen[1].0, "strong");
+        // Second call = the cheaper executor (the main model), seeded with task + plan (2 msgs).
+        assert_eq!(seen[1].0, "cheap-executor");
         assert_eq!(seen[1].2, 2);
     }
 }
