@@ -12,15 +12,17 @@
 //! persistence yet) — opt in with `--tune-bayes`.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 
 use lvz_protocol::{Knobs, Outcome, TaskContext, Tuner};
+use serde::{Deserialize, Serialize};
 
 use crate::{all_neighbours, context_footprint, next_f64, ContextKey, TuneConfig};
 
 /// Beta(successes+1, failures+1) over success probability, and a Welford mean/variance over the
 /// token cost of *successful* runs (cost-when-it-works), per knob vector under one context.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 struct BayesStats {
     successes: f64,
     failures: f64,
@@ -83,6 +85,75 @@ impl BayesTuner {
 impl Default for BayesTuner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// One `(context, knobs) → posterior` row in a serialised snapshot (the nested struct-keyed maps
+/// are flattened to a list because their keys can't be JSON object keys).
+#[derive(Serialize, Deserialize)]
+struct Row {
+    key: ContextKey,
+    knobs: Knobs,
+    stats: BayesStats,
+}
+
+/// Persisted [`BayesTuner`] state: the per-context posteriors plus the PRNG cursor.
+#[derive(Serialize, Deserialize, Default)]
+struct Snapshot {
+    rows: Vec<Row>,
+    rng: u64,
+}
+
+impl BayesTuner {
+    /// Serialise the learned posteriors (and PRNG cursor) to `path` as JSON, so a restarted
+    /// gateway keeps what Thompson sampling has learned (`docs/ATO.md` §10.1 persistence).
+    pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let guard = self.state.lock().expect("bayes tuner state poisoned");
+        let rows = guard
+            .profiles
+            .iter()
+            .flat_map(|(key, candidates)| {
+                candidates.iter().map(move |(knobs, stats)| Row {
+                    key: key.clone(),
+                    knobs: *knobs,
+                    stats: *stats,
+                })
+            })
+            .collect();
+        let snapshot = Snapshot {
+            rows,
+            rng: guard.rng,
+        };
+        let json = serde_json::to_string_pretty(&snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, json)
+    }
+
+    /// Build a tuner pre-loaded from a [`save`](Self::save)d snapshot. A missing file yields a cold
+    /// tuner, so callers can pass a path unconditionally.
+    pub fn load(path: impl AsRef<Path>, cfg: TuneConfig) -> std::io::Result<Self> {
+        let tuner = Self::with_config(cfg);
+        let json = match std::fs::read_to_string(path) {
+            Ok(j) => j,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(tuner),
+            Err(e) => return Err(e),
+        };
+        let snapshot: Snapshot = serde_json::from_str(&json)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        {
+            let mut guard = tuner.state.lock().expect("bayes tuner state poisoned");
+            for row in snapshot.rows {
+                guard
+                    .profiles
+                    .entry(row.key)
+                    .or_default()
+                    .insert(row.knobs, row.stats);
+            }
+            if snapshot.rng != 0 {
+                guard.rng = snapshot.rng; // keep sampling non-repeating across restarts
+            }
+        }
+        Ok(tuner)
     }
 }
 
@@ -307,5 +378,45 @@ mod tests {
             starved_picks < 20,
             "starved vector picked too often: {starved_picks}/200"
         );
+    }
+
+    #[test]
+    fn save_and_load_round_trips_posteriors() {
+        let path = std::env::temp_dir().join(format!("lvz-bayes-test-{}.json", std::process::id()));
+
+        let t = BayesTuner::new();
+        let c = ctx();
+        let cheaper = Knobs {
+            skeleton_radius: 0,
+            ..Knobs::default()
+        };
+        for _ in 0..60 {
+            t.observe(&c, &Knobs::default(), &outcome(1000, true));
+            t.observe(&c, &cheaper, &outcome(600, true));
+        }
+        t.save(&path).expect("save");
+
+        // A fresh tuner loaded from the snapshot carries the same posteriors, so it still favours
+        // the cheaper reliable vector far more than the expensive baseline. (Assert the signal, not
+        // an absolute count near the HashMap-iteration-order noise boundary — see the converges
+        // test for why.)
+        let reloaded = BayesTuner::load(&path, TuneConfig::default()).expect("load");
+        let cheaper_picks = (0..200).filter(|_| reloaded.select(&c) == cheaper).count();
+        let baseline_picks = (0..200)
+            .filter(|_| reloaded.select(&c) == Knobs::default())
+            .count();
+        assert!(
+            cheaper_picks > baseline_picks * 3 && cheaper_picks > 80,
+            "reloaded posteriors lost their edge: cheaper={cheaper_picks} baseline={baseline_picks}"
+        );
+
+        // A missing file loads cold (no error). A cold Thompson sampler explores rather than
+        // pinning the baseline, so we only assert it loaded and selects a valid grid vector.
+        let missing = std::env::temp_dir().join("lvz-bayes-missing-xyz.json");
+        let cold = BayesTuner::load(&missing, TuneConfig::default()).expect("cold load");
+        let k = cold.select(&c);
+        assert!(k.skeleton_radius <= 3 && (1..=8).contains(&k.batch_width));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

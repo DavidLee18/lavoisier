@@ -37,6 +37,26 @@ use serde::{Deserialize, Serialize};
 mod bayes;
 pub use bayes::BayesTuner;
 
+/// A [`Tuner`] whose learned profiles can be snapshotted to disk — the common surface behind
+/// `--tune-state`, so a persistent wrapper can drive either the ε-greedy [`LearningTuner`] or the
+/// Bayesian [`BayesTuner`] uniformly. (Named `persist` to avoid colliding with each tuner's
+/// inherent `save`.)
+pub trait PersistableTuner: Tuner {
+    fn persist(&self, path: &Path) -> std::io::Result<()>;
+}
+
+impl PersistableTuner for LearningTuner {
+    fn persist(&self, path: &Path) -> std::io::Result<()> {
+        self.save(path)
+    }
+}
+
+impl PersistableTuner for BayesTuner {
+    fn persist(&self, path: &Path) -> std::io::Result<()> {
+        self.save(path)
+    }
+}
+
 /// Tuning hyper-parameters.
 #[derive(Debug, Clone, Copy)]
 pub struct TuneConfig {

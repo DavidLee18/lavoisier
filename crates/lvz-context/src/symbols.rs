@@ -2,11 +2,16 @@
 //! skeleton-radius knob `N` real: "include full bodies for symbols within `N` dependency
 //! hops of the edit target."
 //!
-//! Edges are a deliberately cheap, language-agnostic heuristic: a symbol *references* another
-//! when the other symbol's name appears as a whole word in its definition text. This is a
-//! name-based approximation, not full name resolution (same-named symbols across files merge,
-//! shadowing is ignored), but it is enough to drive skeleton expansion and is fully
-//! deterministic — exactly what the §6.5 budget-fixture loop needs.
+//! Edges are **resolved from the parse tree**, not from raw text. For each symbol we walk its
+//! subtree and collect the *reference identifiers* it uses (real `identifier`/`type_identifier`
+//! nodes), minus the identifiers it binds locally (parameters, `let`/variable patterns); an edge
+//! `A → B` exists when one of `A`'s references names a defined symbol `B`. Resolving through the
+//! AST means a name that only appears in a **string or comment** no longer creates a spurious
+//! edge, and a **local variable that shadows** a top-level symbol's name no longer links to it.
+//!
+//! It is still name-keyed, not a full semantic index — same-named symbols across files merge and
+//! there is no import/visibility resolution — but that is all the radius knob needs, and it stays
+//! fully deterministic, exactly what the §6.5 budget-fixture loop requires.
 
 use std::collections::{HashMap, HashSet};
 
@@ -24,40 +29,35 @@ pub struct SymbolGraph {
 impl SymbolGraph {
     /// Build a graph from a single source file.
     pub fn from_source(source: &str, lang: Lang) -> Self {
-        let mut graph = SymbolGraph::default();
-        graph.add_source(source, lang);
-        graph
+        let mut defs = Vec::new();
+        collect_symbol_refs(source, lang, &mut defs);
+        SymbolGraph::link(defs)
     }
 
     /// Build a graph spanning several files (e.g. a cross-file refactor fixture). Symbols are
     /// keyed by name across the whole set, so a call from one file to a definition in another
     /// produces an edge.
     pub fn from_sources<'a>(sources: impl IntoIterator<Item = (Lang, &'a str)>) -> Self {
-        // First pass: collect every symbol's name + text across all files. Second pass: link.
-        let mut defs: Vec<(String, String)> = Vec::new();
+        // First pass: per symbol, its name + the names it *references* (resolved from identifier
+        // nodes, minus its own locals). Second pass: keep only references that name a known symbol.
+        let mut defs: Vec<(String, HashSet<String>)> = Vec::new();
         for (lang, source) in sources {
-            collect_symbols(source, lang, &mut defs);
+            collect_symbol_refs(source, lang, &mut defs);
         }
         SymbolGraph::link(defs)
     }
 
-    fn add_source(&mut self, source: &str, lang: Lang) {
-        let mut defs = Vec::new();
-        collect_symbols(source, lang, &mut defs);
-        let linked = SymbolGraph::link(defs);
-        for (name, refs) in linked.edges {
-            self.edges.entry(name).or_default().extend(refs);
-        }
-    }
-
-    fn link(defs: Vec<(String, String)>) -> Self {
-        let names: Vec<&String> = defs.iter().map(|(n, _)| n).collect();
+    /// Resolve references against the known symbol set: an edge `name → other` exists when `name`
+    /// references `other`'s identifier and `other` is itself a defined symbol. Same-named symbols
+    /// merge by union (a name-keyed graph is all the radius knob needs).
+    fn link(defs: Vec<(String, HashSet<String>)>) -> Self {
+        let names: HashSet<&str> = defs.iter().map(|(n, _)| n.as_str()).collect();
         let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
-        for (name, text) in &defs {
+        for (name, refs) in &defs {
             let entry = edges.entry(name.clone()).or_default();
-            for other in &names {
-                if other.as_str() != name.as_str() && contains_word(text, other) {
-                    entry.insert((*other).clone());
+            for r in refs {
+                if r != name && names.contains(r.as_str()) {
+                    entry.insert(r.clone());
                 }
             }
         }
@@ -103,56 +103,110 @@ pub fn skeleton_with_radius(source: &str, lang: Lang, target: &str, radius: u8) 
     skeleton::skeletonize(source, lang, &keep)
 }
 
-/// Walk the tree collecting `(name, definition_text)` for every symbol-kind node.
-fn collect_symbols(source: &str, lang: Lang, out: &mut Vec<(String, String)>) {
+/// Walk the tree collecting `(name, referenced names)` for every symbol-kind node. References are
+/// resolved from the parse tree (identifier nodes), not raw text, and exclude the symbol's own
+/// locals — so names appearing in strings/comments, and locals shadowing a top-level symbol, no
+/// longer create spurious edges.
+fn collect_symbol_refs(source: &str, lang: Lang, out: &mut Vec<(String, HashSet<String>)>) {
     let Some(tree) = parse(source, lang) else {
         return;
     };
-    let kinds = lang.spec().symbol_kinds;
-    walk(tree.root_node(), source, kinds, out);
+    let spec = lang.spec();
+    walk_symbols(tree.root_node(), source, &spec, out);
 }
 
-fn walk(node: Node, source: &str, kinds: &[&str], out: &mut Vec<(String, String)>) {
-    if kinds.contains(&node.kind()) {
-        if let Some(name) = node
-            .child_by_field_name("name")
-            .map(|n| source[n.start_byte()..n.end_byte()].to_string())
-        {
-            let text = source[node.start_byte()..node.end_byte()].to_string();
-            out.push((name, text));
+fn walk_symbols(
+    node: Node,
+    source: &str,
+    spec: &crate::lang::LangSpec,
+    out: &mut Vec<(String, HashSet<String>)>,
+) {
+    if spec.symbol_kinds.contains(&node.kind()) {
+        if let Some(name) = node.child_by_field_name("name").map(|n| text(n, source)) {
+            let mut bound = HashSet::new();
+            collect_bound(node, source, spec, &mut bound);
+            let mut refs = HashSet::new();
+            collect_refs(node, source, spec, &bound, &mut refs);
+            refs.remove(&name); // a symbol is not a reference to itself
+            out.push((name, refs));
         }
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk(child, source, kinds, out);
+        walk_symbols(child, source, spec, out);
     }
 }
 
-/// True if `word` occurs in `hay` bounded by non-identifier characters (whole-word match).
-fn contains_word(hay: &str, word: &str) -> bool {
-    if word.is_empty() {
-        return false;
-    }
-    let bytes = hay.as_bytes();
-    let mut from = 0;
-    while let Some(rel) = hay[from..].find(word) {
-        let i = from + rel;
-        let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
-        let after = i + word.len();
-        let after_ok = after >= bytes.len() || !is_ident_byte(bytes[after]);
-        if before_ok && after_ok {
-            return true;
+/// Collect the identifiers bound *locally* inside `node`: for every binder (parameter, `let`,
+/// variable declarator) the identifiers in its binding position only (`pattern`/`name` field, or
+/// — for parameter-list nodes that have neither — its direct children). The binder's *value* and
+/// *type* are intentionally not treated as bindings, so a `let x = helper()` still references
+/// `helper` while binding `x`.
+fn collect_bound(
+    node: Node,
+    source: &str,
+    spec: &crate::lang::LangSpec,
+    out: &mut HashSet<String>,
+) {
+    if spec.binder_kinds.contains(&node.kind()) {
+        match node
+            .child_by_field_name("pattern")
+            .or_else(|| node.child_by_field_name("name"))
+        {
+            Some(target) => collect_idents(target, source, spec, out),
+            None => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    collect_idents(child, source, spec, out);
+                }
+            }
         }
-        from = i + 1;
-        if from >= hay.len() {
-            break;
-        }
     }
-    false
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_bound(child, source, spec, out);
+    }
 }
 
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+/// Every reference-identifier name in `node`'s subtree that is not locally `bound`.
+fn collect_refs(
+    node: Node,
+    source: &str,
+    spec: &crate::lang::LangSpec,
+    bound: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    if spec.ref_ident_kinds.contains(&node.kind()) {
+        let t = text(node, source);
+        if !bound.contains(&t) {
+            out.insert(t);
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_refs(child, source, spec, bound, out);
+    }
+}
+
+/// Every reference-identifier name in `node`'s subtree (binding-agnostic — used to harvest the
+/// names a binder introduces).
+fn collect_idents(
+    node: Node,
+    source: &str,
+    spec: &crate::lang::LangSpec,
+    out: &mut HashSet<String>,
+) {
+    if spec.ref_ident_kinds.contains(&node.kind()) {
+        out.insert(text(node, source));
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_idents(child, source, spec, out);
+    }
+}
+
+fn text(node: Node, source: &str) -> String {
+    source[node.start_byte()..node.end_byte()].to_string()
 }
 
 #[cfg(test)]
@@ -174,10 +228,39 @@ fn unrelated() -> i32 {
 ";
 
     #[test]
-    fn whole_word_matching_excludes_substrings() {
-        assert!(contains_word("call add(x)", "add"));
-        assert!(!contains_word("address book", "add"));
-        assert!(!contains_word("readd", "add"));
+    fn references_in_strings_and_comments_do_not_link() {
+        // `helper` appears only in a string literal and a line comment — never as a real call —
+        // so the name-based substring heuristic would wrongly link, but AST resolution does not.
+        let src = "\
+fn helper() -> i32 { 1 }
+fn target() -> i32 {
+    // call helper here later
+    let s = \"remember to call helper\";
+    2
+}
+";
+        let g = SymbolGraph::from_source(src, Lang::Rust);
+        assert!(
+            !g.neighbors_within("target", 1).contains("helper"),
+            "string/comment mention must not create an edge"
+        );
+    }
+
+    #[test]
+    fn a_local_shadowing_a_symbol_name_does_not_link() {
+        // `target` binds a local named `helper`; the top-level `helper` fn is never called.
+        let src = "\
+fn helper() -> i32 { 1 }
+fn target() -> i32 {
+    let helper = 5;
+    helper + 1
+}
+";
+        let g = SymbolGraph::from_source(src, Lang::Rust);
+        assert!(
+            !g.neighbors_within("target", 1).contains("helper"),
+            "a shadowing local must not link to the same-named symbol"
+        );
     }
 
     #[test]

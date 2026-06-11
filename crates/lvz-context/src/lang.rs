@@ -23,6 +23,19 @@ pub(crate) struct LangSpec {
     pub elision: &'static str,
     /// Named-definition node kinds that become nodes in the symbol-dependency graph.
     pub symbol_kinds: &'static [&'static str],
+    /// Keep a leading docstring (a bare string statement as the body's first item) when eliding
+    /// the rest of the body — `RECIPE.md` §6.1 wants docstrings retained as high-signal context.
+    /// True only for Python, whose `def` bodies conventionally open with a `"""…"""` docstring.
+    pub keeps_docstring: bool,
+    /// Leaf node kinds that count as a *reference* to a name when resolving symbol-dependency
+    /// edges (`super::symbols`). Restricting to real identifier nodes (vs. raw substring search)
+    /// is what makes a name in a string or comment stop creating a spurious edge.
+    pub ref_ident_kinds: &'static [&'static str],
+    /// Node kinds that introduce **local bindings** (parameters, `let`/variable declarations).
+    /// The identifiers in their binding position (`pattern`/`name` field, else direct children)
+    /// are locals, so they are excluded from references — this is the scope/shadowing fix: a local
+    /// variable that happens to share a top-level symbol's name no longer links to that symbol.
+    pub binder_kinds: &'static [&'static str],
 }
 
 impl Lang {
@@ -62,11 +75,17 @@ impl Lang {
                     "const_item",
                     "static_item",
                 ],
+                keeps_docstring: false,
+                ref_ident_kinds: &["identifier", "type_identifier"],
+                binder_kinds: &["parameter", "let_declaration", "closure_parameters"],
             },
             Lang::Python => LangSpec {
                 def_kinds: &["function_definition"],
                 elision: "...",
                 symbol_kinds: &["function_definition", "class_definition"],
+                keeps_docstring: true,
+                ref_ident_kinds: &["identifier"],
+                binder_kinds: &["parameters", "lambda_parameters"],
             },
             Lang::JavaScript => LangSpec {
                 def_kinds: &[
@@ -80,6 +99,9 @@ impl Lang {
                     "method_definition",
                     "class_declaration",
                 ],
+                keeps_docstring: false,
+                ref_ident_kinds: &["identifier"],
+                binder_kinds: &["formal_parameters", "variable_declarator"],
             },
             Lang::TypeScript => LangSpec {
                 def_kinds: &[
@@ -94,6 +116,14 @@ impl Lang {
                     "class_declaration",
                     "interface_declaration",
                     "type_alias_declaration",
+                ],
+                keeps_docstring: false,
+                ref_ident_kinds: &["identifier", "type_identifier"],
+                binder_kinds: &[
+                    "formal_parameters",
+                    "variable_declarator",
+                    "required_parameter",
+                    "optional_parameter",
                 ],
             },
         }

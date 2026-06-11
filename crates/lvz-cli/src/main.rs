@@ -27,7 +27,7 @@ use lvz_protocol::{
     TaskTelemetry, TelemetrySink, Tuner,
 };
 use lvz_tools::ToolRegistry;
-use lvz_tune::{BayesTuner, LearningTuner, TuneConfig};
+use lvz_tune::{BayesTuner, LearningTuner, PersistableTuner, TuneConfig};
 use lvz_xai::XaiProvider;
 use std::path::PathBuf;
 
@@ -133,7 +133,7 @@ struct Cli {
     /// hill-climb (`docs/ATO.md` §10). Each knob vector carries a Beta posterior over success and
     /// a Gaussian over cost; selection *samples* and picks the cheapest feasible draw, so posterior
     /// uncertainty drives exploration with no explicit ε. Implies `--tune`; takes precedence over it.
-    /// In-memory only — `--tune-state` does not apply (no persistence yet).
+    /// Persists with `--tune-state` just like `--tune`.
     #[arg(long)]
     tune_bayes: bool,
 
@@ -143,8 +143,9 @@ struct Cli {
     #[arg(long, value_name = "CMD")]
     verify_cmd: Option<String>,
 
-    /// Persist the `--tune` learner's profiles to this JSON file: loaded at start (missing ⇒
-    /// cold), saved after each completed turn. Lets ATO keep what it learned across restarts.
+    /// Persist the `--tune`/`--tune-bayes` learner's profiles to this JSON file: loaded at start
+    /// (missing ⇒ cold), saved after each completed turn. Lets ATO keep what it learned across
+    /// restarts.
     #[arg(long, value_name = "PATH")]
     tune_state: Option<String>,
 
@@ -355,12 +356,23 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
     let mut agent = Agent::new(provider, ToolRegistry::with_builtins(), config);
     if cli.tune_bayes {
         // The experimental Bayesian (Thompson-sampling) learner; takes precedence over the
-        // ε-greedy `--tune` and a fixed `--compact-after`. In-memory only (no `--tune-state`).
+        // ε-greedy `--tune` and a fixed `--compact-after`. Persists like `--tune` when a
+        // `--tune-state` path is given (load prior posteriors, save after each turn).
         let mut tune_cfg = TuneConfig::default();
         if let Some(decay) = cli.tune_decay {
             tune_cfg.decay = decay;
         }
-        agent = agent.with_tuner(Arc::new(BayesTuner::with_config(tune_cfg)));
+        let tuner: Arc<dyn Tuner> = match &cli.tune_state {
+            Some(path) => {
+                let inner = BayesTuner::load(path, tune_cfg).unwrap_or_else(|e| {
+                    eprintln!("tune-state: could not load {path}: {e}; starting cold");
+                    BayesTuner::with_config(tune_cfg)
+                });
+                PersistentTuner::new(Arc::new(inner), path).into_arc()
+            }
+            None => Arc::new(BayesTuner::with_config(tune_cfg)),
+        };
+        agent = agent.with_tuner(tuner);
     } else if cli.tune {
         // The online ATO learner (§6.6); takes precedence over a fixed --compact-after. When a
         // state path is given, load prior profiles (missing ⇒ cold) and persist on drop.
@@ -368,8 +380,14 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
         if let Some(decay) = cli.tune_decay {
             tune_cfg.decay = decay;
         }
-        let tuner = match &cli.tune_state {
-            Some(path) => PersistentTuner::load(path, tune_cfg).into_arc(),
+        let tuner: Arc<dyn Tuner> = match &cli.tune_state {
+            Some(path) => {
+                let inner = LearningTuner::load(path, tune_cfg).unwrap_or_else(|e| {
+                    eprintln!("tune-state: could not load {path}: {e}; starting cold");
+                    LearningTuner::with_config(tune_cfg)
+                });
+                PersistentTuner::new(Arc::new(inner), path).into_arc()
+            }
             None => Arc::new(LearningTuner::with_config(tune_cfg)),
         };
         agent = agent.with_tuner(tuner);
@@ -383,21 +401,16 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
     agent
 }
 
-/// A [`LearningTuner`] that persists its profiles to disk after every observation, so what ATO
-/// learns survives across process restarts (`docs/ATO.md` §10 profile persistence). Selected by
-/// `--tune --tune-state <path>`.
+/// Wraps any [`PersistableTuner`] (the ε-greedy [`LearningTuner`] or the Bayesian [`BayesTuner`])
+/// to snapshot its profiles to disk after every observation, so what ATO learns survives across
+/// process restarts (`docs/ATO.md` §10 profile persistence). Selected by `--tune-state <path>`.
 struct PersistentTuner {
-    inner: LearningTuner,
+    inner: Arc<dyn PersistableTuner>,
     path: PathBuf,
 }
 
 impl PersistentTuner {
-    /// Load profiles from `path` (a missing file starts cold) under `cfg`, keyed to persist back.
-    fn load(path: &str, cfg: TuneConfig) -> Self {
-        let inner = LearningTuner::load(path, cfg).unwrap_or_else(|e| {
-            eprintln!("tune-state: could not load {path}: {e}; starting cold");
-            LearningTuner::with_config(cfg)
-        });
+    fn new(inner: Arc<dyn PersistableTuner>, path: &str) -> Self {
         Self {
             inner,
             path: path.into(),
@@ -416,7 +429,7 @@ impl Tuner for PersistentTuner {
 
     fn observe(&self, ctx: &TaskContext, used: &Knobs, out: &Outcome) {
         self.inner.observe(ctx, used, out);
-        if let Err(e) = self.inner.save(&self.path) {
+        if let Err(e) = self.inner.persist(&self.path) {
             eprintln!("tune-state: could not save {}: {e}", self.path.display());
         }
     }

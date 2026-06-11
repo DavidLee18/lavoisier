@@ -212,10 +212,11 @@ sequential workflows that accumulate ≥3 turn-pairs.)
     `BayesTuner` (`bayes.rs`), a Thompson-sampling alternative (Beta posterior over success +
     Gaussian over cost per knob vector; samples and picks the cheapest feasible draw; hand-rolled
     Box–Muller/Marsaglia–Tsang/Beta samplers, no extra deps), opt-in via `--tune-bayes` (implies
-    `--tune`, precedence over it; in-memory only, so `--tune-state` doesn't apply). Pair `--tune`
-    with `--verify-cmd` for a production-grade signal; `--tune`/`--tune-bayes` alone (and
-    `--radius-counterfactual`) stay experimental. Only deferred now: on-disk persistence for
-    `BayesTuner`, and the radius counterfactual modelling the model's altered *reasoning* (not just
+    `--tune`, precedence over it). It **persists** like the hill-climb: `BayesTuner::save`/`load`
+    snapshot the posteriors, so `--tune-state` works with `--tune-bayes` too (both via the shared
+    `PersistableTuner` wrapper). Pair `--tune` with `--verify-cmd` for a production-grade signal;
+    `--tune`/`--tune-bayes` alone (and `--radius-counterfactual`) stay experimental. Only deferred
+    now: the radius counterfactual modelling the model's altered *reasoning* (not just
     skeleton-input bytes).
   - **`lvz-claude-cli` — built, off by default.** A `Provider` shelling out to `claude -p`
     (`--output-format stream-json`), stream-json → `Event`; `Capabilities` all false (no
@@ -252,11 +253,15 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   by `--telemetry` (one-shot `--agent` runs print a stderr summary line). The per-task ATO
   success signal exists (`--verify-cmd`). Still missing: cache-hit-rate as its own `/metrics`
   gauge (it's derivable from the exported counters but not surfaced separately).
-- **Skeleton fidelity.** Python docstrings are currently elided with the body (RECIPE wants
-  them kept). The symbol-dependency graph is a name-based heuristic (no scope/name
-  resolution; same-named symbols across files merge) — fine for `N`, not a semantic index.
-  `outline_file --focus` builds a single-file graph (the multi-file graph in
-  `lvz-context::symbols` is used by the budget loop, not the tool).
+- **Skeleton fidelity.** Python docstrings are now **kept** when a body is elided
+  (`LangSpec.keeps_docstring`; the skeletoniser elides only the post-docstring range and
+  re-indents the placeholder). The symbol-dependency graph is now **AST-resolved + scope-aware**:
+  edges come from real `identifier`/`type_identifier` nodes (not substring search) minus
+  locally-bound names, so names in strings/comments and shadowing locals no longer create spurious
+  edges (`lvz-context::symbols`, per-language `ref_ident_kinds`/`binder_kinds`). Still name-keyed,
+  not a full semantic index — same-named symbols across files merge and there's no import/visibility
+  resolution (fine for `N`). `outline_file --focus` builds a single-file graph (the multi-file graph
+  is used by the budget loop, not the tool).
 - **Multi-file batching (§6.1)** is implemented: `read_files`/`outline_files` batch tools (take a
   `paths` array, return per-file sections under `===== <path> =====` headers, inline per-file
   read errors), the `batch_width` knob caps the `paths` array agent-side (`apply_knobs_to_args`),

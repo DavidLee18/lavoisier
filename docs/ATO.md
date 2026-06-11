@@ -323,14 +323,17 @@ with **Thompson sampling**:
   grid neighbours of the baseline and of the current empirical best.
 - Samplers are hand-rolled to honour the no-extra-deps rule (Box–Muller normal → Marsaglia–Tsang
   gamma → Beta as `G(a)/(G(a)+G(b))`), driven by the shared xorshift PRNG so a run is reproducible.
+- **Persistence.** `BayesTuner::save`/`load` snapshot the per-context posteriors (and PRNG cursor)
+  to JSON, so `--tune-state` works with `--tune-bayes` exactly as with `--tune` (both flow through
+  the shared `PersistableTuner` wrapper).
 
-It is **experimental and in-memory** — no profile persistence yet, so `--tune-state` does not apply
-to it.
+It is still **experimental** (Thompson sampling needs more evidence than the hill-climb to pay off),
+but no longer in-memory-only.
 
 **Still deferred.**
 
 - The radius counterfactual modelling the model's altered *subsequent reasoning* on a smaller
-  skeleton (not just the skeleton-input byte delta), and on-disk persistence for `BayesTuner`.
+  skeleton (not just the skeleton-input byte delta).
 
 ---
 
