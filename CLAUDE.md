@@ -10,6 +10,10 @@ core. **Read it before any work**: the decision log (§1), crate responsibilitie
 contracts (§5), and milestone sequence (§9) define what to build and in what order. If a
 request conflicts with `RECIPE.md`, surface the conflict rather than silently diverging.
 
+Companion docs: `README.md` (user-facing overview + flags), `docs/ATO.md` (the tuner internals),
+and `docs/BENCHMARKS.md` (a token-cost estimate vs. the Dirac agent — methodology + per-model
+$/task, anchored on real `--telemetry` runs; re-derive from its §2 prices when they move).
+
 Milestones done (per §9): **M0** workspace + `lvz-protocol` contracts · **M1** xAI
 OpenAI-compat first light · **M2** SSE streaming · **M3** `lvz-anthropic` native Messages API
 + caching + thinking · **M4** `lvz-agent` plan→act→observe loop + `lvz-tools` (fs + shell),
