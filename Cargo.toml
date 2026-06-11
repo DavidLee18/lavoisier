@@ -43,6 +43,7 @@ lvz-tools = { path = "crates/lvz-tools" }
 lvz-agent = { path = "crates/lvz-agent" }
 lvz-context = { path = "crates/lvz-context" }
 lvz-memory = { path = "crates/lvz-memory" }
+lvz-tune = { path = "crates/lvz-tune" }
 lvz-gw-http = { path = "crates/lvz-gw-http" }
 lvz-gw-matrix = { path = "crates/lvz-gw-matrix" }
 

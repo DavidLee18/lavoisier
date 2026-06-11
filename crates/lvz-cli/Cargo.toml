@@ -19,6 +19,7 @@ lvz-xai.workspace = true
 lvz-agent.workspace = true
 lvz-tools.workspace = true
 lvz-memory.workspace = true
+lvz-tune.workspace = true
 lvz-gw-http.workspace = true
 lvz-gw-matrix.workspace = true
 tokio.workspace = true

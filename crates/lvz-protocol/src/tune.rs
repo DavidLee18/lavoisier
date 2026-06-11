@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::provider::Capabilities;
 
 /// What kind of coding task this is. Knob optima differ per archetype (`RECIPE.md` §6.5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Archetype {
     SingleFileEdit,
@@ -21,7 +21,7 @@ pub enum Archetype {
 }
 
 /// Coarse model capability/cost tier, used for routing and for keying tuner profiles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelTier {
     /// Cheap/fast: routing, classification, summaries (e.g. Haiku).
@@ -52,7 +52,7 @@ pub struct TaskContext {
 
 /// The efficiency dials tuned per context. [`Default`] returns the static §6.5 baseline,
 /// which is also the floor ATO may never regress below.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Knobs {
     /// Include full bodies for symbols within `N` dependency hops of the edit target.
     pub skeleton_radius: u8,

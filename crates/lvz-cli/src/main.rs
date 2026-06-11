@@ -23,6 +23,7 @@ use lvz_gw_matrix::MatrixGateway;
 use lvz_memory::{InMemoryStore, SessionAgent};
 use lvz_protocol::{AgentHandle, ChatRequest, Event, Gateway, Knobs, Message, Provider};
 use lvz_tools::ToolRegistry;
+use lvz_tune::LearningTuner;
 use lvz_xai::XaiProvider;
 
 #[derive(Parser)]
@@ -100,6 +101,13 @@ struct Cli {
     /// `MATRIX_HOMESERVER`, `MATRIX_USER`, `MATRIX_PASSWORD` from the environment.
     #[arg(long)]
     serve_matrix: bool,
+
+    /// Enable adaptive token optimisation (ATO, experimental): an online tuner that learns
+    /// per-archetype knob settings from realised outcomes (most useful in a long-running
+    /// `--serve` process). The success signal is the agent's coarse "completed without error"
+    /// flag, not a verified quality gate — keep opt-in until a real signal is wired (§6.6).
+    #[arg(long)]
+    tune: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -244,7 +252,10 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
         config = config.with_repo_root(cwd);
     }
     let mut agent = Agent::new(provider, ToolRegistry::with_builtins(), config);
-    if let Some(compact_after) = cli.compact_after {
+    if cli.tune {
+        // The online ATO learner (§6.6); takes precedence over a fixed --compact-after.
+        agent = agent.with_tuner(Arc::new(LearningTuner::new()));
+    } else if let Some(compact_after) = cli.compact_after {
         // A fixed-knob tuner overriding only the compaction trigger (§6.3).
         agent = agent.with_tuner(Arc::new(FixedTuner(Knobs {
             compact_after,
