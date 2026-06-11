@@ -26,7 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use futures::channel::mpsc;
@@ -132,6 +132,16 @@ pub struct AgentConfig {
     /// prove the model wouldn't have failed with less context. It lets ATO discover smaller radii
     /// faster, at the risk of crediting a starved setting. Only meaningful with a learning tuner.
     pub radius_counterfactual: bool,
+    /// Inject a **cache-aware repo-skeleton prefix** (`RECIPE.md` §6.1): when `Some(budget)`, a
+    /// token-bounded skeleton of the whole repo (tree-sitter outlines of every source file under
+    /// [`repo_root`](Self::repo_root), to `budget` estimated tokens) is built **once** and placed
+    /// as the first content block of the first user message, marked cacheable. Ordered
+    /// immutable→stable→volatile, it joins the cached prefix (system + tool defs + skeleton), so on
+    /// a caching provider it is paid for once and re-read cheaply on every subsequent round-trip
+    /// and task in the same repo — giving the model whole-repo structure without per-task reads.
+    /// `None` disables it. Most valuable with prompt caching (Anthropic) and a long-running
+    /// `--serve`; on a non-caching provider it still adds the skeleton but without the amortisation.
+    pub repo_skeleton: Option<usize>,
 }
 
 impl Default for AgentConfig {
@@ -152,6 +162,7 @@ impl Default for AgentConfig {
             verify_command: None,
             classify_with_model: false,
             radius_counterfactual: false,
+            repo_skeleton: None,
         }
     }
 }
@@ -227,6 +238,13 @@ impl AgentConfig {
         self.classify_with_model = enabled;
         self
     }
+
+    /// Inject a cache-aware repo-skeleton prefix bounded to `token_budget` estimated tokens
+    /// (§6.1; see [`repo_skeleton`](Self::repo_skeleton)). Requires [`repo_root`](Self::repo_root).
+    pub fn with_repo_skeleton(mut self, token_budget: usize) -> Self {
+        self.repo_skeleton = Some(token_budget);
+        self
+    }
 }
 
 /// A [`Tuner`] that always returns a fixed [`Knobs`] and ignores observations — for callers
@@ -249,6 +267,10 @@ pub struct Agent {
     config: AgentConfig,
     tuner: Arc<dyn Tuner>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
+    /// Lazily-built, shared cache of the repo-skeleton prefix (§6.1): built once on the first
+    /// turn that needs it, reused verbatim afterwards so a long-running `--serve` walks the repo
+    /// only once and the cached prefix stays byte-identical across turns.
+    repo_skeleton: Arc<OnceLock<Option<String>>>,
 }
 
 impl Agent {
@@ -259,6 +281,7 @@ impl Agent {
             config,
             tuner: Arc::new(NoopTuner),
             telemetry: None,
+            repo_skeleton: Arc::new(OnceLock::new()),
         }
     }
 
@@ -298,9 +321,20 @@ impl Agent {
         let config = self.config.clone();
         let tuner = self.tuner.clone();
         let telemetry = self.telemetry.clone();
+        let skeleton_cell = self.repo_skeleton.clone();
 
         tokio::spawn(async move {
-            run_loop(provider, tools, config, tuner, telemetry, history, &tx).await;
+            run_loop(
+                provider,
+                tools,
+                config,
+                tuner,
+                telemetry,
+                skeleton_cell,
+                history,
+                &tx,
+            )
+            .await;
             // tx drops here, closing the stream.
         });
 
@@ -320,18 +354,30 @@ impl AgentHandle for Agent {
 
 type Sink = mpsc::UnboundedSender<Result<Event, AgentError>>;
 
+// The agent's owned, already-cloned dependencies threaded in once per task; grouping them into a
+// struct would just move the same fields behind an extra indirection without aiding clarity.
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     provider: Arc<dyn Provider>,
     tools: ToolRegistry,
     config: AgentConfig,
     tuner: Arc<dyn Tuner>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
+    skeleton_cell: Arc<OnceLock<Option<String>>>,
     mut history: Vec<Message>,
     tx: &Sink,
 ) {
     let started = std::time::Instant::now();
     let tool_defs = tools.defs();
     let caps = provider.capabilities();
+    // Cache-aware repo-skeleton prefix (§6.1): build the bounded whole-repo skeleton once (shared
+    // across turns via the `OnceLock`), then inject it as the cached first block of each request.
+    let repo_skeleton: Option<&str> = match (config.repo_skeleton, config.repo_root.as_deref()) {
+        (Some(budget), Some(root)) => skeleton_cell
+            .get_or_init(|| build_repo_skeleton(root, budget))
+            .as_deref(),
+        _ => None,
+    };
     let mut total = Usage::default();
     // Classify against the latest user turn (the task); earlier seeded turns are context.
     let task_text = history.last().map(|m| m.text()).unwrap_or_default();
@@ -421,7 +467,15 @@ async fn run_loop(
             _ => config.model.as_str(),
         };
 
-        let req = build_request(&config, active_model, &tool_defs, &caps, &knobs, &history);
+        let req = build_request(
+            &config,
+            active_model,
+            &tool_defs,
+            &caps,
+            &knobs,
+            &history,
+            repo_skeleton,
+        );
         let mut stream = match provider.stream(req).await {
             Ok(s) => s,
             Err(e) => {
@@ -1155,7 +1209,80 @@ fn profile_repo(root: &Path) -> RepoProfile {
     }
 }
 
+/// Build the cache-aware repo-skeleton prefix (§6.1): a deterministic, token-bounded outline of
+/// every recognised source file under `root`. Each file is tree-sitter–skeletonised (signatures
+/// only, bodies elided) and emitted under a `===== <relative path> =====` header. Files are
+/// visited in **sorted path order** so the result is byte-identical across runs (a moving prefix
+/// would never cache); accumulation stops once the estimated token count reaches `token_budget`.
+/// Returns `None` when nothing skeletonisable is found. Best-effort: unreadable files are skipped.
+fn build_repo_skeleton(root: &Path, token_budget: usize) -> Option<String> {
+    const MAX_FILES: usize = 20_000;
+    fn skip_dir(name: &str) -> bool {
+        name.starts_with('.')
+            || matches!(
+                name,
+                "target" | "node_modules" | "dist" | "build" | "vendor" | "__pycache__"
+            )
+    }
+
+    // Collect candidate source-file paths (bounded), then sort for a stable prefix.
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if paths.len() >= MAX_FILES {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            if ft.is_dir() {
+                if !skip_dir(&entry.file_name().to_string_lossy()) {
+                    stack.push(path);
+                }
+            } else if ft.is_file() && path.to_str().and_then(Lang::from_path).is_some() {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+
+    let mut out = String::new();
+    for path in &paths {
+        let Some(rel) = path.strip_prefix(root).ok().and_then(Path::to_str) else {
+            continue;
+        };
+        let Ok(source) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Some(skel) = path
+            .to_str()
+            .and_then(|p| lvz_context::skeleton::skeletonize_path(p, &source))
+        else {
+            continue;
+        };
+        let _ = write!(out, "===== {rel} =====\n{skel}\n\n");
+        if estimate_tokens(&out) >= token_budget {
+            break;
+        }
+    }
+
+    let out = out.trim_end().to_string();
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// Assemble a request, marking the stable prefix cacheable iff the provider supports caching.
+///
+/// When `repo_skeleton` is set it is prepended as the **first content block of the first user
+/// message** and marked cacheable (§6.1): ordered immutable→stable→volatile, it extends the cached
+/// prefix (system + tool defs + skeleton) ahead of the volatile conversation, so a caching provider
+/// pays for it once and re-reads it cheaply on every later round-trip and same-repo task.
 fn build_request(
     config: &AgentConfig,
     model: &str,
@@ -1163,6 +1290,7 @@ fn build_request(
     caps: &Capabilities,
     knobs: &Knobs,
     history: &[Message],
+    repo_skeleton: Option<&str>,
 ) -> ChatRequest {
     let mut req = ChatRequest::new(model.to_string()).max_tokens(config.max_tokens);
     req.system = Some(SystemPrompt {
@@ -1177,6 +1305,19 @@ fn build_request(
     }
     req.tools = defs;
     req.messages = history.to_vec();
+    if let Some(skeleton) = repo_skeleton {
+        if let Some(first) = req.messages.first_mut() {
+            // Prepend the skeleton ahead of the conversation, with a cache breakpoint after it so
+            // [system + tools + skeleton] is the cached prefix and the task text stays volatile.
+            first.content.insert(
+                0,
+                ContentBlock::Text {
+                    text: format!("<repo_skeleton>\n{skeleton}\n</repo_skeleton>"),
+                    cache: caps.prompt_caching,
+                },
+            );
+        }
+    }
     req
 }
 
@@ -1855,6 +1996,116 @@ fn target() -> u32 { helper() + 10 }
         assert_eq!(profile.primary_language, "rust");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_skeleton_is_deterministic_and_skips_build_dirs() {
+        let dir = std::env::temp_dir().join(format!("lvz_skel_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::write(
+            dir.join("src/a.rs"),
+            "pub fn alpha(x: i32) -> i32 { x + 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/b.rs"), "pub fn beta() -> bool { true }\n").unwrap();
+        std::fs::write(dir.join("README.md"), "# not source\n").unwrap();
+        std::fs::write(dir.join("target/debug/junk.rs"), "fn junk() {}\n").unwrap();
+
+        let s1 = build_repo_skeleton(&dir, 10_000).expect("some skeleton");
+        let s2 = build_repo_skeleton(&dir, 10_000).expect("some skeleton");
+        // Byte-identical across runs (sorted walk) — required for a stable cache prefix.
+        assert_eq!(s1, s2);
+        // Signatures kept, bodies elided; both source files present, target/ skipped.
+        assert!(s1.contains("pub fn alpha(x: i32) -> i32"));
+        assert!(s1.contains("pub fn beta() -> bool"));
+        assert!(s1.contains("===== src/a.rs ====="));
+        assert!(!s1.contains("junk"));
+        // Sorted order: a.rs precedes b.rs.
+        assert!(s1.find("src/a.rs").unwrap() < s1.find("src/b.rs").unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_skeleton_respects_token_budget() {
+        let dir = std::env::temp_dir().join(format!("lvz_skelbudget_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..50 {
+            std::fs::write(
+                dir.join(format!("f{i:02}.rs")),
+                format!("pub fn func_{i}(arg: i32) -> i32 {{ arg }}\n"),
+            )
+            .unwrap();
+        }
+        // A tiny budget must stop early — far short of skeletonising all 50 files.
+        let skel = build_repo_skeleton(&dir, 30).expect("some skeleton");
+        assert!(estimate_tokens(&skel) < 80, "budget not respected: {skel}");
+        assert!(skel.contains("func_0"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_request_injects_cached_skeleton_prefix() {
+        let config = AgentConfig::default();
+        let caps = Capabilities {
+            prompt_caching: true,
+            ..Capabilities::default()
+        };
+        let history = vec![Message::user("do the task")];
+        let req = build_request(
+            &config,
+            "m",
+            &[],
+            &caps,
+            &Knobs::default(),
+            &history,
+            Some("===== src/a.rs =====\npub fn alpha()"),
+        );
+        // The skeleton is the first block of the first message, cached, ahead of the task text.
+        let first = &req.messages[0].content;
+        match &first[0] {
+            ContentBlock::Text { text, cache } => {
+                assert!(text.contains("<repo_skeleton>"));
+                assert!(text.contains("pub fn alpha()"));
+                assert!(*cache, "skeleton block must carry the cache breakpoint");
+            }
+            other => panic!("expected a cached text block first, got {other:?}"),
+        }
+        // The original task text follows the skeleton block (still volatile, after the breakpoint).
+        match &first[1] {
+            ContentBlock::Text { text, cache } => {
+                assert_eq!(text, "do the task");
+                assert!(!cache);
+            }
+            other => panic!("expected the task text block second, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_request_skeleton_uncached_when_provider_lacks_caching() {
+        let config = AgentConfig::default();
+        let caps = Capabilities {
+            prompt_caching: false,
+            ..Capabilities::default()
+        };
+        let history = vec![Message::user("task")];
+        let req = build_request(
+            &config,
+            "m",
+            &[],
+            &caps,
+            &Knobs::default(),
+            &history,
+            Some("skel"),
+        );
+        match &req.messages[0].content[0] {
+            ContentBlock::Text { cache, .. } => assert!(!cache, "no caching ⇒ no breakpoint"),
+            other => panic!("expected a text block, got {other:?}"),
+        }
     }
 
     /// A tool that returns a fixed, sizeable string — used to grow history quickly so

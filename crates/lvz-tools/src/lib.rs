@@ -165,9 +165,10 @@ mod tests {
             )
             .await
             .unwrap();
-        // Signature kept, body elided.
+        // Signature kept, body elided. (Check a body token that can't appear in the path header,
+        // not a bare "41" — the temp dir embeds the PID, which may itself contain "41".)
         assert!(out.content.contains("fn keep_sig"));
-        assert!(!out.content.contains("41"));
+        assert!(!out.content.contains("let x = 41"));
         assert!(out.content.contains("===== "));
 
         std::fs::remove_dir_all(&dir).ok();

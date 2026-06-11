@@ -173,6 +173,14 @@ struct Cli {
     /// set); falls back to the heuristic on failure. Mainly useful paired with `--tune`.
     #[arg(long)]
     classify_with_model: bool,
+
+    /// Inject a cache-aware repo-skeleton prefix (`RECIPE.md` §6.1) bounded to this many estimated
+    /// tokens (--agent/--serve): a tree-sitter outline of every source file in the working dir,
+    /// built once and placed in the cached prompt prefix so the model sees whole-repo structure
+    /// without per-task reads. Most valuable on a caching provider (Anthropic) and a long-running
+    /// `--serve`; on a non-caching provider it still adds the skeleton but without amortisation.
+    #[arg(long, value_name = "TOKENS")]
+    repo_skeleton: Option<usize>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -336,6 +344,9 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
     }
     if cli.classify_with_model {
         config = config.with_model_classification(true);
+    }
+    if let Some(budget) = cli.repo_skeleton {
+        config = config.with_repo_skeleton(budget);
     }
     // Profile the working directory so the tuner sees a real repo shape (§6.6).
     if let Ok(cwd) = std::env::current_dir() {

@@ -245,12 +245,13 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   variant). The §10 roadmap is fully landed (per-repo keying, observation decay, the radius
   counterfactual's residency-scaled downstream model, and Bayesian optimisation); only on-disk
   `BayesTuner` persistence and deeper (reasoning-level) radius modelling remain (`docs/ATO.md` §10).
-- **Telemetry (§6.4).** Usage is aggregated, the `--budget` ceiling is enforced, and the
-  **HTTP gateway now exports Prometheus `/metrics`** (tokens, cache read/creation, turns,
-  errors, summed latency). The per-task ATO success signal now exists (`--verify-cmd`). Still
-  missing: an in-process telemetry hook on the CLI/agent path (the `/metrics` recorder lives in
-  `lvz-gw-http`, so one-shot `--agent` runs aren't yet counted); cache-hit-rate is derivable from
-  the exported counters but not surfaced as its own gauge.
+- **Telemetry (§6.4).** Usage is aggregated, the `--budget` ceiling is enforced, the
+  **HTTP gateway exports Prometheus `/metrics`** (tokens, cache read/creation, turns,
+  errors, summed latency), and the **CLI/agent path now has an in-process hook** —
+  `Agent::with_telemetry(Arc<dyn TelemetrySink>)` emits a per-task `TaskTelemetry`, surfaced
+  by `--telemetry` (one-shot `--agent` runs print a stderr summary line). The per-task ATO
+  success signal exists (`--verify-cmd`). Still missing: cache-hit-rate as its own `/metrics`
+  gauge (it's derivable from the exported counters but not surfaced separately).
 - **Skeleton fidelity.** Python docstrings are currently elided with the body (RECIPE wants
   them kept). The symbol-dependency graph is a name-based heuristic (no scope/name
   resolution; same-named symbols across files merge) — fine for `N`, not a semantic index.
@@ -260,8 +261,19 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   `paths` array, return per-file sections under `===== <path> =====` headers, inline per-file
   read errors), the `batch_width` knob caps the `paths` array agent-side (`apply_knobs_to_args`),
   and `system_with_knobs` steers the model to the batch tools. Live-verified (one `read_files`
-  call fetched 3 files in one round-trip). **Cache-aware repo-skeleton prefix** is still not
-  implemented — caching marks only the system prompt + last tool def.
+  call fetched 3 files in one round-trip).
+- **Cache-aware repo-skeleton prefix (§6.1) — implemented.** `AgentConfig.repo_skeleton:
+  Option<usize>` (CLI `--repo-skeleton <TOKENS>`): `build_repo_skeleton` does a bounded, sorted
+  (deterministic ⇒ byte-stable) walk of `repo_root`, tree-sitter–skeletonises every source file to
+  a token budget, and the result is built **once** (memoised in an `Arc<OnceLock>` on the `Agent`)
+  and injected by `build_request` as the **first content block of the first user message**, marked
+  cacheable. Ordered immutable→stable→volatile, it extends the cached prefix (system + tool defs +
+  skeleton) ahead of the volatile conversation, so a caching provider pays for it once and re-reads
+  it cheaply each later round-trip / same-repo task. Off by default; most valuable with Anthropic
+  caching + a long-running `--serve`. Unit-tested (determinism, budget, cached-prefix injection)
+  and **live-verified vs Anthropic** (`claude-haiku-4-5`, `--repo-skeleton 4000`): a 2-round-trip
+  task showed the prefix `cache_creation` on turn 1 then `cache_read` on turn 2 (~99% cache hit).
+  Caching now marks the system prompt, the last tool def, **and** the repo-skeleton block.
 
 ### Gotchas
 
@@ -338,7 +350,8 @@ in-memory), `--serve-matrix` (Matrix gateway), `--api-key <KEY>` (repeatable) / 
 (post-task success gate), `--tune-state <path>` (persist learned profiles; `--tune` only),
 `--tune-decay <F>` (observation-decay EWMA) and `--radius-counterfactual` (opt-in, unsound radius
 counterfactual), `--telemetry` (per-task stderr summary), `--classify-with-model` (model archetype
-classification), `--cheap-model`/`--escalate-after` (cheap-model-first) and `--advisor-model` (advisor+executor
+classification), `--repo-skeleton <TOKENS>` (cache-aware repo-skeleton prefix, §6.1),
+`--cheap-model`/`--escalate-after` (cheap-model-first) and `--advisor-model` (advisor+executor
 split) for §8 cost reduction. Gateway HTTP
 routes: `GET /health`, `GET /metrics` (Prometheus), `POST /v1/turns` (SSE), `GET /v1/ws`
 (WebSocket). Env: `XAI_API_KEY`/`XAI_BASE_URL`/`XAI_GRPC_ENDPOINT`, **`XAI_TRANSPORT=grpc|http`
