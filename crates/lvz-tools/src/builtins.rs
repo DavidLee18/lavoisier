@@ -50,6 +50,65 @@ impl Tool for ReadFileTool {
     }
 }
 
+/// `read_files` — read several files in one round-trip (`RECIPE.md` §6.1 multi-file batching).
+pub struct ReadFilesTool;
+
+#[derive(Deserialize)]
+struct ReadFilesArgs {
+    paths: Vec<String>,
+}
+
+/// Concatenate per-file sections under `===== <path> =====` headers; a read failure for one file
+/// is inlined as an error section so the rest of the batch still returns.
+fn join_sections(sections: impl IntoIterator<Item = (String, String)>) -> String {
+    sections
+        .into_iter()
+        .map(|(path, body)| format!("===== {path} =====\n{body}"))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+#[async_trait]
+impl Tool for ReadFilesTool {
+    fn name(&self) -> &str {
+        "read_files"
+    }
+
+    fn description(&self) -> &str {
+        "Read several files at once and return them concatenated under per-file headers. Prefer \
+         this over multiple read_file calls when you need more than one file — it costs one \
+         round-trip instead of several. A failure to read one file is reported inline; the rest \
+         still return."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Paths to read, relative to the working directory"
+                }
+            },
+            "required": ["paths"]
+        })
+    }
+
+    async fn invoke(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let ReadFilesArgs { paths } = parse_args(args)?;
+        let mut sections = Vec::with_capacity(paths.len());
+        for path in paths {
+            let body = match tokio::fs::read_to_string(&path).await {
+                Ok(content) => content,
+                Err(e) => format!("[error: {e}]"),
+            };
+            sections.push((path, body));
+        }
+        Ok(ToolOutput::ok(join_sections(sections)))
+    }
+}
+
 /// `write_file` — create or overwrite a file with the given contents.
 pub struct WriteFileTool;
 

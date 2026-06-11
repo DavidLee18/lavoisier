@@ -244,10 +244,12 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   resolution; same-named symbols across files merge) — fine for `N`, not a semantic index.
   `outline_file --focus` builds a single-file graph (the multi-file graph in
   `lvz-context::symbols` is used by the budget loop, not the tool).
-- **Multi-file batching (§6.1)** is encouraged via the `batch_width` system-prompt hint (the
-  model is asked to issue independent reads/edits in one parallel turn) but there's no dedicated
-  batching tool/infrastructure; **cache-aware repo-skeleton prefix** is not implemented — caching
-  currently marks only the system prompt + last tool def.
+- **Multi-file batching (§6.1)** is implemented: `read_files`/`outline_files` batch tools (take a
+  `paths` array, return per-file sections under `===== <path> =====` headers, inline per-file
+  read errors), the `batch_width` knob caps the `paths` array agent-side (`apply_knobs_to_args`),
+  and `system_with_knobs` steers the model to the batch tools. Live-verified (one `read_files`
+  call fetched 3 files in one round-trip). **Cache-aware repo-skeleton prefix** is still not
+  implemented — caching marks only the system prompt + last tool def.
 
 ### Gotchas
 

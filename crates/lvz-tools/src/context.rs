@@ -73,14 +73,80 @@ impl Tool for OutlineFileTool {
             Ok(s) => s,
             Err(e) => return Ok(ToolOutput::error(format!("outline_file {path}: {e}"))),
         };
-        let outline = match Lang::from_path(&path) {
-            Some(lang) => match focus {
-                Some(target) => skeleton_with_radius(&source, lang, &target, radius.unwrap_or(1)),
-                None => skeleton::skeleton(&source, lang),
-            },
-            None => source,
-        };
+        let outline = outline_source(&path, &source, focus.as_deref(), radius.unwrap_or(1));
         Ok(ToolOutput::ok(outline))
+    }
+}
+
+/// Skeletonise one file's source (the shared core of `outline_file`/`outline_files`): apply
+/// `focus`+`radius` when supported, fall back to a plain skeleton, or the raw file for an
+/// unsupported language. Read errors are surfaced by the caller.
+fn outline_source(path: &str, source: &str, focus: Option<&str>, radius: u8) -> String {
+    match Lang::from_path(path) {
+        Some(lang) => match focus {
+            Some(target) => skeleton_with_radius(source, lang, target, radius),
+            None => skeleton::skeleton(source, lang),
+        },
+        None => source.to_string(),
+    }
+}
+
+/// `outline_files` — skeletons of several files in one round-trip (`RECIPE.md` §6.1 batching).
+pub struct OutlineFilesTool;
+
+#[derive(Deserialize)]
+struct OutlineFilesArgs {
+    paths: Vec<String>,
+    #[serde(default)]
+    focus: Option<String>,
+    #[serde(default)]
+    radius: Option<u8>,
+}
+
+#[async_trait]
+impl Tool for OutlineFilesTool {
+    fn name(&self) -> &str {
+        "outline_files"
+    }
+
+    fn description(&self) -> &str {
+        "Return token-efficient skeletons of several source files at once, concatenated under \
+         per-file headers. Prefer this over multiple outline_file calls when surveying more than \
+         one file — one round-trip instead of several. Optional `focus`/`radius` apply to each \
+         file. A failure to read one file is reported inline; the rest still return."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Paths to the source files"
+                },
+                "focus": { "type": "string", "description": "Symbol to expand around in each file (keep its body + dependencies)" },
+                "radius": { "type": "integer", "minimum": 0, "description": "Dependency-hop radius for focus (default 1)" }
+            },
+            "required": ["paths"]
+        })
+    }
+
+    async fn invoke(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let OutlineFilesArgs {
+            paths,
+            focus,
+            radius,
+        } = parse_args(args)?;
+        let mut sections = Vec::with_capacity(paths.len());
+        for path in paths {
+            let body = match tokio::fs::read_to_string(&path).await {
+                Ok(source) => outline_source(&path, &source, focus.as_deref(), radius.unwrap_or(1)),
+                Err(e) => format!("[error: {e}]"),
+            };
+            sections.push(format!("===== {path} =====\n{body}"));
+        }
+        Ok(ToolOutput::ok(sections.join("\n\n")))
     }
 }
 

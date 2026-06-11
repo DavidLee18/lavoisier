@@ -451,16 +451,16 @@ async fn run_loop(
 
         let mut results = Vec::with_capacity(turn.tool_calls.len());
         for call in &turn.tool_calls {
-            // Wire the skeleton-radius knob (§6.6): when the model outlines a focus symbol but
-            // doesn't pick a radius, supply the tuner-chosen one so ATO's choice takes effect.
+            // Enforce the agent-side knobs (§6.6/§6.1): inject the tuner's skeleton radius into
+            // focused outlines and cap batch `paths` to batch_width.
             let original_args = call.parsed_args();
             // Snapshot the skeleton (pre-injection args) for the radius counterfactual, if on.
             if config.radius_counterfactual {
-                if let Some(trace) = capture_radius_trace(&call.name, &original_args).await {
-                    radius_traces.push(trace);
-                }
+                radius_traces.extend(
+                    capture_radius_traces(&call.name, &original_args, knobs.batch_width).await,
+                );
             }
-            let args = apply_skeleton_radius(&call.name, original_args, knobs.skeleton_radius);
+            let args = apply_knobs_to_args(&call.name, original_args, &knobs);
             let block = match tools.invoke(&call.name, args).await {
                 Ok(out) => {
                     // Record the pre-truncation size for counterfactual truncate-knob crediting.
@@ -604,15 +604,15 @@ async fn run_verify(config: &AgentConfig) -> bool {
 }
 
 /// Append knob-derived behavioural guidance to the system prompt. Today this carries the
-/// [`batch_width`](Knobs::batch_width) knob (§6.1/§6.6): when the provider can run tools in
-/// parallel and the knob allows batching, the model is told to issue independent reads/edits
-/// together (fewer round-trips → fewer cached-prefix re-sends). The suffix is stable for the
-/// whole task (knobs are selected once), so it stays inside the cacheable prefix.
-fn system_with_knobs(base: &str, knobs: &Knobs, caps: &Capabilities) -> String {
-    if caps.parallel_tool_use && knobs.batch_width > 1 {
+/// [`batch_width`](Knobs::batch_width) knob (§6.1/§6.6): when batching is allowed, the model is
+/// told to gather several files with the batch tools (`read_files`/`outline_files`) in one
+/// round-trip rather than one call per file. The suffix is stable for the whole task (knobs are
+/// selected once), so it stays inside the cacheable prefix.
+fn system_with_knobs(base: &str, knobs: &Knobs) -> String {
+    if knobs.batch_width > 1 {
         format!(
-            "{base}\nWhen multiple independent files need reading or editing, issue up to {} \
-             tool calls in a single turn rather than one at a time.",
+            "{base}\nWhen you need several files, fetch them in one round-trip: use read_files / \
+             outline_files (up to {} paths) instead of one call per file.",
             knobs.batch_width
         )
     } else {
@@ -620,15 +620,27 @@ fn system_with_knobs(base: &str, knobs: &Knobs, caps: &Capabilities) -> String {
     }
 }
 
-/// Apply the [`skeleton_radius`](Knobs::skeleton_radius) knob to an `outline_file` call: when
-/// the model supplied a `focus` but left `radius` unset, inject the tuner-chosen radius so the
-/// knob actually governs how much dependency context the skeleton includes (§6.6). Any other
-/// tool, or a call that already pins `radius`, is passed through untouched.
-fn apply_skeleton_radius(tool: &str, mut args: Value, radius: u8) -> Value {
-    if tool == "outline_file" {
-        if let Some(obj) = args.as_object_mut() {
-            if obj.contains_key("focus") && !obj.contains_key("radius") {
-                obj.insert("radius".to_string(), json!(radius));
+/// Names of the outline tools the skeleton-radius knob governs (single- and multi-file).
+const OUTLINE_TOOLS: [&str; 2] = ["outline_file", "outline_files"];
+/// Names of the batch tools whose `paths` array the [`batch_width`](Knobs::batch_width) knob caps.
+const BATCH_TOOLS: [&str; 2] = ["read_files", "outline_files"];
+
+/// Apply the [`Knobs`] the agent enforces directly to a tool call's arguments (§6.6, §6.1):
+/// - **skeleton radius:** for an outline call that `focus`es a symbol but left `radius` unset,
+///   inject the tuner-chosen radius so the knob governs how much dependency context is kept;
+/// - **batch width:** for a batch tool (`read_files`/`outline_files`), truncate an over-long
+///   `paths` array to `batch_width`, bounding how many files one round-trip pulls.
+///
+/// A call that already pins `radius`, or any other tool, is otherwise passed through untouched.
+fn apply_knobs_to_args(tool: &str, mut args: Value, knobs: &Knobs) -> Value {
+    if let Some(obj) = args.as_object_mut() {
+        if OUTLINE_TOOLS.contains(&tool) && obj.contains_key("focus") && !obj.contains_key("radius")
+        {
+            obj.insert("radius".to_string(), json!(knobs.skeleton_radius));
+        }
+        if BATCH_TOOLS.contains(&tool) {
+            if let Some(Value::Array(paths)) = obj.get_mut("paths") {
+                paths.truncate(knobs.batch_width as usize);
             }
         }
     }
@@ -653,28 +665,46 @@ impl RadiusTrace {
     }
 }
 
-/// Capture a [`RadiusTrace`] for an `outline_file` call **iff** it is the knob-governed kind:
-/// the model asked to `focus` a symbol but left `radius` unset (so the tuner's radius was
-/// injected by [`apply_skeleton_radius`]). Calls where the model pinned an explicit radius are
-/// its own choice, not the knob's, and are skipped. Returns `None` for anything else, or if the
-/// file can't be read or its language isn't supported.
-async fn capture_radius_trace(tool: &str, args: &Value) -> Option<RadiusTrace> {
-    if tool != "outline_file" {
-        return None;
+/// Capture [`RadiusTrace`]s for a knob-governed outline call (`outline_file` → one path,
+/// `outline_files` → its `paths`) **iff** the model asked to `focus` a symbol but left `radius`
+/// unset — so the tuner's radius was injected by [`apply_knobs_to_args`]. Calls that pin an
+/// explicit radius are the model's choice, not the knob's, and yield nothing; ditto unsupported
+/// languages or unreadable files. The `paths` are capped to `batch_width` to mirror the actual
+/// invocation (the over-long tail never runs, so it must not be credited).
+async fn capture_radius_traces(tool: &str, args: &Value, batch_width: u8) -> Vec<RadiusTrace> {
+    let Some(obj) = args.as_object() else {
+        return Vec::new();
+    };
+    if !OUTLINE_TOOLS.contains(&tool) || obj.contains_key("radius") {
+        return Vec::new();
     }
-    let obj = args.as_object()?;
-    if obj.contains_key("radius") {
-        return None; // model pinned the radius — not the knob's call
+    let Some(focus) = obj.get("focus").and_then(|f| f.as_str()) else {
+        return Vec::new();
+    };
+    // Single `path` (outline_file) or a `paths` array (outline_files), capped to batch_width.
+    let paths: Vec<String> = match (obj.get("path"), obj.get("paths")) {
+        (Some(Value::String(p)), _) => vec![p.clone()],
+        (_, Some(Value::Array(ps))) => ps
+            .iter()
+            .filter_map(|p| p.as_str().map(str::to_string))
+            .take(batch_width as usize)
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut traces = Vec::new();
+    for path in paths {
+        let Some(lang) = Lang::from_path(&path) else {
+            continue;
+        };
+        if let Ok(source) = tokio::fs::read_to_string(&path).await {
+            traces.push(RadiusTrace {
+                source,
+                lang,
+                focus: focus.to_string(),
+            });
+        }
     }
-    let focus = obj.get("focus")?.as_str()?.to_string();
-    let path = obj.get("path")?.as_str()?;
-    let lang = Lang::from_path(path)?;
-    let source = tokio::fs::read_to_string(path).await.ok()?;
-    Some(RadiusTrace {
-        source,
-        lang,
-        focus,
-    })
+    traces
 }
 
 /// The result of a successful compaction: a shrunken history and the tokens it cost.
@@ -1001,7 +1031,7 @@ fn build_request(
 ) -> ChatRequest {
     let mut req = ChatRequest::new(model.to_string()).max_tokens(config.max_tokens);
     req.system = Some(SystemPrompt {
-        text: system_with_knobs(&config.system, knobs, caps),
+        text: system_with_knobs(&config.system, knobs),
         cache: caps.prompt_caching,
     });
     let mut defs = tool_defs.to_vec();
@@ -1272,42 +1302,62 @@ mod tests {
 
     #[test]
     fn skeleton_radius_injected_only_for_focused_outline_without_radius() {
+        let r3 = Knobs {
+            skeleton_radius: 3,
+            ..Knobs::default()
+        };
         // outline_file with a focus and no radius → the knob's radius is injected.
-        let got = apply_skeleton_radius("outline_file", json!({"path": "a.rs", "focus": "f"}), 3);
+        let got = apply_knobs_to_args("outline_file", json!({"path": "a.rs", "focus": "f"}), &r3);
+        assert_eq!(got["radius"], json!(3));
+        // outline_files (batch) is governed too.
+        let got = apply_knobs_to_args(
+            "outline_files",
+            json!({"paths": ["a.rs"], "focus": "f"}),
+            &r3,
+        );
         assert_eq!(got["radius"], json!(3));
         // A radius the model already set is left alone.
-        let got = apply_skeleton_radius("outline_file", json!({"focus": "f", "radius": 1}), 3);
+        let got = apply_knobs_to_args("outline_file", json!({"focus": "f", "radius": 1}), &r3);
         assert_eq!(got["radius"], json!(1));
         // No focus → nothing to expand, no radius added.
-        let got = apply_skeleton_radius("outline_file", json!({"path": "a.rs"}), 3);
+        let got = apply_knobs_to_args("outline_file", json!({"path": "a.rs"}), &r3);
         assert!(got.get("radius").is_none());
-        // A different tool is untouched.
-        let got = apply_skeleton_radius("read_file", json!({"path": "a.rs"}), 3);
+        // A non-outline tool is untouched.
+        let got = apply_knobs_to_args("read_file", json!({"path": "a.rs"}), &r3);
         assert!(got.get("radius").is_none());
     }
 
     #[test]
-    fn batch_width_hint_gated_on_capability_and_knob() {
-        let base = "BASE";
-        let parallel = Capabilities {
-            parallel_tool_use: true,
-            ..Capabilities::default()
+    fn batch_width_caps_paths_for_batch_tools() {
+        let w2 = Knobs {
+            batch_width: 2,
+            ..Knobs::default()
         };
-        // Parallel-capable + batch_width > 1 → the hint is appended with the width.
-        let s = system_with_knobs(base, &Knobs::default(), &parallel);
+        // read_files paths are capped to batch_width.
+        let got = apply_knobs_to_args("read_files", json!({"paths": ["a", "b", "c", "d"]}), &w2);
+        assert_eq!(got["paths"], json!(["a", "b"]));
+        // outline_files too.
+        let got = apply_knobs_to_args("outline_files", json!({"paths": ["a", "b", "c"]}), &w2);
+        assert_eq!(got["paths"], json!(["a", "b"]));
+        // A non-batch tool's args are untouched.
+        let got = apply_knobs_to_args("read_file", json!({"path": "a"}), &w2);
+        assert_eq!(got, json!({"path": "a"}));
+    }
+
+    #[test]
+    fn batch_hint_appended_only_when_batching_allowed() {
+        let base = "BASE";
+        // batch_width > 1 → the hint names the batch tools and the width.
+        let s = system_with_knobs(base, &Knobs::default());
         assert!(s.starts_with(base));
+        assert!(s.contains("read_files"));
         assert!(s.contains("up to 4"));
         // batch_width == 1 → no hint.
         let one = Knobs {
             batch_width: 1,
             ..Knobs::default()
         };
-        assert_eq!(system_with_knobs(base, &one, &parallel), base);
-        // No parallel tool use → no hint regardless of the knob.
-        assert_eq!(
-            system_with_knobs(base, &Knobs::default(), &Capabilities::default()),
-            base
-        );
+        assert_eq!(system_with_knobs(base, &one), base);
     }
 
     #[tokio::test]
