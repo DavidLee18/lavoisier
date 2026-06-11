@@ -42,6 +42,7 @@ lvz-xai = { path = "crates/lvz-xai" }
 lvz-tools = { path = "crates/lvz-tools" }
 lvz-agent = { path = "crates/lvz-agent" }
 lvz-context = { path = "crates/lvz-context" }
+lvz-memory = { path = "crates/lvz-memory" }
 lvz-gw-http = { path = "crates/lvz-gw-http" }
 
 [profile.release]

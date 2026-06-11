@@ -182,15 +182,25 @@ impl Agent {
     /// Per-round-trip `Usage`/`Done` events are suppressed; the caller sees exactly one
     /// terminal `Usage` (the task total, including any compaction call) followed by one `Done`.
     pub fn run(&self, input: impl Into<String>) -> BoxStream<'static, Result<Event, AgentError>> {
+        self.run_seeded(vec![Message::user(input.into())])
+    }
+
+    /// Like [`run`](Self::run), but seeded with a prior conversation transcript (the last
+    /// message is the new user turn). This is how a session-aware caller (`lvz-memory`)
+    /// continues a multi-turn conversation: the agent classifies + runs against the latest
+    /// user message while the earlier turns provide context (`RECIPE.md` §7.3).
+    pub fn run_seeded(
+        &self,
+        history: Vec<Message>,
+    ) -> BoxStream<'static, Result<Event, AgentError>> {
         let (tx, rx) = mpsc::unbounded();
         let provider = self.provider.clone();
         let tools = self.tools.clone();
         let config = self.config.clone();
         let tuner = self.tuner.clone();
-        let input = input.into();
 
         tokio::spawn(async move {
-            run_loop(provider, tools, config, tuner, input, &tx).await;
+            run_loop(provider, tools, config, tuner, history, &tx).await;
             // tx drops here, closing the stream.
         });
 
@@ -215,13 +225,15 @@ async fn run_loop(
     tools: ToolRegistry,
     config: AgentConfig,
     tuner: Arc<dyn Tuner>,
-    input: String,
+    mut history: Vec<Message>,
     tx: &Sink,
 ) {
     let tool_defs = tools.defs();
     let caps = provider.capabilities();
+    // Classify against the latest user turn (the task); earlier seeded turns are context.
+    let task_text = history.last().map(|m| m.text()).unwrap_or_default();
     let ctx = TaskContext {
-        archetype: classify_archetype(&input),
+        archetype: classify_archetype(&task_text),
         repo: config
             .repo_root
             .as_deref()
@@ -232,7 +244,6 @@ async fn run_loop(
     };
     let knobs = tuner.select(&ctx);
 
-    let mut history: Vec<Message> = vec![Message::user(input)];
     let mut total = Usage::default();
     let mut round_trips: u32 = 0;
 

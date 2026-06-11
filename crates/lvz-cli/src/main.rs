@@ -19,6 +19,7 @@ use futures::StreamExt;
 use lvz_agent::{Agent, AgentConfig, FixedTuner};
 use lvz_anthropic::AnthropicProvider;
 use lvz_gw_http::HttpGateway;
+use lvz_memory::{InMemoryStore, SessionAgent};
 use lvz_protocol::{AgentHandle, ChatRequest, Event, Gateway, Knobs, Message, Provider};
 use lvz_tools::ToolRegistry;
 use lvz_xai::XaiProvider;
@@ -125,7 +126,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Gateway mode: run the HTTP/WebSocket server over the shared agent and never return until
     // shutdown. No prompt is consumed.
     if let Some(addr) = cli.serve.clone() {
-        let agent: Arc<dyn AgentHandle> = Arc::new(build_agent(provider, model, &cli));
+        // Wrap the agent in process-local session memory so each `session` continues its own
+        // conversation across turns (RECIPE §7.3).
+        let inner = Arc::new(build_agent(provider, model, &cli));
+        let agent: Arc<dyn AgentHandle> =
+            Arc::new(SessionAgent::new(inner, Arc::new(InMemoryStore::new())));
         let gateway = Arc::new(HttpGateway::bind(&addr)?);
         eprintln!(
             "lavoisier: HTTP gateway listening on http://{addr} (POST /v1/turns, GET /v1/ws)"
