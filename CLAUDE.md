@@ -183,9 +183,9 @@ sequential workflows that accumulate ≥3 turn-pairs.)
     to AWS (no creds/spend here) — the runbook drives that. HTTP gateway only; Matrix deploy
     deferred (no inbound port; separate service).
 - **Optional tracks (done; live AWS apply + live Matrix still pending).**
-  - **`lvz-tune` (ATO §6.6) — built, full roadmap landed except Bayesian opt.** `LearningTuner`:
+  - **`lvz-tune` (ATO §6.6) — built, full §10 roadmap landed (incl. Bayesian opt).** `LearningTuner`:
     an ε-greedy hill-climb bandit over `Knobs`, keyed by `(archetype, caching, model-tier,
-    model_id)`, exploiting the cheapest *trusted* (success-rate ≥ target) vector — ties broken
+    model_id, repo_id)`, exploiting the cheapest *trusted* (success-rate ≥ target) vector — ties broken
     toward least context carried — and exploring one-step neighbours on a discrete grid centred
     on `Knobs::default()` (the floor it can't regress below). CLI `--tune` swaps it in (precedence
     over `--compact-after`). **Full mechanism in `docs/ATO.md`.** The 2026-06-11 ATO-roadmap
@@ -204,10 +204,19 @@ sequential workflows that accumulate ≥3 turn-pairs.)
     `ContextKey` so a model upgrade starts a fresh profile; **(5) persistence** — `--tune-state
     <path>` (JSON save/load of profiles + PRNG across restarts via a `PersistentTuner` wrapper).
     Live-verified vs Anthropic: `--verify-cmd` exit-code gating (pass→successes 1, fail→0) and the
-    radius counterfactual (a `skeleton_radius:0` row credited alongside the realised `:1`). Still
-    deferred: per-repo profiles, observation decay, Bayesian optimisation. Pair `--tune` with
-    `--verify-cmd` for a production-grade signal; `--tune` alone (and `--radius-counterfactual`)
-    stay experimental.
+    radius counterfactual (a `skeleton_radius:0` row credited alongside the realised `:1`). The
+    2026-06-12 batch closed the rest: **per-repo profiles** (`repo_id` in the `ContextKey`),
+    **observation decay** (`TuneConfig.decay` EWMA, CLI `--tune-decay`), **downstream-effect
+    modelling** (the radius counterfactual scales each saving by a *residency* factor — turns the
+    skeleton was re-sent — collapsing to 1 under caching), and **Bayesian optimisation**:
+    `BayesTuner` (`bayes.rs`), a Thompson-sampling alternative (Beta posterior over success +
+    Gaussian over cost per knob vector; samples and picks the cheapest feasible draw; hand-rolled
+    Box–Muller/Marsaglia–Tsang/Beta samplers, no extra deps), opt-in via `--tune-bayes` (implies
+    `--tune`, precedence over it; in-memory only, so `--tune-state` doesn't apply). Pair `--tune`
+    with `--verify-cmd` for a production-grade signal; `--tune`/`--tune-bayes` alone (and
+    `--radius-counterfactual`) stay experimental. Only deferred now: on-disk persistence for
+    `BayesTuner`, and the radius counterfactual modelling the model's altered *reasoning* (not just
+    skeleton-input bytes).
   - **`lvz-claude-cli` — built, off by default.** A `Provider` shelling out to `claude -p`
     (`--output-format stream-json`), stream-json → `Event`; `Capabilities` all false (no
     caching). Selected only via `--provider claude-cli` (default model `sonnet`; `CLAUDE_CLI_BIN`
@@ -232,9 +241,10 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   success signal is real when `--verify-cmd` is set (post-task exit-code gate), else the coarse
   completion fallback. Archetype classification defaults to the keyword heuristic but can use a
   model call (`--classify-with-model`, opt-in, routed to `--summary-model`). The default tuner is
-  still `NoopTuner` (ATO is opt-in via `--tune`). Remaining ATO gaps are narrow: per-repo profile
-  keying, observation decay, downstream-effect modelling in the radius counterfactual, Bayesian
-  optimisation (`docs/ATO.md` §10).
+  still `NoopTuner` (ATO is opt-in via `--tune`, or `--tune-bayes` for the Thompson-sampling
+  variant). The §10 roadmap is fully landed (per-repo keying, observation decay, the radius
+  counterfactual's residency-scaled downstream model, and Bayesian optimisation); only on-disk
+  `BayesTuner` persistence and deeper (reasoning-level) radius modelling remain (`docs/ATO.md` §10).
 - **Telemetry (§6.4).** Usage is aggregated, the `--budget` ceiling is enforced, and the
   **HTTP gateway now exports Prometheus `/metrics`** (tokens, cache read/creation, turns,
   errors, summed latency). The per-task ATO success signal now exists (`--verify-cmd`). Still
@@ -324,9 +334,11 @@ in-memory), `--serve-matrix` (Matrix gateway), `--api-key <KEY>` (repeatable) / 
 <N per 60s>` (gateway auth/quota), `--provider xai|anthropic|claude-cli`, `--model`,
 `--max-tokens`, `--system`, `--budget` (total-task token ceiling),
 `--summary-model`/`--compact-after`/`--context-limit` (agent efficiency knobs), `--tune`
-(ATO learner) with `--verify-cmd <cmd>` (post-task success gate), `--tune-state <path>`
-(persist learned profiles) and `--radius-counterfactual` (opt-in, unsound radius counterfactual),
-`--cheap-model`/`--escalate-after` (cheap-model-first) and `--advisor-model` (advisor+executor
+(ε-greedy ATO learner) or `--tune-bayes` (Thompson-sampling variant) with `--verify-cmd <cmd>`
+(post-task success gate), `--tune-state <path>` (persist learned profiles; `--tune` only),
+`--tune-decay <F>` (observation-decay EWMA) and `--radius-counterfactual` (opt-in, unsound radius
+counterfactual), `--telemetry` (per-task stderr summary), `--classify-with-model` (model archetype
+classification), `--cheap-model`/`--escalate-after` (cheap-model-first) and `--advisor-model` (advisor+executor
 split) for §8 cost reduction. Gateway HTTP
 routes: `GET /health`, `GET /metrics` (Prometheus), `POST /v1/turns` (SSE), `GET /v1/ws`
 (WebSocket). Env: `XAI_API_KEY`/`XAI_BASE_URL`/`XAI_GRPC_ENDPOINT`, **`XAI_TRANSPORT=grpc|http`
@@ -346,8 +358,8 @@ roadmap landed, both counterfactuals shipped), `lvz-claude-cli`, and advisor mod
 gateway is **out of scope** (dropped at user request — do not build it). Remaining: live
 verification of `lvz-claude-cli` (needs a subscription) and the Matrix gateway (needs a
 homeserver); the M10 AWS apply itself (artifacts ship local-verified — run `infra/README.md`
-against a real account); and the deferred polish (Python docstring fidelity, ATO per-repo
-profiles / observation decay / Bayesian opt).
+against a real account); and the deferred polish (Python docstring fidelity, on-disk `BayesTuner`
+persistence, deeper reasoning-level radius modelling).
 
 ## Conventions
 

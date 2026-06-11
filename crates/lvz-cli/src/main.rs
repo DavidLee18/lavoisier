@@ -27,7 +27,7 @@ use lvz_protocol::{
     TaskTelemetry, TelemetrySink, Tuner,
 };
 use lvz_tools::ToolRegistry;
-use lvz_tune::{LearningTuner, TuneConfig};
+use lvz_tune::{BayesTuner, LearningTuner, TuneConfig};
 use lvz_xai::XaiProvider;
 use std::path::PathBuf;
 
@@ -128,6 +128,14 @@ struct Cli {
     /// and `--tune-state` to persist what it learns across restarts (§6.6, `docs/ATO.md`).
     #[arg(long)]
     tune: bool,
+
+    /// Use the experimental **Bayesian** (Thompson-sampling) ATO tuner instead of the ε-greedy
+    /// hill-climb (`docs/ATO.md` §10). Each knob vector carries a Beta posterior over success and
+    /// a Gaussian over cost; selection *samples* and picks the cheapest feasible draw, so posterior
+    /// uncertainty drives exploration with no explicit ε. Implies `--tune`; takes precedence over it.
+    /// In-memory only — `--tune-state` does not apply (no persistence yet).
+    #[arg(long)]
+    tune_bayes: bool,
 
     /// Shell command run after each task to gate ATO success (the real §6.6 signal): exit 0 ⇒
     /// the change is good, non-zero ⇒ failed. Runs in the working dir, e.g. `cargo test --quiet`.
@@ -334,7 +342,15 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
         config = config.with_repo_root(cwd);
     }
     let mut agent = Agent::new(provider, ToolRegistry::with_builtins(), config);
-    if cli.tune {
+    if cli.tune_bayes {
+        // The experimental Bayesian (Thompson-sampling) learner; takes precedence over the
+        // ε-greedy `--tune` and a fixed `--compact-after`. In-memory only (no `--tune-state`).
+        let mut tune_cfg = TuneConfig::default();
+        if let Some(decay) = cli.tune_decay {
+            tune_cfg.decay = decay;
+        }
+        agent = agent.with_tuner(Arc::new(BayesTuner::with_config(tune_cfg)));
+    } else if cli.tune {
         // The online ATO learner (§6.6); takes precedence over a fixed --compact-after. When a
         // state path is given, load prior profiles (missing ⇒ cold) and persist on drop.
         let mut tune_cfg = TuneConfig::default();

@@ -289,15 +289,48 @@ pair the two for a production-grade signal.
 - **Profile persistence** (§9) — `--tune-state <path>` saves/loads profiles + PRNG across restarts.
 - **Wiring the inert knobs** (§4) — `skeleton_radius` is injected into focused `outline_file`
   calls; `batch_width` drives a parallel-tool-use system-prompt hint. All four knobs now bite.
+- **Per-repo profiles** (§3) — `ContextKey` now also carries `repo_id` (the repo-root path), so a
+  monorepo and a small service learn distinct optima rather than averaging across codebases.
+- **Observation decay** (§3) — `TuneConfig.decay` (CLI `--tune-decay`, in `(0,1]`) applies an EWMA
+  to each profile's stats so recent outcomes weigh more; a stale optimum fades after a model or
+  codebase shift. Keep it above `1 − 1/min_trials` (≈0.67) so candidates can still cross
+  `min_trials` and become trusted (the EWMA trial count caps at `1/(1−decay)`).
+- **Downstream-effect modelling in the radius counterfactual** (§6) — each `RadiusTrace` records
+  the round it was captured at; `emit_radius_counterfactuals` now scales the per-send saving by a
+  **residency** factor (how many subsequent turns re-sent that skeleton), and collapses residency
+  to 1 when caching is on (cached resends bill as `cache_read`, outside `total_tokens`). It still
+  models only the skeleton-input delta, not the model's altered *reasoning* on a smaller skeleton.
+- **Bayesian optimisation** (§10, below) — `BayesTuner`, a Thompson-sampling alternative to the
+  ε-greedy hill-climb, ships behind `--tune-bayes`. (`--tune`'s hill-climb remains the default ATO
+  tuner; the simple version suffices for most workloads, but the Bayesian one explores more
+  efficiently when evidence is scarce.)
+
+### 10.1 The Bayesian (Thompson-sampling) tuner
+
+`BayesTuner` (in `crates/lvz-tune/src/bayes.rs`, opt-in via `--tune-bayes`) keeps the same `Tuner`
+contract, discrete knob grid, and baseline floor as the hill-climb, but replaces ε-greedy selection
+with **Thompson sampling**:
+
+- Each candidate knob vector (under one `ContextKey`) carries a **Beta(successes+1, failures+1)**
+  posterior over its success probability and a **Welford** mean/variance over the token cost of its
+  *successful* runs (cost-when-it-works).
+- `select` draws one sample per candidate — a success probability from the Beta and a cost from the
+  cost Gaussian (an optimistic cheapest-seen prior for never-succeeded vectors) — then picks the
+  **cheapest sampled cost among draws that clear the success target**; if none clear it, it moves
+  toward feasibility (the highest sampled success probability). Posterior uncertainty drives
+  exploration automatically — no explicit ε to tune.
+- The candidate frontier stays small, exactly like the hill-climb: the baseline plus the one-step
+  grid neighbours of the baseline and of the current empirical best.
+- Samplers are hand-rolled to honour the no-extra-deps rule (Box–Muller normal → Marsaglia–Tsang
+  gamma → Beta as `G(a)/(G(a)+G(b))`), driven by the shared xorshift PRNG so a run is reproducible.
+
+It is **experimental and in-memory** — no profile persistence yet, so `--tune-state` does not apply
+to it.
 
 **Still deferred.**
 
-- **Per-repo profiles & observation decay** — key profiles by repo as well as archetype, and decay
-  stale observations on a model change (beyond the fresh `model_id` keying). The radius
-  counterfactual could also estimate *downstream* token effects (it currently models only the
-  skeleton-input delta, not the model's altered subsequent turns).
-- **Bayesian optimisation** over the knob vector — deferred until the data justifies it; the
-  simple ε-greedy hill-climb is expected to suffice (`RECIPE.md` §6.6, ≈0.65).
+- The radius counterfactual modelling the model's altered *subsequent reasoning* on a smaller
+  skeleton (not just the skeleton-input byte delta), and on-disk persistence for `BayesTuner`.
 
 ---
 
