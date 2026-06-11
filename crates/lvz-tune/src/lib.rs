@@ -34,6 +34,9 @@ use std::sync::Mutex;
 use lvz_protocol::{Archetype, Knobs, ModelTier, Outcome, TaskContext, Tuner};
 use serde::{Deserialize, Serialize};
 
+mod bayes;
+pub use bayes::BayesTuner;
+
 /// Tuning hyper-parameters.
 #[derive(Debug, Clone, Copy)]
 pub struct TuneConfig {
@@ -313,16 +316,16 @@ fn best_candidate(candidates: &HashMap<Knobs, Stats>, cfg: &TuneConfig) -> Optio
 
 /// Tie-break key: the context a knob vector carries, smaller = preferred. Ordered by the dials
 /// that grow the prompt — truncate ceiling, then skeleton radius, then compaction threshold.
-fn context_footprint(k: &Knobs) -> (usize, u8, usize) {
+pub(crate) fn context_footprint(k: &Knobs) -> (usize, u8, usize) {
     (k.truncate_bytes, k.skeleton_radius, k.compact_after)
 }
 
 // --- discrete knob grids (centred on Knobs::default), and one-step neighbour moves ---
 
-const RADIUS_GRID: &[u8] = &[0, 1, 2, 3];
-const TRUNCATE_GRID: &[usize] = &[2048, 4096, 8192, 16384, 32768];
-const COMPACT_GRID: &[usize] = &[8000, 16000, 24000, 32000, 48000, 64000];
-const BATCH_GRID: &[u8] = &[1, 2, 4, 8];
+pub(crate) const RADIUS_GRID: &[u8] = &[0, 1, 2, 3];
+pub(crate) const TRUNCATE_GRID: &[usize] = &[2048, 4096, 8192, 16384, 32768];
+pub(crate) const COMPACT_GRID: &[usize] = &[8000, 16000, 24000, 32000, 48000, 64000];
+pub(crate) const BATCH_GRID: &[u8] = &[1, 2, 4, 8];
 
 fn step(knobs: Knobs, which: usize, up: bool) -> Knobs {
     let mut k = knobs;
@@ -333,6 +336,21 @@ fn step(knobs: Knobs, which: usize, up: bool) -> Knobs {
         _ => k.batch_width = neighbour(BATCH_GRID, k.batch_width, up),
     }
     k
+}
+
+/// All distinct one-step grid neighbours of `knobs` (both directions on all four dials, clamped;
+/// the centre itself is excluded). Shared by the Bayesian tuner to expand its candidate frontier.
+pub(crate) fn all_neighbours(knobs: Knobs) -> Vec<Knobs> {
+    let mut out = Vec::with_capacity(8);
+    for which in 0..4 {
+        for up in [true, false] {
+            let n = step(knobs, which, up);
+            if n != knobs && !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    out
 }
 
 /// Adjacent grid value (clamped at the ends). Off-grid inputs snap to the nearest cell first.
@@ -352,7 +370,7 @@ fn neighbour<T: Copy + PartialOrd>(grid: &[T], current: T, up: bool) -> T {
 
 // --- xorshift64 PRNG (no `rand` dependency) ---
 
-fn next_u64(state: &mut u64) -> u64 {
+pub(crate) fn next_u64(state: &mut u64) -> u64 {
     let mut x = *state;
     x ^= x << 13;
     x ^= x >> 7;
@@ -361,7 +379,7 @@ fn next_u64(state: &mut u64) -> u64 {
     x
 }
 
-fn next_f64(state: &mut u64) -> f64 {
+pub(crate) fn next_f64(state: &mut u64) -> f64 {
     // Top 53 bits → a uniform double in [0, 1).
     (next_u64(state) >> 11) as f64 / (1u64 << 53) as f64
 }
