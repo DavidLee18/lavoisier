@@ -93,23 +93,45 @@ impl Provider for GoogleProvider {
             req.model,
         );
 
-        let resp = self
-            .http
-            .post(url)
-            .header("x-goog-api-key", &self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        // Send with bounded exponential backoff on transient throttling. The Generative Language
+        // API rate-limits per minute, and the agent issues many calls in quick succession, so a
+        // burst hits 429 (RESOURCE_EXHAUSTED) even when the key is healthy; 503 (overloaded) is the
+        // other transient case. We retry those (the request is idempotent — nothing was generated)
+        // and surface every other status immediately. Tunable via GOOGLE_MAX_RETRIES (default 6).
+        let max_retries: u32 = std::env::var("GOOGLE_MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        let mut attempt: u32 = 0;
+        let resp = loop {
+            let resp = self
+                .http
+                .post(&url)
+                .header("x-goog-api-key", &self.api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
-        let status = resp.status();
-        if !status.is_success() {
+            let status = resp.status();
+            if status.is_success() {
+                break resp;
+            }
+            let retryable = status.as_u16() == 429 || status.as_u16() == 503;
+            if retryable && attempt < max_retries {
+                // 2s, 4s, 8s … capped at 32s — long enough to refill a per-minute window.
+                let backoff =
+                    std::time::Duration::from_secs(2u64.saturating_pow(attempt + 1).min(32));
+                attempt += 1;
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
             let message = resp.text().await.unwrap_or_default();
             return Err(ProviderError::Api {
                 status: status.as_u16(),
                 message,
             });
-        }
+        };
 
         let state = SseState {
             body: resp.bytes_stream().boxed(),
