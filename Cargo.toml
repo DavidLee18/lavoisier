@@ -38,6 +38,7 @@ tonic-prost-build = "0.14"
 # Internal crates
 lvz-protocol = { path = "crates/lvz-protocol" }
 lvz-anthropic = { path = "crates/lvz-anthropic" }
+lvz-google = { path = "crates/lvz-google" }
 lvz-claude-cli = { path = "crates/lvz-claude-cli" }
 lvz-xai = { path = "crates/lvz-xai" }
 lvz-tools = { path = "crates/lvz-tools" }

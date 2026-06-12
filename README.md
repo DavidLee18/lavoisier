@@ -1,7 +1,7 @@
 # Lavoisier
 
 A modular, **token-efficient** CLI coding agent in Rust with a provider-agnostic core
-(**Anthropic + xAI**, both native). The same agent brain drives the CLI today and a
+(**Anthropic + xAI native, plus Google Gemini**). The same agent brain drives the CLI today and a
 multi-gateway "Hermes" service (HTTP/WebSocket, Matrix) tomorrow.
 
 > Status: **M0–M10 complete** plus the optional tracks — the full [build blueprint](RECIPE.md)
@@ -47,6 +47,7 @@ is contained behind the normalised `Event` stream + `Capabilities`.
 | `lvz-protocol` | Normalised contracts: `Event` stream, `Provider`, `Tool`, `Gateway`, `Tuner`, `Capabilities`, telemetry. Zero provider/gateway deps. |
 | `lvz-xai` | xAI provider: native **gRPC** (tonic, default) with an OpenAI-compat SSE fallback. |
 | `lvz-anthropic` | Anthropic provider: native Messages API over SSE, prompt caching, extended thinking. |
+| `lvz-google` | Google Gemini provider: native Generative Language API over SSE, configurable thinking effort. |
 | `lvz-claude-cli` | Optional provider shelling out to `claude -p` (subscription; no caching). Off by default. |
 | `lvz-context` | Token engine: tree-sitter skeletons, AST symbol-dependency graph (radius `N`), hash-anchored edits, diffs, budget-fixture loop. |
 | `lvz-tools` | Tool registry + built-ins: `read_file(s)`, `write_file`, `list_dir`, `shell`, `outline_file(s)`, `read_anchored`, `edit_anchored`. |
@@ -79,8 +80,8 @@ XAI_API_KEY=… cargo run -p lvz-cli -- --serve 127.0.0.1:8080
 ### Flags
 
 `--agent` (tool loop) · `--serve <host:port>` (HTTP/WS gateway) · `--serve-matrix` (Matrix) ·
-`--provider xai|anthropic|claude-cli` · `--model` · `--max-tokens` · `--system` · `--budget`
-(total-task token ceiling).
+`--provider xai|anthropic|google|claude-cli` · `--model` · `--max-tokens` · `--system` ·
+`--thinking <low|high|dynamic|N>` (Gemini thinking effort) · `--budget` (total-task token ceiling).
 
 Efficiency / cost levers: `--repo-skeleton <TOKENS>` (cache-aware repo-skeleton prefix) ·
 `--summary-model` / `--compact-after` / `--context-limit` (compaction + eviction) ·
@@ -93,7 +94,8 @@ success gate, e.g. `cargo test`) · `--tune-state <path>` (persist learned profi
 Gateway: `--api-key <KEY>` (repeatable) · `--rate-limit <N per 60s>`.
 
 Env: `XAI_API_KEY` / `XAI_TRANSPORT=grpc|http` (default `grpc`) / `XAI_GRPC_ENDPOINT` /
-`XAI_BASE_URL` · `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` · `MATRIX_HOMESERVER` / `MATRIX_USER` /
+`XAI_BASE_URL` · `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` · `GOOGLE_API_KEY` (or `GEMINI_API_KEY`)
+/ `GOOGLE_THINKING` · `MATRIX_HOMESERVER` / `MATRIX_USER` /
 `MATRIX_PASSWORD` · `LVZ_PROVIDER` / `LVZ_MODEL` / `LVZ_API_KEYS` / `LVZ_RATE_LIMIT` /
 `LVZ_SERVE_ADDR`.
 

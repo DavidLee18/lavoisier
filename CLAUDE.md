@@ -23,9 +23,10 @@ skeleton-radius knob `N`, hash-anchored edits, token-efficient diffs, plus the *
 CI loop (§6.5)** (`tests/budget.rs`, committed per-archetype token ceilings). Surfaced to the
 agent as `outline_file` (with optional `focus`/`radius`), `read_anchored`, `edit_anchored`.
 
-Crates that exist today: `lvz-protocol`, `lvz-xai`, `lvz-anthropic`, `lvz-claude-cli`,
-`lvz-context`, `lvz-tools`, `lvz-agent`, `lvz-memory`, `lvz-tune`, `lvz-gw-http`,
-`lvz-gw-matrix`, `lvz-cli`. (A Discord gateway was considered and dropped — out of scope.)
+Crates that exist today: `lvz-protocol`, `lvz-xai`, `lvz-anthropic`, `lvz-google`,
+`lvz-claude-cli`, `lvz-context`, `lvz-tools`, `lvz-agent`, `lvz-memory`, `lvz-tune`, `lvz-gw-http`,
+`lvz-gw-matrix`, `lvz-cli`. (A Discord gateway was considered and dropped — out of scope.
+`lvz-google` was added 2026-06-12, relaxing the Anthropic+xAI-only provider scope — see §1.)
 
 **Current state (saved 2026-06-09):** M0–M5 complete, committed and pushed to
 `origin/main` (initial commit + author/copyright set to Jaehyun Lee). 7 crates,
@@ -393,6 +394,9 @@ persistence, deeper reasoning-level radius modelling).
 - Keep dependencies minimal and vendor-agnostic; avoid heavyweight agent frameworks. The
   stale Anthropic-native Rust crates (`anthropic*`, `clust`, `misanthropy`) are **not** to be
   depended on — hand-roll a thin `reqwest` adapter to retain caching + extended thinking.
-- Providers in scope: **Anthropic + xAI native only**. Other providers are out of scope.
+- Providers in scope: **Anthropic + xAI native**, plus **Google Gemini** (`lvz-google`, added
+  2026-06-12 at the owner's explicit request to enable same-model benchmarking vs. agents that run
+  on `gemini-3-flash-preview` — see `docs/BENCHMARKS.md`). OpenAI and other providers remain out of
+  scope. (This relaxes the original "Anthropic + xAI native only" decision; `RECIPE.md` §1 records it.)
 - Secrets: read from env / AWS Secrets Manager at runtime; never commit keys.
 - License: prefer **Apache-2.0** (aligns with xai-proto) or MIT.

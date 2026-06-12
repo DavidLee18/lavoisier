@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 lvz-protocol.workspace = true
 lvz-anthropic.workspace = true
+lvz-google.workspace = true
 lvz-claude-cli.workspace = true
 lvz-xai.workspace = true
 lvz-agent.workspace = true

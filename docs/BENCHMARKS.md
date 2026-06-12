@@ -1,14 +1,16 @@
 # Token-cost benchmark: Lavoisier vs. Dirac
 
 **TL;DR.** [Dirac](https://dirac.run)'s headline **$0.18/task** is measured on Google's
-**`gemini-3-flash-preview`** (thinking = High) — a cheap "flash"-tier model. **Lavoisier is
-Anthropic + xAI native only** (Gemini is out of scope by design), so a *literally identical-model*
-run is not possible. Holding the task token volume ≈ Dirac's and re-pricing on Lavoisier-supported
-models, the full 8-task suite is estimated at **~$0.5 on `grok-4.1-fast`** (the only option that
-undercuts Dirac's Gemini run), **~$2.7 on `claude-haiku-4-5`**, **~$8.5 on `claude-sonnet-4-6`**,
-**~$10 on `grok-4`**, and **~$13.5 on `claude-opus-4-8`**. The gap is **model price, not agent
-efficiency** — Dirac and Lavoisier use the same token-curation techniques; Gemini Flash is simply
-cheaper per token (especially on output) than the Claude tiers.
+**`gemini-3-flash-preview`** (thinking = High) — a cheap "flash"-tier model. Lavoisier now ships a
+native **`lvz-google`** provider (`--provider google --thinking high`), so the **identical model at
+identical thinking effort is directly runnable** — turning the comparison below from an estimate into
+a measurable head-to-head. As a *projection* (until the suite is run): holding token volume ≈
+Dirac's and re-pricing on each model, the full 8-task suite is ~$1.5 on `gemini-3-flash-preview`
+(matching Dirac's measured $1.48, since it's the same model), **~$0.5 on `grok-4.1-fast`** (the only
+option that undercuts Gemini Flash), **~$2.7 on `claude-haiku-4-5`**, **~$8.5 on
+`claude-sonnet-4-6`**, **~$10 on `grok-4`**, and **~$13.5 on `claude-opus-4-8`**. The spread is
+**model price, not agent efficiency** — Dirac and Lavoisier use the same token-curation techniques;
+Gemini Flash is simply cheaper per token (especially on output) than the Claude tiers.
 
 > **This is a cost *estimate*, not a head-to-head run.** Dirac's numbers are *measured*; Lavoisier's
 > are *projected* by anchoring to Dirac's real per-task costs (known, below) and Gemini's pricing,
@@ -39,11 +41,13 @@ repo for audit, but task specs, the eval harness, and the grading method are **n
 published. (Sources: [dirac.run](https://dirac.run/),
 [andrew.ooo review](https://andrew.ooo/posts/dirac-open-source-coding-agent-review/).)
 
-**Why identical models is impossible here.** Lavoisier's providers are **Anthropic + xAI native
-only** — a deliberate scope constraint (no OpenAI, no Gemini). Reproducing Dirac on the *same*
-model would require adding a Google/Gemini provider (a new adapter the size of `lvz-anthropic`),
-which is out of scope. So the comparison below substitutes the **nearest-equivalent** supported
-models — and notes that any cost delta then mixes *agent efficiency* with *model price*.
+**Identical-model reproduction is now supported.** Lavoisier originally scoped providers to
+Anthropic + xAI native, but the `lvz-google` provider was added (2026-06-12) precisely so the same
+model Dirac benchmarks on — `gemini-3-flash-preview`, thinking=High — can be driven directly:
+`lavoisier --agent --provider google --model gemini-3-flash-preview --thinking high …` (set
+`GOOGLE_API_KEY`). That makes a *true* head-to-head possible (same model, same thinking effort,
+isolating agent efficiency). The other models below are then the cost trade-offs you'd pick *instead*
+of Gemini once you accept a different quality/price point.
 
 ## 2. Pricing used (June 2026, USD per million tokens)
 
@@ -124,6 +128,7 @@ the cheap ones.
 | Model | Suite cost (est.) | + dev/retries (~2.5×) |
 |---|--:|--:|
 | `grok-4.1-fast` | ~$0.5 | ~$1.25 |
+| `gemini-3-flash-preview` *(Dirac's model — true parity)* | ~$1.5 | ~$3.7 |
 | `claude-haiku-4-5` | ~$2.7 | ~$7 |
 | `claude-sonnet-4-6` | ~$8.5 | ~$21 |
 | `grok-4` | ~$10 | ~$25 |
@@ -146,9 +151,10 @@ Real runs need debugging/retries — budget ~2–3× a clean pass.
 4. **API keys + `protoc`** (build dep) and the binary. Keys for whichever provider(s) above.
 5. **Time.** 8 tasks × multiple round-trips; the 25-file Task 6 alone is many turns — roughly 1–3
    hours wall-clock for one clean pass.
-6. **(Optional) true model parity** — to compare on Gemini itself, add an `lvz-google` provider
-   (out of scope today). Without it the comparison is Lavoisier-on-Claude/Grok vs Dirac-on-Gemini,
-   which conflates agent efficiency with model price; the cleanest supported like-for-like is
-   `grok-4.1-fast` (flash-tier vs flash-tier).
+6. **True model parity is built in.** Run the suite under `--provider google --model
+   gemini-3-flash-preview --thinking high` (the `lvz-google` provider) to compare on Dirac's *exact*
+   model and thinking effort — isolating agent efficiency from model price. `grok-4.1-fast` is the
+   cheapest supported alternative (flash-tier vs flash-tier) if you want lower cost at some quality
+   trade-off.
 
 _Last updated: 2026-06-12. Prices and Dirac figures are point-in-time; re-derive from §2 sources._

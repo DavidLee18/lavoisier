@@ -19,6 +19,7 @@ use futures::StreamExt;
 use lvz_agent::{Agent, AgentConfig, FixedTuner};
 use lvz_anthropic::AnthropicProvider;
 use lvz_claude_cli::ClaudeCliProvider;
+use lvz_google::GoogleProvider;
 use lvz_gw_http::{GatewayConfig, HttpGateway};
 use lvz_gw_matrix::MatrixGateway;
 use lvz_memory::{InMemoryStore, SessionAgent};
@@ -65,6 +66,12 @@ struct Cli {
     /// Sampling temperature (provider default if unset). Ignored in --agent mode.
     #[arg(long)]
     temperature: Option<f32>,
+
+    /// Thinking effort for the Google provider (`--provider google`): a level keyword
+    /// (`low`/`high`/`dynamic`, Gemini 3) or a numeric token budget (Gemini 2.5). E.g. `--thinking
+    /// high` to match the public Dirac refactor suite. Ignored by other providers.
+    #[arg(long, value_name = "LEVEL", env = "GOOGLE_THINKING")]
+    thinking: Option<String>,
 
     /// Total-task token budget (--agent mode); the run aborts if exceeded.
     #[arg(long)]
@@ -188,6 +195,9 @@ struct Cli {
 enum ProviderKind {
     Xai,
     Anthropic,
+    /// Google Gemini (native Generative Language API). Enables same-model benchmarking vs. agents
+    /// that run on `gemini-3-flash-preview` (see `docs/BENCHMARKS.md`).
+    Google,
     /// Rides Claude Code `claude -p` (subscription, no caching) — personal/low-volume only (§8).
     ClaudeCli,
 }
@@ -197,14 +207,25 @@ impl ProviderKind {
         match self {
             ProviderKind::Xai => "grok-4",
             ProviderKind::Anthropic => "claude-sonnet-4-6",
+            ProviderKind::Google => "gemini-3-flash-preview",
             ProviderKind::ClaudeCli => "sonnet",
         }
     }
 
-    fn build(self) -> Result<Arc<dyn Provider>, lvz_protocol::ProviderError> {
+    fn build(
+        self,
+        thinking: Option<&str>,
+    ) -> Result<Arc<dyn Provider>, lvz_protocol::ProviderError> {
         Ok(match self {
             ProviderKind::Xai => Arc::new(XaiProvider::from_env()?),
             ProviderKind::Anthropic => Arc::new(AnthropicProvider::from_env()?),
+            ProviderKind::Google => {
+                let mut p = GoogleProvider::from_env()?;
+                if let Some(t) = thinking {
+                    p = p.with_thinking(t);
+                }
+                Arc::new(p)
+            }
             ProviderKind::ClaudeCli => Arc::new(ClaudeCliProvider::from_env()?),
         })
     }
@@ -224,7 +245,7 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let provider = cli.provider.build()?;
+    let provider = cli.provider.build(cli.thinking.as_deref())?;
     let model = cli
         .model
         .clone()
