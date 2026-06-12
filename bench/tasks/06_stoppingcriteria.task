@@ -1,0 +1,9 @@
+# Dirac refactor suite — Task 6 (transformers). Source: github.com/dirac-run/dirac evals/README.md
+REPO_URL="https://github.com/huggingface/transformers"
+REPO_DIR="transformers"
+REF="main"
+SKELETON=2000
+SETUP='[ -x .venv/bin/ruff ] || { python3 -m venv .venv && .venv/bin/pip -q install ruff; }'
+VERIFY='.venv/bin/ruff check src/transformers/generation'
+---INSTRUCTION---
+Users have requested the ability to stop text generation early if the model becomes highly uncertain. Find the GenerationConfig class and add two new parameters: entropy_threshold: float | None = None and entropy_patience: int = 1. Next, locate the file containing the StoppingCriteria base class. In that same file, implement a new EntropyStoppingCriteria class that inherits from it. It should compute the Shannon entropy of the scores (logits) at each step. If the entropy exceeds entropy_threshold for entropy_patience consecutive steps for a given sequence in the batch, it should flag that sequence as done. Finally, find the _get_stopping_criteria method in the generation framework. If the configuration has an entropy_threshold set, instantiate and append your new criteria to the StoppingCriteriaList. run a ruff check on modified files and make sure they pass. do not run any other checkes

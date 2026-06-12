@@ -1,0 +1,9 @@
+# Dirac refactor suite — Task 2 (vscode). Source: github.com/dirac-run/dirac evals/README.md
+REPO_URL="https://github.com/microsoft/vscode"
+REPO_DIR="vscode"
+REF="main"
+SKELETON=1500
+SETUP='[ -d node_modules ] || npm ci'
+VERIFY='node_modules/.bin/tsc --noEmit -p src/tsconfig.json'
+---INSTRUCTION---
+chat service's sendRequest currently takes multiple parameters. refactor it to take a single param object. make sure to update all call sites

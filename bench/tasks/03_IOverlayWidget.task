@@ -1,0 +1,9 @@
+# Dirac refactor suite — Task 3 (vscode). Source: github.com/dirac-run/dirac evals/README.md
+REPO_URL="https://github.com/microsoft/vscode"
+REPO_DIR="vscode"
+REF="main"
+SKELETON=1500
+SETUP='[ -d node_modules ] || npm ci'
+VERIFY='node_modules/.bin/tsc --noEmit -p src/tsconfig.json'
+---INSTRUCTION---
+Find the IOverlayWidget interface in the codebase. Add a new mandatory method to it: getName(): string. You can simply return a human-readable version of the class name or a stringified version of what getId() returns. Make sure to all implementations are updated and no missing property errors

@@ -1,0 +1,12 @@
+# Dirac refactor suite — Task 5 (transformers). Source: github.com/dirac-run/dirac evals/README.md
+# VERIFY mirrors the in-prompt grade ("Ensure ruff check passes"); scoped to the edited areas.
+REPO_URL="https://github.com/huggingface/transformers"
+REPO_DIR="transformers"
+REF="main"
+SKELETON=2000
+SETUP='[ -x .venv/bin/ruff ] || { python3 -m venv .venv && .venv/bin/pip -q install ruff; }'
+VERIFY='.venv/bin/ruff check src/transformers/cache_utils.py src/transformers/models'
+---INSTRUCTION---
+Find the DynamicCache class in src/transformers/cache_utils.py and add a new boolean property is_stale that defaults to False. Then, locate the forward pass of the Attention modules for the following models in the src/transformers/models/ directory: llama4, mistral4, qwen3, gemma4, deepseek_v3, cohere2, olmo3, ministral3.
+
+Update their attention logic: if past_key_value is an instance of DynamicCache and past_key_value.is_stale is True, bypass the internal cache update block and raise a UserWarning with a descriptive message. Do not break any existing tensor slicing or formatting. Ensure ruff check passes after your edits.

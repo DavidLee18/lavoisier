@@ -1,0 +1,9 @@
+# Dirac refactor suite — Task 8 (django). Source: github.com/dirac-run/dirac evals/README.md
+REPO_URL="https://github.com/django/django"
+REPO_DIR="django"
+REF="main"
+SKELETON=2000
+SETUP='[ -x .venv/bin/ruff ] || { python3 -m venv .venv && .venv/bin/pip -q install ruff; }'
+VERIFY='.venv/bin/ruff check django/forms'
+---INSTRUCTION---
+We want to rename the value_from_datadict method to extract_value_from_request in django.forms.Widget and all its subclasses, and update all calls to this method across the codebase. only update the code, no docs or txt files. make sure to run ruff using .venv locally (only run on the files you modify). do NOT run any tests

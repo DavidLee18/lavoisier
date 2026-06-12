@@ -144,10 +144,13 @@ Real runs need debugging/retries — budget ~2–3× a clean pass.
 2. **The upstream repos at the right commits** — `huggingface/transformers` (Python),
    `django/django` (Python), `microsoft/vscode` (TypeScript; large checkout). All three are
    in-language for Lavoisier's skeletoniser (Rust/Python/JS/TS).
-3. **A per-task harness (zsh).** For each task: `lavoisier --agent --telemetry --verify-cmd
-   '<task acceptance test>' --repo-skeleton <N> "<instruction>"` run in the repo, then sum the
-   `[telemetry]` token lines × the §2 prices. `--verify-cmd` exit 0 = success (the same grading the
-   ATO success signal uses); `--tune-state` if you want it to learn across tasks.
+3. **A per-task harness — built: [`bench/`](../bench/).** `bench/run.zsh` drives `lavoisier --agent
+   --telemetry --verify-cmd … --repo-skeleton …` over the 8 tasks (transcribed verbatim from
+   Dirac's `evals/README.md` into `bench/tasks/*.task`), parses each `[telemetry]` line, prices it
+   from the §2 table, and prints a per-task + total cost/success report. Run `./bench/run.zsh` for
+   identical-model parity (gemini-3-flash-preview, thinking=high) or `--model …` for any other;
+   `--smoke` self-tests the plumbing. See [`bench/README.md`](../bench/README.md) for provenance and
+   the grading/commit-pinning caveats.
 4. **API keys + `protoc`** (build dep) and the binary. Keys for whichever provider(s) above.
 5. **Time.** 8 tasks × multiple round-trips; the 25-file Task 6 alone is many turns — roughly 1–3
    hours wall-clock for one clean pass.

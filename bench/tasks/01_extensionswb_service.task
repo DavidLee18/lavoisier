@@ -1,0 +1,13 @@
+# Dirac refactor suite — Task 1 (vscode). Source: github.com/dirac-run/dirac evals/README.md
+# REF/commit not published by Dirac → defaults to the branch; pin a commit for reproducibility.
+# VERIFY is a reconstructed proxy for Dirac's grading ("clean code, no linter errors"): a TS typecheck.
+REPO_URL="https://github.com/microsoft/vscode"
+REPO_DIR="vscode"
+REF="main"
+SKELETON=1500
+SETUP='[ -d node_modules ] || npm ci'
+VERIFY='node_modules/.bin/tsc --noEmit -p src/tsconfig.json'
+---INSTRUCTION---
+simple refactoring task: src/vs/workbench/contrib/extensions/browser/extensionsWorkbenchService.ts is the central coordinator for all extension-related UI operations it has gotten too large, we want to refactor it without breaking any dependencies. the goal is to divide it in smaller more manageable modules you must produce clean code with no linter errors. Your changes should be limited to the aforementioned file and creating any new file as needed
+
+create two new files, extension.ts and extensions.ts and move the relevant functionality to them
