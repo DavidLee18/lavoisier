@@ -27,19 +27,23 @@ THINKING=high
 TASK_FILTER=""
 EXTRA_FLAGS=""
 BUDGET=4000000      # per-task token ceiling (safety net against a runaway loop)
+MAX_STEPS=60        # agent round-trip ceiling — real refactors need many explore→edit turns
+MAX_TOKENS=16384    # per-turn output cap — thinking=high needs headroom or turns truncate (MaxTokens)
 BIN=""
 SMOKE=0
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --provider) PROVIDER=$2; shift 2;;
-    --model)    MODEL=$2; shift 2;;
-    --thinking) THINKING=$2; shift 2;;
-    --tasks)    TASK_FILTER=$2; shift 2;;
-    --extra)    EXTRA_FLAGS=$2; shift 2;;
-    --budget)   BUDGET=$2; shift 2;;
-    --bin)      BIN=$2; shift 2;;
-    --smoke)    SMOKE=1; shift;;
+    --provider)  PROVIDER=$2; shift 2;;
+    --model)     MODEL=$2; shift 2;;
+    --thinking)  THINKING=$2; shift 2;;
+    --tasks)     TASK_FILTER=$2; shift 2;;
+    --extra)     EXTRA_FLAGS=$2; shift 2;;
+    --budget)    BUDGET=$2; shift 2;;
+    --max-steps) MAX_STEPS=$2; shift 2;;
+    --max-tokens) MAX_TOKENS=$2; shift 2;;
+    --bin)       BIN=$2; shift 2;;
+    --smoke)     SMOKE=1; shift;;
     -h|--help)  sed -n '2,20p' $0; exit 0;;
     *) print -u2 "unknown arg: $1"; exit 2;;
   esac
@@ -104,8 +108,8 @@ run_one() {
   local log=$RESULTS/$id.log
   ( cd $repo
     "$BIN" --agent --provider $PROVIDER --model $MODEL --thinking $THINKING \
-      --telemetry --repo-skeleton $skeleton --budget $BUDGET \
-      --verify-cmd "$verify" ${=EXTRA_FLAGS} "$instruction"
+      --telemetry --repo-skeleton $skeleton --budget $BUDGET --max-steps $MAX_STEPS \
+      --max-tokens $MAX_TOKENS --verify-cmd "$verify" ${=EXTRA_FLAGS} "$instruction"
   ) > $log 2>&1
   parse_telemetry $log
   local c=$(cost_usd)

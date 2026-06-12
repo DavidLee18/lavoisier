@@ -89,6 +89,11 @@ struct Cli {
     #[arg(long)]
     context_limit: Option<usize>,
 
+    /// Max agent round-trips before giving up (--agent mode; default 12). Raise for large
+    /// multi-file refactors that need many explore→edit turns.
+    #[arg(long, value_name = "N")]
+    max_steps: Option<usize>,
+
     /// Cheap model to run the first turns on, escalating to --model after --escalate-after
     /// round-trips (--agent/--serve; §8 cost reduction, e.g. claude-haiku-4-5 → claude-sonnet-4-6).
     #[arg(long, value_name = "MODEL")]
@@ -337,6 +342,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
     let mut config = AgentConfig::default().with_model(model);
     config.max_tokens = cli.max_tokens;
+    if let Some(max_steps) = cli.max_steps {
+        config.max_steps = max_steps;
+    }
     if let Some(budget) = cli.budget {
         config = config.with_budget(budget);
     }
