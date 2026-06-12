@@ -128,6 +128,22 @@ if (( SMOKE )); then
   exit 0
 fi
 
+# Robust clone for huge repos: shallow + single-branch over HTTP/1.1, with retries. macOS system
+# git's LibreSSL corrupts large HTTP/2 transfers ("bad decrypt" / early EOF) and the blob:none
+# filter's on-demand blob fetches make it worse, so we pull the full tree at the tip in one shot.
+clone_repo() {
+  local url=$1 dest=$2 attempt
+  for attempt in 1 2 3; do
+    rm -rf $dest
+    if git -c http.version=HTTP/1.1 -c http.postBuffer=1048576000 \
+         clone --depth 1 --single-branch --no-tags $url $dest >&2; then
+      return 0
+    fi
+    print -u2 "  clone attempt $attempt failed; retrying in 3s…"; sleep 3
+  done
+  return 1
+}
+
 # --- the real suite ---
 for f in $SCRIPT_DIR/tasks/*.task(N); do
   id=${f:t:r}
@@ -147,9 +163,9 @@ for f in $SCRIPT_DIR/tasks/*.task(N); do
   repo=$REPOS/$REPO_DIR
 
   print -u2 "=== $id  ($REPO_DIR @ ${REF}) ==="
-  if [[ ! -d $repo/.git ]]; then
-    print -u2 "  cloning $REPO_URL …"
-    git clone --filter=blob:none $REPO_URL $repo >&2 || { print -u2 "  clone failed; skipping"; continue; }
+  if ! git -C $repo rev-parse HEAD >/dev/null 2>&1; then   # missing or partial → (re)clone
+    print -u2 "  cloning $REPO_URL (shallow)…"
+    clone_repo $REPO_URL $repo || { print -u2 "  clone failed after retries; skipping. Fix: 'brew install git' (OpenSSL), or pre-clone into $repo"; continue; }
   fi
   ( cd $repo
     git checkout -q $REF 2>/dev/null || print -u2 "  (ref '$REF' checkout failed; using current HEAD)"
