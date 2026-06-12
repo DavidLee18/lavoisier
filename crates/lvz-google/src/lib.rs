@@ -3,7 +3,7 @@
 //! Implements [`Provider`] over the native Generative Language API
 //! (`POST /v1beta/models/{model}:streamGenerateContent?alt=sse`). Added so Lavoisier can run the
 //! *same* model other agents benchmark on (`gemini-3-flash-preview`) with the *same* thinking
-//! effort — see `docs/BENCHMARKS.md`. This widens the original "Anthropic + xAI native only" scope
+//! effort — see `bench/README.md`. This widens the original "Anthropic + xAI native only" scope
 //! at the project owner's explicit request (recorded in `RECIPE.md` §1 / `CLAUDE.md`).
 //!
 //! Like the other adapters this is a thin hand-rolled `reqwest` client — no `google-*` SDK — and it

@@ -32,8 +32,8 @@ goal at every layer:
   executor) for long tasks.
 - A **budget-fixture CI loop** that gates skeleton-size regressions against committed token ceilings.
 
-See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for a token-cost analysis (vs. the Dirac agent) and
-[`docs/ATO.md`](docs/ATO.md) for the tuner internals.
+See [`bench/README.md`](bench/README.md) for the measured head-to-head vs. the Dirac agent (cost +
+real-upstream-test correctness, plus the harness) and [`docs/ATO.md`](docs/ATO.md) for the tuner internals.
 
 ## Architecture
 

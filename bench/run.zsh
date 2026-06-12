@@ -5,7 +5,7 @@
 # tallies token cost from the per-task `--telemetry` line, and uses each task's `--verify-cmd`
 # (ruff/tsc) as the pass/fail signal — the same exit-code gate ATO uses. Prints a per-task and
 # total cost+success table comparable to Dirac's published $1.48 suite (8/8) on
-# `gemini-3-flash-preview` (see docs/BENCHMARKS.md, bench/README.md).
+# `gemini-3-flash-preview` (see bench/README.md for the full analysis).
 #
 # Usage:
 #   bench/run.zsh                                   # full suite, gemini-3-flash-preview, thinking=high
@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# --- pricing per million tokens: "input cache_write cache_read output" (docs/BENCHMARKS.md §2) ---
+# --- pricing per million tokens: "input cache_write cache_read output" (bench/README.md §3) ---
 typeset -A PRICING
 PRICING[gemini-3-flash-preview]="0.50 0.50 0.05 3.00"
 PRICING[grok-4.1-fast]="0.20 0.20 0.05 0.50"

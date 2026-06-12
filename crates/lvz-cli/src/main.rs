@@ -201,7 +201,7 @@ enum ProviderKind {
     Xai,
     Anthropic,
     /// Google Gemini (native Generative Language API). Enables same-model benchmarking vs. agents
-    /// that run on `gemini-3-flash-preview` (see `docs/BENCHMARKS.md`).
+    /// that run on `gemini-3-flash-preview` (see `bench/README.md`).
     Google,
     /// Rides Claude Code `claude -p` (subscription, no caching) — personal/low-volume only (§8).
     ClaudeCli,

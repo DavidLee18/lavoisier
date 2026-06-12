@@ -11,8 +11,9 @@ contracts (§5), and milestone sequence (§9) define what to build and in what o
 request conflicts with `RECIPE.md`, surface the conflict rather than silently diverging.
 
 Companion docs: `README.md` (user-facing overview + flags), `docs/ATO.md` (the tuner internals),
-and `docs/BENCHMARKS.md` (a token-cost estimate vs. the Dirac agent — methodology + per-model
-$/task, anchored on real `--telemetry` runs; re-derive from its §2 prices when they move).
+and `bench/README.md` (the measured head-to-head vs. the Dirac agent + the benchmark harness —
+methodology, measured $/task on `gemini-3-flash-preview`, real-upstream-test correctness, and per-model
+re-pricing; re-derive from its §3 prices when they move).
 
 Milestones done (per §9): **M0** workspace + `lvz-protocol` contracts · **M1** xAI
 OpenAI-compat first light · **M2** SSE streaming · **M3** `lvz-anthropic` native Messages API
@@ -396,7 +397,7 @@ persistence, deeper reasoning-level radius modelling).
   depended on — hand-roll a thin `reqwest` adapter to retain caching + extended thinking.
 - Providers in scope: **Anthropic + xAI native**, plus **Google Gemini** (`lvz-google`, added
   2026-06-12 at the owner's explicit request to enable same-model benchmarking vs. agents that run
-  on `gemini-3-flash-preview` — see `docs/BENCHMARKS.md`). OpenAI and other providers remain out of
+  on `gemini-3-flash-preview` — see `bench/README.md`). OpenAI and other providers remain out of
   scope. (This relaxes the original "Anthropic + xAI native only" decision; `RECIPE.md` §1 records it.)
   **Live-verified** against the real Gemini API (`gemini-3-flash-preview`, `--thinking high`): a
   streaming turn plus the agent tool loop end-to-end (functionCall decode, tool-result round-trip,
