@@ -50,8 +50,10 @@ used (e.g. before a rename or signature change), use find_references — it retu
 complete set in one call — instead of repeated grep/sed via shell. When find_references has \
 listed all call sites, that is the full set: edit them all and stop, rather than re-searching \
 to double-check. When a change spans several files, apply them with one edit_files call \
-(batching per-file anchored edits) instead of one edit_anchored call per file. Take minimal, \
-targeted actions; do not narrate. Do not echo file contents or \
+(batching per-file anchored edits) instead of one edit_anchored call per file. When several tool \
+calls are independent, issue them together in a single turn (parallel tool use) rather than one \
+per turn — e.g. read_files/outline_files for many files at once, and edit_files for many edits. \
+Take minimal, targeted actions; do not narrate. Do not echo file contents or \
 tool output back in your replies; reference line anchors and let edit_anchored's diff stand \
 as the record of changes. When the task is complete, give a one-line summary.";
 
@@ -147,6 +149,21 @@ pub struct AgentConfig {
     /// `None` disables it. Most valuable with prompt caching (Anthropic) and a long-running
     /// `--serve`; on a non-caching provider it still adds the skeleton but without the amortisation.
     pub repo_skeleton: Option<usize>,
+    /// **In-loop verify** (convergence lever): run [`verify_command`](Self::verify_command) *during*
+    /// the loop — after any turn that edited a file — and stop with success the moment it passes,
+    /// instead of waiting for the model to decide it is done. Off by default; requires
+    /// `verify_command`. Most reliable with a real test gate — with a weak lint proxy it can stop on
+    /// an incomplete change that happens to lint clean.
+    pub in_loop_verify: bool,
+    /// **No-progress circuit-breaker** (convergence lever): when `Some(n)`, after `n` consecutive
+    /// tool-call turns that edited nothing, inject a one-time nudge to act; after `2n`, hard-stop the
+    /// loop (`Done(Other("no_progress"))`). Breaks the explore-forever paralysis. `None` disables it.
+    pub no_progress_limit: Option<usize>,
+    /// **Budget awareness** (convergence lever): append a short `[progress: turn x/max …]` note to
+    /// each tool-result message so the model knows how close it is to the step/token ceiling and can
+    /// wrap up deliberately rather than being truncated. Off by default. Lives in the volatile tail,
+    /// so it does not disturb the cached prefix.
+    pub budget_awareness: bool,
 }
 
 impl Default for AgentConfig {
@@ -168,6 +185,9 @@ impl Default for AgentConfig {
             classify_with_model: false,
             radius_counterfactual: false,
             repo_skeleton: None,
+            in_loop_verify: false,
+            no_progress_limit: None,
+            budget_awareness: false,
         }
     }
 }
@@ -227,6 +247,24 @@ impl AgentConfig {
     /// clean completion marks the task successful; non-zero marks it failed.
     pub fn with_verify_command(mut self, cmd: impl Into<String>) -> Self {
         self.verify_command = Some(cmd.into());
+        self
+    }
+
+    /// Enable in-loop verification: stop as soon as the verify command passes after an edit turn.
+    pub fn with_in_loop_verify(mut self, on: bool) -> Self {
+        self.in_loop_verify = on;
+        self
+    }
+
+    /// Set the no-progress circuit-breaker limit: nudge after `n` edit-free turns, stop after `2n`.
+    pub fn with_no_progress_limit(mut self, n: usize) -> Self {
+        self.no_progress_limit = Some(n);
+        self
+    }
+
+    /// Enable budget-awareness notes appended to tool results (turn/token budget remaining).
+    pub fn with_budget_awareness(mut self, on: bool) -> Self {
+        self.budget_awareness = on;
         self
     }
 
@@ -424,6 +462,9 @@ async fn run_loop(
         started,
     };
     let mut round_trips: u32 = 0;
+    // Consecutive tool-call turns that edited nothing — drives the no-progress circuit-breaker.
+    let mut edit_free_streak: usize = 0;
+    let mut nudged_at: Option<usize> = None;
     // Largest untruncated tool-result seen, for the learner's safe counterfactual crediting
     // (§6.6 / `docs/ATO.md` §3). `None` until the first tool runs.
     let mut max_result_bytes: Option<usize> = None;
@@ -575,6 +616,68 @@ async fn run_loop(
             };
             results.push(block);
         }
+
+        // --- Convergence levers (act on turns that made tool calls) ---
+        let made_edit = turn.tool_calls.iter().any(|c| is_edit_tool(&c.name));
+        if made_edit {
+            edit_free_streak = 0;
+            nudged_at = None;
+        } else {
+            edit_free_streak += 1;
+        }
+
+        // In-loop verify: an edit turn that makes the verify command pass means the task is done —
+        // stop now instead of waiting for the model to notice. (Only as strong as the verify cmd.)
+        if config.in_loop_verify
+            && made_edit
+            && config.verify_command.is_some()
+            && run_verify(&config).await
+        {
+            history.push(Message {
+                role: Role::User,
+                content: results,
+            });
+            obs.record(&total, round_trips, true, max_result_bytes, &radius_traces);
+            let _ = tx.unbounded_send(Ok(Event::Usage(total)));
+            let _ = tx.unbounded_send(Ok(Event::Done(StopReason::EndTurn)));
+            return;
+        }
+
+        // No-progress circuit-breaker: hard-stop after 2n edit-free turns; nudge once at n.
+        if let Some(limit) = config.no_progress_limit {
+            if limit > 0 && edit_free_streak >= limit.saturating_mul(2) {
+                history.push(Message {
+                    role: Role::User,
+                    content: results,
+                });
+                let success = run_verify(&config).await;
+                obs.record(
+                    &total,
+                    round_trips,
+                    success,
+                    max_result_bytes,
+                    &radius_traces,
+                );
+                let _ = tx.unbounded_send(Ok(Event::Usage(total)));
+                let _ = tx.unbounded_send(Ok(Event::Done(StopReason::Other("no_progress".into()))));
+                return;
+            }
+            if limit > 0 && edit_free_streak >= limit && nudged_at != Some(edit_free_streak) {
+                results.push(ContentBlock::text(NO_PROGRESS_NUDGE));
+                nudged_at = Some(edit_free_streak);
+            }
+        }
+
+        // Budget awareness: tell the model how close it is to the ceilings (volatile tail only).
+        if config.budget_awareness {
+            results.push(budget_note(
+                round_trips,
+                config.max_steps,
+                total.total(),
+                config.token_budget,
+            ));
+        }
+
         history.push(Message {
             role: Role::User,
             content: results,
@@ -715,6 +818,37 @@ async fn run_verify(config: &AgentConfig) -> bool {
         command.current_dir(root);
     }
     matches!(command.status().await, Ok(status) if status.success())
+}
+
+/// Tool names that mutate files — used by the no-progress / in-loop-verify convergence levers to
+/// tell a "made an edit" turn from pure read-only exploration.
+const EDIT_TOOLS: [&str; 3] = ["edit_anchored", "edit_files", "write_file"];
+
+fn is_edit_tool(name: &str) -> bool {
+    EDIT_TOOLS.contains(&name)
+}
+
+/// The one-time nudge the no-progress circuit-breaker injects after `n` edit-free turns.
+const NO_PROGRESS_NUDGE: &str =
+    "[no-progress] You have run several turns without editing any file. \
+If you already have enough information, make the edits now (use edit_files for changes spanning \
+multiple files), then finish — do not keep exploring. If a step failed, fix that specific step.";
+
+/// A terse progress line appended to a tool-result message so the model can pace itself against the
+/// step (and optional token) ceiling and wrap up before being truncated.
+fn budget_note(
+    round_trips: u32,
+    max_steps: usize,
+    used_tokens: u64,
+    token_budget: Option<u64>,
+) -> ContentBlock {
+    let tokens = match token_budget {
+        Some(b) if b > 0 => format!(", ~{}k/{}k tokens", used_tokens / 1000, b / 1000),
+        _ => String::new(),
+    };
+    ContentBlock::text(format!(
+        "[progress: turn {round_trips}/{max_steps}{tokens} — finish before the limit]"
+    ))
 }
 
 /// Append knob-derived behavioural guidance to the system prompt. Today this carries the
@@ -1473,6 +1607,112 @@ mod tests {
             out.push(e.expect("no agent error"));
         }
         out
+    }
+
+    /// One scripted turn that calls a read-only `shell` tool (never an edit).
+    fn shell_turn(id: &str) -> Vec<Event> {
+        vec![
+            Event::ToolUseStart {
+                id: id.into(),
+                name: "shell".into(),
+            },
+            Event::ToolUseDelta {
+                id: id.into(),
+                json: "{\"command\":\"echo x\"}".into(),
+            },
+            Event::ToolUseEnd { id: id.into() },
+            Event::Usage(Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+                ..Default::default()
+            }),
+            Event::Done(StopReason::ToolUse),
+        ]
+    }
+
+    #[test]
+    fn budget_note_and_edit_tool_classification() {
+        assert!(
+            is_edit_tool("edit_files")
+                && is_edit_tool("edit_anchored")
+                && is_edit_tool("write_file")
+        );
+        assert!(!is_edit_tool("shell") && !is_edit_tool("find_references"));
+        let ContentBlock::Text { text, .. } = budget_note(3, 60, 12_000, Some(100_000)) else {
+            panic!("expected text block");
+        };
+        assert!(text.contains("turn 3/60"), "{text}");
+        assert!(text.contains("12k/100k tokens"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn no_progress_breaker_hard_stops_after_2n_editfree_turns() {
+        // Every turn is read-only (shell), so the agent never edits — the breaker must fire.
+        let scripts: Vec<Vec<Event>> = (0..10).map(|i| shell_turn(&format!("t{i}"))).collect();
+        let provider = ScriptedProvider::new(scripts);
+        let config = AgentConfig {
+            max_steps: 20,
+            ..AgentConfig::default().with_no_progress_limit(2)
+        };
+        let agent = Agent::new(provider.clone(), ToolRegistry::with_builtins(), config);
+        let events = collect(agent.run("explore forever")).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Done(StopReason::Other(s)) if s == "no_progress")),
+            "should stop with no_progress, got {events:?}"
+        );
+        // Hard stop at 2n = 4 turns, well before max_steps = 20.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn in_loop_verify_stops_on_first_passing_edit() {
+        let dir = std::env::temp_dir().join(format!("lvz_ilv_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("f.txt").to_string_lossy().to_string();
+        let edit = vec![
+            Event::ToolUseStart {
+                id: "e1".into(),
+                name: "write_file".into(),
+            },
+            Event::ToolUseDelta {
+                id: "e1".into(),
+                json: format!("{{\"path\":\"{p}\",\"content\":\"x\"}}"),
+            },
+            Event::ToolUseEnd { id: "e1".into() },
+            Event::Usage(Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+                ..Default::default()
+            }),
+            Event::Done(StopReason::ToolUse),
+        ];
+        // A second turn exists but must never be reached.
+        let provider = ScriptedProvider::new(vec![
+            edit,
+            vec![
+                Event::TextDelta("late".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+        ]);
+        let config = AgentConfig::default()
+            .with_in_loop_verify(true)
+            .with_verify_command("exit 0");
+        let agent = Agent::new(provider.clone(), ToolRegistry::with_builtins(), config);
+        let events = collect(agent.run("edit it")).await;
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::Done(StopReason::EndTurn))));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::TextDelta(t) if t == "late")));
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "stop right after the first edit turn whose verify passes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

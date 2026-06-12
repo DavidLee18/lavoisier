@@ -94,6 +94,20 @@ struct Cli {
     #[arg(long, value_name = "N")]
     max_steps: Option<usize>,
 
+    /// In-loop verify (--agent mode): stop as soon as --verify-cmd passes after an edit turn,
+    /// instead of waiting for the model to decide it's done. Requires --verify-cmd.
+    #[arg(long)]
+    in_loop_verify: bool,
+
+    /// No-progress circuit-breaker (--agent mode): nudge after N edit-free turns, hard-stop after 2N.
+    #[arg(long, value_name = "N")]
+    no_progress_limit: Option<usize>,
+
+    /// Budget awareness (--agent mode): tell the model its turn/token budget each turn so it can
+    /// wrap up before the ceiling.
+    #[arg(long)]
+    budget_awareness: bool,
+
     /// Cheap model to run the first turns on, escalating to --model after --escalate-after
     /// round-trips (--agent/--serve; §8 cost reduction, e.g. claude-haiku-4-5 → claude-sonnet-4-6).
     #[arg(long, value_name = "MODEL")]
@@ -345,6 +359,11 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
     if let Some(max_steps) = cli.max_steps {
         config.max_steps = max_steps;
     }
+    config = config.with_in_loop_verify(cli.in_loop_verify);
+    if let Some(n) = cli.no_progress_limit {
+        config = config.with_no_progress_limit(n);
+    }
+    config = config.with_budget_awareness(cli.budget_awareness);
     if let Some(budget) = cli.budget {
         config = config.with_budget(budget);
     }

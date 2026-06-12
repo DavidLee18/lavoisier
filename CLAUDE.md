@@ -373,7 +373,11 @@ in-memory), `--serve-matrix` (Matrix gateway), `--api-key <KEY>` (repeatable) / 
 counterfactual), `--telemetry` (per-task stderr summary), `--classify-with-model` (model archetype
 classification), `--repo-skeleton <TOKENS>` (cache-aware repo-skeleton prefix, §6.1),
 `--cheap-model`/`--escalate-after` (cheap-model-first) and `--advisor-model` (advisor+executor
-split) for §8 cost reduction. Gateway HTTP
+split) for §8 cost reduction, plus the **convergence levers** `--in-loop-verify` (stop as soon as
+`--verify-cmd` passes after an edit turn), `--no-progress-limit <N>` (nudge after N edit-free turns,
+hard-stop at 2N) and `--budget-awareness` (tell the model its turn/token budget each turn) — built to
+close the benchmark-surfaced *termination* gap (the agent finds+edits but won't stop; see
+`bench/README.md` Findings #2). Gateway HTTP
 routes: `GET /health`, `GET /metrics` (Prometheus), `POST /v1/turns` (SSE), `GET /v1/ws`
 (WebSocket). Env: `XAI_API_KEY`/`XAI_BASE_URL`/`XAI_GRPC_ENDPOINT`, **`XAI_TRANSPORT=grpc|http`
 (default `grpc`)**, `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`,
