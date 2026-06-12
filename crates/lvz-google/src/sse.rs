@@ -82,7 +82,15 @@ impl GeminiSseDecoder {
         if let Some(parts) = candidate["content"]["parts"].as_array() {
             for part in parts {
                 if let Some(call) = part.get("functionCall") {
-                    let id = format!("call_{}", self.tool_calls);
+                    // Gemini 3 thinking attaches a `thoughtSignature` to the part; it MUST be
+                    // echoed back when this call is resent in history, or the next request 400s.
+                    // The `id` is opaque to the agent and round-trips through tool_use→tool_result,
+                    // so we smuggle the signature in it (`call_{n}#{sig}`) and unpack it in
+                    // `build_contents` — keeping the whole concern inside this adapter.
+                    let id = match part.get("thoughtSignature").and_then(Value::as_str) {
+                        Some(sig) if !sig.is_empty() => format!("call_{}#{sig}", self.tool_calls),
+                        _ => format!("call_{}", self.tool_calls),
+                    };
                     self.tool_calls += 1;
                     let name = call["name"].as_str().unwrap_or_default().to_string();
                     let args = call
@@ -205,6 +213,20 @@ mod tests {
         );
         // STOP + a function call ⇒ the turn ends as ToolUse so the agent runs it.
         assert_eq!(events.last().unwrap(), &Event::Done(StopReason::ToolUse));
+    }
+
+    #[test]
+    fn thought_signature_is_carried_in_the_tool_call_id() {
+        let input = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"shell\",\"args\":{}},\"thoughtSignature\":\"SIG123\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+        let events = decode_all(input);
+        // The signature rides along in the opaque id so build_contents can echo it back.
+        assert_eq!(
+            events[0],
+            Event::ToolUseStart {
+                id: "call_0#SIG123".into(),
+                name: "shell".into()
+            }
+        );
     }
 
     #[test]

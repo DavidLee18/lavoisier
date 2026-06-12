@@ -237,8 +237,14 @@ fn content_part(block: &ContentBlock, id_to_name: &HashMap<&str, &str>) -> Value
         ContentBlock::Text { text, .. } => json!({ "text": text }),
         // Gemini has no inbound "thinking" part; echo it as text (rare on the outbound path).
         ContentBlock::Thinking { text } => json!({ "text": text }),
-        ContentBlock::ToolUse { name, input, .. } => {
-            json!({ "functionCall": { "name": name, "args": input } })
+        ContentBlock::ToolUse { id, name, input } => {
+            let mut part = json!({ "functionCall": { "name": name, "args": input } });
+            // Restore the `thoughtSignature` the decoder smuggled into the id (`call_{n}#{sig}`),
+            // required by Gemini 3 thinking when a call is resent. Absent for non-thinking turns.
+            if let Some((_, sig)) = id.split_once('#') {
+                part["thoughtSignature"] = json!(sig);
+            }
+            part
         }
         ContentBlock::ToolResult {
             tool_use_id,
@@ -342,5 +348,24 @@ mod tests {
             contents[2]["parts"][0]["functionResponse"]["response"]["result"],
             "fn main() {}"
         );
+    }
+
+    #[test]
+    fn thought_signature_smuggled_in_id_is_echoed_back_on_the_function_call() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_0#SIG123".into(),
+                name: "shell".into(),
+                input: json!({ "command": "ls" }),
+            }],
+        }];
+        let contents = build_contents(&messages);
+        let part = &contents[0]["parts"][0];
+        assert_eq!(part["functionCall"]["name"], "shell");
+        // The signature is restored to the part (Gemini 3 thinking requires it on resend); the
+        // synthetic `#SIG` suffix never leaks into the functionCall itself.
+        assert_eq!(part["thoughtSignature"], "SIG123");
+        assert!(part["functionCall"]["name"].as_str() == Some("shell"));
     }
 }

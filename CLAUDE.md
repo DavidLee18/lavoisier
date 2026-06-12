@@ -398,5 +398,11 @@ persistence, deeper reasoning-level radius modelling).
   2026-06-12 at the owner's explicit request to enable same-model benchmarking vs. agents that run
   on `gemini-3-flash-preview` — see `docs/BENCHMARKS.md`). OpenAI and other providers remain out of
   scope. (This relaxes the original "Anthropic + xAI native only" decision; `RECIPE.md` §1 records it.)
+  **Live-verified** against the real Gemini API (`gemini-3-flash-preview`, `--thinking high`): a
+  streaming turn plus the agent tool loop end-to-end (functionCall decode, tool-result round-trip,
+  implicit `cache_read`, clean `EndTurn`). Live testing surfaced + fixed one bug: Gemini 3 thinking
+  attaches a `thoughtSignature` to each functionCall that **must be echoed back on resend** (else a
+  400) — `lvz-google` round-trips it through the opaque tool-call id (`call_{n}#{sig}`), contained
+  to the adapter (no protocol change).
 - Secrets: read from env / AWS Secrets Manager at runtime; never commit keys.
 - License: prefer **Apache-2.0** (aligns with xai-proto) or MIT.
