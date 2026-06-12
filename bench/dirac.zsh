@@ -16,6 +16,11 @@
 emulate -L zsh
 set -uo pipefail
 
+# Dirac self-updates after a run (DIRAC_NO_AUTO_UPDATE!="1"), which churns its own binary at
+# /opt/homebrew/bin/dirac — so the *next* task in the suite hits a vanished binary ("no such file
+# or directory") and silently no-ops. Pin updates off so the whole suite runs against one version.
+export DIRAC_NO_AUTO_UPDATE=1
+
 SCRIPT_DIR=${0:A:h}
 DIRAC=${DIRAC:-dirac}
 MODEL=gemini-3-flash-preview
@@ -33,7 +38,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-command -v $DIRAC >/dev/null || { print -u2 "error: '$DIRAC' not found — npm install -g dirac-cli"; exit 1; }
+# Resolve to an absolute path once: a long task-01 run was observed to drop the CLI's dir from
+# PATH mid-suite (dirac self-update churns its symlink), so later bare-name lookups fail.
+DIRAC=$(command -v $DIRAC) || { print -u2 "error: '$DIRAC' not found — npm install -g dirac-cli"; exit 1; }
 [[ -n ${GEMINI_API_KEY:-} ]] || print -u2 "warning: GEMINI_API_KEY not set (try: export GEMINI_API_KEY=\"\$GOOGLE_API_KEY\")"
 
 STAMP=$(date +%Y%m%d-%H%M%S)
@@ -82,7 +89,7 @@ for f in $SCRIPT_DIR/tasks/*.task(N); do
   fi
   ( cd $repo
     git checkout -q $REF 2>/dev/null || print -u2 "  (ref '$REF' checkout failed; using HEAD)"
-    git reset -q --hard; git clean -qfd
+    git reset -q --hard; git clean -qfd -e .venv
   )
   [[ -n ${SETUP:-} ]] && { print -u2 "  setup…"; ( cd $repo; eval "$SETUP" ) >&2 || print -u2 "  setup failed (continuing)"; }
 

@@ -55,6 +55,8 @@ done
 typeset -A PRICING
 PRICING[gemini-3-flash-preview]="0.50 0.50 0.05 3.00"
 PRICING[grok-4.1-fast]="0.20 0.20 0.05 0.50"
+PRICING[grok-4-1-fast-reasoning]="0.20 0.20 0.05 0.50"
+PRICING[grok-4.3]="1.25 1.25 0.20 2.50"
 PRICING[grok-4]="3.00 3.00 0.75 15.00"
 PRICING[claude-haiku-4-5]="1.00 1.25 0.10 5.00"
 PRICING[claude-sonnet-4-6]="3.00 3.75 0.30 15.00"

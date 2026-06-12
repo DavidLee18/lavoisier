@@ -7,3 +7,7 @@
 .env.*
 
 .DS_Store
+
+# Benchmark run artifacts (transient: per-run results dirs + captured stdout logs)
+bench/results/
+bench/*.out
