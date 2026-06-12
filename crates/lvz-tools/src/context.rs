@@ -294,6 +294,118 @@ impl Tool for EditAnchoredTool {
     }
 }
 
+/// Apply anchored edits to one file (read → apply → write), returning a one-line summary + diff on
+/// success, or an error string on failure. The whole-file apply is atomic: if any anchor is missing
+/// or ambiguous, nothing is written. Shared by the `edit_files` batch tool.
+async fn apply_anchored_to_file(path: &str, specs: Vec<EditSpec>) -> Result<String, String> {
+    let edits: Vec<Edit> = specs
+        .into_iter()
+        .map(EditSpec::into_edit)
+        .collect::<Result<_, ToolError>>()
+        .map_err(|e| format!("{path}: {e}"))?;
+    let original = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| format!("{path}: {e}"))?;
+    let updated = apply_edits(&original, &edits).map_err(|e| format!("{path}: {e}"))?;
+    tokio::fs::write(path, &updated)
+        .await
+        .map_err(|e| format!("{path}: {e}"))?;
+    let diff = unified_diff(&original, &updated, 2);
+    Ok(format!("applied {} edit(s) to {path}\n{diff}", edits.len()))
+}
+
+/// `edit_files` — apply anchored edits across several files in one round-trip (the write-side
+/// counterpart to `read_files`/`outline_files`). The natural follow-up to `find_references`: edit
+/// every call site in a single call instead of one `edit_anchored` round-trip per file.
+pub struct EditFilesTool;
+
+#[derive(Deserialize)]
+struct EditFilesArgs {
+    files: Vec<FileEdits>,
+}
+
+#[derive(Deserialize)]
+struct FileEdits {
+    path: String,
+    edits: Vec<EditSpec>,
+}
+
+#[async_trait]
+impl Tool for EditFilesTool {
+    fn name(&self) -> &str {
+        "edit_files"
+    }
+
+    fn description(&self) -> &str {
+        "Apply anchored edits to SEVERAL files in one call — the multi-file form of edit_anchored. \
+         Pass `files`, each `{ path, edits }` where `edits` are anchored ops (see read_anchored / \
+         edit_anchored). Prefer this over many edit_anchored calls when a change spans multiple \
+         files (e.g. updating every call site after find_references): one round-trip instead of one \
+         per file. Each file is applied atomically; a file whose anchor is missing/ambiguous is \
+         reported inline and skipped while the others still apply. Returns a per-file diff/summary."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "description": "Per-file edit batches",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Path to the file to edit" },
+                            "edits": {
+                                "type": "array",
+                                "description": "Anchored edits to apply to this file",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "anchor": { "type": "string", "description": "Line anchor from read_anchored" },
+                                        "op": { "type": "string", "enum": ["replace", "insert_after", "insert_before", "delete"] },
+                                        "text": { "type": "string", "description": "Replacement/inserted text (omit for delete)" }
+                                    },
+                                    "required": ["anchor", "op"]
+                                }
+                            }
+                        },
+                        "required": ["path", "edits"]
+                    }
+                }
+            },
+            "required": ["files"]
+        })
+    }
+
+    async fn invoke(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let EditFilesArgs { files } = parse_args(args)?;
+        let mut sections = Vec::with_capacity(files.len());
+        let mut applied = 0usize;
+        let mut failed = 0usize;
+        for FileEdits { path, edits } in files {
+            let body = match apply_anchored_to_file(&path, edits).await {
+                Ok(summary) => {
+                    applied += 1;
+                    summary
+                }
+                Err(e) => {
+                    failed += 1;
+                    format!("[error: {e}]")
+                }
+            };
+            sections.push(format!("===== {path} =====\n{body}"));
+        }
+        let header = format!("edit_files: applied {applied} file(s), {failed} failed.\n");
+        let content = format!("{header}\n{}", sections.join("\n\n"));
+        // Surface a batch with any failure as an error so the model retries just those files.
+        Ok(ToolOutput {
+            content,
+            is_error: failed > 0,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,6 +473,71 @@ mod tests {
 
         let after = tokio::fs::read_to_string(&path).await.unwrap();
         assert_eq!(after, "alpha\nBETA\ngamma\n");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn edit_files_applies_across_multiple_files_in_one_call() {
+        let dir = std::env::temp_dir().join(format!("lvz_ctx_editfiles_{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        let (pa, pb) = (
+            a.to_string_lossy().to_string(),
+            b.to_string_lossy().to_string(),
+        );
+        tokio::fs::write(&a, "alpha\nkeep\n").await.unwrap();
+        tokio::fs::write(&b, "beta\nkeep\n").await.unwrap();
+
+        let out = EditFilesTool
+            .invoke(json!({
+                "files": [
+                    { "path": pa, "edits": [{ "anchor": lvz_context::anchor::anchor_of("alpha"), "op": "replace", "text": "ALPHA" }] },
+                    { "path": pb, "edits": [{ "anchor": lvz_context::anchor::anchor_of("beta"), "op": "replace", "text": "BETA" }] }
+                ]
+            }))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("applied 2 file(s), 0 failed"));
+        assert_eq!(
+            tokio::fs::read_to_string(&a).await.unwrap(),
+            "ALPHA\nkeep\n"
+        );
+        assert_eq!(tokio::fs::read_to_string(&b).await.unwrap(), "BETA\nkeep\n");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn edit_files_reports_one_bad_file_inline_and_still_applies_the_rest() {
+        let dir =
+            std::env::temp_dir().join(format!("lvz_ctx_editfiles_mix_{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let a = dir.join("a.txt");
+        let (pa, pb) = (
+            a.to_string_lossy().to_string(),
+            "/nonexistent/lvz/missing.txt",
+        );
+        tokio::fs::write(&a, "one\ntwo\n").await.unwrap();
+
+        let out = EditFilesTool
+            .invoke(json!({
+                "files": [
+                    { "path": pa, "edits": [{ "anchor": lvz_context::anchor::anchor_of("one"), "op": "replace", "text": "ONE" }] },
+                    { "path": pb, "edits": [{ "anchor": "deadbeef", "op": "delete" }] }
+                ]
+            }))
+            .await
+            .unwrap();
+        // One succeeded, one failed → batch is flagged as error but the good file is written.
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("applied 1 file(s), 1 failed"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("[error:"));
+        assert_eq!(tokio::fs::read_to_string(&a).await.unwrap(), "ONE\ntwo\n");
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 

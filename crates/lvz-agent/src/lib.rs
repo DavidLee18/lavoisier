@@ -48,8 +48,10 @@ outline_file over read_file to learn a file's structure, and prefer read_anchore
 edit_anchored over rewriting whole files with write_file. To find every place a name is \
 used (e.g. before a rename or signature change), use find_references — it returns the \
 complete set in one call — instead of repeated grep/sed via shell. When find_references has \
-listed all call sites, that is the full set: edit them and stop, rather than re-searching to \
-double-check. Take minimal, targeted actions; do not narrate. Do not echo file contents or \
+listed all call sites, that is the full set: edit them all and stop, rather than re-searching \
+to double-check. When a change spans several files, apply them with one edit_files call \
+(batching per-file anchored edits) instead of one edit_anchored call per file. Take minimal, \
+targeted actions; do not narrate. Do not echo file contents or \
 tool output back in your replies; reference line anchors and let edit_anchored's diff stand \
 as the record of changes. When the task is complete, give a one-line summary.";
 
