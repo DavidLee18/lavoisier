@@ -218,11 +218,25 @@ retries, budget ~2–3× a clean pass.
      baseline and passed 2/8 verify vs 1/8, but cost **+32% ($2.23 vs $1.69)** and even *regressed*
      one task (04: `EndTurn`→`max_steps`). 5/8 still hit the cap. A plan doesn't remove the reason the
      loop spins, so it's a nudge, not a fix.
-   - **`find_references` tool — the targeted fix (effectiveness pending a benchmark run).** One call
-     returns the *complete*, AST-precise reference set across the repo, grouped by file with a count,
-     giving the model the "that's all of them" signal so it can edit and stop instead of re-grepping.
-     The default system prompt steers to it. Whether it flips `max_steps` outcomes to `EndTurn` in
-     practice is the open measurement.
+   - **`find_references` tool — measured: helps *action*, does NOT fix *termination*.** One call
+     returns the complete, AST-precise reference set, grouped by file with a count. A full suite run
+     with it (tasks 01–06 valid; 07–08 hit Gemini 429s) showed it **was adopted** (4/4 rename/call-site
+     tasks used it; the two additive transformers tasks correctly didn't) and **broke analysis
+     paralysis**: task 02 went from **0 edits to 7**, and task 04 collapsed from **rt=55 → rt=18,
+     $0.22 → $0.055** (4× cheaper, clean `EndTurn`). But the model uses it to *locate* sites and then
+     **still keeps grepping/re-verifying** (35–43 shell calls alongside it) and rides to `max_steps`
+     anyway — 5/6 valid tasks still capped. Finding the set doesn't make the agent stop.
+   - **`edit_files` tool — built (write-side batch), not yet benched.** Applies anchored edits across
+     many files in one call (vs one `edit_anchored` per file); collapses the *edit* phase of a rename
+     from ~N round-trips to 1. Reduces turns spent editing, but — like the above — does not by itself
+     add a stop condition.
+   - **The validated conclusion: the unsolved lever is *termination*.** Three levers (advisor,
+     find_references, edit_files) each improve the *action* phase; none makes the agent decide it is
+     **done**. The loop has no "I'm finished" condition, so it finds the sites, edits them, then keeps
+     going. The remaining fix is an explicit stop-criterion — a **no-progress circuit-breaker** (force
+     a conclusion after N edit-free turns) and **in-loop verify** (run `--verify-cmd` mid-loop and stop
+     when green; today it only runs after `Done`). That, paired with the batch tools, is what should
+     close the gap.
 3. **Token efficiency (caching) is genuinely strong.** 0.6M–1.15M cached tokens/task vs ~0.2–0.46M
    billable input; without caching those re-reads bill at full input and a Sonnet suite would roughly
    double. This is why `lvz-anthropic` uses the native Messages API (an OpenAI-compat shim drops
