@@ -111,6 +111,9 @@ run_one() {
       --telemetry --repo-skeleton $skeleton --budget $BUDGET --max-steps $MAX_STEPS \
       --max-tokens $MAX_TOKENS --verify-cmd "$verify" ${=EXTRA_FLAGS} "$instruction"
   ) > $log 2>&1
+  # Capture the agent's actual changes BEFORE any reset, so they can be applied + real-tested
+  # later (bench/realtest.zsh). Untracked new files are included via `git add -N`.
+  ( cd $repo; git add -A -N >/dev/null 2>&1; git diff > $RESULTS/$id.patch 2>/dev/null )
   parse_telemetry $log
   local c=$(cost_usd)
   [[ -n $c ]] && total_cost=$(( total_cost + c ))
@@ -174,7 +177,7 @@ for f in $SCRIPT_DIR/tasks/*.task(N); do
   ( cd $repo
     git checkout -q $REF 2>/dev/null || print -u2 "  (ref '$REF' checkout failed; using current HEAD)"
     git reset -q --hard
-    git clean -qfd
+    git clean -qfd -e .venv
   )
   if [[ -n ${SETUP:-} ]]; then
     print -u2 "  setup…"; ( cd $repo; eval "$SETUP" ) >&2 || print -u2 "  setup failed (continuing; verify may not run)"

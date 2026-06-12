@@ -5,5 +5,9 @@ REF="main"
 SKELETON=2000
 SETUP='[ -x .venv/bin/ruff ] || { python3 -m venv .venv && .venv/bin/pip -q install ruff; }'
 VERIFY='.venv/bin/ruff check django/forms'
+# Real upstream test: forms_tests directly exercise the renamed method (the suite's own call
+# sites live in tests/), so a partial rename fails with AttributeError — a true completeness
+# gate, unlike ruff. Validated: full rename → 0 errors; source-only rename → 22 errors.
+REALTEST='.venv/bin/pip -q install asgiref sqlparse >/dev/null 2>&1; cd tests && PYTHONPATH=.. ../.venv/bin/python runtests.py forms_tests --parallel 1'
 ---INSTRUCTION---
 We want to rename the value_from_datadict method to extract_value_from_request in django.forms.Widget and all its subclasses, and update all calls to this method across the codebase. only update the code, no docs or txt files. make sure to run ruff using .venv locally (only run on the files you modify). do NOT run any tests

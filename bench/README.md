@@ -57,8 +57,14 @@ Prereqs: a built `lavoisier` (the harness builds `--release` once, or pass `--bi
 
 - **Cost** = `Σ tokens × price/M` from the per-task `[telemetry]` line, using the table in
   `run.zsh` (kept in sync with `docs/BENCHMARKS.md` §2). Edit `PRICING` there when rates move.
-- **Success** = the `--verify-cmd` exit code (the same gate ATO uses): the agent runs it on clean
-  completion; exit 0 ⇒ `success=true`. A per-task `--budget 4M` tokens caps a runaway loop.
+- **Success (proxy)** = the `--verify-cmd` exit code (the same gate ATO uses): the agent runs it on
+  clean completion; exit 0 ⇒ `success=true`. A per-task `--budget 4M` tokens caps a runaway loop.
+- **Success (real)** = `bench/realtest.zsh` — the *direct correctness* check. `run.zsh` now captures
+  each agent's actual diff to `results/<stamp>/<id>.patch`; `realtest.zsh` applies it (and Dirac's
+  published reference diff, fetched via `gh api`) to a clean checkout and runs the task's **real
+  upstream test** (the `REALTEST` field in the `.task`). Only tasks whose upstream suite exercises
+  the change qualify — today **`08_datadict`** (django `forms_tests`; both agents pass, see
+  `docs/BENCHMARKS.md` §3a). Run: `./bench/realtest.zsh --lvz-results bench/results/<stamp>`.
 
 ## Caveats — read before trusting the numbers
 
@@ -68,8 +74,8 @@ Prereqs: a built `lavoisier` (the harness builds `--release` once, or pass `--bi
 - **`VERIFY` is a reconstructed proxy.** Dirac graded via the in-prompt linter checks plus a manual
   audit against its checked-in diffs. Here `--verify-cmd` runs `ruff check <scope>` (transformers/
   django) or `tsc --noEmit` (vscode) — a real signal, but a *pass* means "lints/typechecks clean",
-  not "semantically equivalent to Dirac's diff". For rigorous grading, diff the agent's output
-  against `evals/dirac/dirac_refactor_*`.
+  not "semantically equivalent to Dirac's diff". For rigorous grading use `realtest.zsh` (above) where
+  the upstream suite covers the change, or diff the agent's output against `evals/dirac/dirac_refactor_*`.
 - **Plan mode differs.** Dirac started in plan mode (accept plan → act). Lavoisier has no separate
   plan mode; `--extra "--advisor-model …"` adds a plan pre-pass to approximate it.
 - **vscode tasks are heavy.** Tasks 1–4 need a full `npm ci` (large, slow) and a whole-project

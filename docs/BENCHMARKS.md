@@ -9,7 +9,8 @@ repos, same `--verify-cmd` grading (§3). The measured suite totals on this mach
 on 6/8 of the big multi-file refactors** (it ran to its `max_steps=60` ceiling), so its lower total
 is partly a *capped* cost, not a *completed* one. On the one task both agents finished cleanly and
 Lavoisier passed verify (`django` datadict), Lavoisier cost **$0.026 vs Dirac's $0.123 (~4.8×
-cheaper)** — the cleanest apples-to-apples point. The cross-model projection still holds for the
+cheaper)** — the cleanest apples-to-apples point, and on that task Lavoisier's diff is **verified
+correct by the real django test suite** (§3a), not just lint-clean. The cross-model projection still holds for the
 *other* providers (re-pricing the same token volume): **~$0.5 on `grok-4.1-fast`**, **~$2.7 on
 `claude-haiku-4-5`**, **~$8.5 on `claude-sonnet-4-6`**, **~$10 on `grok-4`**, **~$13.5 on
 `claude-opus-4-8`** — that spread is **model price, not agent efficiency**.
@@ -121,6 +122,39 @@ but it has a real **convergence gap** on large multi-file refactors (6/8 hit the
 Dirac does not. That's an agent-loop finding, not a pricing one — and the lever to close it
 (`--max-steps`, better stop-criteria, `--advisor-model` planning) is the subject of §5.
 
+### 3a. Direct correctness — real upstream tests (not the lint proxy)
+
+The `--verify-cmd` in §3 only proves "compiles / lints clean." To grade *correctness* directly, we
+apply each agent's **actual diff** to a clean checkout and run the **real upstream test suite**
+(`bench/realtest.zsh`: `git apply <agent-patch>` → run the task's test target → pass/fail; the agent
+patches are captured by `bench/run.zsh` into `results/<stamp>/<id>.patch`, and Dirac's are its
+published reference diffs at `dirac-run/dirac` `evals/dirac/dirac_refactor_*`, fetched via `gh api`).
+
+This is only sound where the upstream suite actually exercises the change. **One task qualifies
+cleanly: `08 datadict`** (django) — the rename `value_from_datadict → extract_value_from_request`,
+whose own test files call the method, so an incomplete rename fails with `AttributeError`. We
+validated the gate discriminates: the full reference patch → **0 errors**; a source-only rename
+(tests left unmodified) → **22 errors**.
+
+| Task | gate | **Lavoisier** | **Dirac** | notes |
+|---|---|:--:|:--:|---|
+| 08 datadict (django) | `runtests.py forms_tests` (1058 tests) | **pass** | **pass** | both renamed **all** call sites incl. 8 test files — a *complete* refactor, not just lint-clean |
+
+So on the one task with a real, discriminating correctness gate, **Lavoisier's output is verified
+correct and matches Dirac** — it didn't just satisfy `ruff`, it propagated the rename through the
+test call sites too. (Cost note: this dedicated re-run of task 08 cost Lavoisier **$0.20 at 42
+round-trips**, far above the §3 run's $0.026 at 11 — the agent is **stochastic** in how long it
+explores, so treat any single per-task cost as a sample, not a constant.)
+
+**Why only one task gets a real gate here** (the rest stay on the §3 proxy):
+- **vscode (01–04):** the real suite needs a full Electron build + headless run — impractical to
+  stand up; `tsc --noEmit` is the available signal (and for tasks 02/03 it's actually meaningful, as
+  a missed call site / unimplemented interface method *is* a type error).
+- **transformers (05–07):** torch installs on this box (cp314 wheel), but the baseline
+  `test_stopping_criteria` suite is **already red on a clean tree** (6/13 fail — dev-version drift +
+  offline tokenizer), and the tasks are *additive* features the upstream tests don't cover — so a
+  pass/fail there wouldn't isolate the agent's change. Documented as infeasible-here rather than run.
+
 ## 4. Re-pricing the suite on Lavoisier-supported models
 
 The token *volume* of a task is roughly model-independent (the same refactor needs the same context
@@ -212,5 +246,6 @@ Real runs need debugging/retries — budget ~2–3× a clean pass.
    cheapest supported alternative (flash-tier vs flash-tier) if you want lower cost at some quality
    trade-off.
 
-_Last updated: 2026-06-12 (§3 measured head-to-head added — Lavoisier ~$1.69 vs Dirac ~$2.78 on
-`gemini-3-flash-preview`). Prices and Dirac figures are point-in-time; re-derive from §2 sources._
+_Last updated: 2026-06-12 (§3 measured head-to-head — Lavoisier ~$1.69 vs Dirac ~$2.78 on
+`gemini-3-flash-preview`; §3a real-upstream-test correctness check — both pass django `forms_tests`).
+Prices and Dirac figures are point-in-time; re-derive from §2 sources._
