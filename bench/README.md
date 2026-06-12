@@ -210,11 +210,19 @@ retries, budget ~2–3× a clean pass.
    without self-terminating — it over-uses `shell` to re-verify and keeps exploring (e.g. task 02
    spent **57 of 60 turns** on `grep -r`/`sed -n` and made **zero edits**). The root cause is no
    authoritative "that's all of them" signal: ad-hoc `grep` never tells the model when it has covered
-   every call site, so it keeps searching. Levers: higher `--max-steps` (now exposed), `--advisor-model`
-   (plan pre-pass), and the **`find_references` tool** (added to address exactly this — one call returns
-   the *complete*, AST-precise reference set across the repo, grouped by file with a count, so the model
-   can edit them and stop instead of re-grepping). The earlier `max_steps=12` default and
-   `--max-tokens=2048` (which truncated thinking=High turns) were measurement bugs found + fixed here.
+   every call site, so it keeps searching. The earlier `max_steps=12` default and `--max-tokens=2048`
+   (which truncated thinking=High turns) were measurement bugs found + fixed here. Two fixes for the
+   *gap itself* were then tried:
+   - **`--advisor-model` plan pre-pass (≈ Dirac's plan mode) — measured, did NOT fix it.** A full
+     suite run with `--advisor-model gemini-3-flash-preview` converged 3/8 (`EndTurn`) vs the 2/8
+     baseline and passed 2/8 verify vs 1/8, but cost **+32% ($2.23 vs $1.69)** and even *regressed*
+     one task (04: `EndTurn`→`max_steps`). 5/8 still hit the cap. A plan doesn't remove the reason the
+     loop spins, so it's a nudge, not a fix.
+   - **`find_references` tool — the targeted fix (effectiveness pending a benchmark run).** One call
+     returns the *complete*, AST-precise reference set across the repo, grouped by file with a count,
+     giving the model the "that's all of them" signal so it can edit and stop instead of re-grepping.
+     The default system prompt steers to it. Whether it flips `max_steps` outcomes to `EndTurn` in
+     practice is the open measurement.
 3. **Token efficiency (caching) is genuinely strong.** 0.6M–1.15M cached tokens/task vs ~0.2–0.46M
    billable input; without caching those re-reads bill at full input and a Sonnet suite would roughly
    double. This is why `lvz-anthropic` uses the native Messages API (an OpenAI-compat shim drops
