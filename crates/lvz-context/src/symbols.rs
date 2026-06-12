@@ -95,6 +95,58 @@ impl SymbolGraph {
     }
 }
 
+/// Every 1-based line on which `name` occurs as a **reference identifier** (a real
+/// `identifier`/`type_identifier` node), not inside a string or comment. Each matching line is
+/// returned once, with its trimmed text, in source order.
+///
+/// This is the AST-aware core of the `find_references` tool: unlike a substring `grep`, a mention
+/// of `name` in a string literal or comment does **not** match, so the call-site set it returns is
+/// the *real* code references. (It is name-keyed, like the rest of this module — it does not resolve
+/// imports/visibility, so it matches every same-named identifier; that is exactly what "find all
+/// usages of this name" wants.)
+///
+/// Returns `None` only when the source **fails to parse** — so a caller can distinguish that from a
+/// successful parse with no identifier matches (e.g. the name appears only in a comment), and avoid
+/// falling back to a substring scan that would re-introduce the comment/string false positives.
+pub fn find_identifier_lines(source: &str, lang: Lang, name: &str) -> Option<Vec<(usize, String)>> {
+    let tree = parse(source, lang)?;
+    let spec = lang.spec();
+    let mut rows: HashSet<usize> = HashSet::new();
+    collect_named_ref_rows(tree.root_node(), source, &spec, name, &mut rows);
+    let src_lines: Vec<&str> = source.lines().collect();
+    let mut rows: Vec<usize> = rows.into_iter().collect();
+    rows.sort_unstable();
+    Some(
+        rows.into_iter()
+            .map(|row| {
+                let text = src_lines
+                    .get(row)
+                    .map(|s| s.trim())
+                    .unwrap_or("")
+                    .to_string();
+                (row + 1, text)
+            })
+            .collect(),
+    )
+}
+
+/// Collect the (0-based) rows of every reference-identifier node whose text equals `name`.
+fn collect_named_ref_rows(
+    node: Node,
+    source: &str,
+    spec: &crate::lang::LangSpec,
+    name: &str,
+    out: &mut HashSet<usize>,
+) {
+    if spec.ref_ident_kinds.contains(&node.kind()) && text(node, source) == name {
+        out.insert(node.start_position().row);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_named_ref_rows(child, source, spec, name, out);
+    }
+}
+
 /// Skeletonise `source`, keeping full bodies for symbols within `radius` hops of `target`.
 /// Everything else is elided. This is the knob-`N` entry point used by the budget loop and
 /// the `outline_file` tool's focus mode.
@@ -297,6 +349,31 @@ fn target() -> i32 {
             !out.contains("x + 1"),
             "helper body should be elided at radius 0: {out}"
         );
+    }
+
+    #[test]
+    fn find_identifier_lines_matches_code_not_strings_or_comments() {
+        let src = "\
+fn helper() -> i32 { 1 }
+fn target() -> i32 {
+    // helper is mentioned in this comment
+    let s = \"call helper here\";
+    helper()
+}
+";
+        let hits = find_identifier_lines(src, Lang::Rust, "helper").unwrap();
+        let rows: Vec<usize> = hits.iter().map(|(r, _)| *r).collect();
+        // Line 1 (definition) and line 5 (the real call) — NOT the comment (3) or string (4).
+        assert_eq!(rows, vec![1, 5], "got {hits:?}");
+        assert!(hits.iter().any(|(r, t)| *r == 5 && t.contains("helper()")));
+    }
+
+    #[test]
+    fn find_identifier_lines_dedups_a_line_with_two_uses() {
+        let src = "fn f() -> i32 { g() + g() }\nfn g() -> i32 { 1 }\n";
+        let hits = find_identifier_lines(src, Lang::Rust, "g").unwrap();
+        // The `g() + g()` line is reported once, plus the definition line.
+        assert_eq!(hits.iter().map(|(r, _)| *r).collect::<Vec<_>>(), vec![1, 2]);
     }
 
     #[test]

@@ -273,6 +273,16 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   read errors), the `batch_width` knob caps the `paths` array agent-side (`apply_knobs_to_args`),
   and `system_with_knobs` steers the model to the batch tools. Live-verified (one `read_files`
   call fetched 3 files in one round-trip).
+- **`find_references` tool (`lvz-tools::search`)** — repo-wide "where is this name used?" in one
+  call: a bounded, build-dir-skipping walk that returns the **complete** reference set grouped by
+  file with a total count. For known languages it matches identifier nodes via
+  `lvz_context::symbols::find_identifier_lines` (AST-precise — mentions in strings/comments don't
+  count; returns `Option`, `None` only on parse failure so callers don't text-fall-back on a clean
+  parse), with a word-boundary text scan for other files. Added to fix the **convergence gap** the
+  Dirac benchmark surfaced (the model otherwise loops on ad-hoc `grep -r`/`sed` with no "that's all
+  of them" signal — see `bench/README.md` Findings #2); the default system prompt now steers to it
+  and tells the model to stop once it has the full set. Unit-tested + scale-smoked vs the django
+  checkout (`#[ignore]`d `find_references_scale_smoke`, `LVZ_SMOKE_DIR`/`LVZ_SMOKE_NAME`).
 - **Cache-aware repo-skeleton prefix (§6.1) — implemented.** `AgentConfig.repo_skeleton:
   Option<usize>` (CLI `--repo-skeleton <TOKENS>`): `build_repo_skeleton` does a bounded, sorted
   (deterministic ⇒ byte-stable) walk of `repo_root`, tree-sitter–skeletonises every source file to

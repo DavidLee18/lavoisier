@@ -8,6 +8,7 @@
 
 mod builtins;
 mod context;
+mod search;
 
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use lvz_protocol::{Tool, ToolDef, ToolError, ToolOutput};
 
 pub use builtins::{ListDirTool, ReadFileTool, ReadFilesTool, ShellTool, WriteFileTool};
 pub use context::{EditAnchoredTool, OutlineFileTool, OutlineFilesTool, ReadAnchoredTool};
+pub use search::FindReferencesTool;
 
 /// A name-indexed set of tools. Exposes [`ToolDef`]s for the model and dispatches calls by
 /// name. Cheap to clone (it is a vector of `Arc`s), so the agent can hand a copy to a
@@ -43,6 +45,8 @@ impl ToolRegistry {
         registry.register(Arc::new(OutlineFilesTool));
         registry.register(Arc::new(ReadAnchoredTool));
         registry.register(Arc::new(EditAnchoredTool));
+        // Repo-wide reference search — the structured replacement for ad-hoc `grep -r`.
+        registry.register(Arc::new(FindReferencesTool));
         registry
     }
 
@@ -103,10 +107,11 @@ mod tests {
             "outline_files",
             "read_anchored",
             "edit_anchored",
+            "find_references",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
-        assert_eq!(defs.len(), 9);
+        assert_eq!(defs.len(), 10);
     }
 
     #[tokio::test]

@@ -207,9 +207,13 @@ retries, budget ~2–3× a clean pass.
    clean win. On the one cleanly-completed, **correctness-verified** task they tie (both pass real
    tests) at comparable, noisy cost. The cross-model spread (§6) is **model price**, not technique.
 2. **Lavoisier's headline weakness is agent convergence, not tokens.** 6/8 tasks ran to `max_steps=60`
-   without self-terminating — it over-uses `shell` to re-verify and keeps exploring (one task: 47
-   shell calls alongside 4 real edits). Levers: higher `--max-steps` (now exposed), tighter loop
-   stop-criteria, `--advisor-model` (plan pre-pass). The earlier `max_steps=12` default and
+   without self-terminating — it over-uses `shell` to re-verify and keeps exploring (e.g. task 02
+   spent **57 of 60 turns** on `grep -r`/`sed -n` and made **zero edits**). The root cause is no
+   authoritative "that's all of them" signal: ad-hoc `grep` never tells the model when it has covered
+   every call site, so it keeps searching. Levers: higher `--max-steps` (now exposed), `--advisor-model`
+   (plan pre-pass), and the **`find_references` tool** (added to address exactly this — one call returns
+   the *complete*, AST-precise reference set across the repo, grouped by file with a count, so the model
+   can edit them and stop instead of re-grepping). The earlier `max_steps=12` default and
    `--max-tokens=2048` (which truncated thinking=High turns) were measurement bugs found + fixed here.
 3. **Token efficiency (caching) is genuinely strong.** 0.6M–1.15M cached tokens/task vs ~0.2–0.46M
    billable input; without caching those re-reads bill at full input and a Sonnet suite would roughly
