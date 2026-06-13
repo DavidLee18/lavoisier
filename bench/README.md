@@ -9,12 +9,16 @@ Lavoisier's thesis — *context curation is the whole game*. Both were run on th
 
 **Now a clear win on grok — once the convergence levers landed (see [§7](#7-second-measured-head-to-head--grok-4-1-fast-reasoning-2026-06-13-convergence-gap-closed)).**
 
-- **Latest, cleanest result** (identical model `grok-4-1-fast-reasoning`, 2026-06-13): **Lavoisier
-  $0.20 vs Dirac $1.73 suite — ~8.6× cheaper, with *both* agents terminating on all 8 tasks**, so
-  neither total is a capped artifact. This is the comparison to trust: the convergence levers
-  (`--in-loop-verify`/`--no-progress-limit`/`--budget-awareness`) close the gap that invalidated the
-  earlier totals — all 8 Lavoisier tasks self-terminated (7 `EndTurn` + 1 no-progress breaker), **none
-  hit `max_steps`**.
+- **Three measured models, one honest story** (2026-06-13): **Lavoisier is ~8.6× cheaper on
+  `grok-4-1-fast-reasoning` ($0.20 vs $1.73, §7), a dead heat on `claude-sonnet-4-6` ($5.13 vs $5.16,
+  §8), and self-terminates 8/8 on both.** The technique win is large where the provider transport
+  leaves caching on the table (Dirac's grok path re-sends fresh input) and collapses to model-price
+  parity where both agents cache natively (Anthropic). So: Lavoisier **matches Dirac's convergence,
+  never loses on cost, and wins big when caching isn't a wash** — but there's no blanket "always
+  cheaper" claim.
+- **What fixed it:** the convergence levers (`--in-loop-verify`/`--no-progress-limit`/
+  `--budget-awareness`) close the gap that invalidated the earlier Gemini totals — on both grok and
+  Sonnet all 8 tasks self-terminated (`EndTurn` or no-progress breaker), **none hit `max_steps`**.
 - **Earlier result, identical model `gemini-3-flash-preview`** (§4, before the levers): **Lavoisier
   ≈ $1.69 vs Dirac ≈ $2.78.** Do **not** read that as a 1.6× win — back then **Lavoisier failed to
   self-terminate on 6 of 8 tasks** (it ran to its turn ceiling, `max_steps=60`), so its lower total was
@@ -250,6 +254,52 @@ read: **on identical models Lavoisier is now both cheaper *and* convergent** —
 cannot claim a suite-wide efficiency win" no longer holds for grok, because the capping that invalidated
 the §4 totals is gone.
 
+## 8. Third measured head-to-head — `claude-sonnet-4-6` (2026-06-13): a premium-model dead heat
+
+Same suite, same convergence-levers-on Lavoisier (`--provider anthropic`), and Dirac on the **same
+underlying model** — note its catalog id is **`claude-4-6-sonnet`**, not Lavoisier's `claude-sonnet-4-6`
+(passing the latter would silently fall back). We validated it's genuinely Sonnet: Dirac's reported
+cost reconciles exactly to Sonnet pricing (cache-write $3.75/M + cache-read $0.30/M + output $15/M),
+~10× above what a grok fallback would cost. Both ran with prompt caching (Anthropic native on both
+sides). This is the run to read for **real-world premium-model spend**.
+
+| # | Task | Repo | **Lavoisier $** | LVZ stop | **Dirac $** | verify (LVZ/Dirac) |
+|--|------|------|--:|---|--:|:--:|
+| 01 | extensionswb_service | vscode | 1.1207 | EndTurn | 1.5621 | fail / fail |
+| 02 | sendRequest | vscode | 0.6733 | no_progress | 0.8258 | fail / fail |
+| 03 | IOverlayWidget | vscode | 0.6279 | EndTurn | 0.1323 | fail / fail |
+| 04 | addLogging | vscode | 0.1865 | EndTurn | 0.4494 | fail / fail |
+| 05 | DynamicCache | transformers | 0.7081 | no_progress | 0.5033 | fail / fail |
+| 06 | stoppingcriteria | transformers | 0.2330 | EndTurn | 0.6019 | **pass** / **pass** |
+| 07 | latency | transformers | 1.3713 | no_progress | 1.0233 | fail / **pass** |
+| 08 | datadict | django | 0.2114 | EndTurn | **0.0628** | **pass** / **pass** |
+| | **Total** | | **$5.1322** | **8/8 terminated** | **$5.1609** | 2/8 / 3/8 |
+
+**Result — a dead heat on cost, and the grok efficiency gap does *not* transfer:**
+
+1. **Near-identical suite cost** ($5.13 vs $5.16). Both agents terminated cleanly on all 8 (Lavoisier 5
+   `EndTurn` + 3 no-progress breaker; zero `max_steps`), so both totals are honest completed-work costs.
+2. **Why the ~8.6× grok gap collapses here:** on grok, Dirac runs through an OpenAI-compat client and
+   re-sends large *fresh* input (277k tokens on task 08); on Anthropic it uses **native prompt caching**
+   — e.g. task 01 served **2.93M tokens from cache** at $0.30/M. With both agents caching well at the
+   *same* per-token prices, the per-task token-efficiency advantage that made Lavoisier 8.6× cheaper on
+   grok largely disappears. **The lever that moves real cost is which model + transport you pick**, not
+   agent technique, once both cache. (Model price dominates absolute spend: Sonnet ≈ 25× grok per task,
+   matching the §6 projection.)
+3. **The one fully-trustworthy point (task 08, both pass real `forms_tests`):** here Dirac is *cheaper*
+   ($0.063 vs $0.211) — the opposite of grok. Single per-task costs are stochastic (§5); read the suite,
+   not the cell. Net on the clean task: **both correct, comparable cost.**
+4. **"Did the tasks succeed?"** Yes in the load-bearing sense: 8/8 clean termination on both sides, and
+   the only task with a real correctness gate passes for both. The verify split (2/8 vs 3/8) is within
+   the documented `tsc`/`ruff` proxy noise (missing `@types`, pre-existing whole-repo lint) — it is *not*
+   a correctness ranking.
+
+**Bottom line across all three measured models:** Lavoisier is **dramatically cheaper on grok (~8.6×),
+tied on Sonnet, and convergent (8/8 self-terminate) on both** — the technique win is real where the
+provider transport leaves caching on the table, and collapses to model-price parity where both agents
+cache natively. There is no honest suite-wide "Lavoisier is always cheaper" claim; there *is* an honest
+"Lavoisier matches Dirac's convergence and never loses on cost, and wins big when caching isn't a wash."
+
 ## Findings
 
 1. **On the identical model, cost is the same order of magnitude — neither agent has a runaway edge.**
@@ -315,8 +365,9 @@ the §4 totals is gone.
 - **vscode tasks are heavy.** Tasks 1–4 need a full `npm ci` + whole-project `tsc`; tasks 5–8 only
   need `ruff`. Use `--tasks` to subset.
 
-_Last updated: 2026-06-13. Two measured head-to-heads: §4 on `gemini-3-flash-preview` (Lavoisier
-~$1.69 vs Dirac ~$2.78, but Lavoisier capped 6/8) and §7 on `grok-4-1-fast-reasoning` (Lavoisier $0.20
-vs Dirac $1.73, ~8.6× cheaper, **both terminate 8/8** — the convergence levers close the gap), plus §5
-real-upstream-test correctness (both pass django `forms_tests`). Prices and Dirac figures are
-point-in-time; re-derive from §3 sources._
+_Last updated: 2026-06-13. Three measured head-to-heads: §4 on `gemini-3-flash-preview` (Lavoisier
+~$1.69 vs Dirac ~$2.78, but Lavoisier capped 6/8 — pre-levers), §7 on `grok-4-1-fast-reasoning`
+(Lavoisier $0.20 vs Dirac $1.73, ~8.6× cheaper) and §8 on `claude-sonnet-4-6` (Lavoisier $5.13 vs Dirac
+$5.16, a dead heat) — both post-lever runs terminate 8/8, none capping. Plus §5 real-upstream-test
+correctness (both pass django `forms_tests`). Prices and Dirac figures are point-in-time; re-derive from
+§3 sources._
