@@ -23,8 +23,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    Capabilities, ChatRequest, ContentBlock, Event, Message, Provider, ProviderError, Role,
-    ThinkingLevel,
+    Capabilities, ChatRequest, ContentBlock, Event, Message, OutputFormat, Provider, ProviderError,
+    Role, ThinkingLevel, ToolChoice,
 };
 use serde_json::{json, Value};
 
@@ -208,10 +208,34 @@ fn build_body(req: &ChatRequest, thinking: Option<&str>) -> Value {
             .collect();
         body["tools"] = json!([ { "functionDeclarations": decls } ]);
     }
+    // Tool choice → functionCallingConfig.mode (+ allowedFunctionNames for a forced tool).
+    if let Some(tc) = req.tool_choice.as_ref() {
+        let fcc = match tc {
+            ToolChoice::Auto => json!({ "mode": "AUTO" }),
+            ToolChoice::Required => json!({ "mode": "ANY" }),
+            ToolChoice::None => json!({ "mode": "NONE" }),
+            ToolChoice::Tool(name) => json!({ "mode": "ANY", "allowedFunctionNames": [name] }),
+        };
+        body["toolConfig"] = json!({ "functionCallingConfig": fcc });
+    }
 
     let mut generation = json!({ "maxOutputTokens": req.max_tokens });
     if let Some(t) = req.temperature {
         generation["temperature"] = json!(t);
+    }
+    if let Some(p) = req.top_p {
+        generation["topP"] = json!(p);
+    }
+    if let Some(k) = req.top_k {
+        generation["topK"] = json!(k);
+    }
+    if !req.stop_sequences.is_empty() {
+        generation["stopSequences"] = json!(req.stop_sequences);
+    }
+    // Structured output: JSON mode + response schema (Gemini ignores unsupported schema keywords).
+    if let Some(OutputFormat::JsonSchema { schema }) = req.output_format.as_ref() {
+        generation["responseMimeType"] = json!("application/json");
+        generation["responseSchema"] = schema.clone();
     }
     // A per-request normalised level (set by the agent's per-archetype default / tuner /
     // --thinking-budget) takes precedence over the construction-time `--thinking` fallback.
@@ -325,6 +349,7 @@ mod tests {
             description: "read a file".into(),
             schema: json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
             cache: false,
+            strict: false,
         });
         r
     }
@@ -363,6 +388,28 @@ mod tests {
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             0
         );
+    }
+
+    #[test]
+    fn common_request_params_map_to_gemini_shape() {
+        let mut r = req();
+        r.tool_choice = Some(ToolChoice::Tool("read_file".into()));
+        r.top_p = Some(0.8);
+        r.top_k = Some(20);
+        r.stop_sequences = vec!["END".into()];
+        r.output_format = Some(OutputFormat::JsonSchema {
+            schema: json!({"type": "object"}),
+        });
+        let body = build_body(&r, None);
+        let fcc = &body["toolConfig"]["functionCallingConfig"];
+        assert_eq!(fcc["mode"], "ANY");
+        assert_eq!(fcc["allowedFunctionNames"][0], "read_file");
+        let g = &body["generationConfig"];
+        assert!((g["topP"].as_f64().unwrap() - 0.8).abs() < 1e-4);
+        assert_eq!(g["topK"], 20);
+        assert_eq!(g["stopSequences"][0], "END");
+        assert_eq!(g["responseMimeType"], "application/json");
+        assert_eq!(g["responseSchema"]["type"], "object");
     }
 
     #[test]

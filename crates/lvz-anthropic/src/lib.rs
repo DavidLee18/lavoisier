@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    Capabilities, ChatRequest, ContentBlock, Event, Message, Provider, ProviderError, Role,
-    SystemPrompt, ThinkingLevel, ToolDef,
+    Capabilities, ChatRequest, ContentBlock, Event, Message, OutputFormat, Provider, ProviderError,
+    Role, SystemPrompt, ThinkingLevel, ToolChoice, ToolDef,
 };
 use serde_json::{json, Value};
 
@@ -186,9 +186,39 @@ fn build_body(req: &ChatRequest, extended_ttl: bool) -> Value {
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
     }
+    if let Some(p) = req.top_p {
+        body["top_p"] = json!(p);
+    }
+    if let Some(k) = req.top_k {
+        body["top_k"] = json!(k);
+    }
+    if !req.stop_sequences.is_empty() {
+        body["stop_sequences"] = json!(req.stop_sequences);
+    }
+    if let Some(tc) = req.tool_choice.as_ref() {
+        body["tool_choice"] = build_tool_choice(tc, req.disable_parallel_tool_use);
+    }
+    if let Some(OutputFormat::JsonSchema { schema }) = req.output_format.as_ref() {
+        body["output_config"] = json!({ "format": { "type": "json_schema", "schema": schema } });
+    }
     apply_thinking(&mut body, req.thinking, req.max_tokens);
     mark_conversation_tail(&mut body);
     body
+}
+
+/// Map the normalised [`ToolChoice`] onto Anthropic's `tool_choice` object.
+fn build_tool_choice(choice: &ToolChoice, disable_parallel: bool) -> Value {
+    let mut v = match choice {
+        ToolChoice::Auto => json!({ "type": "auto" }),
+        ToolChoice::Required => json!({ "type": "any" }),
+        ToolChoice::None => json!({ "type": "none" }),
+        ToolChoice::Tool(name) => json!({ "type": "tool", "name": name }),
+    };
+    // `disable_parallel_tool_use` is valid on auto/any/tool (not none).
+    if disable_parallel && !matches!(choice, ToolChoice::None) {
+        v["disable_parallel_tool_use"] = json!(true);
+    }
+    v
 }
 
 /// Map the normalised [`ThinkingLevel`] onto Anthropic's `thinking` block. Extended thinking stays
@@ -333,6 +363,9 @@ fn build_tools(tools: &[ToolDef], extended_ttl: bool) -> Value {
                 "description": t.description,
                 "input_schema": t.schema,
             });
+            if t.strict {
+                v["strict"] = json!(true);
+            }
             if t.cache {
                 v["cache_control"] = cache_control(extended_ttl);
             }
@@ -359,6 +392,7 @@ mod tests {
             description: "read a file".into(),
             schema: json!({"type": "object"}),
             cache: true,
+            strict: false,
         });
 
         let body = build_body(&req, false);
@@ -464,6 +498,7 @@ mod tests {
             description: "d".into(),
             schema: json!({"type": "object"}),
             cache: true,
+            strict: false,
         });
         let body = build_body(&req, false);
         assert_eq!(
@@ -473,6 +508,35 @@ mod tests {
         );
         // The uncached tail block stays uncached because the budget was already spent.
         assert!(body["messages"][0]["content"][2]["cache_control"].is_null());
+    }
+
+    #[test]
+    fn common_request_params_map_to_anthropic_shape() {
+        let mut req = ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi"));
+        req.tool_choice = Some(ToolChoice::Tool("get_weather".into()));
+        req.disable_parallel_tool_use = true;
+        req.top_p = Some(0.9);
+        req.top_k = Some(40);
+        req.stop_sequences = vec!["STOP".into()];
+        req.output_format = Some(OutputFormat::JsonSchema {
+            schema: json!({"type": "object"}),
+        });
+        req.tools.push(ToolDef {
+            name: "get_weather".into(),
+            description: "d".into(),
+            schema: json!({"type": "object"}),
+            cache: false,
+            strict: true,
+        });
+        let body = build_body(&req, false);
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], "get_weather");
+        assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], true);
+        assert!((body["top_p"].as_f64().unwrap() - 0.9).abs() < 1e-4);
+        assert_eq!(body["top_k"], 40);
+        assert_eq!(body["stop_sequences"][0], "STOP");
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(body["tools"][0]["strict"], true);
     }
 
     #[test]

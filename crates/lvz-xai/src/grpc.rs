@@ -13,8 +13,8 @@ use std::collections::VecDeque;
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    Capabilities, ChatRequest, ContentBlock, Event, Message, Provider, ProviderError, Role,
-    StopReason, Usage,
+    Capabilities, ChatRequest, ContentBlock, Event, Message, OutputFormat, Provider, ProviderError,
+    Role, StopReason, ThinkingLevel, ToolChoice, Usage,
 };
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
@@ -253,8 +253,43 @@ fn build_request(req: ChatRequest) -> pb::GetCompletionsRequest {
         model: req.model.clone(),
         max_tokens: Some(i32::try_from(req.max_tokens).unwrap_or(i32::MAX)),
         temperature: req.temperature,
+        top_p: req.top_p,
+        stop: req.stop_sequences.clone(),
         tools: build_tools(&req),
+        tool_choice: req.tool_choice.as_ref().map(build_tool_choice),
+        response_format: req.output_format.as_ref().map(|f| {
+            let OutputFormat::JsonSchema { schema } = f;
+            pb::ResponseFormat {
+                format_type: pb::FormatType::JsonSchema as i32,
+                schema: Some(schema.to_string()),
+            }
+        }),
+        reasoning_effort: req.thinking.map(|t| reasoning_effort(t) as i32),
         ..Default::default()
+    }
+}
+
+/// Map the normalised tool choice onto the xAI proto `ToolChoice` oneof.
+fn build_tool_choice(tc: &ToolChoice) -> pb::ToolChoice {
+    use pb::tool_choice::ToolChoice as Oneof;
+    let inner = match tc {
+        ToolChoice::Auto => Oneof::Mode(pb::ToolMode::Auto as i32),
+        ToolChoice::Required => Oneof::Mode(pb::ToolMode::Required as i32),
+        ToolChoice::None => Oneof::Mode(pb::ToolMode::None as i32),
+        ToolChoice::Tool(name) => Oneof::FunctionName(name.clone()),
+    };
+    pb::ToolChoice {
+        tool_choice: Some(inner),
+    }
+}
+
+/// Map the normalised thinking level onto the xAI proto `ReasoningEffort`.
+fn reasoning_effort(level: ThinkingLevel) -> pb::ReasoningEffort {
+    match level {
+        ThinkingLevel::Off => pb::ReasoningEffort::EffortNone,
+        ThinkingLevel::Low => pb::ReasoningEffort::EffortLow,
+        ThinkingLevel::Medium => pb::ReasoningEffort::EffortMedium,
+        ThinkingLevel::High => pb::ReasoningEffort::EffortHigh,
     }
 }
 
@@ -394,6 +429,7 @@ mod tests {
             description: "list a dir".into(),
             schema: json!({ "type": "object" }),
             cache: false,
+            strict: false,
         });
 
         let g = build_request(req);

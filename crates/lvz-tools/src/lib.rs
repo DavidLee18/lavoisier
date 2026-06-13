@@ -72,6 +72,7 @@ impl ToolRegistry {
                 description: t.description().to_string(),
                 schema: t.schema(),
                 cache: false,
+                strict: false,
             })
             .collect()
     }

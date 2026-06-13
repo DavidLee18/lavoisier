@@ -24,6 +24,30 @@ pub enum ThinkingLevel {
     High,
 }
 
+/// How the model should choose among the offered tools. Each adapter maps this to its provider's
+/// shape (Anthropic `tool_choice`, OpenAI/xAI `tool_choice`, Gemini `functionCallingConfig.mode`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    /// Model decides whether to call a tool (provider default).
+    Auto,
+    /// Model must call at least one tool (Anthropic `any` / OpenAI `required` / Gemini `ANY`).
+    Required,
+    /// Model may not call any tool.
+    None,
+    /// Model must call exactly this tool.
+    Tool(String),
+}
+
+/// Constrain the model's output. Each adapter maps this to its structured-output surface
+/// (Anthropic `output_config.format`, OpenAI/xAI `response_format`, Gemini `responseSchema`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputFormat {
+    /// Constrain the response to JSON matching this JSON Schema.
+    JsonSchema { schema: serde_json::Value },
+}
+
 /// A full chat-completion request in provider-agnostic form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
@@ -46,6 +70,24 @@ pub struct ChatRequest {
     /// `Some(_)` requests a specific level. Set by the agent from the per-archetype default / tuner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingLevel>,
+    /// How the model should choose among tools. `None` defers to the provider default (`auto`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+    /// Forbid parallel tool calls within a single turn (at most one tool per response).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_parallel_tool_use: bool,
+    /// Nucleus-sampling cutoff; `None` defers to the provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Top-k sampling cutoff; `None` defers to the provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    /// Stop generation when any of these strings is produced.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop_sequences: Vec<String>,
+    /// Constrain the output shape (structured outputs / JSON schema). `None` = free-form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormat>,
 }
 
 impl ChatRequest {
@@ -59,12 +101,30 @@ impl ChatRequest {
             max_tokens: 1024,
             temperature: None,
             thinking: None,
+            tool_choice: None,
+            disable_parallel_tool_use: false,
+            top_p: None,
+            top_k: None,
+            stop_sequences: Vec::new(),
+            output_format: None,
         }
     }
 
     /// Set the extended-thinking effort (builder style).
     pub fn thinking(mut self, level: ThinkingLevel) -> Self {
         self.thinking = Some(level);
+        self
+    }
+
+    /// Set the tool-choice policy (builder style).
+    pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.tool_choice = Some(choice);
+        self
+    }
+
+    /// Constrain the output to JSON matching `schema` (builder style).
+    pub fn json_schema(mut self, schema: serde_json::Value) -> Self {
+        self.output_format = Some(OutputFormat::JsonSchema { schema });
         self
     }
 
@@ -200,4 +260,8 @@ pub struct ToolDef {
     pub schema: serde_json::Value,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cache: bool,
+    /// Request strict schema validation of the tool's arguments (structured tool use). Providers
+    /// that don't support it ignore the flag.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict: bool,
 }

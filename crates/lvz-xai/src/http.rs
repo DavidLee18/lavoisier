@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    Capabilities, ChatRequest, ContentBlock, Event, Provider, ProviderError, Role, StopReason,
-    Usage,
+    Capabilities, ChatRequest, ContentBlock, Event, OutputFormat, Provider, ProviderError, Role,
+    StopReason, ThinkingLevel, ToolChoice, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -53,9 +53,22 @@ impl Provider for HttpTransport {
         let body = OaiRequest {
             messages: build_messages(&req),
             tools: build_tools(&req),
+            tool_choice: req.tool_choice.as_ref().map(oai_tool_choice),
+            // Only emit when forbidding parallel calls; otherwise defer to the xAI default.
+            parallel_tool_calls: req.disable_parallel_tool_use.then_some(false),
+            response_format: req.output_format.as_ref().map(|f| {
+                let OutputFormat::JsonSchema { schema } = f;
+                json!({
+                    "type": "json_schema",
+                    "json_schema": { "name": "response", "schema": schema, "strict": true },
+                })
+            }),
+            reasoning_effort: req.thinking.and_then(reasoning_effort),
             model: req.model,
             max_tokens: req.max_tokens,
             temperature: req.temperature,
+            top_p: req.top_p,
+            stop: req.stop_sequences.clone(),
             stream: true,
             stream_options: Some(StreamOptions {
                 include_usage: true,
@@ -359,11 +372,42 @@ struct OaiRequest {
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    stop: Vec<String>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
+}
+
+/// Map the normalised thinking level onto grok's `reasoning_effort` (`low`/`high` on reasoning
+/// models; ignored by non-reasoning models). `None` ⇒ defer to the model default.
+fn reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
+    match level {
+        ThinkingLevel::Off | ThinkingLevel::Low => Some("low"),
+        ThinkingLevel::Medium | ThinkingLevel::High => Some("high"),
+    }
+}
+
+/// Map the normalised tool choice onto OpenAI's `tool_choice`.
+fn oai_tool_choice(tc: &ToolChoice) -> Value {
+    match tc {
+        ToolChoice::Auto => json!("auto"),
+        ToolChoice::Required => json!("required"),
+        ToolChoice::None => json!("none"),
+        ToolChoice::Tool(name) => json!({ "type": "function", "function": { "name": name } }),
+    }
 }
 
 #[derive(Serialize)]
@@ -451,6 +495,7 @@ mod tests {
             description: "list a dir".into(),
             schema: json!({"type": "object"}),
             cache: false,
+            strict: false,
         });
 
         let messages = build_messages(&req);

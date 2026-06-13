@@ -24,7 +24,10 @@ mod tune;
 pub use agent::{AgentError, AgentHandle, TurnRequest};
 pub use event::{Event, StopReason, Usage};
 pub use gateway::{Gateway, GatewayError};
-pub use message::{ChatRequest, ContentBlock, Message, Role, SystemPrompt, ThinkingLevel, ToolDef};
+pub use message::{
+    ChatRequest, ContentBlock, Message, OutputFormat, Role, SystemPrompt, ThinkingLevel,
+    ToolChoice, ToolDef,
+};
 pub use provider::{Capabilities, Provider, ProviderError};
 pub use telemetry::{TaskTelemetry, TelemetrySink};
 pub use tool::{Tool, ToolError, ToolOutput};

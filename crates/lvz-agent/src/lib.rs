@@ -1863,6 +1863,7 @@ mod tests {
             description: "read a file".into(),
             schema: json!({"type": "object"}),
             cache: false,
+            strict: false,
         }];
         let skeleton = "<skeleton of the repo>";
 
