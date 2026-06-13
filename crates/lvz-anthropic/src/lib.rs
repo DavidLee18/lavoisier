@@ -184,14 +184,17 @@ fn build_body(req: &ChatRequest, extended_ttl: bool) -> Value {
     if !req.tools.is_empty() {
         body["tools"] = build_tools(&req.tools, extended_ttl);
     }
-    if let Some(t) = req.temperature {
-        body["temperature"] = json!(t);
-    }
-    if let Some(p) = req.top_p {
-        body["top_p"] = json!(p);
-    }
-    if let Some(k) = req.top_k {
-        body["top_k"] = json!(k);
+    // Sampling parameters are rejected (400) on Opus 4.7/4.8 and Fable/Mythos 5 — skip them there.
+    if !rejects_sampling_params(&req.model) {
+        if let Some(t) = req.temperature {
+            body["temperature"] = json!(t);
+        }
+        if let Some(p) = req.top_p {
+            body["top_p"] = json!(p);
+        }
+        if let Some(k) = req.top_k {
+            body["top_k"] = json!(k);
+        }
     }
     if !req.stop_sequences.is_empty() {
         body["stop_sequences"] = json!(req.stop_sequences);
@@ -200,11 +203,27 @@ fn build_body(req: &ChatRequest, extended_ttl: bool) -> Value {
         body["tool_choice"] = build_tool_choice(tc, req.disable_parallel_tool_use);
     }
     if let Some(OutputFormat::JsonSchema { schema }) = req.output_format.as_ref() {
-        body["output_config"] = json!({ "format": { "type": "json_schema", "schema": schema } });
+        body["output_config"]["format"] = json!({ "type": "json_schema", "schema": schema });
     }
-    apply_thinking(&mut body, req.thinking, req.max_tokens);
+    apply_thinking(&mut body, req.thinking, &req.model, req.max_tokens);
     mark_conversation_tail(&mut body);
     body
+}
+
+/// Models that 400 on `temperature`/`top_p`/`top_k` (Opus 4.7/4.8, Fable 5, Mythos 5).
+fn rejects_sampling_params(model: &str) -> bool {
+    ["opus-4-7", "opus-4-8", "fable-5", "mythos-5"]
+        .iter()
+        .any(|m| model.contains(m))
+}
+
+/// Models that use *legacy* fixed-budget extended thinking (`thinking.budget_tokens`) rather than
+/// adaptive thinking + `effort`. Adaptive/`effort` 400 or are unsupported on these (Sonnet 4.5,
+/// Haiku 4.5, Opus 4.0/4.1); everything 4.6+ (incl. Fable) uses the modern path.
+fn uses_legacy_thinking(model: &str) -> bool {
+    ["haiku", "sonnet-4-5", "sonnet-4-0", "opus-4-1", "opus-4-0"]
+        .iter()
+        .any(|m| model.contains(m))
 }
 
 /// Map the normalised [`ToolChoice`] onto Anthropic's `tool_choice` object.
@@ -222,21 +241,38 @@ fn build_tool_choice(choice: &ToolChoice, disable_parallel: bool) -> Value {
     v
 }
 
-/// Map the normalised [`ThinkingLevel`] onto Anthropic's `thinking` block. Extended thinking stays
-/// opt-in: `Off`/`Low` add nothing (a mechanical task never *raises* cost), `Medium`/`High` enable
-/// it with a token budget. With thinking on, Anthropic requires `max_tokens > budget_tokens` and no
-/// custom temperature, so we bump `max_tokens` and drop `temperature` as needed.
-fn apply_thinking(body: &mut Value, thinking: Option<ThinkingLevel>, max_tokens: u32) {
-    let budget: u32 = match thinking {
-        Some(ThinkingLevel::Medium) => 4096,
-        Some(ThinkingLevel::High) => 12000,
+/// Map the normalised [`ThinkingLevel`] onto Anthropic's thinking surface. Extended thinking stays
+/// opt-in: `Off`/`Low` add nothing (a mechanical task never *raises* cost); `Medium`/`High` enable it.
+///
+/// The shape is **model-dependent** (see [`uses_legacy_thinking`]): modern models (Sonnet 4.6,
+/// Opus 4.6/4.7/4.8, Fable 5) use **adaptive thinking + `output_config.effort`** — `budget_tokens`
+/// 400s on Opus 4.7/4.8/Fable. Legacy models (Sonnet 4.5, Haiku 4.5, Opus 4.0/4.1) use fixed-budget
+/// `thinking.budget_tokens`, where Anthropic requires `max_tokens > budget_tokens`. Either way a
+/// custom `temperature` is disallowed alongside thinking, so it's dropped.
+fn apply_thinking(body: &mut Value, thinking: Option<ThinkingLevel>, model: &str, max_tokens: u32) {
+    let level = match thinking {
+        Some(l @ (ThinkingLevel::Medium | ThinkingLevel::High)) => l,
         _ => return, // None / Off / Low ⇒ no thinking block
     };
-    body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
-    // Anthropic rejects a request whose max_tokens isn't strictly above the thinking budget, and
-    // disallows a custom temperature alongside thinking.
-    if max_tokens <= budget {
-        body["max_tokens"] = json!(budget + 4096);
+    if uses_legacy_thinking(model) {
+        let budget: u32 = if level == ThinkingLevel::High {
+            12000
+        } else {
+            4096
+        };
+        body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+        if max_tokens <= budget {
+            body["max_tokens"] = json!(budget + 4096);
+        }
+    } else {
+        // Modern: adaptive thinking, depth controlled by effort (preserves any output_config.format).
+        body["thinking"] = json!({ "type": "adaptive" });
+        let effort = if level == ThinkingLevel::High {
+            "high"
+        } else {
+            "medium"
+        };
+        body["output_config"]["effort"] = json!(effort);
     }
     if let Some(obj) = body.as_object_mut() {
         obj.remove("temperature");
@@ -581,24 +617,61 @@ mod tests {
     }
 
     #[test]
-    fn thinking_level_maps_to_budget_only_for_medium_and_high() {
+    fn thinking_off_and_low_add_no_block() {
         let mk = |level: Option<ThinkingLevel>| {
             let mut req = ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi"));
             req.thinking = level;
-            req.max_tokens = 4096;
             build_body(&req, false)
         };
-        // None / Off / Low ⇒ no thinking block (mechanical tasks never raise cost).
         assert!(mk(None)["thinking"].is_null());
         assert!(mk(Some(ThinkingLevel::Off))["thinking"].is_null());
         assert!(mk(Some(ThinkingLevel::Low))["thinking"].is_null());
-        // Medium / High ⇒ enabled with a budget, and max_tokens is bumped above the budget.
-        let med = mk(Some(ThinkingLevel::Medium));
-        assert_eq!(med["thinking"]["type"], "enabled");
-        assert_eq!(med["thinking"]["budget_tokens"], 4096);
-        assert!(med["max_tokens"].as_u64().unwrap() > 4096);
-        let high = mk(Some(ThinkingLevel::High));
-        assert_eq!(high["thinking"]["budget_tokens"], 12000);
+    }
+
+    #[test]
+    fn modern_models_use_adaptive_thinking_plus_effort() {
+        // Sonnet 4.6 / Opus 4.8 / Fable 5 must NOT use budget_tokens (it 400s on the flagships).
+        for model in ["claude-sonnet-4-6", "claude-opus-4-8", "claude-fable-5"] {
+            let mut req = ChatRequest::new(model).push(Message::user("hi"));
+            req.thinking = Some(ThinkingLevel::High);
+            let body = build_body(&req, false);
+            assert_eq!(body["thinking"]["type"], "adaptive", "{model}");
+            assert!(body["thinking"]["budget_tokens"].is_null(), "{model}");
+            assert_eq!(body["output_config"]["effort"], "high", "{model}");
+        }
+        // Effort tracks the level (Medium → "medium").
+        let mut req = ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi"));
+        req.thinking = Some(ThinkingLevel::Medium);
+        assert_eq!(build_body(&req, false)["output_config"]["effort"], "medium");
+    }
+
+    #[test]
+    fn legacy_models_use_fixed_budget_thinking() {
+        // Haiku 4.5 / Sonnet 4.5 etc. use budget_tokens (adaptive/effort unsupported there).
+        let mut req = ChatRequest::new("claude-haiku-4-5").push(Message::user("hi"));
+        req.thinking = Some(ThinkingLevel::High);
+        req.max_tokens = 4096;
+        let body = build_body(&req, false);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 12000);
+        assert!(body["max_tokens"].as_u64().unwrap() > 12000);
+    }
+
+    #[test]
+    fn flagship_models_drop_sampling_params() {
+        // temperature/top_p/top_k 400 on Opus 4.7/4.8 + Fable — must be stripped.
+        let mut req = ChatRequest::new("claude-opus-4-8").push(Message::user("hi"));
+        req.temperature = Some(0.7);
+        req.top_p = Some(0.9);
+        req.top_k = Some(40);
+        let body = build_body(&req, false);
+        assert!(body["temperature"].is_null());
+        assert!(body["top_p"].is_null());
+        assert!(body["top_k"].is_null());
+        // Sonnet 4.6 still accepts them.
+        let mut s = ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi"));
+        s.temperature = Some(0.5);
+        assert!(!build_body(&s, false)["temperature"].is_null());
     }
 
     #[test]
