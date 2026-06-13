@@ -64,12 +64,8 @@ impl Provider for HttpTransport {
                 })
             }),
             reasoning_effort: req.thinking.and_then(reasoning_effort),
-            // A WebSearch server tool enables xAI Live Search (model decides when to search).
-            search_parameters: req
-                .server_tools
-                .iter()
-                .any(|t| matches!(t, ServerTool::WebSearch { .. }))
-                .then(|| json!({ "mode": "auto" })),
+            // A WebSearch server tool enables xAI Live Search; map its domain lists + cap.
+            search_parameters: http_search_params(&req.server_tools),
             model: req.model,
             max_tokens: req.max_tokens,
             temperature: req.temperature,
@@ -428,6 +424,33 @@ struct OaiRequest {
     reasoning_effort: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     search_parameters: Option<Value>,
+}
+
+/// Build xAI Live Search `search_parameters` JSON from a `WebSearch` server tool, if present.
+fn http_search_params(server_tools: &[ServerTool]) -> Option<Value> {
+    let (max_uses, allowed, blocked) = server_tools.iter().find_map(|t| match t {
+        ServerTool::WebSearch {
+            max_uses,
+            allowed_domains,
+            blocked_domains,
+        } => Some((max_uses, allowed_domains, blocked_domains)),
+        _ => None,
+    })?;
+    let mut sp = json!({ "mode": "auto" });
+    if let Some(n) = max_uses {
+        sp["max_search_results"] = json!(n);
+    }
+    if !allowed.is_empty() || !blocked.is_empty() {
+        let mut web = json!({ "type": "web" });
+        if !allowed.is_empty() {
+            web["allowed_websites"] = json!(allowed);
+        }
+        if !blocked.is_empty() {
+            web["excluded_websites"] = json!(blocked);
+        }
+        sp["sources"] = json!([web]);
+    }
+    Some(sp)
 }
 
 /// Map the normalised thinking level onto grok's `reasoning_effort` (`low`/`high` on reasoning

@@ -78,12 +78,30 @@ impl AnthropicSseDecoder {
             }
             Some("content_block_start") => {
                 let cb = &v["content_block"];
-                if cb["type"].as_str() == Some("tool_use") {
-                    let idx = v["index"].as_u64().unwrap_or(0);
-                    let id = cb["id"].as_str().unwrap_or_default().to_string();
-                    let name = cb["name"].as_str().unwrap_or_default().to_string();
-                    self.tool_blocks.insert(idx, id.clone());
-                    out.push_back(Ok(Event::ToolUseStart { id, name }));
+                match cb["type"].as_str() {
+                    Some("tool_use") => {
+                        let idx = v["index"].as_u64().unwrap_or(0);
+                        let id = cb["id"].as_str().unwrap_or_default().to_string();
+                        let name = cb["name"].as_str().unwrap_or_default().to_string();
+                        self.tool_blocks.insert(idx, id.clone());
+                        out.push_back(Ok(Event::ToolUseStart { id, name }));
+                    }
+                    // Provider-executed tool the model invoked (e.g. web_search, code_execution).
+                    Some("server_tool_use") => {
+                        let id = cb["id"].as_str().unwrap_or_default().to_string();
+                        let name = cb["name"].as_str().unwrap_or_default().to_string();
+                        out.push_back(Ok(Event::ServerToolUse { id, name }));
+                    }
+                    // The server's result for a built-in tool arrives whole in the start block
+                    // (it's computed server-side, not token-streamed).
+                    Some(t) if t.ends_with("_tool_result") => {
+                        let id = cb["tool_use_id"].as_str().unwrap_or_default().to_string();
+                        out.push_back(Ok(Event::ServerToolResult {
+                            id,
+                            content: cb["content"].to_string(),
+                        }));
+                    }
+                    _ => {}
                 }
             }
             Some("content_block_delta") => {
@@ -224,6 +242,31 @@ mod tests {
         assert_eq!(events.len(), 4);
         assert_eq!(events[0], Event::TextDelta("Hi".into()));
         assert_eq!(events[3], Event::Done(StopReason::EndTurn));
+    }
+
+    #[test]
+    fn surfaces_server_tool_use_and_result() {
+        let input = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_1\",\"name\":\"web_search\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srvtoolu_1\",\"content\":[{\"title\":\"r\"}]}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let events = decode_all(input);
+        assert_eq!(
+            events[0],
+            Event::ServerToolUse {
+                id: "srvtoolu_1".into(),
+                name: "web_search".into()
+            }
+        );
+        match &events[1] {
+            Event::ServerToolResult { id, content } => {
+                assert_eq!(id, "srvtoolu_1");
+                assert!(content.contains("title"));
+            }
+            other => panic!("expected server tool result, got {other:?}"),
+        }
     }
 
     #[test]

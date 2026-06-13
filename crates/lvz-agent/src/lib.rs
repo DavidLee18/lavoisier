@@ -1709,6 +1709,9 @@ impl TurnAccumulator {
                 Some(event)
             }
             Event::ToolUseEnd { .. } => Some(event),
+            // Provider-executed tools: forward for visibility, but don't treat as client tool
+            // calls (the provider already ran them; the agent must not try to execute them).
+            Event::ServerToolUse { .. } | Event::ServerToolResult { .. } => Some(event),
             Event::Usage(u) => {
                 self.usage = u; // providers emit one usage per turn; last wins
                 None

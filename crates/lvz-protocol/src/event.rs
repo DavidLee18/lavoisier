@@ -25,6 +25,12 @@ pub enum Event {
     ToolUseDelta { id: String, json: String },
     /// The tool call identified by `id` is complete; its argument JSON is now whole.
     ToolUseEnd { id: String },
+    /// A **provider-executed** (server-side) tool was invoked by the model — e.g. web search or
+    /// code execution. Informational: the agent does not execute these (the provider does).
+    ServerToolUse { id: String, name: String },
+    /// The result of a provider-executed tool, as a serialized JSON string (search hits, code
+    /// stdout/stderr, fetched page, …), correlated by `id`.
+    ServerToolResult { id: String, content: String },
     /// Token accounting, including cache hits. May arrive mid-stream and/or at the end.
     Usage(Usage),
     /// Terminal event: the turn finished for the given reason.

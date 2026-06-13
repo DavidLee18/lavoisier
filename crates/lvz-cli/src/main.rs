@@ -601,6 +601,8 @@ impl Renderer {
                     }
                 }
             }
+            Event::ServerToolUse { name, .. } => eprintln!("\n[server tool] {name}"),
+            Event::ServerToolResult { .. } => eprintln!("[server tool result]"),
             Event::Usage(usage) => {
                 eprintln!(
                     "\n[usage] in={} out={} cache_read={} cache_creation={}",

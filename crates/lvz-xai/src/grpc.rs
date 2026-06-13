@@ -275,17 +275,38 @@ fn build_request(req: ChatRequest) -> pb::GetCompletionsRequest {
             }
         }),
         reasoning_effort: req.thinking.map(|t| reasoning_effort(t) as i32),
-        // A WebSearch server tool enables xAI Live Search (model decides when to search).
-        search_parameters: req
-            .server_tools
-            .iter()
-            .any(|t| matches!(t, ServerTool::WebSearch { .. }))
-            .then(|| pb::SearchParameters {
-                mode: pb::SearchMode::AutoSearchMode as i32,
-                ..Default::default()
-            }),
+        // A WebSearch server tool enables xAI Live Search (model decides when to search), with the
+        // requested domain allow/block lists and result cap mapped onto a web source.
+        search_parameters: grpc_search_params(&req.server_tools),
         ..Default::default()
     }
+}
+
+/// Build xAI [`SearchParameters`](pb::SearchParameters) from a `WebSearch` server tool, if present.
+fn grpc_search_params(server_tools: &[ServerTool]) -> Option<pb::SearchParameters> {
+    let (max_uses, allowed, blocked) = server_tools.iter().find_map(|t| match t {
+        ServerTool::WebSearch {
+            max_uses,
+            allowed_domains,
+            blocked_domains,
+        } => Some((max_uses, allowed_domains, blocked_domains)),
+        _ => None,
+    })?;
+    let mut sp = pb::SearchParameters {
+        mode: pb::SearchMode::AutoSearchMode as i32,
+        max_search_results: max_uses.map(|n| n as i32),
+        ..Default::default()
+    };
+    if !allowed.is_empty() || !blocked.is_empty() {
+        sp.sources = vec![pb::Source {
+            source: Some(pb::source::Source::Web(pb::WebSource {
+                allowed_websites: allowed.clone(),
+                excluded_websites: blocked.clone(),
+                ..Default::default()
+            })),
+        }];
+    }
+    Some(sp)
 }
 
 /// Map the normalised tool choice onto the xAI proto `ToolChoice` oneof.
@@ -530,18 +551,21 @@ mod tests {
         let mut req = ChatRequest::new("grok-4").push(Message::user("hi"));
         req.server_tools = vec![
             ServerTool::WebSearch {
-                max_uses: None,
-                allowed_domains: vec![],
+                max_uses: Some(5),
+                allowed_domains: vec!["docs.rs".into()],
                 blocked_domains: vec![],
             },
             ServerTool::CodeExecution,
         ];
         let g = build_request(req);
-        // WebSearch → Live Search (AUTO mode).
-        assert_eq!(
-            g.search_parameters.unwrap().mode,
-            pb::SearchMode::AutoSearchMode as i32
-        );
+        // WebSearch → Live Search (AUTO mode) with the cap + allowed-domain web source.
+        let sp = g.search_parameters.unwrap();
+        assert_eq!(sp.mode, pb::SearchMode::AutoSearchMode as i32);
+        assert_eq!(sp.max_search_results, Some(5));
+        let Some(pb::source::Source::Web(web)) = &sp.sources[0].source else {
+            panic!("expected a web source");
+        };
+        assert_eq!(web.allowed_websites, vec!["docs.rs".to_string()]);
         // CodeExecution → a built-in code-execution tool entry.
         assert!(g
             .tools
