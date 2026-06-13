@@ -11,6 +11,7 @@
 //! breakpoint at the end of the stable prefix. The agent (not this crate) decides where that
 //! boundary is by setting the flags.
 
+pub mod batch;
 mod sse;
 
 use std::collections::VecDeque;
