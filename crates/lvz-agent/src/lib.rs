@@ -484,6 +484,11 @@ async fn run_loop(
     }
 
     for _step in 0..config.max_steps {
+        // Staleness eviction (§6.3): once a file has been edited, replace earlier reads/outlines
+        // of it with a short pointer — their bytes are now wrong and re-billing them wastes tokens.
+        // Runs first so dedup/compaction see the shrunken results.
+        mark_stale_reads(&mut history);
+
         // Deduplication (§6.3): collapse byte-identical repeated tool results (e.g. the same
         // file read twice with no change), keeping only the most recent copy. Cheap and
         // lossless, so it runs before compaction/eviction to shrink their input.
@@ -1106,6 +1111,140 @@ fn history_tokens(history: &[Message]) -> usize {
     history.iter().map(|m| estimate_tokens(&proxy(m))).sum()
 }
 
+/// Tools that *read* file content (their result goes stale once the file is edited). Edits use
+/// the shared [`is_edit_tool`]/[`EDIT_TOOLS`] classifier.
+const READ_TOOLS: &[&str] = &[
+    "read_file",
+    "read_files",
+    "read_anchored",
+    "outline_file",
+    "outline_files",
+];
+
+/// Collect every file path referenced in a tool call's arguments — `path` (string) and `paths`
+/// (array) at any nesting depth (so `edit_files`'s nested `edits[].path` is captured too).
+fn collect_paths(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(map) => {
+            for (k, val) in map {
+                match k.as_str() {
+                    "path" => {
+                        if let Some(s) = val.as_str() {
+                            out.push(s.to_string());
+                        }
+                    }
+                    "paths" => {
+                        if let Some(arr) = val.as_array() {
+                            out.extend(arr.iter().filter_map(|e| e.as_str().map(str::to_string)));
+                        }
+                    }
+                    _ => collect_paths(val, out),
+                }
+            }
+        }
+        Value::Array(arr) => arr.iter().for_each(|e| collect_paths(e, out)),
+        _ => {}
+    }
+}
+
+/// Staleness-aware eviction (`RECIPE.md` §6.3). Once a file has been *edited*, any earlier read or
+/// outline of that same file in the transcript is out of date — carrying its (now-wrong) bytes
+/// wastes tokens and can mislead the model. Replace each such superseded read result with a short
+/// "[stale: …]" pointer telling the model to re-read if it needs the current contents. The most
+/// recent read of a path (the one with no edit after it) is left intact, as are non-read results,
+/// small results, failed edits, and already-elided placeholders.
+fn mark_stale_reads(history: &mut [Message]) {
+    struct Call {
+        pos: usize,
+        read: bool,
+        edit: bool,
+        paths: Vec<String>,
+    }
+    // Pass 1: index every read/edit tool call in linear order, and note which results errored.
+    let mut calls: HashMap<String, Call> = HashMap::new();
+    let mut errored: HashSet<String> = HashSet::new();
+    let mut pos = 0usize;
+    for msg in history.iter() {
+        for block in &msg.content {
+            match block {
+                ContentBlock::ToolUse { id, name, input } => {
+                    let read = READ_TOOLS.contains(&name.as_str());
+                    let edit = is_edit_tool(name);
+                    if read || edit {
+                        let mut paths = Vec::new();
+                        collect_paths(input, &mut paths);
+                        calls.insert(
+                            id.clone(),
+                            Call {
+                                pos,
+                                read,
+                                edit,
+                                paths,
+                            },
+                        );
+                    }
+                    pos += 1;
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    ..
+                } if *is_error => {
+                    errored.insert(tool_use_id.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    // Latest position at which each path was *successfully* edited.
+    let mut last_edit: HashMap<String, usize> = HashMap::new();
+    for (id, c) in &calls {
+        if c.edit && !errored.contains(id) {
+            for p in &c.paths {
+                last_edit
+                    .entry(p.clone())
+                    .and_modify(|e| *e = (*e).max(c.pos))
+                    .or_insert(c.pos);
+            }
+        }
+    }
+    if last_edit.is_empty() {
+        return;
+    }
+    // Pass 2: elide read results superseded by a later edit of the same path.
+    for msg in history.iter_mut() {
+        for block in &mut msg.content {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } = block
+            {
+                if *is_error || content.len() < DEDUP_MIN_BYTES || content.starts_with('[') {
+                    continue;
+                }
+                let Some(c) = calls.get(tool_use_id) else {
+                    continue;
+                };
+                if !c.read {
+                    continue;
+                }
+                if let Some(stale_path) = c
+                    .paths
+                    .iter()
+                    .find(|p| last_edit.get(*p).is_some_and(|&e| e > c.pos))
+                {
+                    let n = content.len();
+                    *content = format!(
+                        "[stale: {stale_path} was edited after this read; {n} bytes elided — \
+                         re-read it if you need the current contents]"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Context deduplication (`RECIPE.md` §6.3). Collapse byte-identical tool-result content that
 /// appears more than once — e.g. the same file outlined or read twice without change. Walking
 /// newest→oldest, the most recent copy is kept verbatim and earlier identical copies are
@@ -1628,6 +1767,76 @@ mod tests {
             }),
             Event::Done(StopReason::ToolUse),
         ]
+    }
+
+    #[test]
+    fn cached_prefix_is_byte_stable_across_turns() {
+        // The cached prefix (system + tool defs + repo-skeleton block) must be byte-identical from
+        // one round-trip to the next, so a caching provider keeps hitting it; volatile per-turn
+        // content (the budget-awareness progress note) must live only in the conversation tail.
+        let config = AgentConfig::default();
+        let caps = Capabilities {
+            prompt_caching: true,
+            ..Default::default()
+        };
+        let knobs = Knobs::default();
+        let defs = vec![ToolDef {
+            name: "read_file".into(),
+            description: "read a file".into(),
+            schema: json!({"type": "object"}),
+            cache: false,
+        }];
+        let skeleton = "<skeleton of the repo>";
+
+        // Turn 1: just the task. Turn 2: task + an answer + a tool result carrying a volatile note.
+        let mut later = vec![ContentBlock::text("the answer")];
+        later.push(budget_note(2, 60, 5000, Some(100_000)));
+        let h1 = vec![Message::user("the task")];
+        let h2 = vec![
+            Message::user("the task"),
+            Message {
+                role: Role::Assistant,
+                content: later,
+            },
+        ];
+        let r1 = build_request(
+            &config,
+            &config.model,
+            &defs,
+            &caps,
+            &knobs,
+            &h1,
+            Some(skeleton),
+        );
+        let r2 = build_request(
+            &config,
+            &config.model,
+            &defs,
+            &caps,
+            &knobs,
+            &h2,
+            Some(skeleton),
+        );
+
+        // System prompt and tool defs are identical turn-to-turn.
+        assert_eq!(
+            r1.system.as_ref().unwrap().text,
+            r2.system.as_ref().unwrap().text
+        );
+        assert_eq!(
+            serde_json::to_value(&r1.tools).unwrap(),
+            serde_json::to_value(&r2.tools).unwrap()
+        );
+        // The skeleton block (first block of the first user message) is byte-identical.
+        let skel_block = |r: &ChatRequest| match &r.messages[0].content[0] {
+            ContentBlock::Text { text, cache } => (text.clone(), *cache),
+            other => panic!("expected cached skeleton text block, got {other:?}"),
+        };
+        assert_eq!(skel_block(&r1), skel_block(&r2));
+        assert!(skel_block(&r1).0.contains("skeleton") && skel_block(&r1).1);
+        // The volatile progress note never leaks into the cached prefix.
+        assert!(!r2.system.as_ref().unwrap().text.contains("progress:"));
+        assert!(!skel_block(&r2).0.contains("progress:"));
     }
 
     #[test]
@@ -2178,6 +2387,105 @@ fn target() -> u32 { helper() + 10 }
         assert!(content(2).starts_with("[duplicate"), "older copy collapsed");
         assert_eq!(content(6), big_a, "most recent copy kept verbatim");
         assert_eq!(content(4), big_b, "unique result untouched");
+    }
+
+    #[test]
+    fn mark_stale_reads_elides_reads_superseded_by_an_edit() {
+        let big = "fn foo() { /* body */ } ".repeat(15); // >200 bytes
+        let read = |id: &str, path: &str| Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "read_file".into(),
+                input: json!({ "path": path }),
+            }],
+        };
+        let edit = |id: &str, path: &str| Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "edit_anchored".into(),
+                input: json!({ "path": path }),
+            }],
+        };
+        let result = |id: &str, err: bool| Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: big.clone(),
+                is_error: err,
+            }],
+        };
+        let mut history = vec![
+            Message::user("task"),
+            read("r1", "a.rs"), // stale: edited later (index 2 result)
+            result("r1", false),
+            read("r2", "b.rs"), // fresh: b.rs never edited (index 4 result)
+            result("r2", false),
+            edit("e1", "a.rs"), // the edit to a.rs
+            result("e1", false),
+            read("r3", "a.rs"), // fresh: most recent read of a.rs, no edit after (index 8)
+            result("r3", false),
+        ];
+        mark_stale_reads(&mut history);
+        let content = |i: usize| match &history[i].content[0] {
+            ContentBlock::ToolResult { content, .. } => content.clone(),
+            _ => unreachable!("expected tool result at {i}"),
+        };
+        assert!(
+            content(2).starts_with("[stale"),
+            "pre-edit read of a.rs elided"
+        );
+        assert!(content(2).contains("a.rs"));
+        assert_eq!(content(4), big, "read of un-edited b.rs untouched");
+        assert_eq!(content(8), big, "post-edit read of a.rs kept fresh");
+    }
+
+    #[test]
+    fn mark_stale_reads_ignores_failed_edits() {
+        let big = "data ".repeat(60);
+        let mut history = vec![
+            Message::user("task"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "r1".into(),
+                    name: "read_file".into(),
+                    input: json!({ "path": "a.rs" }),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "r1".into(),
+                    content: big.clone(),
+                    is_error: false,
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "e1".into(),
+                    name: "edit_anchored".into(),
+                    input: json!({ "path": "a.rs" }),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "e1".into(),
+                    content: "anchor not found".into(),
+                    is_error: true, // the edit FAILED → file unchanged → read still valid
+                }],
+            },
+        ];
+        mark_stale_reads(&mut history);
+        match &history[2].content[0] {
+            ContentBlock::ToolResult { content, .. } => {
+                assert_eq!(*content, big, "a failed edit must not stale the prior read")
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]

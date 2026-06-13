@@ -161,7 +161,53 @@ fn build_body(req: &ChatRequest) -> Value {
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
     }
+    mark_conversation_tail(&mut body);
     body
+}
+
+/// Anthropic caps a request at **4** `cache_control` breakpoints. The static prefix (system +
+/// last tool def + repo-skeleton block) uses up to 3; this spends the spare one on the **tail of
+/// the conversation** — the last content block of the last message — so the whole transcript prefix
+/// bills as `cache_read` on the next round-trip instead of full-price fresh input (the rolling-cache
+/// pattern). It pays a one-time cache *write* on this turn to save the (larger) *read* next turn.
+/// No-op when the breakpoint budget is already spent or there is no message content to mark.
+fn mark_conversation_tail(body: &mut Value) {
+    const MAX_BREAKPOINTS: usize = 4;
+    if count_cache_breakpoints(body) >= MAX_BREAKPOINTS {
+        return;
+    }
+    if let Some(last_msg) = body["messages"].as_array_mut().and_then(|m| m.last_mut()) {
+        if let Some(last_block) = last_msg["content"]
+            .as_array_mut()
+            .and_then(|c| c.last_mut())
+        {
+            if last_block.get("cache_control").is_none() {
+                last_block["cache_control"] = cache_control();
+            }
+        }
+    }
+}
+
+/// Count `cache_control` markers already present across system, tools, and message content.
+fn count_cache_breakpoints(body: &Value) -> usize {
+    fn count(v: &Value) -> usize {
+        match v {
+            Value::Object(map) => {
+                let here = map.contains_key("cache_control") as usize;
+                here + map
+                    .iter()
+                    .filter(|(k, _)| *k != "cache_control")
+                    .map(|(_, val)| count(val))
+                    .sum::<usize>()
+            }
+            Value::Array(arr) => arr.iter().map(count).sum(),
+            _ => 0,
+        }
+    }
+    ["system", "tools", "messages"]
+        .iter()
+        .map(|k| count(&body[*k]))
+        .sum()
 }
 
 /// System prompt as a one-element text-block array, so a cache breakpoint can attach to it.
@@ -181,15 +227,22 @@ fn build_messages(messages: &[Message]) -> Value {
                 Role::User => "user",
                 Role::Assistant => "assistant",
             };
-            let content: Vec<Value> = m.content.iter().map(build_content_block).collect();
+            let content: Vec<Value> = m.content.iter().filter_map(build_content_block).collect();
             json!({ "role": role, "content": content })
         })
         .collect::<Vec<_>>();
     Value::Array(arr)
 }
 
-fn build_content_block(block: &ContentBlock) -> Value {
-    match block {
+/// Map one normalised block to its Messages-API JSON, or `None` to omit it.
+///
+/// Prior-turn **thinking is dropped**, not re-sent. Echoing it back (verbatim or as text) would
+/// re-bill those tokens every round-trip; the cheaper *and* correct choice is to omit it (the
+/// Messages API does not require past thinking blocks once a turn's tool loop has closed). Caching
+/// thinking would still cost cache-read tokens, so dropping it is strictly the most token-efficient
+/// option.
+fn build_content_block(block: &ContentBlock) -> Option<Value> {
+    Some(match block {
         ContentBlock::Text { text, cache } => {
             let mut v = json!({ "type": "text", "text": text });
             if *cache {
@@ -197,9 +250,7 @@ fn build_content_block(block: &ContentBlock) -> Value {
             }
             v
         }
-        // Re-sending thinking verbatim requires a signature we don't yet track; until M4
-        // wires that through, echo it as plain text. Outbound thinking is rare pre-agent.
-        ContentBlock::Thinking { text } => json!({ "type": "text", "text": text }),
+        ContentBlock::Thinking { .. } => return None,
         ContentBlock::ToolUse { id, name, input } => {
             json!({ "type": "tool_use", "id": id, "name": name, "input": input })
         }
@@ -218,7 +269,7 @@ fn build_content_block(block: &ContentBlock) -> Value {
             }
             v
         }
-    }
+    })
 }
 
 fn build_tools(tools: &[ToolDef]) -> Value {
@@ -289,5 +340,86 @@ mod tests {
         assert_eq!(block["type"], "tool_result");
         assert_eq!(block["tool_use_id"], "toolu_9");
         assert!(block["is_error"].is_null()); // omitted when false
+    }
+
+    #[test]
+    fn conversation_tail_gets_rolling_cache_breakpoint() {
+        // A multi-turn transcript: the last block of the last message should carry the rolling
+        // breakpoint so the whole prefix bills as cache_read next round-trip.
+        let req = ChatRequest::new("claude-sonnet-4-6")
+            .push(Message::user("do the task"))
+            .push(Message::assistant("on it"))
+            .push(Message::user("more context here"));
+        let body = build_body(&req);
+        let msgs = body["messages"].as_array().unwrap();
+        let last = msgs.last().unwrap();
+        let last_block = last["content"].as_array().unwrap().last().unwrap();
+        assert_eq!(
+            last_block["cache_control"]["type"], "ephemeral",
+            "the conversation tail must carry the rolling cache breakpoint"
+        );
+        // Earlier messages stay uncached (the breakpoint is only on the tail).
+        assert!(msgs[0]["content"][0]["cache_control"].is_null());
+    }
+
+    #[test]
+    fn thinking_blocks_are_dropped_from_resent_history() {
+        let msg = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    text: "lots of reasoning we must not re-bill".into(),
+                },
+                ContentBlock::text("the answer"),
+            ],
+        };
+        let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg));
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "thinking block must be omitted");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "the answer");
+        let serialized = body.to_string();
+        assert!(
+            !serialized.contains("re-bill"),
+            "thinking text must not be re-sent in any form"
+        );
+    }
+
+    #[test]
+    fn cache_breakpoints_never_exceed_four() {
+        // Saturate the static prefix with breakpoints (system + tool + two cached text blocks),
+        // then assert the rolling-tail logic refuses to add a 5th.
+        let mut req = ChatRequest::new("claude-sonnet-4-6").push(Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "skeleton".into(),
+                    cache: true,
+                },
+                ContentBlock::Text {
+                    text: "task".into(),
+                    cache: true,
+                },
+                ContentBlock::text("uncached tail"),
+            ],
+        });
+        req.system = Some(SystemPrompt {
+            text: "rules".into(),
+            cache: true,
+        });
+        req.tools.push(ToolDef {
+            name: "t".into(),
+            description: "d".into(),
+            schema: json!({"type": "object"}),
+            cache: true,
+        });
+        let body = build_body(&req);
+        assert_eq!(
+            count_cache_breakpoints(&body),
+            4,
+            "must cap at 4 breakpoints"
+        );
+        // The uncached tail block stays uncached because the budget was already spent.
+        assert!(body["messages"][0]["content"][2]["cache_control"].is_null());
     }
 }

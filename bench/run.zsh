@@ -110,10 +110,15 @@ cost_usd() {
 run_one() {
   local id=$1 repo=$2 verify=$3 skeleton=$4 instruction=$5
   local log=$RESULTS/$id.log
-  # Convergence levers (default on): in-loop verify, no-progress breaker (nudge@8/stop@16),
-  # budget awareness. Disable with --no-converge for an A/B baseline.
+  # Convergence levers (default on in the CLI too): in-loop verify, no-progress breaker
+  # (nudge@8/stop@16), budget awareness. For the A/B baseline we must pass --no-converge
+  # explicitly, since omitting the flags no longer disables them (the binary defaults them on).
   local converge=()
-  (( CONVERGE )) && converge=(--in-loop-verify --no-progress-limit 8 --budget-awareness)
+  if (( CONVERGE )); then
+    converge=(--in-loop-verify --no-progress-limit 8 --budget-awareness)
+  else
+    converge=(--no-converge)
+  fi
   ( cd $repo
     "$BIN" --agent --provider $PROVIDER --model $MODEL --thinking $THINKING \
       --telemetry --repo-skeleton $skeleton --budget $BUDGET --max-steps $MAX_STEPS \

@@ -95,18 +95,26 @@ struct Cli {
     max_steps: Option<usize>,
 
     /// In-loop verify (--agent mode): stop as soon as --verify-cmd passes after an edit turn,
-    /// instead of waiting for the model to decide it's done. Requires --verify-cmd.
+    /// instead of waiting for the model to decide it's done. On by default; inert without
+    /// --verify-cmd. Disable all convergence levers with --no-converge.
     #[arg(long)]
     in_loop_verify: bool,
 
-    /// No-progress circuit-breaker (--agent mode): nudge after N edit-free turns, hard-stop after 2N.
+    /// No-progress circuit-breaker (--agent mode): nudge after N edit-free turns, hard-stop after
+    /// 2N. Defaults to N=8 (on); --no-converge disables it.
     #[arg(long, value_name = "N")]
     no_progress_limit: Option<usize>,
 
     /// Budget awareness (--agent mode): tell the model its turn/token budget each turn so it can
-    /// wrap up before the ceiling.
+    /// wrap up before the ceiling. On by default; --no-converge disables it.
     #[arg(long)]
     budget_awareness: bool,
+
+    /// Turn OFF the default convergence levers (--in-loop-verify / --no-progress-limit 8 /
+    /// --budget-awareness). They only lower cost by making the agent loop self-terminate; this
+    /// restores the raw "run until the model stops or hits --max-steps" behaviour for A/B baselines.
+    #[arg(long)]
+    no_converge: bool,
 
     /// Cheap model to run the first turns on, escalating to --model after --escalate-after
     /// round-trips (--agent/--serve; §8 cost reduction, e.g. claude-haiku-4-5 → claude-sonnet-4-6).
@@ -359,11 +367,16 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
     if let Some(max_steps) = cli.max_steps {
         config.max_steps = max_steps;
     }
-    config = config.with_in_loop_verify(cli.in_loop_verify);
-    if let Some(n) = cli.no_progress_limit {
+    // Convergence levers are ON by default (they only lower cost — they make the loop stop instead
+    // of riding to the turn ceiling). `--no-converge` opts out; the explicit positive flags still
+    // force-enable. `in_loop_verify` is inert without `--verify-cmd`, so defaulting it on is safe.
+    let converge = !cli.no_converge;
+    config = config.with_in_loop_verify(cli.in_loop_verify || converge);
+    let no_progress = cli.no_progress_limit.or(converge.then_some(8));
+    if let Some(n) = no_progress {
         config = config.with_no_progress_limit(n);
     }
-    config = config.with_budget_awareness(cli.budget_awareness);
+    config = config.with_budget_awareness(cli.budget_awareness || converge);
     if let Some(budget) = cli.budget {
         config = config.with_budget(budget);
     }

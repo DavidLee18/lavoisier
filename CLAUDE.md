@@ -334,9 +334,21 @@ implementing the context/agent/protocol layers, preserve these:
 
 - Prompt caching via Anthropic native Messages API + `cache_control: ephemeral` on stable
   prefixes — this is the single biggest cost lever and the reason `lvz-anthropic` does **not**
-  use any OpenAI-compat shim (the shim drops caching).
+  use any OpenAI-compat shim (the shim drops caching). **`lvz-anthropic` also places a rolling
+  4th breakpoint on the conversation tail** (the last block of the last message) so the *growing
+  transcript* — not just the static system+tools+skeleton prefix — bills as `cache_read` each
+  round-trip (closes the measured gap where Dirac's explicit Anthropic caching out-cached us on
+  small tasks; `bench/README.md` §8). The adapter counts existing breakpoints and never exceeds
+  the Anthropic limit of 4.
+- **Prior-turn thinking is dropped on resend, never re-billed** (`build_content_block` returns
+  `None` for `Thinking`): the Messages API doesn't need past thinking once a turn's tool loop has
+  closed, and dropping beats caching it (zero tokens < cache-read tokens).
+- **Staleness-aware eviction** (`mark_stale_reads`, runs each loop before dedup): once a file is
+  *successfully* edited, earlier read/outline results for that path are replaced with a short
+  `[stale: …]` pointer (the most recent read and failed-edit cases are left intact).
 - Order context immutable → stable → volatile to maximise cache hits; never let volatile
-  content leak into the cached prefix.
+  content leak into the cached prefix (guarded by the `cached_prefix_is_byte_stable_across_turns`
+  test: the budget-awareness progress note lives only in the conversation tail).
 - File-skeleton extraction, symbol-dependency tracking, hash-anchored/AST-native edits, and
   token-efficient diffs over full-file rewrites (`lvz-context`).
 - The optimisation metric is **total task tokens across all round-trips**, never per-call
@@ -377,7 +389,10 @@ split) for §8 cost reduction, plus the **convergence levers** `--in-loop-verify
 `--verify-cmd` passes after an edit turn), `--no-progress-limit <N>` (nudge after N edit-free turns,
 hard-stop at 2N) and `--budget-awareness` (tell the model its turn/token budget each turn) — built to
 close the benchmark-surfaced *termination* gap (the agent finds+edits but won't stop; see
-`bench/README.md` Findings #2). Gateway HTTP
+`bench/README.md` Findings #2). **The convergence levers are now ON by default in the CLI**
+(`--in-loop-verify` + `--no-progress-limit 8` + `--budget-awareness`); `--no-converge` restores the
+raw run-to-`--max-steps` behaviour (used by `bench/run.zsh --no-converge` for A/B baselines).
+Gateway HTTP
 routes: `GET /health`, `GET /metrics` (Prometheus), `POST /v1/turns` (SSE), `GET /v1/ws`
 (WebSocket). Env: `XAI_API_KEY`/`XAI_BASE_URL`/`XAI_GRPC_ENDPOINT`, **`XAI_TRANSPORT=grpc|http`
 (default `grpc`)**, `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`,
