@@ -21,6 +21,14 @@ pub trait Provider: Send + Sync {
 
     /// Declare optional features so the agent can negotiate / degrade gracefully.
     fn capabilities(&self) -> Capabilities;
+
+    /// Count the input tokens this request would consume, using the provider's **native** counter
+    /// when it has one. Returns `Ok(None)` when the provider exposes no count endpoint (the caller
+    /// then falls back to its own estimate). The default is `Ok(None)`; adapters with a counter
+    /// (e.g. Anthropic `/v1/messages/count_tokens`) override it.
+    async fn count_tokens(&self, _req: &ChatRequest) -> Result<Option<u64>, ProviderError> {
+        Ok(None)
+    }
 }
 
 /// Optional features a provider may support. The agent conditions behaviour on these —

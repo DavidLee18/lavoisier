@@ -150,6 +150,57 @@ impl Provider for AnthropicProvider {
             vision: true,
         }
     }
+
+    /// Native token counting via `POST /v1/messages/count_tokens` (returns `usage.input_tokens`).
+    async fn count_tokens(&self, req: &ChatRequest) -> Result<Option<u64>, ProviderError> {
+        let body = build_count_body(req);
+        let url = format!(
+            "{}/v1/messages/count_tokens",
+            self.base_url.trim_end_matches('/')
+        );
+        let resp = self
+            .http
+            .post(url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                message,
+            });
+        }
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Decode(e.to_string()))?;
+        Ok(v["input_tokens"].as_u64())
+    }
+}
+
+/// Build the count-tokens request body: the same prompt-shaping fields as a completion request
+/// (model, system, messages, tools) but **no** `stream`/`max_tokens` (rejected by the endpoint),
+/// and no rolling cache-tail marker (counting is a one-shot, not a cached turn).
+fn build_count_body(req: &ChatRequest) -> Value {
+    let mut body = json!({
+        "model": req.model,
+        "messages": build_messages(&req.messages, false),
+    });
+    if let Some(system) = req.system.as_ref().map(|s| build_system(s, false)) {
+        body["system"] = system;
+    }
+    if !req.tools.is_empty() {
+        body["tools"] = build_tools(&req.tools, false);
+    }
+    if let Some(tc) = req.tool_choice.as_ref() {
+        body["tool_choice"] = build_tool_choice(tc, req.disable_parallel_tool_use);
+    }
+    body
 }
 
 struct SseState {
@@ -614,6 +665,28 @@ mod tests {
         assert_eq!(c[1]["type"], "document");
         assert_eq!(c[1]["source"]["type"], "url");
         assert_eq!(c[1]["source"]["url"], "https://x/y.pdf");
+    }
+
+    #[test]
+    fn count_tokens_body_omits_stream_and_max_tokens() {
+        let mut req = ChatRequest::new("claude-sonnet-4-6")
+            .system("rules")
+            .push(Message::user("hi"));
+        req.tools.push(ToolDef {
+            name: "t".into(),
+            description: "d".into(),
+            schema: json!({"type": "object"}),
+            cache: false,
+            strict: false,
+        });
+        let body = build_count_body(&req);
+        assert_eq!(body["model"], "claude-sonnet-4-6");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["system"][0]["text"], "rules");
+        assert_eq!(body["tools"][0]["name"], "t");
+        // The count endpoint rejects these completion-only fields.
+        assert!(body["stream"].is_null());
+        assert!(body["max_tokens"].is_null());
     }
 
     #[test]
