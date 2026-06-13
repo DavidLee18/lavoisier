@@ -24,7 +24,7 @@ use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
     Capabilities, ChatRequest, ContentBlock, Event, MediaSource, Message, OutputFormat, Provider,
-    ProviderError, Role, ThinkingLevel, ToolChoice,
+    ProviderError, Role, ServerTool, ThinkingLevel, ToolChoice,
 };
 use serde_json::{json, Value};
 
@@ -38,6 +38,10 @@ pub struct GoogleProvider {
     base_url: String,
     /// Optional thinking effort: a keyword level (`low`/`high`/`dynamic`) or a numeric budget.
     thinking: Option<String>,
+    /// Optional explicit `cachedContents/...` name to reference on every request (see
+    /// [`create_cached_content`](Self::create_cached_content)). Pins a large reused prefix
+    /// (e.g. a repo skeleton) at Gemini's cache-read rate.
+    cached_content: Option<String>,
     http: reqwest::Client,
 }
 
@@ -53,8 +57,17 @@ impl GoogleProvider {
             api_key: api_key.into(),
             base_url: base_url.into(),
             thinking: None,
+            cached_content: None,
             http: reqwest::Client::new(),
         }
+    }
+
+    /// Reference an explicit `cachedContents/...` resource on every request (created via
+    /// [`create_cached_content`](Self::create_cached_content)).
+    pub fn with_cached_content(mut self, name: impl Into<String>) -> Self {
+        let n = name.into();
+        self.cached_content = (!n.is_empty()).then_some(n);
+        self
     }
 
     /// Set the thinking effort — a level keyword (`low`/`high`/`dynamic`) or a numeric token budget.
@@ -79,6 +92,54 @@ impl GoogleProvider {
         }
         Ok(provider)
     }
+
+    /// Create an explicit cached-content resource over a fixed prefix (system + contents) for
+    /// `model`, returning its `cachedContents/...` name. Pass that to [`with_cached_content`]
+    /// (Self::with_cached_content) so a large reused prefix (e.g. a repo skeleton) bills at the
+    /// cache-read rate. `ttl_seconds` sets the cache lifetime.
+    pub async fn create_cached_content(
+        &self,
+        model: &str,
+        system: Option<&str>,
+        contents: &[Message],
+        ttl_seconds: u64,
+    ) -> Result<String, ProviderError> {
+        let mut body = json!({
+            "model": format!("models/{model}"),
+            "contents": build_contents(contents),
+            "ttl": format!("{ttl_seconds}s"),
+        });
+        if let Some(s) = system {
+            body["systemInstruction"] = json!({ "parts": [ { "text": s } ] });
+        }
+        let url = format!(
+            "{}/v1beta/cachedContents",
+            self.base_url.trim_end_matches('/')
+        );
+        let resp = self
+            .http
+            .post(url)
+            .header("x-goog-api-key", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                message: resp.text().await.unwrap_or_default(),
+            });
+        }
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Decode(e.to_string()))?;
+        v["name"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| ProviderError::Decode("cachedContents response missing name".into()))
+    }
 }
 
 #[async_trait]
@@ -87,7 +148,11 @@ impl Provider for GoogleProvider {
         &self,
         req: ChatRequest,
     ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
-        let body = build_body(&req, self.thinking.as_deref());
+        let body = build_body(
+            &req,
+            self.thinking.as_deref(),
+            self.cached_content.as_deref(),
+        );
         let url = format!(
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
             self.base_url.trim_end_matches('/'),
@@ -189,12 +254,18 @@ struct SseState {
 
 /// Build the `generateContent` request body from a normalised [`ChatRequest`]. The model id lives
 /// in the URL path, not the body.
-fn build_body(req: &ChatRequest, thinking: Option<&str>) -> Value {
+fn build_body(req: &ChatRequest, thinking: Option<&str>, cached_content: Option<&str>) -> Value {
     let mut body = json!({ "contents": build_contents(&req.messages) });
+    if let Some(name) = cached_content {
+        body["cachedContent"] = json!(name);
+    }
 
     if let Some(system) = &req.system {
         body["systemInstruction"] = json!({ "parts": [ { "text": system.text } ] });
     }
+    // Tools entry: custom function declarations + provider-executed server tools
+    // (WebSearch → Google Search grounding, CodeExecution → the code-execution tool).
+    let mut tools: Vec<Value> = Vec::new();
     if !req.tools.is_empty() {
         let decls: Vec<Value> = req
             .tools
@@ -207,7 +278,17 @@ fn build_body(req: &ChatRequest, thinking: Option<&str>) -> Value {
                 })
             })
             .collect();
-        body["tools"] = json!([ { "functionDeclarations": decls } ]);
+        tools.push(json!({ "functionDeclarations": decls }));
+    }
+    for st in &req.server_tools {
+        match st {
+            ServerTool::WebSearch { .. } => tools.push(json!({ "googleSearch": {} })),
+            ServerTool::CodeExecution => tools.push(json!({ "codeExecution": {} })),
+            ServerTool::WebFetch { .. } => {} // no direct Gemini equivalent
+        }
+    }
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
     }
     // Tool choice → functionCallingConfig.mode (+ allowedFunctionNames for a forced tool).
     if let Some(tc) = req.tool_choice.as_ref() {
@@ -374,7 +455,7 @@ mod tests {
 
     #[test]
     fn maps_system_tools_and_generation_config() {
-        let body = build_body(&req(), Some("high"));
+        let body = build_body(&req(), Some("high"), None);
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be terse");
         assert_eq!(
             body["tools"][0]["functionDeclarations"][0]["name"],
@@ -394,14 +475,14 @@ mod tests {
         let mut r = req();
         r.thinking = Some(ThinkingLevel::Low);
         // Construction fallback says "high", but the per-request Low must win.
-        let body = build_body(&r, Some("high"));
+        let body = build_body(&r, Some("high"), None);
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "low"
         );
         // Off disables thinking outright.
         r.thinking = Some(ThinkingLevel::Off);
-        let body = build_body(&r, Some("high"));
+        let body = build_body(&r, Some("high"), None);
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             0
@@ -418,7 +499,7 @@ mod tests {
         r.output_format = Some(OutputFormat::JsonSchema {
             schema: json!({"type": "object"}),
         });
-        let body = build_body(&r, None);
+        let body = build_body(&r, None, None);
         let fcc = &body["toolConfig"]["functionCallingConfig"];
         assert_eq!(fcc["mode"], "ANY");
         assert_eq!(fcc["allowedFunctionNames"][0], "read_file");
@@ -431,8 +512,30 @@ mod tests {
     }
 
     #[test]
+    fn server_tools_and_cached_content_map_to_gemini() {
+        let mut r = req();
+        r.server_tools = vec![
+            ServerTool::WebSearch {
+                max_uses: None,
+                allowed_domains: vec![],
+                blocked_domains: vec![],
+            },
+            ServerTool::CodeExecution,
+        ];
+        let body = build_body(&r, None, Some("cachedContents/abc"));
+        let tools = body["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t.get("googleSearch").is_some()));
+        assert!(tools.iter().any(|t| t.get("codeExecution").is_some()));
+        // The custom function declarations still ride alongside the server tools.
+        assert!(tools
+            .iter()
+            .any(|t| t.get("functionDeclarations").is_some()));
+        assert_eq!(body["cachedContent"], "cachedContents/abc");
+    }
+
+    #[test]
     fn numeric_thinking_is_a_budget_not_a_level() {
-        let body = build_body(&req(), Some("2048"));
+        let body = build_body(&req(), Some("2048"), None);
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             2048

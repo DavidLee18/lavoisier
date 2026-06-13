@@ -307,23 +307,36 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   committed baseline; update them deliberately when skeleton output legitimately changes
   (`cargo test -p lvz-context --test budget -- --nocapture` prints the trend line).
 
-## Native-API feature build (in progress)
+## Native-API feature coverage
 
-Bringing each provider adapter to **full native-API coverage** (audit + roadmap tracked in the
-task list). Shared, cross-provider request features were added to `lvz-protocol` first, then mapped
-in all three adapters; provider-specific features follow per provider (Anthropic first).
-- **Common request params (done):** `ChatRequest.tool_choice` (`ToolChoice` Auto/Required/None/Tool
-  + `disable_parallel_tool_use`), `top_p`/`top_k`/`stop_sequences`, `OutputFormat::JsonSchema`
-  (structured outputs), `ToolDef.strict`. Mapped: Anthropic (`tool_choice`/`output_config.format`/
-  strict), Google (`functionCallingConfig`/`responseSchema`), xAI gRPC+HTTP (`tool_choice`/
-  `response_format`/`reasoning_effort`).
-- **Multimodal (done):** `ContentBlock::Image`/`Document` + `MediaSource` (base64/url) +
-  `Capabilities.vision`. Mapped: Anthropic image/document `source`, Gemini `inlineData`/`fileData`,
-  xAI `image_url` (gRPC `ImageUrlContent`/`FileContent`; base64 docs URL-only on gRPC).
-- **Pending (per task list):** Anthropic adaptive-thinking+`effort` (fixes the `budget_tokens` 400
-  on Opus 4.7/4.8/Fable), native token counting, Batch API, server-side tools + MCP + Files,
-  refusal/pause_turn + citations; then xAI (Live Search, deferred) and Google (explicit caching,
-  grounding, code exec, safety, files/batch).
+Each provider adapter now covers its native API's major features. Cross-provider request features
+live in `lvz-protocol` and are mapped in all three adapters; provider-specific features are
+implemented per adapter.
+
+**Common (all three providers):**
+- `ChatRequest.tool_choice` (`ToolChoice` Auto/Required/None/Tool + `disable_parallel_tool_use`),
+  `top_p`/`top_k`/`stop_sequences`, `OutputFormat::JsonSchema` (structured outputs), `ToolDef.strict`.
+- Multimodal: `ContentBlock::Image`/`Document` + `MediaSource` (base64/url/**file_id**) +
+  `Capabilities.vision`. Anthropic image/document `source`, Gemini `inlineData`/`fileData`, xAI
+  `image_url`/`FileContent`.
+- `ServerTool` (`WebSearch`/`WebFetch`/`CodeExecution`) + `mcp_servers` — provider-executed tools,
+  unified: WebSearch → Anthropic `web_search_20260209` / xAI **Live Search** / Gemini
+  `googleSearch`; CodeExecution → each provider's built-in.
+
+**Anthropic:** model-aware thinking — **adaptive + `output_config.effort`** on modern models
+(Sonnet 4.6, Opus 4.6/4.7/4.8, Fable 5), legacy `budget_tokens` on Haiku/older; sampling params
+stripped on the flagships that 400 on them. Native token counting (`Provider::count_tokens` →
+`/v1/messages/count_tokens`). **Batch API** (`lvz_anthropic::batch`, 50% pricing). Server-side
+tools + MCP connector (`mcp_servers`) + Files API (`upload_file`) with auto beta headers.
+`StopReason::Refusal`/`PauseTurn`; document `citations`.
+
+**xAI:** `reasoning_effort` (gRPC + HTTP), Live Search (`search_parameters`), `response_format`,
+`tool_choice`, vision (`image_url`/`FileContent`). Deferred async completions: not implemented (niche).
+
+**Google:** `functionCallingConfig`, `responseSchema`, sampling, multimodal, **explicit context
+caching** (`GoogleProvider::create_cached_content` + `with_cached_content` → `cachedContent`),
+Google Search grounding + code-execution tools. `safetySettings`, Gemini Files upload, batch mode:
+not implemented (lower value / policy).
 
 ## Architecture invariants (do not violate)
 
