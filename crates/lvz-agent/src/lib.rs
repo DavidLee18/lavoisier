@@ -1116,6 +1116,12 @@ fn render_transcript(messages: &[Message]) -> String {
                     let tag = if *is_error { " (error)" } else { "" };
                     let _ = writeln!(out, "tool result{tag}: {content}");
                 }
+                ContentBlock::Image { .. } => {
+                    let _ = writeln!(out, "{role}: [image]");
+                }
+                ContentBlock::Document { .. } => {
+                    let _ = writeln!(out, "{role}: [document]");
+                }
             }
         }
     }
@@ -1331,11 +1337,17 @@ fn proxy(m: &Message) -> String {
                 s.push_str(&input.to_string());
             }
             ContentBlock::ToolResult { content, .. } => s.push_str(content),
+            // Media bytes aren't text; approximate their prompt footprint with a small token cost.
+            ContentBlock::Image { .. } | ContentBlock::Document { .. } => s.push_str(MEDIA_PROXY),
         }
         s.push(' ');
     }
     s
 }
+
+/// Rough token-proxy stand-in for a media block (real image/doc token cost is provider-specific;
+/// this keeps compaction/eviction estimates from treating media as free).
+const MEDIA_PROXY: &str = "[media block ~1500 tokens placeholder]";
 
 /// Resolve the thinking level for a task: an explicit `--thinking-budget` wins, then the tuner's
 /// learned knob, then the per-archetype default. `None` ⇒ defer to the provider default.

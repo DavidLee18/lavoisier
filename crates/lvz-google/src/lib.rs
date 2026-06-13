@@ -23,8 +23,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    Capabilities, ChatRequest, ContentBlock, Event, Message, OutputFormat, Provider, ProviderError,
-    Role, ThinkingLevel, ToolChoice,
+    Capabilities, ChatRequest, ContentBlock, Event, MediaSource, Message, OutputFormat, Provider,
+    ProviderError, Role, ThinkingLevel, ToolChoice,
 };
 use serde_json::{json, Value};
 
@@ -175,6 +175,7 @@ impl Provider for GoogleProvider {
             extended_thinking: true,
             parallel_tool_use: true,
             server_side_tools: false,
+            vision: true,
         }
     }
 }
@@ -301,11 +302,26 @@ fn build_contents(messages: &[Message]) -> Value {
     Value::Array(contents)
 }
 
+/// Map a normalised media source onto a Gemini data part (`inlineData` / `fileData`).
+fn gemini_media_part(source: &MediaSource) -> Value {
+    match source {
+        MediaSource::Base64 { media_type, data } => {
+            json!({ "inlineData": { "mimeType": media_type, "data": data } })
+        }
+        MediaSource::Url { url } => json!({ "fileData": { "fileUri": url } }),
+    }
+}
+
 fn content_part(block: &ContentBlock, id_to_name: &HashMap<&str, &str>) -> Value {
     match block {
         ContentBlock::Text { text, .. } => json!({ "text": text }),
         // Gemini has no inbound "thinking" part; echo it as text (rare on the outbound path).
         ContentBlock::Thinking { text } => json!({ "text": text }),
+        // Images and documents (PDF) both map to a Gemini data part: inlineData for base64,
+        // fileData for a URL. Gemini accepts a PDF the same way as an image.
+        ContentBlock::Image { source } | ContentBlock::Document { source } => {
+            gemini_media_part(source)
+        }
         ContentBlock::ToolUse { id, name, input } => {
             let mut part = json!({ "functionCall": { "name": name, "args": input } });
             // Restore the `thoughtSignature` the decoder smuggled into the id (`call_{n}#{sig}`),

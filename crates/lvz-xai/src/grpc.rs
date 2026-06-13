@@ -13,8 +13,8 @@ use std::collections::VecDeque;
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    Capabilities, ChatRequest, ContentBlock, Event, Message, OutputFormat, Provider, ProviderError,
-    Role, StopReason, ThinkingLevel, ToolChoice, Usage,
+    Capabilities, ChatRequest, ContentBlock, Event, MediaSource, Message, OutputFormat, Provider,
+    ProviderError, Role, StopReason, ThinkingLevel, ToolChoice, Usage,
 };
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
@@ -119,6 +119,7 @@ impl Provider for GrpcTransport {
             parallel_tool_use: true,
             // The native path exposes provider-executed tools (web/x search, code exec, …).
             server_side_tools: true,
+            vision: true,
         }
     }
 }
@@ -319,12 +320,15 @@ fn build_messages(req: &ChatRequest) -> Vec<pb::Message> {
 
 fn push_user(m: &Message, out: &mut Vec<pb::Message>) {
     let mut text = String::new();
+    let mut media = Vec::new();
     let mut tool_results = Vec::new();
     for block in &m.content {
         match block {
             ContentBlock::Text { text: t, .. } | ContentBlock::Thinking { text: t } => {
                 text.push_str(t)
             }
+            ContentBlock::Image { source } => media.push(image_content(source)),
+            ContentBlock::Document { source } => media.extend(file_content(source)),
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -340,9 +344,14 @@ fn push_user(m: &Message, out: &mut Vec<pb::Message>) {
     }
     // Tool results are their own ROLE_TOOL messages and precede any free-text follow-up.
     out.extend(tool_results);
+    let mut content: Vec<pb::Content> = Vec::new();
     if !text.is_empty() {
+        content.push(text_content(text));
+    }
+    content.extend(media);
+    if !content.is_empty() {
         out.push(pb::Message {
-            content: vec![text_content(text)],
+            content,
             role: pb::MessageRole::RoleUser as i32,
             ..Default::default()
         });
@@ -355,6 +364,38 @@ fn push_user(m: &Message, out: &mut Vec<pb::Message>) {
     }
 }
 
+/// An image content part. xAI's `image_url` accepts either a URL or a base64 data-URL string.
+fn image_content(source: &MediaSource) -> pb::Content {
+    let url = match source {
+        MediaSource::Url { url } => url.clone(),
+        MediaSource::Base64 { media_type, data } => format!("data:{media_type};base64,{data}"),
+    };
+    pb::Content {
+        content: Some(pb::content::Content::ImageUrl(pb::ImageUrlContent {
+            image_url: url,
+            detail: pb::ImageDetail::DetailAuto as i32,
+        })),
+    }
+}
+
+/// A document/file content part. A URL maps to `FileContent.url`; inline base64 is unsupported on
+/// the gRPC transport (it wants raw bytes, not base64), so it degrades to a short text note.
+fn file_content(source: &MediaSource) -> Vec<pb::Content> {
+    match source {
+        MediaSource::Url { url } => vec![pb::Content {
+            content: Some(pb::content::Content::File(pb::FileContent {
+                url: url.clone(),
+                ..Default::default()
+            })),
+        }],
+        MediaSource::Base64 { .. } => {
+            vec![text_content(
+                "[document omitted: send via URL on the xAI gRPC transport]".into(),
+            )]
+        }
+    }
+}
+
 fn build_assistant(m: &Message) -> pb::Message {
     let mut text = String::new();
     let mut tool_calls = Vec::new();
@@ -363,6 +404,8 @@ fn build_assistant(m: &Message) -> pb::Message {
             ContentBlock::Text { text: t, .. } => text.push_str(t),
             // Thinking is rehydrated server-side via encrypted_content, which we don't echo.
             ContentBlock::Thinking { .. } => {}
+            // Images/documents are inputs, not assistant output — never re-sent on an assistant turn.
+            ContentBlock::Image { .. } | ContentBlock::Document { .. } => {}
             ContentBlock::ToolUse { id, name, input } => tool_calls.push(pb::ToolCall {
                 id: id.clone(),
                 tool: Some(pb::tool_call::Tool::Function(pb::FunctionCall {

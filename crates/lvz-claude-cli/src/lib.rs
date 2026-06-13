@@ -145,6 +145,7 @@ impl Provider for ClaudeCliProvider {
             extended_thinking: false,
             parallel_tool_use: false,
             server_side_tools: false,
+            vision: false,
         }
     }
 }

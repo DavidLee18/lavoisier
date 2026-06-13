@@ -36,6 +36,8 @@ pub struct Capabilities {
     pub parallel_tool_use: bool,
     /// Provider-executed (server-side) tools. xAI gRPC v6: true.
     pub server_side_tools: bool,
+    /// Image/document (multimodal) inputs. Anthropic / Google / xAI vision models: true.
+    pub vision: bool,
 }
 
 /// Errors surfaced by a provider. Adapters map their transport/API failures onto these.

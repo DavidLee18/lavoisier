@@ -307,6 +307,24 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   committed baseline; update them deliberately when skeleton output legitimately changes
   (`cargo test -p lvz-context --test budget -- --nocapture` prints the trend line).
 
+## Native-API feature build (in progress)
+
+Bringing each provider adapter to **full native-API coverage** (audit + roadmap tracked in the
+task list). Shared, cross-provider request features were added to `lvz-protocol` first, then mapped
+in all three adapters; provider-specific features follow per provider (Anthropic first).
+- **Common request params (done):** `ChatRequest.tool_choice` (`ToolChoice` Auto/Required/None/Tool
+  + `disable_parallel_tool_use`), `top_p`/`top_k`/`stop_sequences`, `OutputFormat::JsonSchema`
+  (structured outputs), `ToolDef.strict`. Mapped: Anthropic (`tool_choice`/`output_config.format`/
+  strict), Google (`functionCallingConfig`/`responseSchema`), xAI gRPC+HTTP (`tool_choice`/
+  `response_format`/`reasoning_effort`).
+- **Multimodal (done):** `ContentBlock::Image`/`Document` + `MediaSource` (base64/url) +
+  `Capabilities.vision`. Mapped: Anthropic image/document `source`, Gemini `inlineData`/`fileData`,
+  xAI `image_url` (gRPC `ImageUrlContent`/`FileContent`; base64 docs URL-only on gRPC).
+- **Pending (per task list):** Anthropic adaptive-thinking+`effort` (fixes the `budget_tokens` 400
+  on Opus 4.7/4.8/Fable), native token counting, Batch API, server-side tools + MCP + Files,
+  refusal/pause_turn + citations; then xAI (Live Search, deferred) and Google (explicit caching,
+  grounding, code exec, safety, files/batch).
+
 ## Architecture invariants (do not violate)
 
 The whole design exists to keep one agent core reusable by the CLI today and a future

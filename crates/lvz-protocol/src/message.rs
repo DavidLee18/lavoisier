@@ -213,8 +213,19 @@ impl Message {
     }
 }
 
-/// A unit of message content. A message can mix text, thinking, tool calls, and tool
-/// results, mirroring the providers' block model.
+/// Where the bytes of an image or document come from. Adapters map this to their media source
+/// shape (Anthropic `source.type` base64/url, Gemini `inlineData`/`fileData`, OpenAI `image_url`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MediaSource {
+    /// Inline base64-encoded bytes with their MIME type (e.g. `image/png`, `application/pdf`).
+    Base64 { media_type: String, data: String },
+    /// A URL the provider fetches itself.
+    Url { url: String },
+}
+
+/// A unit of message content. A message can mix text, thinking, images, documents, tool calls,
+/// and tool results, mirroring the providers' block model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -226,6 +237,10 @@ pub enum ContentBlock {
     },
     /// Extended-thinking text echoed back into history (Anthropic).
     Thinking { text: String },
+    /// An image input (vision). Providers without vision ignore it.
+    Image { source: MediaSource },
+    /// A document input (e.g. PDF). Anthropic/Gemini support it; others ignore it.
+    Document { source: MediaSource },
     /// An assistant tool call: opaque `id`, tool `name`, and parsed argument JSON.
     ToolUse {
         id: String,
@@ -247,6 +262,23 @@ impl ContentBlock {
         ContentBlock::Text {
             text: text.into(),
             cache: false,
+        }
+    }
+
+    /// An inline (base64) image block.
+    pub fn image_base64(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        ContentBlock::Image {
+            source: MediaSource::Base64 {
+                media_type: media_type.into(),
+                data: data.into(),
+            },
+        }
+    }
+
+    /// An image block referencing a URL the provider fetches.
+    pub fn image_url(url: impl Into<String>) -> Self {
+        ContentBlock::Image {
+            source: MediaSource::Url { url: url.into() },
         }
     }
 }

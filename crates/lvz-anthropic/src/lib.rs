@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    Capabilities, ChatRequest, ContentBlock, Event, Message, OutputFormat, Provider, ProviderError,
-    Role, SystemPrompt, ThinkingLevel, ToolChoice, ToolDef,
+    Capabilities, ChatRequest, ContentBlock, Event, MediaSource, Message, OutputFormat, Provider,
+    ProviderError, Role, SystemPrompt, ThinkingLevel, ToolChoice, ToolDef,
 };
 use serde_json::{json, Value};
 
@@ -147,6 +147,7 @@ impl Provider for AnthropicProvider {
             extended_thinking: true,
             parallel_tool_use: true,
             server_side_tools: false,
+            vision: true,
         }
     }
 }
@@ -316,6 +317,16 @@ fn build_messages(messages: &[Message], extended_ttl: bool) -> Value {
     Value::Array(arr)
 }
 
+/// Map a normalised media source onto Anthropic's `source` object.
+fn anthropic_media_source(source: &MediaSource) -> Value {
+    match source {
+        MediaSource::Base64 { media_type, data } => {
+            json!({ "type": "base64", "media_type": media_type, "data": data })
+        }
+        MediaSource::Url { url } => json!({ "type": "url", "url": url }),
+    }
+}
+
 /// Map one normalised block to its Messages-API JSON, or `None` to omit it.
 ///
 /// Prior-turn **thinking is dropped**, not re-sent. Echoing it back (verbatim or as text) would
@@ -333,6 +344,12 @@ fn build_content_block(block: &ContentBlock, extended_ttl: bool) -> Option<Value
             v
         }
         ContentBlock::Thinking { .. } => return None,
+        ContentBlock::Image { source } => {
+            json!({ "type": "image", "source": anthropic_media_source(source) })
+        }
+        ContentBlock::Document { source } => {
+            json!({ "type": "document", "source": anthropic_media_source(source) })
+        }
         ContentBlock::ToolUse { id, name, input } => {
             json!({ "type": "tool_use", "id": id, "name": name, "input": input })
         }
@@ -537,6 +554,30 @@ mod tests {
         assert_eq!(body["stop_sequences"][0], "STOP");
         assert_eq!(body["output_config"]["format"]["type"], "json_schema");
         assert_eq!(body["tools"][0]["strict"], true);
+    }
+
+    #[test]
+    fn image_and_document_blocks_map_to_anthropic_shape() {
+        let msg = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::image_base64("image/png", "AAAA"),
+                ContentBlock::Document {
+                    source: MediaSource::Url {
+                        url: "https://x/y.pdf".into(),
+                    },
+                },
+                ContentBlock::text("describe these"),
+            ],
+        };
+        let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
+        let c = &body["messages"][0]["content"];
+        assert_eq!(c[0]["type"], "image");
+        assert_eq!(c[0]["source"]["type"], "base64");
+        assert_eq!(c[0]["source"]["media_type"], "image/png");
+        assert_eq!(c[1]["type"], "document");
+        assert_eq!(c[1]["source"]["type"], "url");
+        assert_eq!(c[1]["source"]["url"], "https://x/y.pdf");
     }
 
     #[test]

@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    Capabilities, ChatRequest, ContentBlock, Event, OutputFormat, Provider, ProviderError, Role,
-    StopReason, ThinkingLevel, ToolChoice, Usage,
+    Capabilities, ChatRequest, ContentBlock, Event, MediaSource, OutputFormat, Provider,
+    ProviderError, Role, StopReason, ThinkingLevel, ToolChoice, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -133,6 +133,7 @@ impl Provider for HttpTransport {
             extended_thinking: false,
             parallel_tool_use: true,
             server_side_tools: false,
+            vision: true,
         }
     }
 }
@@ -164,11 +165,22 @@ fn build_messages(req: &ChatRequest) -> Vec<Value> {
 
 fn push_user_message(m: &lvz_protocol::Message, out: &mut Vec<Value>) {
     let mut text = String::new();
+    let mut images = Vec::new();
     let mut tool_results = Vec::new();
     for block in &m.content {
         match block {
             ContentBlock::Text { text: t, .. } | ContentBlock::Thinking { text: t } => {
                 text.push_str(t)
+            }
+            ContentBlock::Image { source } | ContentBlock::Document { source } => {
+                // OpenAI-compat carries images as `image_url` parts (URL or base64 data-URL).
+                let url = match source {
+                    MediaSource::Url { url } => url.clone(),
+                    MediaSource::Base64 { media_type, data } => {
+                        format!("data:{media_type};base64,{data}")
+                    }
+                };
+                images.push(json!({ "type": "image_url", "image_url": { "url": url } }));
             }
             ContentBlock::ToolResult {
                 tool_use_id,
@@ -184,10 +196,20 @@ fn push_user_message(m: &lvz_protocol::Message, out: &mut Vec<Value>) {
     }
     // Tool results are their own messages and must precede any free-text follow-up.
     out.extend(tool_results);
-    if !text.is_empty() {
-        out.push(json!({ "role": "user", "content": text }));
-    } else if m.content.is_empty() {
-        out.push(json!({ "role": "user", "content": "" }));
+    if images.is_empty() {
+        if !text.is_empty() {
+            out.push(json!({ "role": "user", "content": text }));
+        } else if m.content.is_empty() {
+            out.push(json!({ "role": "user", "content": "" }));
+        }
+    } else {
+        // Mixed text+image turns use the content-array form.
+        let mut parts = Vec::new();
+        if !text.is_empty() {
+            parts.push(json!({ "type": "text", "text": text }));
+        }
+        parts.extend(images);
+        out.push(json!({ "role": "user", "content": parts }));
     }
 }
 
@@ -199,6 +221,8 @@ fn build_assistant_message(m: &lvz_protocol::Message) -> Value {
             ContentBlock::Text { text: t, .. } => text.push_str(t),
             // Thinking is not echoed back to the OpenAI-compat endpoint.
             ContentBlock::Thinking { .. } => {}
+            // Images/documents are inputs, never part of an assistant turn we re-send.
+            ContentBlock::Image { .. } | ContentBlock::Document { .. } => {}
             ContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                 "id": id,
                 "type": "function",
