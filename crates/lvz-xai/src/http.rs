@@ -14,7 +14,7 @@ use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
     Capabilities, ChatRequest, ContentBlock, Event, MediaSource, OutputFormat, Provider,
-    ProviderError, Role, StopReason, ThinkingLevel, ToolChoice, Usage,
+    ProviderError, Role, ServerTool, StopReason, ThinkingLevel, ToolChoice, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -64,6 +64,12 @@ impl Provider for HttpTransport {
                 })
             }),
             reasoning_effort: req.thinking.and_then(reasoning_effort),
+            // A WebSearch server tool enables xAI Live Search (model decides when to search).
+            search_parameters: req
+                .server_tools
+                .iter()
+                .any(|t| matches!(t, ServerTool::WebSearch { .. }))
+                .then(|| json!({ "mode": "auto" })),
             model: req.model,
             max_tokens: req.max_tokens,
             temperature: req.temperature,
@@ -420,6 +426,8 @@ struct OaiRequest {
     response_format: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_parameters: Option<Value>,
 }
 
 /// Map the normalised thinking level onto grok's `reasoning_effort` (`low`/`high` on reasoning

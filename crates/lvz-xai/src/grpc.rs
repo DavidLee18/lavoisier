@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
     Capabilities, ChatRequest, ContentBlock, Event, MediaSource, Message, OutputFormat, Provider,
-    ProviderError, Role, StopReason, ThinkingLevel, ToolChoice, Usage,
+    ProviderError, Role, ServerTool, StopReason, ThinkingLevel, ToolChoice, Usage,
 };
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
@@ -249,6 +249,15 @@ fn status_to_err(status: tonic::Status) -> ProviderError {
 // --- request building: normalised ChatRequest → xAI GetCompletionsRequest ---
 
 fn build_request(req: ChatRequest) -> pb::GetCompletionsRequest {
+    // Custom tools + any provider-executed server tools (code execution → proto built-in).
+    let mut tools = build_tools(&req);
+    for st in &req.server_tools {
+        if matches!(st, ServerTool::CodeExecution) {
+            tools.push(pb::Tool {
+                tool: Some(pb::tool::Tool::CodeExecution(pb::CodeExecution {})),
+            });
+        }
+    }
     pb::GetCompletionsRequest {
         messages: build_messages(&req),
         model: req.model.clone(),
@@ -256,7 +265,7 @@ fn build_request(req: ChatRequest) -> pb::GetCompletionsRequest {
         temperature: req.temperature,
         top_p: req.top_p,
         stop: req.stop_sequences.clone(),
-        tools: build_tools(&req),
+        tools,
         tool_choice: req.tool_choice.as_ref().map(build_tool_choice),
         response_format: req.output_format.as_ref().map(|f| {
             let OutputFormat::JsonSchema { schema } = f;
@@ -266,6 +275,15 @@ fn build_request(req: ChatRequest) -> pb::GetCompletionsRequest {
             }
         }),
         reasoning_effort: req.thinking.map(|t| reasoning_effort(t) as i32),
+        // A WebSearch server tool enables xAI Live Search (model decides when to search).
+        search_parameters: req
+            .server_tools
+            .iter()
+            .any(|t| matches!(t, ServerTool::WebSearch { .. }))
+            .then(|| pb::SearchParameters {
+                mode: pb::SearchMode::AutoSearchMode as i32,
+                ..Default::default()
+            }),
         ..Default::default()
     }
 }
@@ -505,6 +523,30 @@ mod tests {
         };
         assert_eq!(f.name, "list_dir");
         assert!(f.parameters.contains("object"));
+    }
+
+    #[test]
+    fn server_tools_enable_live_search_and_code_execution() {
+        let mut req = ChatRequest::new("grok-4").push(Message::user("hi"));
+        req.server_tools = vec![
+            ServerTool::WebSearch {
+                max_uses: None,
+                allowed_domains: vec![],
+                blocked_domains: vec![],
+            },
+            ServerTool::CodeExecution,
+        ];
+        let g = build_request(req);
+        // WebSearch → Live Search (AUTO mode).
+        assert_eq!(
+            g.search_parameters.unwrap().mode,
+            pb::SearchMode::AutoSearchMode as i32
+        );
+        // CodeExecution → a built-in code-execution tool entry.
+        assert!(g
+            .tools
+            .iter()
+            .any(|t| matches!(&t.tool, Some(pb::tool::Tool::CodeExecution(_)))));
     }
 
     #[test]
