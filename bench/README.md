@@ -11,11 +11,12 @@ Lavoisier's thesis — *context curation is the whole game*. Both were run on th
 
 - **Three measured models, one honest story** (2026-06-13): **Lavoisier is ~8.6× cheaper on
   `grok-4-1-fast-reasoning` ($0.20 vs $1.73, §7), a dead heat on `claude-sonnet-4-6` ($5.13 vs $5.16,
-  §8), and self-terminates 8/8 on both.** The technique win is large where the provider transport
-  leaves caching on the table (Dirac's grok path re-sends fresh input) and collapses to model-price
-  parity where both agents cache natively (Anthropic). So: Lavoisier **matches Dirac's convergence,
-  never loses on cost, and wins big when caching isn't a wash** — but there's no blanket "always
-  cheaper" claim.
+  §8), and self-terminates 8/8 on both.** The technique win is large where the model's caching mode
+  holds the evolving context poorly (grok caches *implicitly* — server-side exact-prefix only — so
+  Dirac re-bills most input as fresh) and collapses to model-price parity where it holds nearly all of
+  it (Anthropic's *explicit* cache breakpoints give Dirac a near-total hit ratio). So: Lavoisier
+  **matches Dirac's convergence, never loses on cost, and wins big when the provider's caching can't
+  absorb a large re-read volume** — but there's no blanket "always cheaper" claim.
 - **What fixed it:** the convergence levers (`--in-loop-verify`/`--no-progress-limit`/
   `--budget-awareness`) close the gap that invalidated the earlier Gemini totals — on both grok and
   Sonnet all 8 tasks self-terminated (`EndTurn` or no-progress breaker), **none hit `max_steps`**.
@@ -279,12 +280,20 @@ sides). This is the run to read for **real-world premium-model spend**.
 
 1. **Near-identical suite cost** ($5.13 vs $5.16). Both agents terminated cleanly on all 8 (Lavoisier 5
    `EndTurn` + 3 no-progress breaker; zero `max_steps`), so both totals are honest completed-work costs.
-2. **Why the ~8.6× grok gap collapses here:** on grok, Dirac runs through an OpenAI-compat client and
-   re-sends large *fresh* input (277k tokens on task 08); on Anthropic it uses **native prompt caching**
-   — e.g. task 01 served **2.93M tokens from cache** at $0.30/M. With both agents caching well at the
-   *same* per-token prices, the per-task token-efficiency advantage that made Lavoisier 8.6× cheaper on
-   grok largely disappears. **The lever that moves real cost is which model + transport you pick**, not
-   agent technique, once both cache. (Model price dominates absolute spend: Sonnet ≈ 25× grok per task,
+2. **Why the ~8.6× grok gap collapses here — explicit vs implicit caching, not caching on/off.** Dirac's
+   catalog marks *both* grok and Sonnet cache-capable, and the grok run did get cache reads (262k on
+   task 08), so this isn't "grok caching was off." The difference is the **caching mode**. Anthropic
+   (and DeepSeek) carry a `cacheWritesPrice` (Sonnet write $3.75/M, read $0.30/M): the client sets
+   **cache breakpoints** and pays a one-time write to cache the *whole growing prefix*, so Dirac's
+   effective hit ratio is near-total — task 01 served **2.93M tokens from cache**, and task 08 billed
+   just **95 uncached** input tokens. grok/Gemini/OpenAI cache **implicitly** (no write price; the
+   server auto-matches an *exact* prefix), so once interleaved tool results and edits perturb the
+   prefix, the bulk re-bills as **fresh** input — Dirac's grok task 08 billed **277k uncached** tokens
+   with **0 cache writes**. Net: on grok, Lavoisier's lean skeleton/anchored-read volume (15k fresh)
+   wins ~18×; on Sonnet, Dirac's explicit breakpoints cache so aggressively that its fresh input (95)
+   drops *below* Lavoisier's (32k) and the gap closes — even reverses on the small task. **The lever
+   that moves real cost is the model and how well its caching mode holds the evolving context**, not
+   agent technique per se. (Model price still dominates absolute spend: Sonnet ≈ 25× grok per task,
    matching the §6 projection.)
 3. **The one fully-trustworthy point (task 08, both pass real `forms_tests`):** here Dirac is *cheaper*
    ($0.063 vs $0.211) — the opposite of grok. Single per-task costs are stochastic (§5); read the suite,
