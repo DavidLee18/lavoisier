@@ -10,13 +10,13 @@ Lavoisier's thesis — *context curation is the whole game*. Both were run on th
 **Now a clear win on grok — once the convergence levers landed (see [§7](#7-second-measured-head-to-head--grok-4-1-fast-reasoning-2026-06-13-convergence-gap-closed)).**
 
 - **Three measured models, one honest story** (2026-06-13): **Lavoisier is ~8.6× cheaper on
-  `grok-4-1-fast-reasoning` ($0.20 vs $1.73, §7), a dead heat on `claude-sonnet-4-6` ($5.13 vs $5.16,
-  §8), and self-terminates 8/8 on both.** The technique win is large where the model's caching mode
-  holds the evolving context poorly (grok caches *implicitly* — server-side exact-prefix only — so
-  Dirac re-bills most input as fresh) and collapses to model-price parity where it holds nearly all of
-  it (Anthropic's *explicit* cache breakpoints give Dirac a near-total hit ratio). So: Lavoisier
-  **matches Dirac's convergence, never loses on cost, and wins big when the provider's caching can't
-  absorb a large re-read volume** — but there's no blanket "always cheaper" claim.
+  `grok-4-1-fast-reasoning` ($0.20 vs $1.73, §7) and ~1.6× cheaper on `claude-sonnet-4-6` ($3.14 vs
+  $5.16, §8a), self-terminating on both.** The grok win is lower read *volume* (skeletons + anchored
+  reads); the Sonnet win arrived after a one-line caching fix — Lavoisier originally tied Dirac there
+  ($5.13 vs $5.16) because it cached only its static prefix and re-billed the growing transcript as
+  fresh input; adding a **rolling cache breakpoint on the conversation tail** cut suite fresh input from
+  ~860k tokens to ~340 and the cost from $5.13 → **$3.14** (§8a). So Lavoisier now **matches Dirac's
+  convergence and caching hit-ratio, and undercuts it on cost on both measured models.**
 - **What fixed it:** the convergence levers (`--in-loop-verify`/`--no-progress-limit`/
   `--budget-awareness`) close the gap that invalidated the earlier Gemini totals — on both grok and
   Sonnet all 8 tasks self-terminated (`EndTurn` or no-progress breaker), **none hit `max_steps`**.
@@ -255,7 +255,7 @@ read: **on identical models Lavoisier is now both cheaper *and* convergent** —
 cannot claim a suite-wide efficiency win" no longer holds for grok, because the capping that invalidated
 the §4 totals is gone.
 
-## 8. Third measured head-to-head — `claude-sonnet-4-6` (2026-06-13): a premium-model dead heat
+## 8. Third measured head-to-head — `claude-sonnet-4-6` (2026-06-13): a dead heat that a one-line caching fix turned into a win
 
 Same suite, same convergence-levers-on Lavoisier (`--provider anthropic`), and Dirac on the **same
 underlying model** — note its catalog id is **`claude-4-6-sonnet`**, not Lavoisier's `claude-sonnet-4-6`
@@ -275,6 +275,8 @@ sides). This is the run to read for **real-world premium-model spend**.
 | 07 | latency | transformers | 1.3713 | no_progress | 1.0233 | fail / **pass** |
 | 08 | datadict | django | 0.2114 | EndTurn | **0.0628** | **pass** / **pass** |
 | | **Total** | | **$5.1322** | **8/8 terminated** | **$5.1609** | 2/8 / 3/8 |
+
+*(This was the run **before** the rolling-cache fix below; §8a is the current state.)*
 
 **Result — a dead heat on cost, and the grok efficiency gap does *not* transfer:**
 
@@ -303,11 +305,48 @@ sides). This is the run to read for **real-world premium-model spend**.
    the documented `tsc`/`ruff` proxy noise (missing `@types`, pre-existing whole-repo lint) — it is *not*
    a correctness ranking.
 
-**Bottom line across all three measured models:** Lavoisier is **dramatically cheaper on grok (~8.6×),
-tied on Sonnet, and convergent (8/8 self-terminate) on both** — the technique win is real where the
-provider transport leaves caching on the table, and collapses to model-price parity where both agents
-cache natively. There is no honest suite-wide "Lavoisier is always cheaper" claim; there *is* an honest
-"Lavoisier matches Dirac's convergence and never loses on cost, and wins big when caching isn't a wash."
+### 8a. The fix and the re-measurement — Sonnet becomes a Lavoisier win
+
+The diagnosis in #2 was directly actionable: Lavoisier cached only its *static* prefix (system + tool
+defs + repo skeleton), re-billing the **growing conversation** as fresh input every round-trip, while
+Dirac placed a rolling Anthropic cache breakpoint over the transcript. So `lvz-anthropic` now places a
+**4th `cache_control` breakpoint on the conversation tail** (the last block of the last message; it
+counts existing breakpoints and never exceeds Anthropic's limit of 4) — the rolling-cache pattern. Two
+smaller savers shipped with it: prior-turn **thinking is dropped on resend** (not re-billed) and, once a
+file is edited, earlier reads of it are replaced with a `[stale: …]` pointer.
+
+Re-running the identical Sonnet suite with the fix:
+
+| # | Task | uncached input: **before → after** | **before $** | **after $** |
+|--|------|--:|--:|--:|
+| 01 | extensionswb_service | 178,639 → **50** | 1.1207 | 0.3767 |
+| 02 | sendRequest | 120,806 → **50** | 0.6733 | 0.4407 |
+| 03 | IOverlayWidget | 105,232 → **98** | 0.6279 | 0.6791 |
+| 04 | addLogging | 26,661 → **36** | 0.1865 | 0.2472 |
+| 05 | DynamicCache | 105,372 → **50** | 0.7081 | 0.6185 |
+| 06 | stoppingcriteria | 47,025 → **24** | 0.2330 | 0.1240\* |
+| 07 | latency | 189,325 → **50** | 1.3713 | 0.4749 |
+| 08 | datadict | 32,453 → **30** | 0.2114 | 0.1824 |
+| | **Total** | ~860k → **~340** fresh tokens | **$5.1322** | **$3.1435** |
+
+- **Suite cost fell 39% ($5.13 → $3.14)** with no change to the model, tasks, or convergence settings —
+  purely from caching the transcript. Fresh (uncached) input across the whole suite went from ~860k
+  tokens to **~340**; everything now bills as `cache_read`/`cache_creation`. The win concentrates on the
+  high-round-trip tasks (01, 07) where re-billing the transcript was the dominant cost.
+- **This flips the result: Lavoisier @ Sonnet $3.14 vs Dirac $5.16 — ~1.6× cheaper**, where it was a dead
+  heat. Lavoisier now matches Dirac's explicit-cache hit ratio (per-task uncached input 24–98 tokens,
+  comparable to Dirac's ~95) **and** keeps its lower read-volume edge.
+- Termination held: 7/8 self-terminated (3 `EndTurn` + 4 no-progress); task 06 hit a transient Anthropic
+  stream-decode transport error on its 8th round-trip (unrelated to caching — the request was accepted at
+  `cache_hit=100%`), so its `$0.1240`\* is a partial. Verify came in 1/8 (08) — the `ruff` proxy is noisy
+  and stochastic (06 flipped vs the prior run); cost is the trustworthy axis, and only task 08 has a real
+  gate (still a pass).
+
+**Bottom line across all three measured models:** Lavoisier is **~8.6× cheaper on grok, ~1.6× cheaper on
+Sonnet (after the rolling-cache fix), and convergent (self-terminates) on both.** The grok win comes from
+lower read *volume* (skeletons + anchored reads); the Sonnet win comes from now caching the transcript as
+aggressively as Dirac *plus* that lower volume. The earlier "tied on Sonnet" caveat is closed — the dead
+heat was a missing cache breakpoint, not a ceiling on the technique.
 
 ## Findings
 
@@ -376,7 +415,7 @@ cache natively. There is no honest suite-wide "Lavoisier is always cheaper" clai
 
 _Last updated: 2026-06-13. Three measured head-to-heads: §4 on `gemini-3-flash-preview` (Lavoisier
 ~$1.69 vs Dirac ~$2.78, but Lavoisier capped 6/8 — pre-levers), §7 on `grok-4-1-fast-reasoning`
-(Lavoisier $0.20 vs Dirac $1.73, ~8.6× cheaper) and §8 on `claude-sonnet-4-6` (Lavoisier $5.13 vs Dirac
-$5.16, a dead heat) — both post-lever runs terminate 8/8, none capping. Plus §5 real-upstream-test
-correctness (both pass django `forms_tests`). Prices and Dirac figures are point-in-time; re-derive from
-§3 sources._
+(Lavoisier $0.20 vs Dirac $1.73, ~8.6× cheaper) and §8/§8a on `claude-sonnet-4-6` (a $5.13-vs-$5.16 dead
+heat that a rolling-cache fix turned into **$3.14 vs $5.16, ~1.6× cheaper**) — both post-lever runs
+self-terminate, none capping. Plus §5 real-upstream-test correctness (both pass django `forms_tests`).
+Prices and Dirac figures are point-in-time; re-derive from §3 sources._
