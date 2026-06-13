@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::message::ThinkingLevel;
 use crate::provider::Capabilities;
 
 /// What kind of coding task this is. Knob optima differ per archetype (`RECIPE.md` §6.5).
@@ -72,6 +73,11 @@ pub struct Knobs {
     pub compact_after: usize,
     /// Number of file reads/edits to batch into a single round-trip.
     pub batch_width: u8,
+    /// Extended-thinking effort to request. `None` ⇒ the agent's per-archetype default applies
+    /// (mechanical archetypes think less); ATO tunes this like any other dial. Defaulted (and
+    /// `#[serde(default)]`) so older persisted tune-state files load without it.
+    #[serde(default)]
+    pub thinking: Option<ThinkingLevel>,
 }
 
 impl Default for Knobs {
@@ -81,6 +87,7 @@ impl Default for Knobs {
             truncate_bytes: 8 * 1024,
             compact_after: 24_000,
             batch_width: 4,
+            thinking: None,
         }
     }
 }

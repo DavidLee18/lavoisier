@@ -25,7 +25,7 @@ use lvz_gw_matrix::MatrixGateway;
 use lvz_memory::{InMemoryStore, SessionAgent};
 use lvz_protocol::{
     AgentHandle, ChatRequest, Event, Gateway, Knobs, Message, Outcome, Provider, TaskContext,
-    TaskTelemetry, TelemetrySink, Tuner,
+    TaskTelemetry, TelemetrySink, ThinkingLevel, Tuner,
 };
 use lvz_tools::ToolRegistry;
 use lvz_tune::{BayesTuner, LearningTuner, PersistableTuner, TuneConfig};
@@ -72,6 +72,13 @@ struct Cli {
     /// high` to match the public Dirac refactor suite. Ignored by other providers.
     #[arg(long, value_name = "LEVEL", env = "GOOGLE_THINKING")]
     thinking: Option<String>,
+
+    /// Normalised, cross-provider extended-thinking budget (`--agent` mode): `off`/`low`/`medium`/
+    /// `high`. Forces that level every turn, overriding the per-archetype default (mechanical tasks
+    /// think less) and the ATO tuner. Maps to each provider's economical equivalent; unset ⇒ the
+    /// per-archetype default applies and ATO may tune it.
+    #[arg(long, value_name = "LEVEL", value_enum)]
+    thinking_budget: Option<ThinkingBudgetArg>,
 
     /// Total-task token budget (--agent mode); the run aborts if exceeded.
     #[arg(long)]
@@ -229,6 +236,26 @@ enum ProviderKind {
     ClaudeCli,
 }
 
+/// CLI spelling of [`ThinkingLevel`] for `--thinking-budget`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ThinkingBudgetArg {
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl From<ThinkingBudgetArg> for ThinkingLevel {
+    fn from(a: ThinkingBudgetArg) -> Self {
+        match a {
+            ThinkingBudgetArg::Off => ThinkingLevel::Off,
+            ThinkingBudgetArg::Low => ThinkingLevel::Low,
+            ThinkingBudgetArg::Medium => ThinkingLevel::Medium,
+            ThinkingBudgetArg::High => ThinkingLevel::High,
+        }
+    }
+}
+
 impl ProviderKind {
     fn default_model(self) -> &'static str {
         match self {
@@ -242,10 +269,15 @@ impl ProviderKind {
     fn build(
         self,
         thinking: Option<&str>,
+        extended_cache_ttl: bool,
     ) -> Result<Arc<dyn Provider>, lvz_protocol::ProviderError> {
         Ok(match self {
             ProviderKind::Xai => Arc::new(XaiProvider::from_env()?),
-            ProviderKind::Anthropic => Arc::new(AnthropicProvider::from_env()?),
+            ProviderKind::Anthropic => {
+                // A long-running gateway benefits from the 1-hour cache TTL on the immutable prefix
+                // (it survives idle gaps between turns); one-shot runs keep the cheaper 5-min TTL.
+                Arc::new(AnthropicProvider::from_env()?.with_extended_cache_ttl(extended_cache_ttl))
+            }
             ProviderKind::Google => {
                 let mut p = GoogleProvider::from_env()?;
                 if let Some(t) = thinking {
@@ -272,7 +304,9 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let provider = cli.provider.build(cli.thinking.as_deref())?;
+    // Long-running gateways (HTTP/Matrix) get the 1-hour cache TTL on the immutable prefix.
+    let serving = cli.serve.is_some() || cli.serve_matrix;
+    let provider = cli.provider.build(cli.thinking.as_deref(), serving)?;
     let model = cli
         .model
         .clone()
@@ -377,6 +411,9 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
         config = config.with_no_progress_limit(n);
     }
     config = config.with_budget_awareness(cli.budget_awareness || converge);
+    if let Some(tb) = cli.thinking_budget {
+        config = config.with_forced_thinking(tb.into());
+    }
     if let Some(budget) = cli.budget {
         config = config.with_budget(budget);
     }

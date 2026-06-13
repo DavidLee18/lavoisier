@@ -24,6 +24,7 @@ use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
     Capabilities, ChatRequest, ContentBlock, Event, Message, Provider, ProviderError, Role,
+    ThinkingLevel,
 };
 use serde_json::{json, Value};
 
@@ -212,16 +213,38 @@ fn build_body(req: &ChatRequest, thinking: Option<&str>) -> Value {
     if let Some(t) = req.temperature {
         generation["temperature"] = json!(t);
     }
-    if let Some(thinking) = thinking {
-        // A bare integer is a token budget (Gemini 2.5); anything else is a level (Gemini 3).
-        generation["thinkingConfig"] = match thinking.parse::<i64>() {
-            Ok(budget) => json!({ "thinkingBudget": budget }),
-            Err(_) => json!({ "thinkingLevel": thinking }),
-        };
+    // A per-request normalised level (set by the agent's per-archetype default / tuner /
+    // --thinking-budget) takes precedence over the construction-time `--thinking` fallback.
+    if let Some(cfg) = req
+        .thinking
+        .map(thinking_level_config)
+        .or_else(|| thinking.map(thinking_str_config))
+    {
+        generation["thinkingConfig"] = cfg;
     }
     body["generationConfig"] = generation;
 
     body
+}
+
+/// Map a normalised [`ThinkingLevel`] to Gemini's `thinkingConfig`. `Off` disables thinking
+/// (`thinkingBudget: 0`); `Low`/`Medium`/`High` map to Gemini 3 effort levels (which are `low`/
+/// `high`, so `Medium` and `High` both request `high`).
+fn thinking_level_config(level: ThinkingLevel) -> Value {
+    match level {
+        ThinkingLevel::Off => json!({ "thinkingBudget": 0 }),
+        ThinkingLevel::Low => json!({ "thinkingLevel": "low" }),
+        ThinkingLevel::Medium | ThinkingLevel::High => json!({ "thinkingLevel": "high" }),
+    }
+}
+
+/// Map the construction-time `--thinking` string: a bare integer is a token budget (Gemini 2.5);
+/// anything else is a level keyword (Gemini 3, e.g. `low`/`high`/`dynamic`).
+fn thinking_str_config(thinking: &str) -> Value {
+    match thinking.parse::<i64>() {
+        Ok(budget) => json!({ "thinkingBudget": budget }),
+        Err(_) => json!({ "thinkingLevel": thinking }),
+    }
 }
 
 /// Map the conversation to Gemini `contents`. Tool results carry only a `tool_use_id`, but Gemini
@@ -321,6 +344,25 @@ mod tests {
         );
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["contents"][0]["parts"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn per_request_thinking_level_overrides_the_construction_fallback() {
+        let mut r = req();
+        r.thinking = Some(ThinkingLevel::Low);
+        // Construction fallback says "high", but the per-request Low must win.
+        let body = build_body(&r, Some("high"));
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "low"
+        );
+        // Off disables thinking outright.
+        r.thinking = Some(ThinkingLevel::Off);
+        let body = build_body(&r, Some("high"));
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            0
+        );
     }
 
     #[test]

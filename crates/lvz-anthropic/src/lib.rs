@@ -20,7 +20,7 @@ use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
     Capabilities, ChatRequest, ContentBlock, Event, Message, Provider, ProviderError, Role,
-    SystemPrompt, ToolDef,
+    SystemPrompt, ThinkingLevel, ToolDef,
 };
 use serde_json::{json, Value};
 
@@ -28,12 +28,19 @@ use crate::sse::AnthropicSseDecoder;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Beta flag enabling the 1-hour cache TTL (`cache_control.ttl = "1h"`).
+const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 
 /// A [`Provider`] backed by the native Anthropic Messages API.
 pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
     http: reqwest::Client,
+    /// When set, the **immutable** prefix breakpoints (system / tool defs / repo skeleton — the
+    /// protocol-`cache`-flagged blocks) use a 1-hour cache TTL instead of the default 5 minutes,
+    /// so a long-running gateway keeps re-reading them across idle gaps without re-creating the
+    /// cache. The volatile rolling conversation-tail breakpoint always stays at 5 minutes.
+    extended_cache_ttl: bool,
 }
 
 impl AnthropicProvider {
@@ -48,7 +55,15 @@ impl AnthropicProvider {
             api_key: api_key.into(),
             base_url: base_url.into(),
             http: reqwest::Client::new(),
+            extended_cache_ttl: false,
         }
+    }
+
+    /// Use a 1-hour cache TTL on the immutable prefix (best for a long-running `--serve` gateway;
+    /// for one-shot runs the default 5-minute TTL is cheaper, since 1h cache writes cost more).
+    pub fn with_extended_cache_ttl(mut self, on: bool) -> Self {
+        self.extended_cache_ttl = on;
+        self
     }
 
     /// Construct from `ANTHROPIC_API_KEY` (required) and `ANTHROPIC_BASE_URL` (optional).
@@ -67,14 +82,18 @@ impl Provider for AnthropicProvider {
         &self,
         req: ChatRequest,
     ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
-        let body = build_body(&req);
+        let body = build_body(&req, self.extended_cache_ttl);
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
 
-        let resp = self
+        let mut request = self
             .http
             .post(url)
             .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("anthropic-version", ANTHROPIC_VERSION);
+        if self.extended_cache_ttl {
+            request = request.header("anthropic-beta", EXTENDED_CACHE_TTL_BETA);
+        }
+        let resp = request
             .json(&body)
             .send()
             .await
@@ -139,30 +158,58 @@ struct SseState {
     drained: bool,
 }
 
-/// The ephemeral cache-control marker placed at a stable-prefix breakpoint.
-fn cache_control() -> Value {
-    json!({ "type": "ephemeral" })
+/// The ephemeral cache-control marker placed at a stable-prefix breakpoint. `ttl_1h` requests the
+/// 1-hour TTL (immutable prefix on a long-running gateway); otherwise the default 5-minute TTL.
+fn cache_control(ttl_1h: bool) -> Value {
+    if ttl_1h {
+        json!({ "type": "ephemeral", "ttl": "1h" })
+    } else {
+        json!({ "type": "ephemeral" })
+    }
 }
 
-/// Build the Messages API request body from a normalised [`ChatRequest`].
-fn build_body(req: &ChatRequest) -> Value {
+/// Build the Messages API request body from a normalised [`ChatRequest`]. `extended_ttl` puts the
+/// 1-hour TTL on the immutable-prefix breakpoints (system / tools / skeleton).
+fn build_body(req: &ChatRequest, extended_ttl: bool) -> Value {
     let mut body = json!({
         "model": req.model,
         "max_tokens": req.max_tokens,
-        "messages": build_messages(&req.messages),
+        "messages": build_messages(&req.messages, extended_ttl),
         "stream": true,
     });
-    if let Some(system) = req.system.as_ref().map(build_system) {
+    if let Some(system) = req.system.as_ref().map(|s| build_system(s, extended_ttl)) {
         body["system"] = system;
     }
     if !req.tools.is_empty() {
-        body["tools"] = build_tools(&req.tools);
+        body["tools"] = build_tools(&req.tools, extended_ttl);
     }
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
     }
+    apply_thinking(&mut body, req.thinking, req.max_tokens);
     mark_conversation_tail(&mut body);
     body
+}
+
+/// Map the normalised [`ThinkingLevel`] onto Anthropic's `thinking` block. Extended thinking stays
+/// opt-in: `Off`/`Low` add nothing (a mechanical task never *raises* cost), `Medium`/`High` enable
+/// it with a token budget. With thinking on, Anthropic requires `max_tokens > budget_tokens` and no
+/// custom temperature, so we bump `max_tokens` and drop `temperature` as needed.
+fn apply_thinking(body: &mut Value, thinking: Option<ThinkingLevel>, max_tokens: u32) {
+    let budget: u32 = match thinking {
+        Some(ThinkingLevel::Medium) => 4096,
+        Some(ThinkingLevel::High) => 12000,
+        _ => return, // None / Off / Low ⇒ no thinking block
+    };
+    body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+    // Anthropic rejects a request whose max_tokens isn't strictly above the thinking budget, and
+    // disallows a custom temperature alongside thinking.
+    if max_tokens <= budget {
+        body["max_tokens"] = json!(budget + 4096);
+    }
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("temperature");
+    }
 }
 
 /// Anthropic caps a request at **4** `cache_control` breakpoints. The static prefix (system +
@@ -182,7 +229,8 @@ fn mark_conversation_tail(body: &mut Value) {
             .and_then(|c| c.last_mut())
         {
             if last_block.get("cache_control").is_none() {
-                last_block["cache_control"] = cache_control();
+                // The conversation tail is volatile — always the short (5-minute) TTL.
+                last_block["cache_control"] = cache_control(false);
             }
         }
     }
@@ -211,15 +259,15 @@ fn count_cache_breakpoints(body: &Value) -> usize {
 }
 
 /// System prompt as a one-element text-block array, so a cache breakpoint can attach to it.
-fn build_system(system: &SystemPrompt) -> Value {
+fn build_system(system: &SystemPrompt, extended_ttl: bool) -> Value {
     let mut block = json!({ "type": "text", "text": system.text });
     if system.cache {
-        block["cache_control"] = cache_control();
+        block["cache_control"] = cache_control(extended_ttl);
     }
     json!([block])
 }
 
-fn build_messages(messages: &[Message]) -> Value {
+fn build_messages(messages: &[Message], extended_ttl: bool) -> Value {
     let arr = messages
         .iter()
         .map(|m| {
@@ -227,7 +275,11 @@ fn build_messages(messages: &[Message]) -> Value {
                 Role::User => "user",
                 Role::Assistant => "assistant",
             };
-            let content: Vec<Value> = m.content.iter().filter_map(build_content_block).collect();
+            let content: Vec<Value> = m
+                .content
+                .iter()
+                .filter_map(|b| build_content_block(b, extended_ttl))
+                .collect();
             json!({ "role": role, "content": content })
         })
         .collect::<Vec<_>>();
@@ -241,12 +293,12 @@ fn build_messages(messages: &[Message]) -> Value {
 /// Messages API does not require past thinking blocks once a turn's tool loop has closed). Caching
 /// thinking would still cost cache-read tokens, so dropping it is strictly the most token-efficient
 /// option.
-fn build_content_block(block: &ContentBlock) -> Option<Value> {
+fn build_content_block(block: &ContentBlock, extended_ttl: bool) -> Option<Value> {
     Some(match block {
         ContentBlock::Text { text, cache } => {
             let mut v = json!({ "type": "text", "text": text });
             if *cache {
-                v["cache_control"] = cache_control();
+                v["cache_control"] = cache_control(extended_ttl);
             }
             v
         }
@@ -272,7 +324,7 @@ fn build_content_block(block: &ContentBlock) -> Option<Value> {
     })
 }
 
-fn build_tools(tools: &[ToolDef]) -> Value {
+fn build_tools(tools: &[ToolDef], extended_ttl: bool) -> Value {
     let arr = tools
         .iter()
         .map(|t| {
@@ -282,7 +334,7 @@ fn build_tools(tools: &[ToolDef]) -> Value {
                 "input_schema": t.schema,
             });
             if t.cache {
-                v["cache_control"] = cache_control();
+                v["cache_control"] = cache_control(extended_ttl);
             }
             v
         })
@@ -309,7 +361,7 @@ mod tests {
             cache: true,
         });
 
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
@@ -321,7 +373,7 @@ mod tests {
         let req = ChatRequest::new("claude-sonnet-4-6")
             .system("volatile")
             .push(Message::user("hi"));
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert!(body["system"][0]["cache_control"].is_null());
     }
 
@@ -335,7 +387,7 @@ mod tests {
                 is_error: false,
             }],
         };
-        let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg));
+        let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
         let block = &body["messages"][0]["content"][0];
         assert_eq!(block["type"], "tool_result");
         assert_eq!(block["tool_use_id"], "toolu_9");
@@ -350,7 +402,7 @@ mod tests {
             .push(Message::user("do the task"))
             .push(Message::assistant("on it"))
             .push(Message::user("more context here"));
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         let msgs = body["messages"].as_array().unwrap();
         let last = msgs.last().unwrap();
         let last_block = last["content"].as_array().unwrap().last().unwrap();
@@ -373,7 +425,7 @@ mod tests {
                 ContentBlock::text("the answer"),
             ],
         };
-        let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg));
+        let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1, "thinking block must be omitted");
         assert_eq!(content[0]["type"], "text");
@@ -413,7 +465,7 @@ mod tests {
             schema: json!({"type": "object"}),
             cache: true,
         });
-        let body = build_body(&req);
+        let body = build_body(&req, false);
         assert_eq!(
             count_cache_breakpoints(&body),
             4,
@@ -421,5 +473,70 @@ mod tests {
         );
         // The uncached tail block stays uncached because the budget was already spent.
         assert!(body["messages"][0]["content"][2]["cache_control"].is_null());
+    }
+
+    #[test]
+    fn thinking_level_maps_to_budget_only_for_medium_and_high() {
+        let mk = |level: Option<ThinkingLevel>| {
+            let mut req = ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi"));
+            req.thinking = level;
+            req.max_tokens = 4096;
+            build_body(&req, false)
+        };
+        // None / Off / Low ⇒ no thinking block (mechanical tasks never raise cost).
+        assert!(mk(None)["thinking"].is_null());
+        assert!(mk(Some(ThinkingLevel::Off))["thinking"].is_null());
+        assert!(mk(Some(ThinkingLevel::Low))["thinking"].is_null());
+        // Medium / High ⇒ enabled with a budget, and max_tokens is bumped above the budget.
+        let med = mk(Some(ThinkingLevel::Medium));
+        assert_eq!(med["thinking"]["type"], "enabled");
+        assert_eq!(med["thinking"]["budget_tokens"], 4096);
+        assert!(med["max_tokens"].as_u64().unwrap() > 4096);
+        let high = mk(Some(ThinkingLevel::High));
+        assert_eq!(high["thinking"]["budget_tokens"], 12000);
+    }
+
+    #[test]
+    fn thinking_drops_temperature() {
+        let mut req = ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi"));
+        req.thinking = Some(ThinkingLevel::High);
+        req.temperature = Some(0.7);
+        let body = build_body(&req, false);
+        assert!(
+            body["temperature"].is_null(),
+            "temperature must be dropped when thinking is enabled"
+        );
+    }
+
+    #[test]
+    fn extended_ttl_marks_only_the_immutable_prefix() {
+        let mut req = ChatRequest::new("claude-sonnet-4-6").push(Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "skeleton".into(),
+                    cache: true,
+                },
+                ContentBlock::text("volatile tail"),
+            ],
+        });
+        req.system = Some(SystemPrompt {
+            text: "rules".into(),
+            cache: true,
+        });
+        let body = build_body(&req, true);
+        // System + skeleton (immutable prefix) get the 1h TTL...
+        assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["ttl"],
+            "1h"
+        );
+        // ...but the rolling conversation tail stays at the default (5-minute) TTL.
+        let tail = &body["messages"][0]["content"][1]["cache_control"];
+        assert_eq!(tail["type"], "ephemeral");
+        assert!(
+            tail["ttl"].is_null(),
+            "the volatile tail must not use the 1h TTL"
+        );
     }
 }

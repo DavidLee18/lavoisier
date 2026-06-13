@@ -346,6 +346,19 @@ implementing the context/agent/protocol layers, preserve these:
 - **Staleness-aware eviction** (`mark_stale_reads`, runs each loop before dedup): once a file is
   *successfully* edited, earlier read/outline results for that path are replaced with a short
   `[stale: …]` pointer (the most recent read and failed-edit cases are left intact).
+- **Thinking budget as a cost dial** (`ThinkingLevel {Off,Low,Medium,High}` on `ChatRequest` +
+  `Knobs`): output (thinking) tokens are the dominant cost once input is cached, so the agent
+  defaults thinking **lower for mechanical archetypes** (rename/single-file-edit/refactor →
+  `Low`; feature/other → provider default) via `resolve_thinking`, the **ATO tuner can tune it**
+  (5th dial, `THINKING_GRID`), and `--thinking-budget <off|low|medium|high>` forces it. Each
+  provider maps the level to its cheapest equivalent so a mechanical task never *raises* cost
+  (Anthropic: `Off`/`Low` ⇒ no thinking block, `Medium`/`High` ⇒ `budget_tokens`; Google ⇒
+  `thinkingConfig`; xAI ⇒ ignored, grok reasons automatically).
+- **1-hour cache TTL on the immutable prefix for long-running gateways**
+  (`AnthropicProvider::with_extended_cache_ttl`, auto-enabled under `--serve`/`--serve-matrix`):
+  marks the system+tools+skeleton breakpoints `ttl: "1h"` (+ the `extended-cache-ttl-2025-04-11`
+  beta header) so they survive idle gaps between turns without re-creation; the volatile
+  conversation tail stays at the default 5-minute TTL. One-shot CLI runs keep 5-min (cheaper write).
 - Order context immutable → stable → volatile to maximise cache hits; never let volatile
   content leak into the cached prefix (guarded by the `cached_prefix_is_byte_stable_across_turns`
   test: the budget-awareness progress note lives only in the conversation tail).
@@ -384,6 +397,8 @@ in-memory), `--serve-matrix` (Matrix gateway), `--api-key <KEY>` (repeatable) / 
 `--tune-decay <F>` (observation-decay EWMA) and `--radius-counterfactual` (opt-in, unsound radius
 counterfactual), `--telemetry` (per-task stderr summary), `--classify-with-model` (model archetype
 classification), `--repo-skeleton <TOKENS>` (cache-aware repo-skeleton prefix, §6.1),
+`--thinking-budget <off|low|medium|high>` (force the normalised thinking level — else mechanical
+archetypes default lower and ATO can tune it),
 `--cheap-model`/`--escalate-after` (cheap-model-first) and `--advisor-model` (advisor+executor
 split) for §8 cost reduction, plus the **convergence levers** `--in-loop-verify` (stop as soon as
 `--verify-cmd` passes after an edit turn), `--no-progress-limit <N>` (nudge after N edit-free turns,

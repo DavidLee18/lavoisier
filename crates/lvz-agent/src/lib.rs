@@ -37,7 +37,7 @@ use lvz_context::Lang;
 use lvz_protocol::{
     AgentError, AgentHandle, Archetype, Capabilities, ChatRequest, ContentBlock, Event, Knobs,
     Message, ModelTier, NoopTuner, Outcome, Provider, RepoProfile, Role, StopReason, SystemPrompt,
-    TaskContext, TaskTelemetry, TelemetrySink, ToolDef, Tuner, TurnRequest, Usage,
+    TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, ToolDef, Tuner, TurnRequest, Usage,
 };
 use lvz_tools::ToolRegistry;
 use serde_json::{json, Value};
@@ -164,6 +164,11 @@ pub struct AgentConfig {
     /// wrap up deliberately rather than being truncated. Off by default. Lives in the volatile tail,
     /// so it does not disturb the cached prefix.
     pub budget_awareness: bool,
+    /// **Forced thinking level** (`--thinking-budget`): when `Some(_)`, every turn requests exactly
+    /// this [`ThinkingLevel`], overriding both the tuner and the per-archetype default. `None` lets
+    /// the resolved default apply — mechanical archetypes (rename / single-file edit / refactor)
+    /// think *less* to save output tokens; everything else defers to the provider default.
+    pub forced_thinking: Option<ThinkingLevel>,
 }
 
 impl Default for AgentConfig {
@@ -188,6 +193,7 @@ impl Default for AgentConfig {
             in_loop_verify: false,
             no_progress_limit: None,
             budget_awareness: false,
+            forced_thinking: None,
         }
     }
 }
@@ -265,6 +271,13 @@ impl AgentConfig {
     /// Enable budget-awareness notes appended to tool results (turn/token budget remaining).
     pub fn with_budget_awareness(mut self, on: bool) -> Self {
         self.budget_awareness = on;
+        self
+    }
+
+    /// Force a fixed thinking level for every turn (`--thinking-budget`), overriding the tuner and
+    /// the per-archetype default.
+    pub fn with_forced_thinking(mut self, level: ThinkingLevel) -> Self {
+        self.forced_thinking = Some(level);
         self
     }
 
@@ -453,6 +466,9 @@ async fn run_loop(
             .unwrap_or_default(),
     };
     let knobs = tuner.select(&ctx);
+    // Resolve the per-task thinking level once: forced (--thinking-budget) > tuner knob >
+    // per-archetype default (mechanical archetypes think less). Fixed for the whole task.
+    let task_thinking = resolve_thinking(&config, &knobs, archetype);
     let obs = Observation {
         tuner: &tuner,
         telemetry: &telemetry,
@@ -526,6 +542,7 @@ async fn run_loop(
             &knobs,
             &history,
             repo_skeleton,
+            task_thinking,
         );
         let mut stream = match provider.stream(req).await {
             Ok(s) => s,
@@ -1320,6 +1337,31 @@ fn proxy(m: &Message) -> String {
     s
 }
 
+/// Resolve the thinking level for a task: an explicit `--thinking-budget` wins, then the tuner's
+/// learned knob, then the per-archetype default. `None` ⇒ defer to the provider default.
+fn resolve_thinking(
+    config: &AgentConfig,
+    knobs: &Knobs,
+    archetype: Archetype,
+) -> Option<ThinkingLevel> {
+    config
+        .forced_thinking
+        .or(knobs.thinking)
+        .or_else(|| default_thinking(archetype))
+}
+
+/// Per-archetype thinking default. **Mechanical** archetypes (rename / single-file edit / refactor)
+/// rarely need deep reasoning, so they request `Low` to save output tokens; feature work and
+/// unclassified tasks return `None` (defer to the provider default, which may reason more).
+fn default_thinking(archetype: Archetype) -> Option<ThinkingLevel> {
+    match archetype {
+        Archetype::Rename | Archetype::SingleFileEdit | Archetype::Refactor => {
+            Some(ThinkingLevel::Low)
+        }
+        Archetype::Feature | Archetype::Other => None,
+    }
+}
+
 /// Cheap keyword classifier mapping a task prompt to an [`Archetype`] prior (`RECIPE.md`
 /// §6.5/§6.6). Deterministic and free — a good-enough prior for keying tuner profiles, with
 /// no extra round-trip. Ordering is intentional: more specific intents win (a rename is a
@@ -1561,6 +1603,7 @@ fn build_repo_skeleton(root: &Path, token_budget: usize) -> Option<String> {
 /// message** and marked cacheable (§6.1): ordered immutable→stable→volatile, it extends the cached
 /// prefix (system + tool defs + skeleton) ahead of the volatile conversation, so a caching provider
 /// pays for it once and re-reads it cheaply on every later round-trip and same-repo task.
+#[allow(clippy::too_many_arguments)]
 fn build_request(
     config: &AgentConfig,
     model: &str,
@@ -1569,8 +1612,10 @@ fn build_request(
     knobs: &Knobs,
     history: &[Message],
     repo_skeleton: Option<&str>,
+    thinking: Option<ThinkingLevel>,
 ) -> ChatRequest {
     let mut req = ChatRequest::new(model.to_string()).max_tokens(config.max_tokens);
+    req.thinking = thinking;
     req.system = Some(SystemPrompt {
         text: system_with_knobs(&config.system, knobs),
         cache: caps.prompt_caching,
@@ -1770,6 +1815,39 @@ mod tests {
     }
 
     #[test]
+    fn thinking_resolution_prefers_forced_then_knob_then_archetype_default() {
+        use Archetype::*;
+        let base = AgentConfig::default();
+        let knobs = Knobs::default(); // thinking None
+                                      // Per-archetype default: mechanical ⇒ Low, others ⇒ None (provider default).
+        assert_eq!(
+            resolve_thinking(&base, &knobs, Rename),
+            Some(ThinkingLevel::Low)
+        );
+        assert_eq!(
+            resolve_thinking(&base, &knobs, SingleFileEdit),
+            Some(ThinkingLevel::Low)
+        );
+        assert_eq!(resolve_thinking(&base, &knobs, Feature), None);
+        assert_eq!(resolve_thinking(&base, &knobs, Other), None);
+        // A tuner knob overrides the archetype default...
+        let tuned = Knobs {
+            thinking: Some(ThinkingLevel::Medium),
+            ..Knobs::default()
+        };
+        assert_eq!(
+            resolve_thinking(&base, &tuned, Feature),
+            Some(ThinkingLevel::Medium)
+        );
+        // ...and a forced level (--thinking-budget) overrides everything.
+        let forced = AgentConfig::default().with_forced_thinking(ThinkingLevel::High);
+        assert_eq!(
+            resolve_thinking(&forced, &tuned, Rename),
+            Some(ThinkingLevel::High)
+        );
+    }
+
+    #[test]
     fn cached_prefix_is_byte_stable_across_turns() {
         // The cached prefix (system + tool defs + repo-skeleton block) must be byte-identical from
         // one round-trip to the next, so a caching provider keeps hitting it; volatile per-turn
@@ -1807,6 +1885,7 @@ mod tests {
             &knobs,
             &h1,
             Some(skeleton),
+            None,
         );
         let r2 = build_request(
             &config,
@@ -1816,6 +1895,7 @@ mod tests {
             &knobs,
             &h2,
             Some(skeleton),
+            None,
         );
 
         // System prompt and tool defs are identical turn-to-turn.
@@ -2617,6 +2697,7 @@ fn target() -> u32 { helper() + 10 }
             &Knobs::default(),
             &history,
             Some("===== src/a.rs =====\npub fn alpha()"),
+            None,
         );
         // The skeleton is the first block of the first message, cached, ahead of the task text.
         let first = &req.messages[0].content;
@@ -2654,6 +2735,7 @@ fn target() -> u32 { helper() + 10 }
             &Knobs::default(),
             &history,
             Some("skel"),
+            None,
         );
         match &req.messages[0].content[0] {
             ContentBlock::Text { cache, .. } => assert!(!cache, "no caching ⇒ no breakpoint"),

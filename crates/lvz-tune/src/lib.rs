@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
-use lvz_protocol::{Archetype, Knobs, ModelTier, Outcome, TaskContext, Tuner};
+use lvz_protocol::{Archetype, Knobs, ModelTier, Outcome, TaskContext, ThinkingLevel, Tuner};
 use serde::{Deserialize, Serialize};
 
 mod bayes;
@@ -255,7 +255,7 @@ impl Tuner for LearningTuner {
 
         if next_f64(&mut st.rng) < self.cfg.epsilon {
             // Explore: step one knob to an adjacent grid value and register the neighbour.
-            let knob = (next_u64(&mut st.rng) % 4) as usize;
+            let knob = (next_u64(&mut st.rng) % DIALS as u64) as usize;
             let up = next_u64(&mut st.rng).is_multiple_of(2);
             let neighbour = step(best, knob, up);
             st.profiles
@@ -346,6 +346,19 @@ pub(crate) const RADIUS_GRID: &[u8] = &[0, 1, 2, 3];
 pub(crate) const TRUNCATE_GRID: &[usize] = &[2048, 4096, 8192, 16384, 32768];
 pub(crate) const COMPACT_GRID: &[usize] = &[8000, 16000, 24000, 32000, 48000, 64000];
 pub(crate) const BATCH_GRID: &[u8] = &[1, 2, 4, 8];
+/// Thinking-effort dial, cheapest→most expensive. `None` (the floor) defers to the agent's
+/// per-archetype default; the explicit levels let the learner push thinking down (to save output
+/// tokens) or up (when a harder context needs it). Ordered so `neighbour` steps monotonically.
+pub(crate) const THINKING_GRID: &[Option<ThinkingLevel>] = &[
+    None,
+    Some(ThinkingLevel::Off),
+    Some(ThinkingLevel::Low),
+    Some(ThinkingLevel::Medium),
+    Some(ThinkingLevel::High),
+];
+
+/// Number of tunable dials (radius, truncate, compact, batch, thinking).
+pub(crate) const DIALS: usize = 5;
 
 fn step(knobs: Knobs, which: usize, up: bool) -> Knobs {
     let mut k = knobs;
@@ -353,16 +366,17 @@ fn step(knobs: Knobs, which: usize, up: bool) -> Knobs {
         0 => k.skeleton_radius = neighbour(RADIUS_GRID, k.skeleton_radius, up),
         1 => k.truncate_bytes = neighbour(TRUNCATE_GRID, k.truncate_bytes, up),
         2 => k.compact_after = neighbour(COMPACT_GRID, k.compact_after, up),
-        _ => k.batch_width = neighbour(BATCH_GRID, k.batch_width, up),
+        3 => k.batch_width = neighbour(BATCH_GRID, k.batch_width, up),
+        _ => k.thinking = neighbour(THINKING_GRID, k.thinking, up),
     }
     k
 }
 
-/// All distinct one-step grid neighbours of `knobs` (both directions on all four dials, clamped;
+/// All distinct one-step grid neighbours of `knobs` (both directions on every dial, clamped;
 /// the centre itself is excluded). Shared by the Bayesian tuner to expand its candidate frontier.
 pub(crate) fn all_neighbours(knobs: Knobs) -> Vec<Knobs> {
-    let mut out = Vec::with_capacity(8);
-    for which in 0..4 {
+    let mut out = Vec::with_capacity(2 * DIALS);
+    for which in 0..DIALS {
         for up in [true, false] {
             let n = step(knobs, which, up);
             if n != knobs && !out.contains(&n) {
@@ -437,6 +451,19 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(t.select(&ctx()), Knobs::default());
+    }
+
+    #[test]
+    fn thinking_is_a_tunable_dial() {
+        // The thinking dial is reachable from the baseline, so the learner/Bayes can explore it.
+        let neighbours = all_neighbours(Knobs::default());
+        assert!(
+            neighbours.iter().any(|k| k.thinking.is_some()),
+            "all_neighbours must include a thinking-varied vector"
+        );
+        // Stepping the thinking dial up from the baseline (None) reaches an explicit level.
+        let up = step(Knobs::default(), DIALS - 1, true);
+        assert!(up.thinking.is_some() && up != Knobs::default());
     }
 
     #[test]

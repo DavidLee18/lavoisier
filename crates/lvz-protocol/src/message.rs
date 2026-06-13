@@ -5,6 +5,25 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Normalised extended-thinking effort, mapped per-provider by each adapter (`RECIPE.md` §8).
+///
+/// This is a *cost* dial: more thinking ⇒ more (priced) output tokens. The agent defaults it
+/// **lower for mechanical archetypes** (renames, single-file edits) and lets the ATO tuner learn
+/// it; `--thinking-budget` forces a level. Mapping per provider (each maps `Low` to its cheapest
+/// meaningful setting, so a mechanical task never *raises* cost):
+/// - **Anthropic**: `Off`/`Low` ⇒ no `thinking` block; `Medium` ⇒ `budget_tokens: 4096`;
+///   `High` ⇒ `budget_tokens: 12000` (extended thinking stays opt-in via `Medium`/`High`).
+/// - **Google**: `Off` ⇒ budget 0; `Low`/`Medium`/`High` ⇒ the matching Gemini effort.
+/// - **xAI**: no request-side control (grok reasons automatically) — ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingLevel {
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
 /// A full chat-completion request in provider-agnostic form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
@@ -23,6 +42,10 @@ pub struct ChatRequest {
     /// Sampling temperature; `None` defers to the provider default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Extended-thinking effort. `None` defers to the provider's own default (current behaviour);
+    /// `Some(_)` requests a specific level. Set by the agent from the per-archetype default / tuner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingLevel>,
 }
 
 impl ChatRequest {
@@ -35,7 +58,14 @@ impl ChatRequest {
             tools: Vec::new(),
             max_tokens: 1024,
             temperature: None,
+            thinking: None,
         }
+    }
+
+    /// Set the extended-thinking effort (builder style).
+    pub fn thinking(mut self, level: ThinkingLevel) -> Self {
+        self.thinking = Some(level);
+        self
     }
 
     /// Set an (un-cached) system prompt.
