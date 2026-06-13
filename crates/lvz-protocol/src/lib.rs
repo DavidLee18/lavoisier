@@ -25,8 +25,8 @@ pub use agent::{AgentError, AgentHandle, TurnRequest};
 pub use event::{Event, StopReason, Usage};
 pub use gateway::{Gateway, GatewayError};
 pub use message::{
-    ChatRequest, ContentBlock, MediaSource, Message, OutputFormat, Role, SystemPrompt,
-    ThinkingLevel, ToolChoice, ToolDef,
+    ChatRequest, ContentBlock, McpServer, MediaSource, Message, OutputFormat, Role, ServerTool,
+    SystemPrompt, ThinkingLevel, ToolChoice, ToolDef,
 };
 pub use provider::{Capabilities, Provider, ProviderError};
 pub use telemetry::{TaskTelemetry, TelemetrySink};

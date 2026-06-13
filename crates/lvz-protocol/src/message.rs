@@ -48,6 +48,41 @@ pub enum OutputFormat {
     JsonSchema { schema: serde_json::Value },
 }
 
+/// A **provider-executed** (server-side) tool: the model invokes it and the *provider* runs it,
+/// returning results inline — the agent never executes these. Adapters map each to their built-in
+/// tool type (Anthropic versioned tool blocks, xAI `WebSearch`/`CodeExecution`, Gemini grounding).
+/// Providers that don't offer a given tool ignore it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ServerTool {
+    /// Web search with optional caps and domain allow/block lists.
+    WebSearch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_uses: Option<u32>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        allowed_domains: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        blocked_domains: Vec<String>,
+    },
+    /// Fetch the contents of a specific URL.
+    WebFetch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_uses: Option<u32>,
+    },
+    /// Run code in a provider-hosted sandbox.
+    CodeExecution,
+}
+
+/// A remote MCP (Model Context Protocol) server the provider connects to on the model's behalf.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServer {
+    pub name: String,
+    pub url: String,
+    /// Bearer token for the server (omit when the provider injects credentials out of band).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_token: Option<String>,
+}
+
 /// A full chat-completion request in provider-agnostic form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
@@ -88,6 +123,12 @@ pub struct ChatRequest {
     /// Constrain the output shape (structured outputs / JSON schema). `None` = free-form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_format: Option<OutputFormat>,
+    /// Provider-executed (server-side) tools to offer — web search, code execution, etc.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_tools: Vec<ServerTool>,
+    /// Remote MCP servers the provider should connect to on the model's behalf.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServer>,
 }
 
 impl ChatRequest {
@@ -107,6 +148,8 @@ impl ChatRequest {
             top_k: None,
             stop_sequences: Vec::new(),
             output_format: None,
+            server_tools: Vec::new(),
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -222,6 +265,8 @@ pub enum MediaSource {
     Base64 { media_type: String, data: String },
     /// A URL the provider fetches itself.
     Url { url: String },
+    /// A previously-uploaded file referenced by id (provider Files API).
+    File { file_id: String },
 }
 
 /// A unit of message content. A message can mix text, thinking, images, documents, tool calls,

@@ -309,6 +309,8 @@ fn gemini_media_part(source: &MediaSource) -> Value {
             json!({ "inlineData": { "mimeType": media_type, "data": data } })
         }
         MediaSource::Url { url } => json!({ "fileData": { "fileUri": url } }),
+        // Gemini references uploaded files by URI; treat a file id as the file URI.
+        MediaSource::File { file_id } => json!({ "fileData": { "fileUri": file_id } }),
     }
 }
 

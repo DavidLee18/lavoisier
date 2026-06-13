@@ -364,36 +364,53 @@ fn push_user(m: &Message, out: &mut Vec<pb::Message>) {
     }
 }
 
-/// An image content part. xAI's `image_url` accepts either a URL or a base64 data-URL string.
+/// An image content part. xAI's `image_url` accepts a URL or a base64 data-URL string; a
+/// Files-API id maps to a `FileContent` attachment instead.
 fn image_content(source: &MediaSource) -> pb::Content {
-    let url = match source {
-        MediaSource::Url { url } => url.clone(),
-        MediaSource::Base64 { media_type, data } => format!("data:{media_type};base64,{data}"),
-    };
+    match source {
+        MediaSource::Url { url } => image_url_content(url.clone()),
+        MediaSource::Base64 { media_type, data } => {
+            image_url_content(format!("data:{media_type};base64,{data}"))
+        }
+        MediaSource::File { file_id } => pb::Content {
+            content: Some(pb::content::Content::File(pb::FileContent {
+                file_id: file_id.clone(),
+                ..Default::default()
+            })),
+        },
+    }
+}
+
+fn image_url_content(image_url: String) -> pb::Content {
     pb::Content {
         content: Some(pb::content::Content::ImageUrl(pb::ImageUrlContent {
-            image_url: url,
+            image_url,
             detail: pb::ImageDetail::DetailAuto as i32,
         })),
     }
 }
 
-/// A document/file content part. A URL maps to `FileContent.url`; inline base64 is unsupported on
-/// the gRPC transport (it wants raw bytes, not base64), so it degrades to a short text note.
+/// A document/file content part. A URL → `FileContent.url`, a Files-API id → `FileContent.file_id`;
+/// inline base64 is unsupported on the gRPC transport (it wants raw bytes), so it degrades to a note.
 fn file_content(source: &MediaSource) -> Vec<pb::Content> {
-    match source {
-        MediaSource::Url { url } => vec![pb::Content {
-            content: Some(pb::content::Content::File(pb::FileContent {
-                url: url.clone(),
-                ..Default::default()
-            })),
-        }],
+    let fc = match source {
+        MediaSource::Url { url } => pb::FileContent {
+            url: url.clone(),
+            ..Default::default()
+        },
+        MediaSource::File { file_id } => pb::FileContent {
+            file_id: file_id.clone(),
+            ..Default::default()
+        },
         MediaSource::Base64 { .. } => {
-            vec![text_content(
-                "[document omitted: send via URL on the xAI gRPC transport]".into(),
+            return vec![text_content(
+                "[document omitted: send via URL or file id on the xAI gRPC transport]".into(),
             )]
         }
-    }
+    };
+    vec![pb::Content {
+        content: Some(pb::content::Content::File(fc)),
+    }]
 }
 
 fn build_assistant(m: &Message) -> pb::Message {

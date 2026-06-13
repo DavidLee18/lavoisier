@@ -21,7 +21,7 @@ use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
     Capabilities, ChatRequest, ContentBlock, Event, MediaSource, Message, OutputFormat, Provider,
-    ProviderError, Role, SystemPrompt, ThinkingLevel, ToolChoice, ToolDef,
+    ProviderError, Role, ServerTool, SystemPrompt, ThinkingLevel, ToolChoice, ToolDef,
 };
 use serde_json::{json, Value};
 
@@ -31,6 +31,10 @@ const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Beta flag enabling the 1-hour cache TTL (`cache_control.ttl = "1h"`).
 const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
+/// Beta flag for the MCP connector (`mcp_servers`).
+const MCP_BETA: &str = "mcp-client-2025-11-20";
+/// Beta flag for the Files API (`/v1/files`, `source.type = "file"`).
+const FILES_BETA: &str = "files-api-2025-04-14";
 
 /// A [`Provider`] backed by the native Anthropic Messages API.
 pub struct AnthropicProvider {
@@ -75,6 +79,48 @@ impl AnthropicProvider {
             std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
         Ok(Self::with_base_url(api_key, base_url))
     }
+
+    /// Upload a file to the Files API (`POST /v1/files`) and return its `file_id`, which can then
+    /// be referenced from a message via [`MediaSource::File`]. `mime` is the file's content type
+    /// (e.g. `application/pdf`, `image/png`).
+    pub async fn upload_file(
+        &self,
+        filename: impl Into<String>,
+        bytes: Vec<u8>,
+        mime: &str,
+    ) -> Result<String, ProviderError> {
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename.into())
+            .mime_str(mime)
+            .map_err(|e| ProviderError::Config(e.to_string()))?;
+        let form = reqwest::multipart::Form::new().part("file", part);
+        let url = format!("{}/v1/files", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .post(url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("anthropic-beta", FILES_BETA)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                message: resp.text().await.unwrap_or_default(),
+            });
+        }
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Decode(e.to_string()))?;
+        v["id"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| ProviderError::Decode("files response missing id".into()))
+    }
 }
 
 #[async_trait]
@@ -86,13 +132,36 @@ impl Provider for AnthropicProvider {
         let body = build_body(&req, self.extended_cache_ttl);
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
 
+        // Collect the beta flags this request needs (sent as one comma-joined header).
+        let mut betas: Vec<&str> = Vec::new();
+        if self.extended_cache_ttl {
+            betas.push(EXTENDED_CACHE_TTL_BETA);
+        }
+        if !req.mcp_servers.is_empty() {
+            betas.push(MCP_BETA);
+        }
+        // A file-id media source references the Files API.
+        if req.messages.iter().any(|m| {
+            m.content.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::Image {
+                        source: MediaSource::File { .. }
+                    } | ContentBlock::Document {
+                        source: MediaSource::File { .. }
+                    }
+                )
+            })
+        }) {
+            betas.push(FILES_BETA);
+        }
         let mut request = self
             .http
             .post(url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION);
-        if self.extended_cache_ttl {
-            request = request.header("anthropic-beta", EXTENDED_CACHE_TTL_BETA);
+        if !betas.is_empty() {
+            request = request.header("anthropic-beta", betas.join(","));
         }
         let resp = request
             .json(&body)
@@ -147,7 +216,8 @@ impl Provider for AnthropicProvider {
             prompt_caching: true,
             extended_thinking: true,
             parallel_tool_use: true,
-            server_side_tools: false,
+            // Provider-executed tools (web_search/web_fetch/code_execution) are declarable.
+            server_side_tools: true,
             vision: true,
         }
     }
@@ -233,8 +303,24 @@ fn build_body(req: &ChatRequest, extended_ttl: bool) -> Value {
     if let Some(system) = req.system.as_ref().map(|s| build_system(s, extended_ttl)) {
         body["system"] = system;
     }
-    if !req.tools.is_empty() {
-        body["tools"] = build_tools(&req.tools, extended_ttl);
+    if !req.tools.is_empty() || !req.server_tools.is_empty() {
+        let mut tools = build_tools(&req.tools, extended_ttl);
+        let arr = tools.as_array_mut().expect("build_tools returns an array");
+        arr.extend(req.server_tools.iter().map(build_server_tool));
+        body["tools"] = tools;
+    }
+    if !req.mcp_servers.is_empty() {
+        body["mcp_servers"] = json!(req
+            .mcp_servers
+            .iter()
+            .map(|s| {
+                let mut v = json!({ "type": "url", "name": s.name, "url": s.url });
+                if let Some(tok) = &s.authorization_token {
+                    v["authorization_token"] = json!(tok);
+                }
+                v
+            })
+            .collect::<Vec<_>>());
     }
     // Sampling parameters are rejected (400) on Opus 4.7/4.8 and Fable/Mythos 5 — skip them there.
     if !rejects_sampling_params(&req.model) {
@@ -405,6 +491,39 @@ fn build_messages(messages: &[Message], extended_ttl: bool) -> Value {
     Value::Array(arr)
 }
 
+/// Map a normalised [`ServerTool`] onto Anthropic's versioned built-in tool block.
+fn build_server_tool(tool: &ServerTool) -> Value {
+    match tool {
+        ServerTool::WebSearch {
+            max_uses,
+            allowed_domains,
+            blocked_domains,
+        } => {
+            let mut v = json!({ "type": "web_search_20260209", "name": "web_search" });
+            if let Some(n) = max_uses {
+                v["max_uses"] = json!(n);
+            }
+            if !allowed_domains.is_empty() {
+                v["allowed_domains"] = json!(allowed_domains);
+            }
+            if !blocked_domains.is_empty() {
+                v["blocked_domains"] = json!(blocked_domains);
+            }
+            v
+        }
+        ServerTool::WebFetch { max_uses } => {
+            let mut v = json!({ "type": "web_fetch_20260209", "name": "web_fetch" });
+            if let Some(n) = max_uses {
+                v["max_uses"] = json!(n);
+            }
+            v
+        }
+        ServerTool::CodeExecution => {
+            json!({ "type": "code_execution_20260120", "name": "code_execution" })
+        }
+    }
+}
+
 /// Map a normalised media source onto Anthropic's `source` object.
 fn anthropic_media_source(source: &MediaSource) -> Value {
     match source {
@@ -412,6 +531,7 @@ fn anthropic_media_source(source: &MediaSource) -> Value {
             json!({ "type": "base64", "media_type": media_type, "data": data })
         }
         MediaSource::Url { url } => json!({ "type": "url", "url": url }),
+        MediaSource::File { file_id } => json!({ "type": "file", "file_id": file_id }),
     }
 }
 
@@ -666,6 +786,53 @@ mod tests {
         assert_eq!(c[1]["type"], "document");
         assert_eq!(c[1]["source"]["type"], "url");
         assert_eq!(c[1]["source"]["url"], "https://x/y.pdf");
+    }
+
+    #[test]
+    fn server_tools_and_mcp_map_to_anthropic_shape() {
+        use lvz_protocol::{McpServer, ServerTool};
+        let mut req = ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi"));
+        req.server_tools = vec![
+            ServerTool::WebSearch {
+                max_uses: Some(3),
+                allowed_domains: vec!["docs.rs".into()],
+                blocked_domains: vec![],
+            },
+            ServerTool::CodeExecution,
+        ];
+        req.mcp_servers = vec![McpServer {
+            name: "gh".into(),
+            url: "https://mcp.example/sse".into(),
+            authorization_token: Some("tok".into()),
+        }];
+        let body = build_body(&req, false);
+        let tools = body["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["type"] == "web_search_20260209"));
+        assert!(tools.iter().any(|t| t["type"] == "code_execution_20260120"));
+        let ws = tools
+            .iter()
+            .find(|t| t["type"] == "web_search_20260209")
+            .unwrap();
+        assert_eq!(ws["max_uses"], 3);
+        assert_eq!(ws["allowed_domains"][0], "docs.rs");
+        assert_eq!(body["mcp_servers"][0]["url"], "https://mcp.example/sse");
+        assert_eq!(body["mcp_servers"][0]["authorization_token"], "tok");
+    }
+
+    #[test]
+    fn file_media_source_maps_to_anthropic_file_block() {
+        let msg = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Document {
+                source: MediaSource::File {
+                    file_id: "file_123".into(),
+                },
+            }],
+        };
+        let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
+        let src = &body["messages"][0]["content"][0]["source"];
+        assert_eq!(src["type"], "file");
+        assert_eq!(src["file_id"], "file_123");
     }
 
     #[test]

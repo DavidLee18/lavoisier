@@ -173,14 +173,21 @@ fn push_user_message(m: &lvz_protocol::Message, out: &mut Vec<Value>) {
                 text.push_str(t)
             }
             ContentBlock::Image { source } | ContentBlock::Document { source } => {
-                // OpenAI-compat carries images as `image_url` parts (URL or base64 data-URL).
-                let url = match source {
-                    MediaSource::Url { url } => url.clone(),
-                    MediaSource::Base64 { media_type, data } => {
-                        format!("data:{media_type};base64,{data}")
+                // OpenAI-compat carries images as `image_url` parts (URL or base64 data-URL); a
+                // Files-API id becomes a `file` part.
+                let part = match source {
+                    MediaSource::Url { url } => {
+                        json!({ "type": "image_url", "image_url": { "url": url } })
+                    }
+                    MediaSource::Base64 { media_type, data } => json!({
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:{media_type};base64,{data}") },
+                    }),
+                    MediaSource::File { file_id } => {
+                        json!({ "type": "file", "file": { "file_id": file_id } })
                     }
                 };
-                images.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+                images.push(part);
             }
             ContentBlock::ToolResult {
                 tool_use_id,
