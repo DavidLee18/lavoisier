@@ -580,6 +580,17 @@ async fn run_loop(
             }
         }
 
+        // Server-side tool loop paused (`pause_turn`): the provider ran a built-in tool and wants
+        // to continue. There are no *client* tools to execute — echo the assistant turn back and
+        // re-request so the provider resumes. Bounded by `max_steps` like any other round-trip.
+        // (Faithful resume of a server_tool_use chain also needs those blocks carried on the
+        // assistant turn; the agent reconstructs text + client tool calls only, so this is a
+        // best-effort continue for the client-tool agent loop.)
+        if turn.stop == Some(StopReason::PauseTurn) && turn.tool_calls.is_empty() {
+            history.push(turn.to_assistant_message());
+            continue;
+        }
+
         if turn.tool_calls.is_empty() {
             let stop = turn.stop.unwrap_or(StopReason::EndTurn);
             // Real ATO success signal (§6.6): a clean completion is only counted successful if
@@ -2086,6 +2097,54 @@ mod tests {
         assert_eq!(usage.input_tokens, 120);
         assert_eq!(usage.output_tokens, 15);
         // Provider was called exactly twice.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pause_turn_resumes_instead_of_terminating() {
+        // Turn 1 ends with pause_turn (a server-side tool loop paused, no client tool calls).
+        // The agent must NOT terminate there — it resends and the second turn finishes.
+        let scripts = vec![
+            vec![
+                Event::ServerToolUse {
+                    id: "s1".into(),
+                    name: "web_search".into(),
+                },
+                Event::Usage(Usage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    ..Default::default()
+                }),
+                Event::Done(StopReason::PauseTurn),
+            ],
+            vec![
+                Event::TextDelta("answer".into()),
+                Event::Usage(Usage {
+                    input_tokens: 20,
+                    output_tokens: 3,
+                    ..Default::default()
+                }),
+                Event::Done(StopReason::EndTurn),
+            ],
+        ];
+        let provider = ScriptedProvider::new(scripts);
+        let agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::with_builtins(),
+            AgentConfig::default(),
+        );
+        let events = collect(agent.run("search the web")).await;
+        // Exactly one terminal Done, and it's the resumed turn's EndTurn (not PauseTurn).
+        let dones: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, Event::Done(_)))
+            .collect();
+        assert_eq!(dones.len(), 1);
+        assert_eq!(dones[0], &Event::Done(StopReason::EndTurn));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::TextDelta(t) if t == "answer")));
+        // Two provider calls: the paused turn, then the resume.
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 
