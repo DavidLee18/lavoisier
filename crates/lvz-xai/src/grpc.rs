@@ -328,7 +328,7 @@ fn push_user(m: &Message, out: &mut Vec<pb::Message>) {
                 text.push_str(t)
             }
             ContentBlock::Image { source } => media.push(image_content(source)),
-            ContentBlock::Document { source } => media.extend(file_content(source)),
+            ContentBlock::Document { source, .. } => media.extend(file_content(source)),
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,

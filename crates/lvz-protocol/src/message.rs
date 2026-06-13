@@ -284,8 +284,13 @@ pub enum ContentBlock {
     Thinking { text: String },
     /// An image input (vision). Providers without vision ignore it.
     Image { source: MediaSource },
-    /// A document input (e.g. PDF). Anthropic/Gemini support it; others ignore it.
-    Document { source: MediaSource },
+    /// A document input (e.g. PDF). Anthropic/Gemini support it; others ignore it. `citations`
+    /// requests source-grounded citations in the answer (Anthropic; ignored elsewhere).
+    Document {
+        source: MediaSource,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        citations: bool,
+    },
     /// An assistant tool call: opaque `id`, tool `name`, and parsed argument JSON.
     ToolUse {
         id: String,

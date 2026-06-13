@@ -321,7 +321,7 @@ fn content_part(block: &ContentBlock, id_to_name: &HashMap<&str, &str>) -> Value
         ContentBlock::Thinking { text } => json!({ "text": text }),
         // Images and documents (PDF) both map to a Gemini data part: inlineData for base64,
         // fileData for a URL. Gemini accepts a PDF the same way as an image.
-        ContentBlock::Image { source } | ContentBlock::Document { source } => {
+        ContentBlock::Image { source } | ContentBlock::Document { source, .. } => {
             gemini_media_part(source)
         }
         ContentBlock::ToolUse { id, name, input } => {

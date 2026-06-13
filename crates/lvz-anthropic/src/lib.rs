@@ -148,7 +148,8 @@ impl Provider for AnthropicProvider {
                     ContentBlock::Image {
                         source: MediaSource::File { .. }
                     } | ContentBlock::Document {
-                        source: MediaSource::File { .. }
+                        source: MediaSource::File { .. },
+                        ..
                     }
                 )
             })
@@ -555,8 +556,12 @@ fn build_content_block(block: &ContentBlock, extended_ttl: bool) -> Option<Value
         ContentBlock::Image { source } => {
             json!({ "type": "image", "source": anthropic_media_source(source) })
         }
-        ContentBlock::Document { source } => {
-            json!({ "type": "document", "source": anthropic_media_source(source) })
+        ContentBlock::Document { source, citations } => {
+            let mut v = json!({ "type": "document", "source": anthropic_media_source(source) });
+            if *citations {
+                v["citations"] = json!({ "enabled": true });
+            }
+            v
         }
         ContentBlock::ToolUse { id, name, input } => {
             json!({ "type": "tool_use", "id": id, "name": name, "input": input })
@@ -774,6 +779,7 @@ mod tests {
                     source: MediaSource::Url {
                         url: "https://x/y.pdf".into(),
                     },
+                    citations: false,
                 },
                 ContentBlock::text("describe these"),
             ],
@@ -827,12 +833,31 @@ mod tests {
                 source: MediaSource::File {
                     file_id: "file_123".into(),
                 },
+                citations: false,
             }],
         };
         let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
         let src = &body["messages"][0]["content"][0]["source"];
         assert_eq!(src["type"], "file");
         assert_eq!(src["file_id"], "file_123");
+    }
+
+    #[test]
+    fn document_citations_flag_maps_to_anthropic() {
+        let msg = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Document {
+                source: MediaSource::File {
+                    file_id: "file_9".into(),
+                },
+                citations: true,
+            }],
+        };
+        let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
+        assert_eq!(
+            body["messages"][0]["content"][0]["citations"]["enabled"],
+            true
+        );
     }
 
     #[test]

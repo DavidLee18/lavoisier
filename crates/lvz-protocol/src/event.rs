@@ -79,6 +79,11 @@ pub enum StopReason {
     ToolUse,
     /// Matched a caller-supplied stop sequence.
     StopSequence,
+    /// The model declined the request for safety reasons (Anthropic `refusal`). Terminal.
+    Refusal,
+    /// The provider paused a server-side tool loop; resend the turn to continue (Anthropic
+    /// `pause_turn`). Not terminal — the caller re-submits to let the model carry on.
+    PauseTurn,
     /// Anything provider-specific not captured above.
     Other(String),
 }

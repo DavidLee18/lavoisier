@@ -172,7 +172,7 @@ fn push_user_message(m: &lvz_protocol::Message, out: &mut Vec<Value>) {
             ContentBlock::Text { text: t, .. } | ContentBlock::Thinking { text: t } => {
                 text.push_str(t)
             }
-            ContentBlock::Image { source } | ContentBlock::Document { source } => {
+            ContentBlock::Image { source } | ContentBlock::Document { source, .. } => {
                 // OpenAI-compat carries images as `image_url` parts (URL or base64 data-URL); a
                 // Files-API id becomes a `file` part.
                 let part = match source {

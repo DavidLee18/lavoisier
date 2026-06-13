@@ -160,6 +160,8 @@ fn map_stop(reason: &str) -> StopReason {
         "max_tokens" => StopReason::MaxTokens,
         "tool_use" => StopReason::ToolUse,
         "stop_sequence" => StopReason::StopSequence,
+        "refusal" => StopReason::Refusal,
+        "pause_turn" => StopReason::PauseTurn,
         other => StopReason::Other(other.to_string()),
     }
 }
@@ -222,6 +224,14 @@ mod tests {
         assert_eq!(events.len(), 4);
         assert_eq!(events[0], Event::TextDelta("Hi".into()));
         assert_eq!(events[3], Event::Done(StopReason::EndTurn));
+    }
+
+    #[test]
+    fn maps_refusal_and_pause_turn_stop_reasons() {
+        assert_eq!(map_stop("refusal"), StopReason::Refusal);
+        assert_eq!(map_stop("pause_turn"), StopReason::PauseTurn);
+        assert_eq!(map_stop("end_turn"), StopReason::EndTurn);
+        assert_eq!(map_stop("weird"), StopReason::Other("weird".into()));
     }
 
     #[test]
