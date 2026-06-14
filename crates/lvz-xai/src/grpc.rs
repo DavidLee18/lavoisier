@@ -47,6 +47,78 @@ impl GrpcTransport {
             endpoint: endpoint.into(),
         }
     }
+
+    /// Open a TLS channel to the endpoint and return a ready `Chat` client.
+    async fn connect(
+        &self,
+    ) -> Result<pb::chat_client::ChatClient<tonic::transport::Channel>, ProviderError> {
+        let tls = ClientTlsConfig::new().with_webpki_roots();
+        let channel = Endpoint::from_shared(self.endpoint.clone())
+            .map_err(|e| ProviderError::Config(format!("invalid xAI gRPC endpoint: {e}")))?
+            .tls_config(tls)
+            .map_err(|e| ProviderError::Transport(e.to_string()))?
+            .connect()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        Ok(pb::chat_client::ChatClient::new(channel))
+    }
+
+    /// Wrap a request message with the per-request `authorization: Bearer <key>` metadata.
+    fn authed<T>(&self, msg: T) -> Result<tonic::Request<T>, ProviderError> {
+        let mut request = tonic::Request::new(msg);
+        let bearer: tonic::metadata::MetadataValue<_> = format!("Bearer {}", self.api_key)
+            .parse()
+            .map_err(|_| ProviderError::Config("xAI API key is not a valid header value".into()))?;
+        request.metadata_mut().insert("authorization", bearer);
+        Ok(request)
+    }
+
+    /// Start a **deferred** (async) completion: submit the request and immediately receive a
+    /// `request_id` to poll with [`poll_deferred`](Self::poll_deferred). Best for long jobs where
+    /// holding a stream open is impractical; xAI keeps the result available for a limited window.
+    pub async fn start_deferred(&self, req: ChatRequest) -> Result<String, ProviderError> {
+        let mut client = self.connect().await?;
+        let resp = client
+            .start_deferred_completion(self.authed(build_request(req))?)
+            .await
+            .map_err(status_to_err)?
+            .into_inner();
+        Ok(resp.request_id)
+    }
+
+    /// Poll a deferred completion by `request_id`. `Ok(None)` while still pending; `Ok(Some(events))`
+    /// once done — the same normalised [`Event`] sequence the streaming path would yield. Errors if
+    /// the job failed or its result has expired.
+    pub async fn poll_deferred(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<Vec<Event>>, ProviderError> {
+        let mut client = self.connect().await?;
+        let resp = client
+            .get_deferred_completion(self.authed(pb::GetDeferredRequest {
+                request_id: request_id.to_string(),
+            })?)
+            .await
+            .map_err(status_to_err)?
+            .into_inner();
+        match resp.status() {
+            pb::DeferredStatus::Done => {
+                let response = resp.response.ok_or_else(|| {
+                    ProviderError::Decode("deferred completion DONE but no response payload".into())
+                })?;
+                Ok(Some(events_from_response(response)))
+            }
+            pb::DeferredStatus::Pending | pb::DeferredStatus::InvalidDeferredStatus => Ok(None),
+            pb::DeferredStatus::Expired => Err(ProviderError::Api {
+                status: 410,
+                message: "deferred completion result expired".into(),
+            }),
+            pb::DeferredStatus::Failed => Err(ProviderError::Api {
+                status: 500,
+                message: "deferred completion failed".into(),
+            }),
+        }
+    }
 }
 
 #[async_trait]
@@ -56,23 +128,8 @@ impl Provider for GrpcTransport {
         req: ChatRequest,
     ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
         let grpc_req = build_request(req);
-
-        let tls = ClientTlsConfig::new().with_webpki_roots();
-        let channel = Endpoint::from_shared(self.endpoint.clone())
-            .map_err(|e| ProviderError::Config(format!("invalid xAI gRPC endpoint: {e}")))?
-            .tls_config(tls)
-            .map_err(|e| ProviderError::Transport(e.to_string()))?
-            .connect()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-
-        let mut client = pb::chat_client::ChatClient::new(channel);
-
-        let mut request = tonic::Request::new(grpc_req);
-        let bearer: tonic::metadata::MetadataValue<_> = format!("Bearer {}", self.api_key)
-            .parse()
-            .map_err(|_| ProviderError::Config("xAI API key is not a valid header value".into()))?;
-        request.metadata_mut().insert("authorization", bearer);
+        let mut client = self.connect().await?;
+        let request = self.authed(grpc_req)?;
 
         let streaming = client
             .get_completion_chunk(request)
@@ -237,6 +294,53 @@ fn usage_from(u: &pb::SamplingUsage) -> Usage {
         cache_creation_tokens: 0,
         cache_read_tokens: cached,
     }
+}
+
+/// Normalise a non-streaming [`pb::GetChatCompletionResponse`] (as returned by a finished
+/// deferred completion) into the same [`Event`] sequence the streaming decoder produces:
+/// text/thinking, whole tool calls (start→delta→end), then usage and a terminal `Done`.
+fn events_from_response(resp: pb::GetChatCompletionResponse) -> Vec<Event> {
+    let mut events = Vec::new();
+    let mut stop = StopReason::EndTurn;
+    for output in resp.outputs {
+        let reason = output.finish_reason();
+        if reason != pb::FinishReason::ReasonInvalid {
+            stop = map_finish(reason);
+        }
+        if let Some(msg) = output.message {
+            if !msg.content.is_empty() {
+                events.push(Event::TextDelta(msg.content));
+            }
+            if !msg.reasoning_content.is_empty() {
+                events.push(Event::Thinking(msg.reasoning_content));
+            }
+            for tc in msg.tool_calls {
+                if tc.id.is_empty() {
+                    continue;
+                }
+                let (name, args) = match &tc.tool {
+                    Some(pb::tool_call::Tool::Function(f)) => (f.name.clone(), f.arguments.clone()),
+                    None => (String::new(), String::new()),
+                };
+                events.push(Event::ToolUseStart {
+                    id: tc.id.clone(),
+                    name,
+                });
+                if !args.is_empty() {
+                    events.push(Event::ToolUseDelta {
+                        id: tc.id.clone(),
+                        json: args,
+                    });
+                }
+                events.push(Event::ToolUseEnd { id: tc.id });
+            }
+        }
+    }
+    if let Some(usage) = &resp.usage {
+        events.push(Event::Usage(usage_from(usage)));
+    }
+    events.push(Event::Done(stop));
+    events
 }
 
 fn status_to_err(status: tonic::Status) -> ProviderError {
@@ -767,5 +871,63 @@ mod tests {
             }
         );
         assert_eq!(events[3], Event::Done(StopReason::ToolUse));
+    }
+
+    #[test]
+    fn deferred_response_maps_to_event_sequence() {
+        let resp = pb::GetChatCompletionResponse {
+            outputs: vec![pb::CompletionOutput {
+                finish_reason: pb::FinishReason::ReasonToolCalls as i32,
+                message: Some(pb::CompletionMessage {
+                    content: "done".into(),
+                    reasoning_content: "thought".into(),
+                    tool_calls: vec![pb::ToolCall {
+                        id: "call_7".into(),
+                        tool: Some(pb::tool_call::Tool::Function(pb::FunctionCall {
+                            name: "shell".into(),
+                            arguments: "{\"cmd\":\"ls\"}".into(),
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            usage: Some(pb::SamplingUsage {
+                prompt_tokens: 9,
+                completion_tokens: 3,
+                cached_prompt_text_tokens: 4,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let events = events_from_response(resp);
+        assert_eq!(events[0], Event::TextDelta("done".into()));
+        assert_eq!(events[1], Event::Thinking("thought".into()));
+        assert_eq!(
+            events[2],
+            Event::ToolUseStart {
+                id: "call_7".into(),
+                name: "shell".into()
+            }
+        );
+        assert_eq!(
+            events[3],
+            Event::ToolUseDelta {
+                id: "call_7".into(),
+                json: "{\"cmd\":\"ls\"}".into()
+            }
+        );
+        assert_eq!(
+            events[4],
+            Event::ToolUseEnd {
+                id: "call_7".into()
+            }
+        );
+        assert!(matches!(
+            events[5],
+            Event::Usage(u) if u.input_tokens == 5 && u.cache_read_tokens == 4 && u.output_tokens == 3
+        ));
+        assert_eq!(events[6], Event::Done(StopReason::ToolUse));
     }
 }
