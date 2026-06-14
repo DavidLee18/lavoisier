@@ -326,17 +326,25 @@ implemented per adapter.
 **Anthropic:** model-aware thinking — **adaptive + `output_config.effort`** on modern models
 (Sonnet 4.6, Opus 4.6/4.7/4.8, Fable 5), legacy `budget_tokens` on Haiku/older; sampling params
 stripped on the flagships that 400 on them. Native token counting (`Provider::count_tokens` →
-`/v1/messages/count_tokens`). **Batch API** (`lvz_anthropic::batch`, 50% pricing). Server-side
-tools + MCP connector (`mcp_servers`) + Files API (`upload_file`) with auto beta headers.
-`StopReason::Refusal`/`PauseTurn`; document `citations`.
+`/v1/messages/count_tokens`). **Batch API** (`lvz_anthropic::batch`, 50% pricing) incl.
+`create`/`get`/`results`/**`cancel`/`list`**. Server-side tools + MCP connector (`mcp_servers`) +
+Files API (`upload_file`) + **client builtin tools** (`BuiltinTool::Bash`/`TextEditor`/`Memory` →
+versioned `bash_20250124`/`text_editor_20250728`/`memory_20250818`, memory rides the
+context-management beta) with auto beta headers. `StopReason::Refusal`/`PauseTurn`; document
+`citations` request-side **and response-side** (`Event::Citation{cited_text,source}` from the
+SSE `citations_delta`).
 
 **xAI:** `reasoning_effort` (gRPC + HTTP), Live Search (`search_parameters`), `response_format`,
-`tool_choice`, vision (`image_url`/`FileContent`). Deferred async completions: not implemented (niche).
+`tool_choice`, vision (`image_url`/`FileContent`). **Deferred (async) completions**
+(`GrpcTransport::start_deferred`/`poll_deferred`). Server tools beyond web search:
+**X search** (`ServerTool::XSearch`, handle allow/block + ISO date window), **collections search**
+(`ServerTool::CollectionsSearch`), and **MCP** (`mcp_servers` → proto `Tool::Mcp`).
 
 **Google:** `functionCallingConfig`, `responseSchema`, sampling, multimodal, **explicit context
 caching** (`GoogleProvider::create_cached_content` + `with_cached_content` → `cachedContent`),
-Google Search grounding + code-execution tools. `safetySettings`, Gemini Files upload, batch mode:
-not implemented (lower value / policy).
+Google Search grounding + code-execution tools, **`safetySettings`** (`with_safety_settings`,
+opt-in — no silent disabling), **Files upload** (`upload_file`, resumable → `fileUri`), and
+**batch mode** (`lvz_google::batch`, `batchGenerateContent`, 50% pricing).
 
 ## Architecture invariants (do not violate)
 
