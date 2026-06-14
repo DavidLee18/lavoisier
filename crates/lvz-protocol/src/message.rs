@@ -73,6 +73,22 @@ pub enum ServerTool {
     CodeExecution,
 }
 
+/// An Anthropic-defined tool whose argument schema the model already knows — declared by a
+/// versioned `type` rather than a custom `input_schema`. The model invokes it as an ordinary
+/// `tool_use` (so it flows through [`Event::ToolUseStart`](crate::Event::ToolUseStart) and is
+/// executed **client-side**, like any other tool); the only difference is the declaration.
+/// Anthropic-specific — other providers ignore these (no equivalent built-in client tool type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltinTool {
+    /// Run shell commands (`bash_20250124`, tool name `bash`).
+    Bash,
+    /// View and str-replace-edit files (`text_editor_20250728`, name `str_replace_based_edit_tool`).
+    TextEditor,
+    /// Agentic file-backed memory (`memory_20250818`, tool name `memory`).
+    Memory,
+}
+
 /// A remote MCP (Model Context Protocol) server the provider connects to on the model's behalf.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServer {
@@ -129,6 +145,10 @@ pub struct ChatRequest {
     /// Remote MCP servers the provider should connect to on the model's behalf.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServer>,
+    /// Anthropic-defined client tools to declare by versioned type (bash/text_editor/memory).
+    /// The model calls them as normal `tool_use` blocks; non-Anthropic providers ignore them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub builtin_tools: Vec<BuiltinTool>,
 }
 
 impl ChatRequest {
@@ -150,6 +170,7 @@ impl ChatRequest {
             output_format: None,
             server_tools: Vec::new(),
             mcp_servers: Vec::new(),
+            builtin_tools: Vec::new(),
         }
     }
 

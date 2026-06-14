@@ -20,8 +20,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    Capabilities, ChatRequest, ContentBlock, Event, MediaSource, Message, OutputFormat, Provider,
-    ProviderError, Role, ServerTool, SystemPrompt, ThinkingLevel, ToolChoice, ToolDef,
+    BuiltinTool, Capabilities, ChatRequest, ContentBlock, Event, MediaSource, Message,
+    OutputFormat, Provider, ProviderError, Role, ServerTool, SystemPrompt, ThinkingLevel,
+    ToolChoice, ToolDef,
 };
 use serde_json::{json, Value};
 
@@ -35,6 +36,8 @@ const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 const MCP_BETA: &str = "mcp-client-2025-11-20";
 /// Beta flag for the Files API (`/v1/files`, `source.type = "file"`).
 const FILES_BETA: &str = "files-api-2025-04-14";
+/// Beta flag for the memory tool (`memory_20250818`) / context management.
+const CONTEXT_MGMT_BETA: &str = "context-management-2025-06-27";
 
 /// A [`Provider`] backed by the native Anthropic Messages API.
 pub struct AnthropicProvider {
@@ -139,6 +142,10 @@ impl Provider for AnthropicProvider {
         }
         if !req.mcp_servers.is_empty() {
             betas.push(MCP_BETA);
+        }
+        // The memory tool rides on the context-management beta.
+        if req.builtin_tools.contains(&BuiltinTool::Memory) {
+            betas.push(CONTEXT_MGMT_BETA);
         }
         // A file-id media source references the Files API.
         if req.messages.iter().any(|m| {
@@ -304,10 +311,11 @@ fn build_body(req: &ChatRequest, extended_ttl: bool) -> Value {
     if let Some(system) = req.system.as_ref().map(|s| build_system(s, extended_ttl)) {
         body["system"] = system;
     }
-    if !req.tools.is_empty() || !req.server_tools.is_empty() {
+    if !req.tools.is_empty() || !req.server_tools.is_empty() || !req.builtin_tools.is_empty() {
         let mut tools = build_tools(&req.tools, extended_ttl);
         let arr = tools.as_array_mut().expect("build_tools returns an array");
         arr.extend(req.server_tools.iter().map(build_server_tool));
+        arr.extend(req.builtin_tools.iter().map(build_builtin_tool));
         body["tools"] = tools;
     }
     if !req.mcp_servers.is_empty() {
@@ -522,6 +530,18 @@ fn build_server_tool(tool: &ServerTool) -> Value {
         ServerTool::CodeExecution => {
             json!({ "type": "code_execution_20260120", "name": "code_execution" })
         }
+    }
+}
+
+/// Map an Anthropic-defined client tool to its versioned `{type, name}` declaration. The schema
+/// is implicit (Anthropic knows it); the model calls it as a normal `tool_use`.
+fn build_builtin_tool(tool: &BuiltinTool) -> Value {
+    match tool {
+        BuiltinTool::Bash => json!({ "type": "bash_20250124", "name": "bash" }),
+        BuiltinTool::TextEditor => {
+            json!({ "type": "text_editor_20250728", "name": "str_replace_based_edit_tool" })
+        }
+        BuiltinTool::Memory => json!({ "type": "memory_20250818", "name": "memory" }),
     }
 }
 
@@ -823,6 +843,30 @@ mod tests {
         assert_eq!(ws["allowed_domains"][0], "docs.rs");
         assert_eq!(body["mcp_servers"][0]["url"], "https://mcp.example/sse");
         assert_eq!(body["mcp_servers"][0]["authorization_token"], "tok");
+    }
+
+    #[test]
+    fn builtin_tools_map_to_versioned_declarations() {
+        use lvz_protocol::BuiltinTool;
+        let mut req = ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi"));
+        req.builtin_tools = vec![
+            BuiltinTool::Bash,
+            BuiltinTool::TextEditor,
+            BuiltinTool::Memory,
+        ];
+        let body = build_body(&req, false);
+        let tools = body["tools"].as_array().unwrap();
+        let bash = tools.iter().find(|t| t["name"] == "bash").unwrap();
+        assert_eq!(bash["type"], "bash_20250124");
+        let ed = tools
+            .iter()
+            .find(|t| t["name"] == "str_replace_based_edit_tool")
+            .unwrap();
+        assert_eq!(ed["type"], "text_editor_20250728");
+        let mem = tools.iter().find(|t| t["name"] == "memory").unwrap();
+        assert_eq!(mem["type"], "memory_20250818");
+        // Builtin tools carry no input_schema (Anthropic supplies it).
+        assert!(bash.get("input_schema").is_none());
     }
 
     #[test]
