@@ -128,6 +128,16 @@ impl AnthropicSseDecoder {
                             }));
                         }
                     }
+                    // A citation the model attached to the text span just emitted (only present
+                    // when a request document/web-search set `citations: true`).
+                    Some("citations_delta") => {
+                        let c = &delta["citation"];
+                        let cited_text = c["cited_text"].as_str().unwrap_or_default().to_string();
+                        out.push_back(Ok(Event::Citation {
+                            cited_text,
+                            source: citation_source(c),
+                        }));
+                    }
                     _ => {}
                 }
             }
@@ -170,6 +180,24 @@ impl AnthropicSseDecoder {
         let stop = self.stop.take().unwrap_or(StopReason::EndTurn);
         out.push_back(Ok(Event::Done(stop)));
     }
+}
+
+/// Derive a human-readable source label from an Anthropic citation object. The shape varies by
+/// citation `type` (`char_location`/`page_location`/`content_block_location` carry a
+/// `document_title`; `web_search_result_location` carries `url`/`title`); fall back to the
+/// document index.
+fn citation_source(c: &Value) -> String {
+    for key in ["document_title", "title", "url"] {
+        if let Some(s) = c[key].as_str() {
+            if !s.is_empty() {
+                return s.to_string();
+            }
+        }
+    }
+    if let Some(idx) = c["document_index"].as_u64() {
+        return format!("document {idx}");
+    }
+    String::new()
 }
 
 fn map_stop(reason: &str) -> StopReason {
@@ -267,6 +295,40 @@ mod tests {
             }
             other => panic!("expected server tool result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn surfaces_document_citations() {
+        let input = concat!(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"The grass is green\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"citations_delta\",\"citation\":{\"type\":\"char_location\",\"cited_text\":\"grass is green\",\"document_index\":0,\"document_title\":\"facts.txt\",\"start_char_index\":0,\"end_char_index\":14}}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let events = decode_all(input);
+        assert_eq!(events[0], Event::TextDelta("The grass is green".into()));
+        assert_eq!(
+            events[1],
+            Event::Citation {
+                cited_text: "grass is green".into(),
+                source: "facts.txt".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn citation_source_falls_back_to_url_then_index() {
+        let web = serde_json::json!({
+            "type": "web_search_result_location",
+            "cited_text": "x",
+            "url": "https://example.com/a",
+            "title": "Example",
+        });
+        assert_eq!(citation_source(&web), "Example");
+        let no_title = serde_json::json!({ "url": "https://example.com/a" });
+        assert_eq!(citation_source(&no_title), "https://example.com/a");
+        let only_idx = serde_json::json!({ "document_index": 3 });
+        assert_eq!(citation_source(&only_idx), "document 3");
     }
 
     #[test]

@@ -31,6 +31,15 @@ pub enum Event {
     /// The result of a provider-executed tool, as a serialized JSON string (search hits, code
     /// stdout/stderr, fetched page, …), correlated by `id`.
     ServerToolResult { id: String, content: String },
+    /// A citation the model attached to the preceding span of output (Anthropic document /
+    /// web-search citations, emitted as the text is produced). Informational — the agent
+    /// forwards it; gateways/CLIs surface it.
+    Citation {
+        /// The exact text from the source that supports the cited output span.
+        cited_text: String,
+        /// Human-readable source reference (document title, URL, or `document N`).
+        source: String,
+    },
     /// Token accounting, including cache hits. May arrive mid-stream and/or at the end.
     Usage(Usage),
     /// Terminal event: the turn finished for the given reason.
@@ -113,6 +122,10 @@ mod tests {
             },
             Event::ToolUseEnd {
                 id: "call_1".into(),
+            },
+            Event::Citation {
+                cited_text: "the sky is blue".into(),
+                source: "doc.txt".into(),
             },
             Event::Usage(Usage {
                 input_tokens: 1,
