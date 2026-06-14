@@ -108,6 +108,9 @@ pub struct GoogleProvider {
     cached_content: Option<String>,
     /// Optional content-safety overrides (`safetySettings`). Empty = Gemini's defaults.
     safety_settings: Vec<SafetySetting>,
+    /// Minimum `maxOutputTokens` applied to reasoning models so thinking can't starve the answer
+    /// ([`DEFAULT_REASONING_FLOOR`]; `0` disables it).
+    reasoning_floor: u32,
     http: reqwest::Client,
 }
 
@@ -125,6 +128,7 @@ impl GoogleProvider {
             thinking: None,
             cached_content: None,
             safety_settings: Vec::new(),
+            reasoning_floor: DEFAULT_REASONING_FLOOR,
             http: reqwest::Client::new(),
         }
     }
@@ -133,6 +137,13 @@ impl GoogleProvider {
     /// callers must opt in deliberately (e.g. relaxing a category for a security-research workload).
     pub fn with_safety_settings(mut self, settings: Vec<SafetySetting>) -> Self {
         self.safety_settings = settings;
+        self
+    }
+
+    /// Override the reasoning-model `maxOutputTokens` floor (default [`DEFAULT_REASONING_FLOOR`]).
+    /// `0` disables it (send `max_tokens` verbatim even for reasoning models).
+    pub fn with_reasoning_floor(mut self, floor: u32) -> Self {
+        self.reasoning_floor = floor;
         self
     }
 
@@ -163,6 +174,12 @@ impl GoogleProvider {
         let mut provider = Self::with_base_url(api_key, base_url);
         if let Ok(thinking) = std::env::var("GOOGLE_THINKING") {
             provider = provider.with_thinking(thinking);
+        }
+        if let Some(floor) = std::env::var("GOOGLE_REASONING_FLOOR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            provider = provider.with_reasoning_floor(floor);
         }
         Ok(provider)
     }
@@ -296,6 +313,7 @@ impl Provider for GoogleProvider {
             &req,
             self.thinking.as_deref(),
             self.cached_content.as_deref(),
+            self.reasoning_floor,
         );
         if !self.safety_settings.is_empty() {
             body["safetySettings"] = safety_settings_json(&self.safety_settings);
@@ -401,7 +419,12 @@ struct SseState {
 
 /// Build the `generateContent` request body from a normalised [`ChatRequest`]. The model id lives
 /// in the URL path, not the body.
-fn build_body(req: &ChatRequest, thinking: Option<&str>, cached_content: Option<&str>) -> Value {
+fn build_body(
+    req: &ChatRequest,
+    thinking: Option<&str>,
+    cached_content: Option<&str>,
+    reasoning_floor: u32,
+) -> Value {
     let mut body = json!({ "contents": build_contents(&req.messages) });
     if let Some(name) = cached_content {
         body["cachedContent"] = json!(name);
@@ -450,8 +473,9 @@ fn build_body(req: &ChatRequest, thinking: Option<&str>, cached_content: Option<
         body["toolConfig"] = json!({ "functionCallingConfig": fcc });
     }
 
-    let mut generation =
-        json!({ "maxOutputTokens": effective_max_output(&req.model, req.max_tokens) });
+    let mut generation = json!({
+        "maxOutputTokens": effective_max_output(&req.model, req.max_tokens, reasoning_floor)
+    });
     if let Some(t) = req.temperature {
         generation["temperature"] = json!(t);
     }
@@ -483,11 +507,11 @@ fn build_body(req: &ChatRequest, thinking: Option<&str>, cached_content: Option<
     body
 }
 
-/// Minimum `maxOutputTokens` for reasoning Gemini models. They spend output budget on internal
-/// thinking *first*, so a small cap can be wholly consumed before any answer text is emitted
-/// (the visible response comes back empty). Raise a too-small cap to this floor so reasoning
-/// models always have room to answer; a larger caller-supplied cap is left untouched.
-const REASONING_MAX_OUTPUT_FLOOR: u32 = 8192;
+/// Default minimum `maxOutputTokens` for reasoning Gemini models. They spend output budget on
+/// internal thinking *first*, so a small cap can be wholly consumed before any answer text is
+/// emitted (the visible response comes back empty). Configurable per provider via
+/// [`GoogleProvider::with_reasoning_floor`] / `GOOGLE_REASONING_FLOOR`; `0` disables the floor.
+pub const DEFAULT_REASONING_FLOOR: u32 = 8192;
 
 /// Whether `model` is a thinking/reasoning Gemini (3.x, or 2.5 which reasons by default).
 fn is_reasoning_model(model: &str) -> bool {
@@ -495,11 +519,11 @@ fn is_reasoning_model(model: &str) -> bool {
     m.starts_with("gemini-3") || m.contains("gemini-2.5") || m.contains("gemini-2-5")
 }
 
-/// The output-token cap to send: a floor is applied for reasoning models (see
-/// [`REASONING_MAX_OUTPUT_FLOOR`]); otherwise the request's value is used verbatim.
-fn effective_max_output(model: &str, requested: u32) -> u32 {
+/// The output-token cap to send: `floor` is applied for reasoning models (raising a too-small
+/// cap); otherwise — or when `floor` is 0 — the request's value is used verbatim.
+fn effective_max_output(model: &str, requested: u32, floor: u32) -> u32 {
     if is_reasoning_model(model) {
-        requested.max(REASONING_MAX_OUTPUT_FLOOR)
+        requested.max(floor)
     } else {
         requested
     }
@@ -629,7 +653,7 @@ mod tests {
 
     #[test]
     fn maps_system_tools_and_generation_config() {
-        let body = build_body(&req(), Some("high"), None);
+        let body = build_body(&req(), Some("high"), None, DEFAULT_REASONING_FLOOR);
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be terse");
         assert_eq!(
             body["tools"][0]["functionDeclarations"][0]["name"],
@@ -650,14 +674,14 @@ mod tests {
         let mut r = req();
         r.thinking = Some(ThinkingLevel::Low);
         // Construction fallback says "high", but the per-request Low must win.
-        let body = build_body(&r, Some("high"), None);
+        let body = build_body(&r, Some("high"), None, DEFAULT_REASONING_FLOOR);
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "low"
         );
         // Off disables thinking outright.
         r.thinking = Some(ThinkingLevel::Off);
-        let body = build_body(&r, Some("high"), None);
+        let body = build_body(&r, Some("high"), None, DEFAULT_REASONING_FLOOR);
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             0
@@ -674,7 +698,7 @@ mod tests {
         r.output_format = Some(OutputFormat::JsonSchema {
             schema: json!({"type": "object"}),
         });
-        let body = build_body(&r, None, None);
+        let body = build_body(&r, None, None, DEFAULT_REASONING_FLOOR);
         let fcc = &body["toolConfig"]["functionCallingConfig"];
         assert_eq!(fcc["mode"], "ANY");
         assert_eq!(fcc["allowedFunctionNames"][0], "read_file");
@@ -690,15 +714,15 @@ mod tests {
     fn reasoning_models_get_a_max_output_floor() {
         // A small cap on a reasoning model is raised to the floor…
         let r = ChatRequest::new("gemini-3-flash-preview").max_tokens(256);
-        let body = build_body(&r, None, None);
+        let body = build_body(&r, None, None, DEFAULT_REASONING_FLOOR);
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 8192);
         // …a larger cap is left untouched…
         let r = ChatRequest::new("gemini-3-flash-preview").max_tokens(20000);
-        let body = build_body(&r, None, None);
+        let body = build_body(&r, None, None, DEFAULT_REASONING_FLOOR);
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 20000);
         // …and a non-reasoning model is never bumped.
         let r = ChatRequest::new("gemini-2.0-flash").max_tokens(256);
-        let body = build_body(&r, None, None);
+        let body = build_body(&r, None, None, DEFAULT_REASONING_FLOOR);
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 256);
     }
 
@@ -732,7 +756,12 @@ mod tests {
             },
             ServerTool::CodeExecution,
         ];
-        let body = build_body(&r, None, Some("cachedContents/abc"));
+        let body = build_body(
+            &r,
+            None,
+            Some("cachedContents/abc"),
+            DEFAULT_REASONING_FLOOR,
+        );
         let tools = body["tools"].as_array().unwrap();
         assert!(tools.iter().any(|t| t.get("googleSearch").is_some()));
         assert!(tools.iter().any(|t| t.get("codeExecution").is_some()));
@@ -745,7 +774,7 @@ mod tests {
 
     #[test]
     fn numeric_thinking_is_a_budget_not_a_level() {
-        let body = build_body(&req(), Some("2048"), None);
+        let body = build_body(&req(), Some("2048"), None, DEFAULT_REASONING_FLOOR);
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             2048

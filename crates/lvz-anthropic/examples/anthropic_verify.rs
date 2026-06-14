@@ -2,15 +2,20 @@
 //!
 //! Run with a real key (a few cents on Haiku + Sonnet):
 //! ```sh
-//! ANTHROPIC_API_KEY=… cargo run -p lvz-anthropic --example live_verify
+//! ANTHROPIC_API_KEY=… cargo run -p lvz-anthropic --example anthropic_verify
 //! ```
 //! Verifies: A3 response-side document citations, A4 builtin tools (bash/text_editor/memory
 //! declarations accepted + a bash tool_use), and A5 batch list/create/get/cancel.
 
+use std::time::Duration;
+
 use futures::StreamExt;
 use lvz_anthropic::batch::BatchRequest;
 use lvz_anthropic::AnthropicProvider;
-use lvz_protocol::{BuiltinTool, ChatRequest, ContentBlock, Event, MediaSource, Message, Provider};
+use lvz_protocol::{
+    BatchProvider, BatchTask, BuiltinTool, ChatRequest, ContentBlock, Event, MediaSource, Message,
+    Provider,
+};
 
 #[tokio::main]
 async fn main() {
@@ -19,8 +24,36 @@ async fn main() {
     a3_citations(&provider).await;
     a4_builtin_tools(&provider).await;
     a5_batch(&provider).await;
+    auto_batch(&provider).await;
 
     println!("\n== live verify complete ==");
+}
+
+/// Auto-batch — run two independent requests through the unified `BatchProvider::run_batch`
+/// (create → poll → results) at the 50% batch price. Wrapped in a timeout so the demo can't hang.
+async fn auto_batch(provider: &AnthropicProvider) {
+    println!("\n--- auto-batch: BatchProvider::run_batch (haiku, 50% price) ---");
+    let task = |id: &str, prompt: &str| {
+        let mut r = ChatRequest::new("claude-haiku-4-5").push(Message::user(prompt));
+        r.max_tokens = 16;
+        BatchTask::new(id, r)
+    };
+    let tasks = vec![task("q1", "Reply with: one"), task("q2", "Reply with: two")];
+    match tokio::time::timeout(Duration::from_secs(300), provider.run_batch(tasks)).await {
+        Ok(Ok(items)) => {
+            for it in &items {
+                println!(
+                    "  [{}] {:?} err={:?}",
+                    it.custom_id,
+                    it.text.trim(),
+                    it.error
+                );
+            }
+            println!("  => auto-batch VERIFIED ({} items)", items.len());
+        }
+        Ok(Err(e)) => println!("  run_batch error: {e:?}"),
+        Err(_) => println!("  => still running after 300s (endpoints fine; not awaited)"),
+    }
 }
 
 /// A3 — attach a plain-text document with `citations: true`; expect `Event::Citation` deltas.

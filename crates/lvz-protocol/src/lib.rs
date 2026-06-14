@@ -13,6 +13,7 @@
 //! ```
 
 mod agent;
+mod batch;
 mod event;
 mod gateway;
 mod message;
@@ -22,6 +23,7 @@ mod tool;
 mod tune;
 
 pub use agent::{AgentError, AgentHandle, TurnRequest};
+pub use batch::{BatchItem, BatchProvider, BatchTask};
 pub use event::{Event, StopReason, Usage};
 pub use gateway::{Gateway, GatewayError};
 pub use message::{

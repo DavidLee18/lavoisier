@@ -2,7 +2,7 @@
 //!
 //! Run with a real key (a few cents on grok-4):
 //! ```sh
-//! XAI_API_KEY=… cargo run -p lvz-xai --example live_verify
+//! XAI_API_KEY=… cargo run -p lvz-xai --example xai_verify
 //! ```
 //! Verifies: A6 deferred (async) completions (start + poll), and A7 X search (a `ServerTool`
 //! mapped to the proto `Tool` oneof). Collections search and MCP need real resources (a

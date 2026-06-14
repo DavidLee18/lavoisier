@@ -2,7 +2,7 @@
 //!
 //! Run with a real key (a few cents on gemini-3-flash-preview):
 //! ```sh
-//! GOOGLE_API_KEY=… cargo run -p lvz-google --example live_verify
+//! GOOGLE_API_KEY=… cargo run -p lvz-google --example google_verify
 //! ```
 //! Verifies: A9 safetySettings (request accepted + answered), A10 Files upload (→ fileUri, then
 //! referenced in a follow-up turn), and A11 batch mode (create + poll the operation).
@@ -12,7 +12,10 @@ use std::time::Duration;
 use futures::StreamExt;
 use lvz_google::batch::{BatchOutcome, BatchRequest};
 use lvz_google::{GoogleProvider, HarmBlockThreshold, HarmCategory, SafetySetting};
-use lvz_protocol::{ChatRequest, ContentBlock, Event, MediaSource, Message, Provider, Role};
+use lvz_protocol::{
+    BatchProvider, BatchTask, ChatRequest, ContentBlock, Event, MediaSource, Message, Provider,
+    Role,
+};
 
 const MODEL: &str = "gemini-3-flash-preview";
 
@@ -25,8 +28,37 @@ async fn main() {
     a9_safety(&key).await;
     a10_files(&key).await;
     a11_batch(&key).await;
+    auto_batch(&key).await;
 
     println!("\n== live verify complete ==");
+}
+
+/// Auto-batch — run two requests through the unified `BatchProvider::run_batch` (create → poll →
+/// results) at the 50% batch price. Wrapped in a timeout so the demo can't hang.
+async fn auto_batch(key: &str) {
+    println!("\n--- auto-batch: BatchProvider::run_batch (gemini, 50% price) ---");
+    let provider = GoogleProvider::new(key);
+    let task = |id: &str, prompt: &str| {
+        let mut r = ChatRequest::new(MODEL).push(Message::user(prompt));
+        r.max_tokens = 64;
+        BatchTask::new(id, r)
+    };
+    let tasks = vec![task("q1", "Reply with: one"), task("q2", "Reply with: two")];
+    match tokio::time::timeout(Duration::from_secs(300), provider.run_batch(tasks)).await {
+        Ok(Ok(items)) => {
+            for it in &items {
+                println!(
+                    "  [{}] {:?} err={:?}",
+                    it.custom_id,
+                    it.text.trim(),
+                    it.error
+                );
+            }
+            println!("  => auto-batch VERIFIED ({} items)", items.len());
+        }
+        Ok(Err(e)) => println!("  run_batch error: {e:?}"),
+        Err(_) => println!("  => still running after 300s (endpoints fine; not awaited)"),
+    }
 }
 
 /// A9 — set explicit safety thresholds and confirm the request is accepted and answers.

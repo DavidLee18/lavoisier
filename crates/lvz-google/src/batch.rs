@@ -3,10 +3,18 @@
 //! long-running operation until it finishes, then read the per-request inline responses. Like the
 //! Anthropic batch path, this is for non-interactive workloads (offline evals, bulk classification).
 
-use lvz_protocol::{ChatRequest, ProviderError, Usage};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use lvz_protocol::{BatchItem, BatchProvider, BatchTask, ChatRequest, ProviderError, Usage};
 use serde_json::{json, Value};
 
 use crate::{build_body, GoogleProvider};
+
+/// How often [`BatchProvider::run_batch`] polls for completion.
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Safety cap on poll attempts (≈30 min at [`POLL_INTERVAL`]) before giving up.
+const MAX_POLLS: u32 = 360;
 
 /// One entry in a batch: a caller-chosen `custom_id` (echoed back to correlate the result) and the
 /// request. All requests in a batch share the batch's `model` (passed to [`create_batch`]).
@@ -66,6 +74,7 @@ impl GoogleProvider {
                         &r.request,
                         self.thinking.as_deref(),
                         self.cached_content.as_deref(),
+                        self.reasoning_floor,
                     ),
                     "metadata": { "key": r.custom_id },
                 })
@@ -115,6 +124,50 @@ impl GoogleProvider {
         resp.json()
             .await
             .map_err(|e| ProviderError::Decode(e.to_string()))
+    }
+}
+
+#[async_trait]
+impl BatchProvider for GoogleProvider {
+    async fn run_batch(&self, tasks: Vec<BatchTask>) -> Result<Vec<BatchItem>, ProviderError> {
+        // All tasks in a Gemini batch share the URL's model; take it from the first request.
+        let model = tasks
+            .first()
+            .map(|t| t.request.model.clone())
+            .ok_or_else(|| ProviderError::Config("run_batch: no tasks".into()))?;
+        let reqs: Vec<BatchRequest> = tasks
+            .into_iter()
+            .map(|t| BatchRequest {
+                custom_id: t.custom_id,
+                request: t.request,
+            })
+            .collect();
+        let batch = self.create_batch(&model, &reqs).await?;
+        for _ in 0..MAX_POLLS {
+            let got = self.get_batch(&batch.name).await?;
+            if got.done || got.succeeded() {
+                let results = self.batch_results(&batch.name).await?;
+                return Ok(results.into_iter().map(item_from_result).collect());
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        Err(ProviderError::Transport(
+            "batch did not finish within the poll window".into(),
+        ))
+    }
+}
+
+/// Flatten a per-request [`BatchResult`] into the unified [`BatchItem`].
+fn item_from_result(r: BatchResult) -> BatchItem {
+    let (text, usage, error) = match r.outcome {
+        BatchOutcome::Succeeded { text, usage } => (text, usage, None),
+        BatchOutcome::Errored(e) => (String::new(), Usage::default(), Some(e)),
+    };
+    BatchItem {
+        custom_id: r.custom_id,
+        text,
+        usage,
+        error,
     }
 }
 
@@ -186,6 +239,29 @@ fn usage_from_metadata(meta: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn item_from_result_flattens_outcomes() {
+        let ok = item_from_result(BatchResult {
+            custom_id: "a".into(),
+            outcome: BatchOutcome::Succeeded {
+                text: "hi".into(),
+                usage: Usage {
+                    output_tokens: 2,
+                    ..Default::default()
+                },
+            },
+        });
+        assert_eq!(ok.text, "hi");
+        assert_eq!(ok.usage.output_tokens, 2);
+        assert!(ok.error.is_none());
+
+        let err = item_from_result(BatchResult {
+            custom_id: "b".into(),
+            outcome: BatchOutcome::Errored("boom".into()),
+        });
+        assert_eq!(err.error.as_deref(), Some("boom"));
+    }
 
     #[test]
     fn parses_batch_operation_state() {

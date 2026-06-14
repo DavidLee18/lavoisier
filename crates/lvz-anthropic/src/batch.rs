@@ -3,10 +3,18 @@
 //! path: you submit many requests, poll until the batch ends, then fetch the JSONL results. Best
 //! for non-interactive workloads (offline evals, the benchmark suite, bulk classification).
 
-use lvz_protocol::{ChatRequest, ProviderError, Usage};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use lvz_protocol::{BatchItem, BatchProvider, BatchTask, ChatRequest, ProviderError, Usage};
 use serde_json::{json, Value};
 
 use crate::{build_body, AnthropicProvider, ANTHROPIC_VERSION};
+
+/// How often [`BatchProvider::run_batch`] polls for completion.
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Safety cap on poll attempts (≈30 min at [`POLL_INTERVAL`]) before giving up.
+const MAX_POLLS: u32 = 360;
 
 /// One entry in a batch: a caller-chosen `custom_id` correlating the result, plus the request.
 pub struct BatchRequest {
@@ -186,6 +194,46 @@ impl AnthropicProvider {
     }
 }
 
+#[async_trait]
+impl BatchProvider for AnthropicProvider {
+    async fn run_batch(&self, tasks: Vec<BatchTask>) -> Result<Vec<BatchItem>, ProviderError> {
+        let reqs: Vec<BatchRequest> = tasks
+            .into_iter()
+            .map(|t| BatchRequest {
+                custom_id: t.custom_id,
+                request: t.request,
+            })
+            .collect();
+        let batch = self.create_batch(&reqs).await?;
+        for _ in 0..MAX_POLLS {
+            if self.get_batch(&batch.id).await?.ended() {
+                let results = self.batch_results(&batch.id).await?;
+                return Ok(results.into_iter().map(item_from_result).collect());
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        Err(ProviderError::Transport(
+            "batch did not finish within the poll window".into(),
+        ))
+    }
+}
+
+/// Flatten a per-request [`BatchResult`] into the unified [`BatchItem`].
+fn item_from_result(r: BatchResult) -> BatchItem {
+    let (text, usage, error) = match r.outcome {
+        BatchOutcome::Succeeded { text, usage } => (text, usage, None),
+        BatchOutcome::Errored(e) => (String::new(), Usage::default(), Some(e)),
+        BatchOutcome::Canceled => (String::new(), Usage::default(), Some("canceled".into())),
+        BatchOutcome::Expired => (String::new(), Usage::default(), Some("expired".into())),
+    };
+    BatchItem {
+        custom_id: r.custom_id,
+        text,
+        usage,
+        error,
+    }
+}
+
 fn parse_batch(v: &Value) -> Batch {
     Batch {
         id: v["id"].as_str().unwrap_or_default().to_string(),
@@ -273,6 +321,30 @@ mod tests {
             }
             _ => panic!("expected succeeded"),
         }
+    }
+
+    #[test]
+    fn item_from_result_flattens_outcomes() {
+        let ok = item_from_result(BatchResult {
+            custom_id: "a".into(),
+            outcome: BatchOutcome::Succeeded {
+                text: "hi".into(),
+                usage: Usage {
+                    input_tokens: 5,
+                    ..Default::default()
+                },
+            },
+        });
+        assert_eq!(ok.text, "hi");
+        assert_eq!(ok.usage.input_tokens, 5);
+        assert!(ok.error.is_none());
+
+        let err = item_from_result(BatchResult {
+            custom_id: "b".into(),
+            outcome: BatchOutcome::Expired,
+        });
+        assert_eq!(err.text, "");
+        assert_eq!(err.error.as_deref(), Some("expired"));
     }
 
     #[test]
