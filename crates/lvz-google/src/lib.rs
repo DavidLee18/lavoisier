@@ -213,6 +213,76 @@ impl GoogleProvider {
             .map(str::to_string)
             .ok_or_else(|| ProviderError::Decode("cachedContents response missing name".into()))
     }
+
+    /// Upload a file to the Gemini **Files API** (resumable two-step), returning its `fileUri`.
+    /// Pass that uri as a [`MediaSource::File`] `file_id` in a later request's
+    /// [`ContentBlock::Image`]/[`ContentBlock::Document`] — the adapter renders it as `fileData`.
+    /// Large media may still be `PROCESSING` server-side immediately after upload.
+    pub async fn upload_file(
+        &self,
+        display_name: &str,
+        bytes: Vec<u8>,
+        mime: &str,
+    ) -> Result<String, ProviderError> {
+        // Step 1 — start a resumable session; the upload URL comes back in a response header.
+        let start_url = format!(
+            "{}/upload/v1beta/files",
+            self.base_url.trim_end_matches('/')
+        );
+        let start = self
+            .http
+            .post(start_url)
+            .header("x-goog-api-key", &self.api_key)
+            .header("X-Goog-Upload-Protocol", "resumable")
+            .header("X-Goog-Upload-Command", "start")
+            .header("X-Goog-Upload-Header-Content-Length", bytes.len())
+            .header("X-Goog-Upload-Header-Content-Type", mime)
+            .json(&json!({ "file": { "display_name": display_name } }))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        if !start.status().is_success() {
+            return Err(ProviderError::Api {
+                status: start.status().as_u16(),
+                message: start.text().await.unwrap_or_default(),
+            });
+        }
+        let upload_url = start
+            .headers()
+            .get("x-goog-upload-url")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                ProviderError::Decode("Files upload start missing x-goog-upload-url header".into())
+            })?
+            .to_string();
+
+        // Step 2 — upload the bytes and finalize in one command.
+        let len = bytes.len();
+        let resp = self
+            .http
+            .post(upload_url)
+            .header("Content-Length", len)
+            .header("X-Goog-Upload-Offset", "0")
+            .header("X-Goog-Upload-Command", "upload, finalize")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(ProviderError::Api {
+                status: resp.status().as_u16(),
+                message: resp.text().await.unwrap_or_default(),
+            });
+        }
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Decode(e.to_string()))?;
+        v["file"]["uri"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| ProviderError::Decode("Files upload response missing file.uri".into()))
+    }
 }
 
 #[async_trait]
