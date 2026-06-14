@@ -29,6 +29,16 @@ impl Batch {
     }
 }
 
+/// One page of the batch list (`GET /v1/messages/batches`).
+#[derive(Debug, Clone)]
+pub struct BatchList {
+    pub batches: Vec<Batch>,
+    /// True if more pages follow; pass [`last_id`](Self::last_id) as `after_id` to fetch them.
+    pub has_more: bool,
+    /// The id of the last batch on this page (the pagination cursor), if any.
+    pub last_id: Option<String>,
+}
+
 /// The per-request outcome read from a finished batch.
 #[derive(Debug, Clone)]
 pub struct BatchResult {
@@ -73,6 +83,38 @@ impl AnthropicProvider {
     pub async fn get_batch(&self, batch_id: &str) -> Result<Batch, ProviderError> {
         let v = self.batch_get(&format!("/{batch_id}")).await?;
         Ok(parse_batch(&v))
+    }
+
+    /// Request cancellation of an in-progress batch. Returns the batch with its updated status
+    /// (`canceling`, then eventually `ended`); requests already in flight may still complete.
+    pub async fn cancel_batch(&self, batch_id: &str) -> Result<Batch, ProviderError> {
+        let v = self
+            .batch_post(&format!("/{batch_id}/cancel"), json!({}))
+            .await?;
+        Ok(parse_batch(&v))
+    }
+
+    /// List batches, most recent first. `limit` caps the page size (Anthropic default 20, max
+    /// 100); `after_id` is the pagination cursor (pass a prior page's [`BatchList::last_id`]).
+    pub async fn list_batches(
+        &self,
+        limit: Option<u32>,
+        after_id: Option<&str>,
+    ) -> Result<BatchList, ProviderError> {
+        let mut query = Vec::new();
+        if let Some(n) = limit {
+            query.push(format!("limit={n}"));
+        }
+        if let Some(id) = after_id {
+            query.push(format!("after_id={id}"));
+        }
+        let suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
+        let v = self.batch_get(&suffix).await?;
+        Ok(parse_batch_list(&v))
     }
 
     /// Read a finished batch's per-request results (the JSONL results stream, one object per line).
@@ -154,6 +196,18 @@ fn parse_batch(v: &Value) -> Batch {
     }
 }
 
+fn parse_batch_list(v: &Value) -> BatchList {
+    let batches = v["data"]
+        .as_array()
+        .map(|arr| arr.iter().map(parse_batch).collect())
+        .unwrap_or_default();
+    BatchList {
+        batches,
+        has_more: v["has_more"].as_bool().unwrap_or(false),
+        last_id: v["last_id"].as_str().map(str::to_string),
+    }
+}
+
 fn parse_result(v: &Value) -> BatchResult {
     let custom_id = v["custom_id"].as_str().unwrap_or_default().to_string();
     let result = &v["result"];
@@ -219,6 +273,25 @@ mod tests {
             }
             _ => panic!("expected succeeded"),
         }
+    }
+
+    #[test]
+    fn batch_list_parses_page_and_cursor() {
+        let page = json!({
+            "data": [
+                { "id": "batch_a", "processing_status": "ended" },
+                { "id": "batch_b", "processing_status": "in_progress" }
+            ],
+            "has_more": true,
+            "first_id": "batch_a",
+            "last_id": "batch_b"
+        });
+        let list = parse_batch_list(&page);
+        assert_eq!(list.batches.len(), 2);
+        assert_eq!(list.batches[0].id, "batch_a");
+        assert!(list.batches[0].ended());
+        assert!(list.has_more);
+        assert_eq!(list.last_id.as_deref(), Some("batch_b"));
     }
 
     #[test]
