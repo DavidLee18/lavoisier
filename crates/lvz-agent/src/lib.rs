@@ -855,7 +855,7 @@ async fn run_verify(config: &AgentConfig) -> bool {
 
 /// Tool names that mutate files — used by the no-progress / in-loop-verify convergence levers to
 /// tell a "made an edit" turn from pure read-only exploration.
-const EDIT_TOOLS: [&str; 3] = ["edit_anchored", "edit_files", "write_file"];
+const EDIT_TOOLS: [&str; 4] = ["edit_anchored", "edit_files", "write_file", "batch_edit"];
 
 fn is_edit_tool(name: &str) -> bool {
     EDIT_TOOLS.contains(&name)
@@ -1954,6 +1954,7 @@ mod tests {
             is_edit_tool("edit_files")
                 && is_edit_tool("edit_anchored")
                 && is_edit_tool("write_file")
+                && is_edit_tool("batch_edit")
         );
         assert!(!is_edit_tool("shell") && !is_edit_tool("find_references"));
         let ContentBlock::Text { text, .. } = budget_note(3, 60, 12_000, Some(100_000)) else {

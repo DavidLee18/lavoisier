@@ -6,6 +6,7 @@
 //! capabilities (web search, memory, …) means registering more — nothing in the agent
 //! changes.
 
+mod batch;
 mod builtins;
 mod context;
 mod search;
@@ -14,6 +15,7 @@ use std::sync::Arc;
 
 use lvz_protocol::{Tool, ToolDef, ToolError, ToolOutput};
 
+pub use batch::BatchEditTool;
 pub use builtins::{ListDirTool, ReadFileTool, ReadFilesTool, ShellTool, WriteFileTool};
 pub use context::{
     EditAnchoredTool, EditFilesTool, OutlineFileTool, OutlineFilesTool, ReadAnchoredTool,

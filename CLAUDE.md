@@ -329,8 +329,15 @@ implemented per adapter.
   `custom_id` + `ChatRequest`; each `BatchItem` carries the answer text, `Usage`, and an optional
   per-item error). Implemented for **Anthropic** (`lvz_anthropic::batch`) and **Google**
   (`lvz_google::batch`); both poll at 5s intervals (360-poll cap). xAI has no batch API — use its
-  **deferred completions** (`start_deferred`/`poll_deferred`) instead. Library primitive only (no
-  CLI/bench wiring yet); live-verified on Anthropic + Google.
+  **deferred completions** (`start_deferred`/`poll_deferred`) instead. Live-verified on Anthropic +
+  Google. Surfaced to the agent as the **`batch_edit` tool** (`lvz-tools`, opt-in via CLI
+  `--batch-edit`): the model fans a set of **independent, mechanical** per-file edits out to
+  `run_batch` (~50% cost) instead of editing them one-by-one in the interactive loop — the natural
+  fit for bulk-mechanical archetypes (rename across modules, one migration per file). Each edit is a
+  single-shot request (file + self-contained instruction → full-file rewrite, fence-stripped),
+  applied locally; unreadable files and per-item errors are reported, not fatal. Only registered when
+  the provider has a batch API; counted as an edit tool by the convergence/staleness levers
+  (`EDIT_TOOLS`). Trades latency for the discount, hence opt-in.
 
 **Anthropic:** model-aware thinking — **adaptive + `output_config.effort`** on modern models
 (Sonnet 4.6, Opus 4.6/4.7/4.8, Fable 5), legacy `budget_tokens` on Haiku/older; sampling params
@@ -450,6 +457,8 @@ in-memory), `--serve-matrix` (Matrix gateway), `--api-key <KEY>` (repeatable) / 
 `--tune-decay <F>` (observation-decay EWMA) and `--radius-counterfactual` (opt-in, unsound radius
 counterfactual), `--telemetry` (per-task stderr summary), `--classify-with-model` (model archetype
 classification), `--repo-skeleton <TOKENS>` (cache-aware repo-skeleton prefix, §6.1),
+`--batch-edit` (offer the `batch_edit` fan-out tool — independent mechanical edits via the
+provider's discounted batch API; Anthropic/Google only),
 `--thinking-budget <off|low|medium|high>` (force the normalised thinking level — else mechanical
 archetypes default lower and ATO can tune it),
 `--cheap-model`/`--escalate-after` (cheap-model-first) and `--advisor-model` (advisor+executor

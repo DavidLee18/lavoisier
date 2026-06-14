@@ -42,7 +42,7 @@ pub struct BatchItem {
 /// submits every task, polls until the batch finishes, and returns one [`BatchItem`] per task — the
 /// entire lifecycle behind a single call ("auto-batch"). Trades latency for ≈50% lower token cost.
 #[async_trait]
-pub trait BatchProvider {
+pub trait BatchProvider: Send + Sync {
     /// Run all `tasks` as one batch and return their results once the batch completes.
     async fn run_batch(&self, tasks: Vec<BatchTask>) -> Result<Vec<BatchItem>, ProviderError>;
 }

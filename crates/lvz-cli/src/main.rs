@@ -24,10 +24,10 @@ use lvz_gw_http::{GatewayConfig, HttpGateway};
 use lvz_gw_matrix::MatrixGateway;
 use lvz_memory::{InMemoryStore, SessionAgent};
 use lvz_protocol::{
-    AgentHandle, ChatRequest, Event, Gateway, Knobs, Message, Outcome, Provider, TaskContext,
-    TaskTelemetry, TelemetrySink, ThinkingLevel, Tuner,
+    AgentHandle, BatchProvider, ChatRequest, Event, Gateway, Knobs, Message, Outcome, Provider,
+    TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, Tuner,
 };
-use lvz_tools::ToolRegistry;
+use lvz_tools::{BatchEditTool, ToolRegistry};
 use lvz_tune::{BayesTuner, LearningTuner, PersistableTuner, TuneConfig};
 use lvz_xai::XaiProvider;
 use std::path::PathBuf;
@@ -223,9 +223,17 @@ struct Cli {
     /// `--serve`; on a non-caching provider it still adds the skeleton but without amortisation.
     #[arg(long, value_name = "TOKENS")]
     repo_skeleton: Option<usize>,
+
+    /// Offer the `batch_edit` tool (--agent/--serve): the model can fan a set of INDEPENDENT,
+    /// mechanical per-file edits out to the provider's discounted async batch API (~50% token
+    /// cost) instead of editing them one-by-one in the loop. Requires a batch-capable provider
+    /// (Anthropic / Google); ignored (with a warning) on xAI / claude-cli. Trades latency for cost,
+    /// so it is opt-in.
+    #[arg(long)]
+    batch_edit: bool,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
 enum ProviderKind {
     Xai,
     Anthropic,
@@ -266,26 +274,34 @@ impl ProviderKind {
         }
     }
 
+    /// Build the streaming [`Provider`] plus, when the provider offers a discounted batch API
+    /// (Anthropic / Google), a [`BatchProvider`] handle to the *same* instance (used by the
+    /// `batch_edit` fan-out tool). xAI / claude-cli have no batch API, so the handle is `None`.
     fn build(
         self,
         thinking: Option<&str>,
         extended_cache_ttl: bool,
-    ) -> Result<Arc<dyn Provider>, lvz_protocol::ProviderError> {
+    ) -> Result<(Arc<dyn Provider>, Option<Arc<dyn BatchProvider>>), lvz_protocol::ProviderError>
+    {
         Ok(match self {
-            ProviderKind::Xai => Arc::new(XaiProvider::from_env()?),
+            ProviderKind::Xai => (Arc::new(XaiProvider::from_env()?), None),
             ProviderKind::Anthropic => {
                 // A long-running gateway benefits from the 1-hour cache TTL on the immutable prefix
                 // (it survives idle gaps between turns); one-shot runs keep the cheaper 5-min TTL.
-                Arc::new(AnthropicProvider::from_env()?.with_extended_cache_ttl(extended_cache_ttl))
+                let p = Arc::new(
+                    AnthropicProvider::from_env()?.with_extended_cache_ttl(extended_cache_ttl),
+                );
+                (p.clone(), Some(p))
             }
             ProviderKind::Google => {
                 let mut p = GoogleProvider::from_env()?;
                 if let Some(t) = thinking {
                     p = p.with_thinking(t);
                 }
-                Arc::new(p)
+                let p = Arc::new(p);
+                (p.clone(), Some(p))
             }
-            ProviderKind::ClaudeCli => Arc::new(ClaudeCliProvider::from_env()?),
+            ProviderKind::ClaudeCli => (Arc::new(ClaudeCliProvider::from_env()?), None),
         })
     }
 }
@@ -306,7 +322,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Long-running gateways (HTTP/Matrix) get the 1-hour cache TTL on the immutable prefix.
     let serving = cli.serve.is_some() || cli.serve_matrix;
-    let provider = cli.provider.build(cli.thinking.as_deref(), serving)?;
+    let (provider, batch_provider) = cli.provider.build(cli.thinking.as_deref(), serving)?;
+    if cli.batch_edit && batch_provider.is_none() {
+        eprintln!(
+            "lavoisier: --batch-edit ignored: provider {:?} has no batch API (use Anthropic or Google)",
+            cli.provider
+        );
+    }
     let model = cli
         .model
         .clone()
@@ -317,7 +339,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(addr) = cli.serve.clone() {
         // Wrap the agent in process-local session memory so each `session` continues its own
         // conversation across turns (RECIPE §7.3).
-        let inner = Arc::new(build_agent(provider, model, &cli));
+        let inner = Arc::new(build_agent(provider, batch_provider, model, &cli));
         let agent: Arc<dyn AgentHandle> =
             Arc::new(SessionAgent::new(inner, Arc::new(InMemoryStore::new())));
 
@@ -344,7 +366,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Matrix gateway mode: drive the shared agent from a homeserver, one room per session.
     if cli.serve_matrix {
-        let inner = Arc::new(build_agent(provider, model, &cli));
+        let inner = Arc::new(build_agent(provider, batch_provider, model, &cli));
         let agent: Arc<dyn AgentHandle> =
             Arc::new(SessionAgent::new(inner, Arc::new(InMemoryStore::new())));
         let gateway = Arc::new(MatrixGateway::from_env()?);
@@ -366,7 +388,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut renderer = Renderer::new();
 
     if cli.agent {
-        let mut agent = build_agent(provider, model, &cli);
+        let mut agent = build_agent(provider, batch_provider, model, &cli);
         if cli.telemetry {
             agent = agent.with_telemetry(Arc::new(StderrTelemetry));
         }
@@ -395,7 +417,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Build the tool-using [`Agent`] from the CLI config. Shared by `--agent` (one-shot) and
 /// `--serve` (gateway) so both drive an identically-configured agent core.
-fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
+fn build_agent(
+    provider: Arc<dyn Provider>,
+    batch_provider: Option<Arc<dyn BatchProvider>>,
+    model: String,
+    cli: &Cli,
+) -> Agent {
+    let editor_model = model.clone();
     let mut config = AgentConfig::default().with_model(model);
     config.max_tokens = cli.max_tokens;
     if let Some(max_steps) = cli.max_steps {
@@ -451,7 +479,15 @@ fn build_agent(provider: Arc<dyn Provider>, model: String, cli: &Cli) -> Agent {
     if let Ok(cwd) = std::env::current_dir() {
         config = config.with_repo_root(cwd);
     }
-    let mut agent = Agent::new(provider, ToolRegistry::with_builtins(), config);
+    let mut registry = ToolRegistry::with_builtins();
+    // `batch_edit` fan-out tool (opt-in, only when the provider has a batch API). Lets the model
+    // run independent mechanical edits as one discounted async batch instead of looping over them.
+    if cli.batch_edit {
+        if let Some(batch) = batch_provider {
+            registry.register(Arc::new(BatchEditTool::new(batch, editor_model)));
+        }
+    }
+    let mut agent = Agent::new(provider, registry, config);
     if cli.tune_bayes {
         // The experimental Bayesian (Thompson-sampling) learner; takes precedence over the
         // ε-greedy `--tune` and a fixed `--compact-after`. Persists like `--tune` when a
