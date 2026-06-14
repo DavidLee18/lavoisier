@@ -353,14 +353,54 @@ fn status_to_err(status: tonic::Status) -> ProviderError {
 // --- request building: normalised ChatRequest → xAI GetCompletionsRequest ---
 
 fn build_request(req: ChatRequest) -> pb::GetCompletionsRequest {
-    // Custom tools + any provider-executed server tools (code execution → proto built-in).
+    // Custom tools + any provider-executed server tools mapped to the proto `Tool` oneof.
+    // (WebSearch is handled separately via `search_parameters`, below.)
     let mut tools = build_tools(&req);
     for st in &req.server_tools {
-        if matches!(st, ServerTool::CodeExecution) {
-            tools.push(pb::Tool {
-                tool: Some(pb::tool::Tool::CodeExecution(pb::CodeExecution {})),
-            });
+        match st {
+            ServerTool::CodeExecution => {
+                tools.push(grpc_tool(pb::tool::Tool::CodeExecution(
+                    pb::CodeExecution {},
+                )));
+            }
+            ServerTool::XSearch {
+                allowed_handles,
+                blocked_handles,
+                from_date,
+                to_date,
+            } => {
+                tools.push(grpc_tool(pb::tool::Tool::XSearch(pb::XSearch {
+                    from_date: from_date.as_deref().and_then(iso_date_to_timestamp),
+                    to_date: to_date.as_deref().and_then(iso_date_to_timestamp),
+                    allowed_x_handles: allowed_handles.clone(),
+                    excluded_x_handles: blocked_handles.clone(),
+                    ..Default::default()
+                })));
+            }
+            ServerTool::CollectionsSearch {
+                collection_ids,
+                limit,
+            } => {
+                tools.push(grpc_tool(pb::tool::Tool::CollectionsSearch(
+                    pb::CollectionsSearch {
+                        collection_ids: collection_ids.clone(),
+                        limit: limit.map(|n| n as i32),
+                        ..Default::default()
+                    },
+                )));
+            }
+            // WebSearch → search_parameters; WebFetch has no xAI equivalent.
+            ServerTool::WebSearch { .. } | ServerTool::WebFetch { .. } => {}
         }
+    }
+    // MCP servers are a `Tool` variant on the xAI proto (Anthropic uses a top-level field).
+    for mcp in &req.mcp_servers {
+        tools.push(grpc_tool(pb::tool::Tool::Mcp(pb::Mcp {
+            server_label: mcp.name.clone(),
+            server_url: mcp.url.clone(),
+            authorization: mcp.authorization_token.clone(),
+            ..Default::default()
+        })));
     }
     pb::GetCompletionsRequest {
         messages: build_messages(&req),
@@ -384,6 +424,37 @@ fn build_request(req: ChatRequest) -> pb::GetCompletionsRequest {
         search_parameters: grpc_search_params(&req.server_tools),
         ..Default::default()
     }
+}
+
+/// Wrap a proto tool oneof in a [`pb::Tool`].
+fn grpc_tool(t: pb::tool::Tool) -> pb::Tool {
+    pb::Tool { tool: Some(t) }
+}
+
+/// Parse an ISO-8601 `YYYY-MM-DD` date into a UTC midnight [`prost_types::Timestamp`]. Returns
+/// `None` on a malformed date (the field is then simply omitted).
+fn iso_date_to_timestamp(s: &str) -> Option<prost_types::Timestamp> {
+    let mut parts = s.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let d: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(prost_types::Timestamp {
+        seconds: days_from_civil(y, m, d) * 86_400,
+        nanos: 0,
+    })
+}
+
+/// Days since the Unix epoch for a civil date (Howard Hinnant's `days_from_civil`).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Build xAI [`SearchParameters`](pb::SearchParameters) from a `WebSearch` server tool, if present.
@@ -871,6 +942,73 @@ mod tests {
             }
         );
         assert_eq!(events[3], Event::Done(StopReason::ToolUse));
+    }
+
+    #[test]
+    fn x_collections_and_mcp_tools_map_to_proto_oneof() {
+        use lvz_protocol::{McpServer, ServerTool};
+        let mut req = ChatRequest::new("grok-4").push(Message::user("hi"));
+        req.server_tools = vec![
+            ServerTool::XSearch {
+                allowed_handles: vec!["xai".into()],
+                blocked_handles: vec![],
+                from_date: Some("2024-05-24".into()),
+                to_date: None,
+            },
+            ServerTool::CollectionsSearch {
+                collection_ids: vec!["col_1".into(), "col_2".into()],
+                limit: Some(5),
+            },
+        ];
+        req.mcp_servers = vec![McpServer {
+            name: "gh".into(),
+            url: "https://mcp.example".into(),
+            authorization_token: Some("tok".into()),
+        }];
+        let g = build_request(req);
+        let xs = g
+            .tools
+            .iter()
+            .find_map(|t| match &t.tool {
+                Some(pb::tool::Tool::XSearch(x)) => Some(x),
+                _ => None,
+            })
+            .expect("x search tool");
+        assert_eq!(xs.allowed_x_handles, vec!["xai".to_string()]);
+        assert!(xs.from_date.is_some());
+        let cs = g
+            .tools
+            .iter()
+            .find_map(|t| match &t.tool {
+                Some(pb::tool::Tool::CollectionsSearch(c)) => Some(c),
+                _ => None,
+            })
+            .expect("collections search tool");
+        assert_eq!(cs.collection_ids.len(), 2);
+        assert_eq!(cs.limit, Some(5));
+        let mcp = g
+            .tools
+            .iter()
+            .find_map(|t| match &t.tool {
+                Some(pb::tool::Tool::Mcp(m)) => Some(m),
+                _ => None,
+            })
+            .expect("mcp tool");
+        assert_eq!(mcp.server_label, "gh");
+        assert_eq!(mcp.server_url, "https://mcp.example");
+        assert_eq!(mcp.authorization.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn iso_date_parses_to_epoch_midnight() {
+        // 1970-01-01 is day 0; 2024-05-24 is a known offset.
+        assert_eq!(iso_date_to_timestamp("1970-01-01").unwrap().seconds, 0);
+        assert_eq!(
+            iso_date_to_timestamp("2024-05-24").unwrap().seconds,
+            19_867 * 86_400
+        );
+        assert!(iso_date_to_timestamp("not-a-date").is_none());
+        assert!(iso_date_to_timestamp("2024-13-01").is_none());
     }
 
     #[test]

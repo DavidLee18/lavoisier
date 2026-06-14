@@ -426,29 +426,66 @@ struct OaiRequest {
     search_parameters: Option<Value>,
 }
 
-/// Build xAI Live Search `search_parameters` JSON from a `WebSearch` server tool, if present.
+/// Build xAI Live Search `search_parameters` JSON from `WebSearch`/`XSearch` server tools, if any.
+/// (Collections search and MCP are gRPC-native and have no OpenAI-compat equivalent.)
 fn http_search_params(server_tools: &[ServerTool]) -> Option<Value> {
-    let (max_uses, allowed, blocked) = server_tools.iter().find_map(|t| match t {
-        ServerTool::WebSearch {
-            max_uses,
-            allowed_domains,
-            blocked_domains,
-        } => Some((max_uses, allowed_domains, blocked_domains)),
-        _ => None,
-    })?;
     let mut sp = json!({ "mode": "auto" });
-    if let Some(n) = max_uses {
-        sp["max_search_results"] = json!(n);
+    let mut sources = Vec::new();
+    // Whether any live-search tool was requested at all (a bare WebSearch yields no explicit
+    // source — xAI then uses its default sources — but still enables search).
+    let mut requested = false;
+    for t in server_tools {
+        match t {
+            ServerTool::WebSearch {
+                max_uses,
+                allowed_domains,
+                blocked_domains,
+            } => {
+                requested = true;
+                if let Some(n) = max_uses {
+                    sp["max_search_results"] = json!(n);
+                }
+                if !allowed_domains.is_empty() || !blocked_domains.is_empty() {
+                    let mut web = json!({ "type": "web" });
+                    if !allowed_domains.is_empty() {
+                        web["allowed_websites"] = json!(allowed_domains);
+                    }
+                    if !blocked_domains.is_empty() {
+                        web["excluded_websites"] = json!(blocked_domains);
+                    }
+                    sources.push(web);
+                }
+            }
+            ServerTool::XSearch {
+                allowed_handles,
+                blocked_handles,
+                from_date,
+                to_date,
+            } => {
+                requested = true;
+                if let Some(d) = from_date {
+                    sp["from_date"] = json!(d);
+                }
+                if let Some(d) = to_date {
+                    sp["to_date"] = json!(d);
+                }
+                let mut x = json!({ "type": "x" });
+                if !allowed_handles.is_empty() {
+                    x["allowed_x_handles"] = json!(allowed_handles);
+                }
+                if !blocked_handles.is_empty() {
+                    x["excluded_x_handles"] = json!(blocked_handles);
+                }
+                sources.push(x);
+            }
+            _ => {}
+        }
     }
-    if !allowed.is_empty() || !blocked.is_empty() {
-        let mut web = json!({ "type": "web" });
-        if !allowed.is_empty() {
-            web["allowed_websites"] = json!(allowed);
-        }
-        if !blocked.is_empty() {
-            web["excluded_websites"] = json!(blocked);
-        }
-        sp["sources"] = json!([web]);
+    if !requested {
+        return None;
+    }
+    if !sources.is_empty() {
+        sp["sources"] = json!(sources);
     }
     Some(sp)
 }

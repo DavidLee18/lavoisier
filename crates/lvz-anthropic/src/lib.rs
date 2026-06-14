@@ -314,7 +314,7 @@ fn build_body(req: &ChatRequest, extended_ttl: bool) -> Value {
     if !req.tools.is_empty() || !req.server_tools.is_empty() || !req.builtin_tools.is_empty() {
         let mut tools = build_tools(&req.tools, extended_ttl);
         let arr = tools.as_array_mut().expect("build_tools returns an array");
-        arr.extend(req.server_tools.iter().map(build_server_tool));
+        arr.extend(req.server_tools.iter().filter_map(build_server_tool));
         arr.extend(req.builtin_tools.iter().map(build_builtin_tool));
         body["tools"] = tools;
     }
@@ -500,9 +500,10 @@ fn build_messages(messages: &[Message], extended_ttl: bool) -> Value {
     Value::Array(arr)
 }
 
-/// Map a normalised [`ServerTool`] onto Anthropic's versioned built-in tool block.
-fn build_server_tool(tool: &ServerTool) -> Value {
-    match tool {
+/// Map a normalised [`ServerTool`] onto Anthropic's versioned built-in tool block. Returns `None`
+/// for tools Anthropic doesn't offer (xAI's X/collections search), which are silently skipped.
+fn build_server_tool(tool: &ServerTool) -> Option<Value> {
+    let v = match tool {
         ServerTool::WebSearch {
             max_uses,
             allowed_domains,
@@ -530,7 +531,10 @@ fn build_server_tool(tool: &ServerTool) -> Value {
         ServerTool::CodeExecution => {
             json!({ "type": "code_execution_20260120", "name": "code_execution" })
         }
-    }
+        // xAI-specific provider tools — no Anthropic equivalent.
+        ServerTool::XSearch { .. } | ServerTool::CollectionsSearch { .. } => return None,
+    };
+    Some(v)
 }
 
 /// Map an Anthropic-defined client tool to its versioned `{type, name}` declaration. The schema

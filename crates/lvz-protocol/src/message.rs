@@ -71,6 +71,25 @@ pub enum ServerTool {
     },
     /// Run code in a provider-hosted sandbox.
     CodeExecution,
+    /// Search X (Twitter) posts (xAI Live Search). Optional handle allow/block lists and an
+    /// ISO-8601 `YYYY-MM-DD` date window. xAI-specific — other providers ignore it.
+    XSearch {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        allowed_handles: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        blocked_handles: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_date: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_date: Option<String>,
+    },
+    /// Retrieval-augmented search over xAI document collections by id, with an optional result
+    /// cap. xAI-specific — other providers ignore it.
+    CollectionsSearch {
+        collection_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
 }
 
 /// An Anthropic-defined tool whose argument schema the model already knows — declared by a

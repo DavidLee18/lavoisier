@@ -285,6 +285,8 @@ fn build_body(req: &ChatRequest, thinking: Option<&str>, cached_content: Option<
             ServerTool::WebSearch { .. } => tools.push(json!({ "googleSearch": {} })),
             ServerTool::CodeExecution => tools.push(json!({ "codeExecution": {} })),
             ServerTool::WebFetch { .. } => {} // no direct Gemini equivalent
+            // xAI-specific provider tools — no Gemini equivalent.
+            ServerTool::XSearch { .. } | ServerTool::CollectionsSearch { .. } => {}
         }
     }
     if !tools.is_empty() {
