@@ -15,6 +15,7 @@
 //! Gemini 3) or a numeric token budget (Gemini 2.5) — set via [`GoogleProvider::with_thinking`] or
 //! `GOOGLE_THINKING` / the CLI `--thinking` flag. "High" matches the public Dirac refactor suite.
 
+pub mod batch;
 mod sse;
 
 use std::collections::{HashMap, VecDeque};
