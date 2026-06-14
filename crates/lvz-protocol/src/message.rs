@@ -307,6 +307,10 @@ pub enum MediaSource {
     Url { url: String },
     /// A previously-uploaded file referenced by id (provider Files API).
     File { file_id: String },
+    /// Inline **plain text** (raw, not base64) — used for text documents, the lightest way to get
+    /// source-grounded [`ContentBlock::Document`] `citations` without a PDF. Anthropic maps it to a
+    /// `text`-type document source; Gemini inlines it as a text part; image inputs ignore it.
+    PlainText { text: String },
 }
 
 /// A unit of message content. A message can mix text, thinking, images, documents, tool calls,

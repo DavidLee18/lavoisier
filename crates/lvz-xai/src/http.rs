@@ -179,17 +179,24 @@ fn push_user_message(m: &lvz_protocol::Message, out: &mut Vec<Value>) {
                 // Files-API id becomes a `file` part.
                 let part = match source {
                     MediaSource::Url { url } => {
-                        json!({ "type": "image_url", "image_url": { "url": url } })
+                        Some(json!({ "type": "image_url", "image_url": { "url": url } }))
                     }
-                    MediaSource::Base64 { media_type, data } => json!({
+                    MediaSource::Base64 { media_type, data } => Some(json!({
                         "type": "image_url",
                         "image_url": { "url": format!("data:{media_type};base64,{data}") },
-                    }),
+                    })),
                     MediaSource::File { file_id } => {
-                        json!({ "type": "file", "file": { "file_id": file_id } })
+                        Some(json!({ "type": "file", "file": { "file_id": file_id } }))
+                    }
+                    // No xAI document-citation source; fold inline text into the message text.
+                    MediaSource::PlainText { text: t } => {
+                        text.push_str(t);
+                        None
                     }
                 };
-                images.push(part);
+                if let Some(part) = part {
+                    images.push(part);
+                }
             }
             ContentBlock::ToolResult {
                 tool_use_id,

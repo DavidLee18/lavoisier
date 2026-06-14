@@ -557,6 +557,9 @@ fn anthropic_media_source(source: &MediaSource) -> Value {
         }
         MediaSource::Url { url } => json!({ "type": "url", "url": url }),
         MediaSource::File { file_id } => json!({ "type": "file", "file_id": file_id }),
+        MediaSource::PlainText { text } => {
+            json!({ "type": "text", "media_type": "text/plain", "data": text })
+        }
     }
 }
 
@@ -902,6 +905,28 @@ mod tests {
             }],
         };
         let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
+        assert_eq!(
+            body["messages"][0]["content"][0]["citations"]["enabled"],
+            true
+        );
+    }
+
+    #[test]
+    fn plain_text_document_maps_to_text_source_for_citations() {
+        let msg = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Document {
+                source: MediaSource::PlainText {
+                    text: "The sky is blue.".into(),
+                },
+                citations: true,
+            }],
+        };
+        let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
+        let src = &body["messages"][0]["content"][0]["source"];
+        assert_eq!(src["type"], "text");
+        assert_eq!(src["media_type"], "text/plain");
+        assert_eq!(src["data"], "The sky is blue.");
         assert_eq!(
             body["messages"][0]["content"][0]["citations"]["enabled"],
             true

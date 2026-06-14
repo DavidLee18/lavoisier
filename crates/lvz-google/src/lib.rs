@@ -450,7 +450,8 @@ fn build_body(req: &ChatRequest, thinking: Option<&str>, cached_content: Option<
         body["toolConfig"] = json!({ "functionCallingConfig": fcc });
     }
 
-    let mut generation = json!({ "maxOutputTokens": req.max_tokens });
+    let mut generation =
+        json!({ "maxOutputTokens": effective_max_output(&req.model, req.max_tokens) });
     if let Some(t) = req.temperature {
         generation["temperature"] = json!(t);
     }
@@ -480,6 +481,28 @@ fn build_body(req: &ChatRequest, thinking: Option<&str>, cached_content: Option<
     body["generationConfig"] = generation;
 
     body
+}
+
+/// Minimum `maxOutputTokens` for reasoning Gemini models. They spend output budget on internal
+/// thinking *first*, so a small cap can be wholly consumed before any answer text is emitted
+/// (the visible response comes back empty). Raise a too-small cap to this floor so reasoning
+/// models always have room to answer; a larger caller-supplied cap is left untouched.
+const REASONING_MAX_OUTPUT_FLOOR: u32 = 8192;
+
+/// Whether `model` is a thinking/reasoning Gemini (3.x, or 2.5 which reasons by default).
+fn is_reasoning_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.starts_with("gemini-3") || m.contains("gemini-2.5") || m.contains("gemini-2-5")
+}
+
+/// The output-token cap to send: a floor is applied for reasoning models (see
+/// [`REASONING_MAX_OUTPUT_FLOOR`]); otherwise the request's value is used verbatim.
+fn effective_max_output(model: &str, requested: u32) -> u32 {
+    if is_reasoning_model(model) {
+        requested.max(REASONING_MAX_OUTPUT_FLOOR)
+    } else {
+        requested
+    }
 }
 
 /// Map a normalised [`ThinkingLevel`] to Gemini's `thinkingConfig`. `Off` disables thinking
@@ -541,6 +564,8 @@ fn gemini_media_part(source: &MediaSource) -> Value {
         MediaSource::Url { url } => json!({ "fileData": { "fileUri": url } }),
         // Gemini references uploaded files by URI; treat a file id as the file URI.
         MediaSource::File { file_id } => json!({ "fileData": { "fileUri": file_id } }),
+        // Gemini has no document-citation source; inline plain text as a text part.
+        MediaSource::PlainText { text } => json!({ "text": text }),
     }
 }
 
@@ -610,7 +635,8 @@ mod tests {
             body["tools"][0]["functionDeclarations"][0]["name"],
             "read_file"
         );
-        assert_eq!(body["generationConfig"]["maxOutputTokens"], 256);
+        // gemini-3 is a reasoning model, so 256 is raised to the floor (see effective_max_output).
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 8192);
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "high"
@@ -658,6 +684,22 @@ mod tests {
         assert_eq!(g["stopSequences"][0], "END");
         assert_eq!(g["responseMimeType"], "application/json");
         assert_eq!(g["responseSchema"]["type"], "object");
+    }
+
+    #[test]
+    fn reasoning_models_get_a_max_output_floor() {
+        // A small cap on a reasoning model is raised to the floor…
+        let r = ChatRequest::new("gemini-3-flash-preview").max_tokens(256);
+        let body = build_body(&r, None, None);
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 8192);
+        // …a larger cap is left untouched…
+        let r = ChatRequest::new("gemini-3-flash-preview").max_tokens(20000);
+        let body = build_body(&r, None, None);
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 20000);
+        // …and a non-reasoning model is never bumped.
+        let r = ChatRequest::new("gemini-2.0-flash").max_tokens(256);
+        let body = build_body(&r, None, None);
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 256);
     }
 
     #[test]

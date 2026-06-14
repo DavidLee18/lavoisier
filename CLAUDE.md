@@ -316,9 +316,10 @@ implemented per adapter.
 **Common (all three providers):**
 - `ChatRequest.tool_choice` (`ToolChoice` Auto/Required/None/Tool + `disable_parallel_tool_use`),
   `top_p`/`top_k`/`stop_sequences`, `OutputFormat::JsonSchema` (structured outputs), `ToolDef.strict`.
-- Multimodal: `ContentBlock::Image`/`Document` + `MediaSource` (base64/url/**file_id**) +
+- Multimodal: `ContentBlock::Image`/`Document` + `MediaSource` (base64/url/**file_id**/**plain_text**) +
   `Capabilities.vision`. Anthropic image/document `source`, Gemini `inlineData`/`fileData`, xAI
-  `image_url`/`FileContent`.
+  `image_url`/`FileContent`. `MediaSource::PlainText` is the lightweight text-document path for
+  Anthropic `citations` (maps to a `text`-type document source — no PDF needed; Gemini/xAI inline it).
 - `ServerTool` (`WebSearch`/`WebFetch`/`CodeExecution`) + `mcp_servers` — provider-executed tools,
   unified: WebSearch → Anthropic `web_search_20260209` / xAI **Live Search** / Gemini
   `googleSearch`; CodeExecution → each provider's built-in.
@@ -344,7 +345,10 @@ SSE `citations_delta`).
 caching** (`GoogleProvider::create_cached_content` + `with_cached_content` → `cachedContent`),
 Google Search grounding + code-execution tools, **`safetySettings`** (`with_safety_settings`,
 opt-in — no silent disabling), **Files upload** (`upload_file`, resumable → `fileUri`), and
-**batch mode** (`lvz_google::batch`, `batchGenerateContent`, 50% pricing).
+**batch mode** (`lvz_google::batch`, `batchGenerateContent`, 50% pricing). Reasoning Gemini models
+(`gemini-3*`/`gemini-2.5*`) get a **`maxOutputTokens` floor** (`effective_max_output`, 8192) so
+internal thinking can't consume the whole budget and leave the visible answer empty (a too-small
+cap is raised; a larger caller value is untouched).
 
 ## Architecture invariants (do not violate)
 

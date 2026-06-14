@@ -592,6 +592,8 @@ fn image_content(source: &MediaSource) -> pb::Content {
                 ..Default::default()
             })),
         },
+        // No image semantics for inline text; pass it through as a text part.
+        MediaSource::PlainText { text } => text_content(text.clone()),
     }
 }
 
@@ -621,6 +623,8 @@ fn file_content(source: &MediaSource) -> Vec<pb::Content> {
                 "[document omitted: send via URL or file id on the xAI gRPC transport]".into(),
             )]
         }
+        // xAI has no document-citation source; inline plain text directly.
+        MediaSource::PlainText { text } => return vec![text_content(text.clone())],
     };
     vec![pb::Content {
         content: Some(pb::content::Content::File(fc)),

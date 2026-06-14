@@ -23,12 +23,13 @@ async fn main() {
     println!("\n== live verify complete ==");
 }
 
-/// A3 — ask about a tiny public PDF with `citations: true`; expect `Event::Citation` deltas.
+/// A3 — attach a plain-text document with `citations: true`; expect `Event::Citation` deltas.
+/// Uses the `MediaSource::PlainText` source (no PDF needed).
 async fn a3_citations(provider: &AnthropicProvider) {
-    println!("\n--- A3: response-side citations (haiku) ---");
+    println!("\n--- A3: response-side citations, plain-text doc (haiku) ---");
     let doc = ContentBlock::Document {
-        source: MediaSource::Url {
-            url: "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf".into(),
+        source: MediaSource::PlainText {
+            text: "The Lavoisier mascot is a blue otter named Pascal, adopted in 2026.".into(),
         },
         citations: true,
     };
@@ -36,7 +37,9 @@ async fn a3_citations(provider: &AnthropicProvider) {
         role: lvz_protocol::Role::User,
         content: vec![
             doc,
-            ContentBlock::text("Quote exactly what this document says, and cite it."),
+            ContentBlock::text(
+                "What is the name of the mascot? Answer briefly and cite the document.",
+            ),
         ],
     };
     let mut req = ChatRequest::new("claude-haiku-4-5").push(msg);
