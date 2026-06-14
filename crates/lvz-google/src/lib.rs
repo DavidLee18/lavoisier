@@ -32,6 +32,69 @@ use crate::sse::GeminiSseDecoder;
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
+/// A Gemini content-safety harm category (`safetySettings[].category`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarmCategory {
+    Harassment,
+    HateSpeech,
+    SexuallyExplicit,
+    DangerousContent,
+    CivicIntegrity,
+}
+
+impl HarmCategory {
+    fn as_api(self) -> &'static str {
+        match self {
+            HarmCategory::Harassment => "HARM_CATEGORY_HARASSMENT",
+            HarmCategory::HateSpeech => "HARM_CATEGORY_HATE_SPEECH",
+            HarmCategory::SexuallyExplicit => "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            HarmCategory::DangerousContent => "HARM_CATEGORY_DANGEROUS_CONTENT",
+            HarmCategory::CivicIntegrity => "HARM_CATEGORY_CIVIC_INTEGRITY",
+        }
+    }
+}
+
+/// The blocking threshold for a [`HarmCategory`] (`safetySettings[].threshold`). Ordered from
+/// strictest to most permissive; `Off` disables the filter entirely (use deliberately).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarmBlockThreshold {
+    /// Block low-probability-and-above harmful content (strictest).
+    BlockLowAndAbove,
+    BlockMediumAndAbove,
+    BlockOnlyHigh,
+    /// Block nothing (the filter still scores but never blocks).
+    BlockNone,
+    /// Disable the safety filter for this category.
+    Off,
+}
+
+impl HarmBlockThreshold {
+    fn as_api(self) -> &'static str {
+        match self {
+            HarmBlockThreshold::BlockLowAndAbove => "BLOCK_LOW_AND_ABOVE",
+            HarmBlockThreshold::BlockMediumAndAbove => "BLOCK_MEDIUM_AND_ABOVE",
+            HarmBlockThreshold::BlockOnlyHigh => "BLOCK_ONLY_HIGH",
+            HarmBlockThreshold::BlockNone => "BLOCK_NONE",
+            HarmBlockThreshold::Off => "OFF",
+        }
+    }
+}
+
+/// One configurable Gemini safety filter: a category and its blocking threshold.
+#[derive(Debug, Clone, Copy)]
+pub struct SafetySetting {
+    pub category: HarmCategory,
+    pub threshold: HarmBlockThreshold,
+}
+
+/// Render safety settings to the Gemini `safetySettings` array.
+fn safety_settings_json(settings: &[SafetySetting]) -> Value {
+    json!(settings
+        .iter()
+        .map(|s| json!({ "category": s.category.as_api(), "threshold": s.threshold.as_api() }))
+        .collect::<Vec<_>>())
+}
+
 /// A [`Provider`] backed by the native Gemini Generative Language API.
 pub struct GoogleProvider {
     api_key: String,
@@ -42,6 +105,8 @@ pub struct GoogleProvider {
     /// [`create_cached_content`](Self::create_cached_content)). Pins a large reused prefix
     /// (e.g. a repo skeleton) at Gemini's cache-read rate.
     cached_content: Option<String>,
+    /// Optional content-safety overrides (`safetySettings`). Empty = Gemini's defaults.
+    safety_settings: Vec<SafetySetting>,
     http: reqwest::Client,
 }
 
@@ -58,8 +123,16 @@ impl GoogleProvider {
             base_url: base_url.into(),
             thinking: None,
             cached_content: None,
+            safety_settings: Vec::new(),
             http: reqwest::Client::new(),
         }
+    }
+
+    /// Set explicit Gemini content-safety thresholds. Empty leaves Gemini's defaults in place;
+    /// callers must opt in deliberately (e.g. relaxing a category for a security-research workload).
+    pub fn with_safety_settings(mut self, settings: Vec<SafetySetting>) -> Self {
+        self.safety_settings = settings;
+        self
     }
 
     /// Reference an explicit `cachedContents/...` resource on every request (created via
@@ -148,11 +221,14 @@ impl Provider for GoogleProvider {
         &self,
         req: ChatRequest,
     ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
-        let body = build_body(
+        let mut body = build_body(
             &req,
             self.thinking.as_deref(),
             self.cached_content.as_deref(),
         );
+        if !self.safety_settings.is_empty() {
+            body["safetySettings"] = safety_settings_json(&self.safety_settings);
+        }
         let url = format!(
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
             self.base_url.trim_end_matches('/'),
@@ -511,6 +587,25 @@ mod tests {
         assert_eq!(g["stopSequences"][0], "END");
         assert_eq!(g["responseMimeType"], "application/json");
         assert_eq!(g["responseSchema"]["type"], "object");
+    }
+
+    #[test]
+    fn safety_settings_render_category_and_threshold() {
+        let json = safety_settings_json(&[
+            SafetySetting {
+                category: HarmCategory::DangerousContent,
+                threshold: HarmBlockThreshold::BlockOnlyHigh,
+            },
+            SafetySetting {
+                category: HarmCategory::Harassment,
+                threshold: HarmBlockThreshold::Off,
+            },
+        ]);
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr[0]["category"], "HARM_CATEGORY_DANGEROUS_CONTENT");
+        assert_eq!(arr[0]["threshold"], "BLOCK_ONLY_HIGH");
+        assert_eq!(arr[1]["category"], "HARM_CATEGORY_HARASSMENT");
+        assert_eq!(arr[1]["threshold"], "OFF");
     }
 
     #[test]
