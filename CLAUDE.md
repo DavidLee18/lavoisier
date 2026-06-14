@@ -323,6 +323,14 @@ implemented per adapter.
 - `ServerTool` (`WebSearch`/`WebFetch`/`CodeExecution`) + `mcp_servers` — provider-executed tools,
   unified: WebSearch → Anthropic `web_search_20260209` / xAI **Live Search** / Gemini
   `googleSearch`; CodeExecution → each provider's built-in.
+- **Auto-batch (`lvz_protocol::BatchProvider`)** — a unified primitive that runs a
+  create→poll→results lifecycle over each provider's **discounted (~50%) batch API** for
+  non-interactive bulk work. `run_batch(Vec<BatchTask>) -> Vec<BatchItem>` (each `BatchTask` =
+  `custom_id` + `ChatRequest`; each `BatchItem` carries the answer text, `Usage`, and an optional
+  per-item error). Implemented for **Anthropic** (`lvz_anthropic::batch`) and **Google**
+  (`lvz_google::batch`); both poll at 5s intervals (360-poll cap). xAI has no batch API — use its
+  **deferred completions** (`start_deferred`/`poll_deferred`) instead. Library primitive only (no
+  CLI/bench wiring yet); live-verified on Anthropic + Google.
 
 **Anthropic:** model-aware thinking — **adaptive + `output_config.effort`** on modern models
 (Sonnet 4.6, Opus 4.6/4.7/4.8, Fable 5), legacy `budget_tokens` on Haiku/older; sampling params
@@ -346,9 +354,11 @@ caching** (`GoogleProvider::create_cached_content` + `with_cached_content` → `
 Google Search grounding + code-execution tools, **`safetySettings`** (`with_safety_settings`,
 opt-in — no silent disabling), **Files upload** (`upload_file`, resumable → `fileUri`), and
 **batch mode** (`lvz_google::batch`, `batchGenerateContent`, 50% pricing). Reasoning Gemini models
-(`gemini-3*`/`gemini-2.5*`) get a **`maxOutputTokens` floor** (`effective_max_output`, 8192) so
-internal thinking can't consume the whole budget and leave the visible answer empty (a too-small
-cap is raised; a larger caller value is untouched).
+(`gemini-3*`/`gemini-2.5*`) get a **configurable `maxOutputTokens` floor** (`effective_max_output`)
+so internal thinking can't consume the whole budget and leave the visible answer empty (a too-small
+cap is raised; a larger caller value is untouched). The floor defaults to
+`DEFAULT_REASONING_FLOOR` (8192) and is set via `GoogleProvider::with_reasoning_floor` or the
+`GOOGLE_REASONING_FLOOR` env var (`0` disables it).
 
 ## Architecture invariants (do not violate)
 
