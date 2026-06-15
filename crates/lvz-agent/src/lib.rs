@@ -87,6 +87,12 @@ const ADVISOR_MAX_TOKENS: u32 = 512;
 /// Number of trailing (assistant, tool-result) turn-pairs kept verbatim when compacting.
 const KEEP_RECENT_TURNS: usize = 2;
 
+/// Maximum silence between streamed events before the agent treats the provider stream as stalled
+/// and aborts the turn (no provider sets an HTTP timeout, so a hung/throttled connection would
+/// otherwise block forever). Bounds the gap *between* events, not the whole turn, so a slow but
+/// progressing response is unaffected. Generous enough to ride out a model's thinking pause.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Tunable settings for an agent run that are *not* efficiency knobs (those are [`Knobs`],
 /// chosen per task by a [`Tuner`]).
 #[derive(Clone, Debug)]
@@ -596,7 +602,20 @@ async fn run_loop(
             repo_skeleton,
             task_thinking,
         );
-        let mut stream = match provider.stream(req).await {
+        // Bound the initial send too (connect + response headers): a connection that hangs before
+        // the first byte must also fail fast, not block forever (no provider sets an HTTP timeout).
+        let opened = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, provider.stream(req)).await {
+            Ok(r) => r,
+            Err(_) => {
+                obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
+                let _ = tx.unbounded_send(Err(AgentError::Provider(format!(
+                    "provider did not respond within {}s",
+                    STREAM_IDLE_TIMEOUT.as_secs()
+                ))));
+                return;
+            }
+        };
+        let mut stream = match opened {
             Ok(s) => s,
             Err(e) => {
                 obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
@@ -606,7 +625,24 @@ async fn run_loop(
         };
 
         let mut turn = TurnAccumulator::default();
-        while let Some(event) = stream.next().await {
+        // Idle-timeout guard: a provider stream that stalls mid-response (a hung/throttled
+        // connection with no bytes arriving) must not freeze the agent forever — wrap each poll
+        // in a timeout so a silent gap surfaces as a recoverable error instead of an infinite
+        // wait. Bounds time *between* events, not total turn length, so a slow-but-progressing
+        // stream is fine.
+        loop {
+            let next = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await {
+                Ok(item) => item,
+                Err(_) => {
+                    obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
+                    let _ = tx.unbounded_send(Err(AgentError::Provider(format!(
+                        "provider stream stalled (no data for {}s)",
+                        STREAM_IDLE_TIMEOUT.as_secs()
+                    ))));
+                    return;
+                }
+            };
+            let Some(event) = next else { break };
             match event {
                 Ok(event) => {
                     if let Some(forward) = turn.observe(event) {
@@ -1972,6 +2008,52 @@ mod tests {
             out.push(e.expect("no agent error"));
         }
         out
+    }
+
+    /// A provider whose stream yields one event then stalls forever (a hung/throttled connection).
+    struct StallingProvider;
+
+    #[async_trait]
+    impl Provider for StallingProvider {
+        async fn stream(
+            &self,
+            _req: ChatRequest,
+        ) -> Result<
+            BoxStream<'static, Result<Event, lvz_protocol::ProviderError>>,
+            lvz_protocol::ProviderError,
+        > {
+            // One delta, then never another item — models a connection that goes silent mid-stream.
+            let s = stream::once(async { Ok(Event::TextDelta("partial".into())) })
+                .chain(stream::pending());
+            Ok(s.boxed())
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_provider_stream_fails_fast_instead_of_hanging() {
+        // With the clock paused, tokio auto-advances past STREAM_IDLE_TIMEOUT once the task is
+        // idle, so this completes instantly in virtual time — proving the agent doesn't hang.
+        let agent = Agent::new(
+            Arc::new(StallingProvider),
+            ToolRegistry::with_builtins(),
+            AgentConfig::default(),
+        );
+        let mut stream = agent.run("do something");
+        let mut last_err: Option<AgentError> = None;
+        while let Some(ev) = stream.next().await {
+            if let Err(e) = ev {
+                last_err = Some(e);
+            }
+        }
+        let err = last_err.expect("stalled stream should surface an error, not hang");
+        assert!(
+            matches!(&err, AgentError::Provider(m) if m.contains("stall")),
+            "expected a stall error, got {err:?}"
+        );
     }
 
     /// One scripted turn that calls a read-only `shell` tool (never an edit).
