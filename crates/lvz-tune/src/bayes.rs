@@ -8,8 +8,11 @@
 //! Like the hill-climb it keeps the candidate set small (the baseline plus the one-step grid
 //! neighbours of the baseline and of the current best), so it stays tractable. Hand-rolled samplers
 //! (Box–Muller normal, Marsaglia–Tsang gamma → beta) keep the no-extra-deps rule; the shared
-//! xorshift PRNG drives them, so a run is reproducible. **Experimental and in-memory** (no
-//! persistence yet) — opt in with `--tune-bayes`.
+//! xorshift PRNG drives them, so a run is reproducible. **On-disk persistence** is supported
+//! ([`save`](BayesTuner::save)/[`load`](BayesTuner::load) snapshot the posteriors + PRNG cursor as
+//! JSON, also via the [`PersistableTuner`](crate::PersistableTuner) impl), so `--tune-bayes
+//! --tune-state <path>` carries learning across restarts just like the hill-climb. Still
+//! experimental — opt in with `--tune-bayes`.
 
 use std::collections::HashMap;
 use std::path::Path;

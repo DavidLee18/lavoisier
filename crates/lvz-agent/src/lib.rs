@@ -35,9 +35,10 @@ use lvz_context::symbols::skeleton_with_radius;
 use lvz_context::tokens::estimate_tokens;
 use lvz_context::Lang;
 use lvz_protocol::{
-    AgentError, AgentHandle, Archetype, Capabilities, ChatRequest, ContentBlock, Event, Knobs,
-    Message, ModelTier, NoopTuner, Outcome, Provider, RepoProfile, Role, StopReason, SystemPrompt,
-    TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, ToolDef, Tuner, TurnRequest, Usage,
+    AgentError, AgentHandle, Archetype, Capabilities, ChatRequest, ContentBlock, CostWeights,
+    Event, Knobs, Message, ModelTier, NoopTuner, Outcome, Provider, RepoProfile, Role, StopReason,
+    SystemPrompt, TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, ToolDef, Tuner,
+    TurnRequest, Usage,
 };
 use lvz_tools::ToolRegistry;
 use serde_json::{json, Value};
@@ -169,7 +170,30 @@ pub struct AgentConfig {
     /// the resolved default apply — mechanical archetypes (rename / single-file edit / refactor)
     /// think *less* to save output tokens; everything else defers to the provider default.
     pub forced_thinking: Option<ThinkingLevel>,
+    /// **Cost weights** for the objective ([`CostWeights`]). The budget ceiling and the ATO
+    /// tuner optimise [`Usage::cost`] under these weights rather than a flat token count, so
+    /// caching (cheap reads, pricier writes) and output cost all register. Defaults to the
+    /// Anthropic/xAI ratios; the CLI sets the provider-appropriate preset. Use
+    /// [`CostWeights::flat`] to restore the legacy raw-token objective.
+    pub cost_weights: CostWeights,
+    /// **Radius-counterfactual re-exploration risk** in `[0, 1]` (`docs/ATO.md` §6, §10). The
+    /// estimate-based radius counterfactual ([`radius_counterfactual`](Self::radius_counterfactual))
+    /// used to credit a smaller skeleton with the *full* input saving and the realised success bit —
+    /// modelling only the input-byte delta, never that the model's *reasoning* changes on a thinner
+    /// skeleton. This factor models that altered reasoning: a smaller radius is assumed to claw back
+    /// `risk × (fraction of dependency context removed)` of its saving as expected re-acquisition
+    /// cost (an extra read/think round-trip), and when a radius strips more than
+    /// [`RADIUS_SUCCESS_CUT_FLOOR`] of the context its success bit is **not** transferred at all (too
+    /// optimistic to claim). `0.0` restores the old pure-saving behaviour. Only used when
+    /// `radius_counterfactual` is on.
+    pub radius_reexploration_risk: f64,
 }
+
+/// Above this fraction of dependency context removed, the estimate-based radius counterfactual
+/// refuses to transfer the realised success bit to the smaller radius (`docs/ATO.md` §6, §10) —
+/// claiming a task would still have succeeded on a near-empty skeleton is the least defensible
+/// part of the (already opt-in, unsound) counterfactual, so it is suppressed there.
+pub const RADIUS_SUCCESS_CUT_FLOOR: f64 = 0.9;
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -194,6 +218,8 @@ impl Default for AgentConfig {
             no_progress_limit: None,
             budget_awareness: false,
             forced_thinking: None,
+            cost_weights: CostWeights::default(),
+            radius_reexploration_risk: 0.5,
         }
     }
 }
@@ -281,10 +307,23 @@ impl AgentConfig {
         self
     }
 
+    /// Set the [`CostWeights`] used for the budget ceiling and the ATO objective (builder style).
+    pub fn with_cost_weights(mut self, weights: CostWeights) -> Self {
+        self.cost_weights = weights;
+        self
+    }
+
     /// Enable the unsound, estimate-based skeleton-radius counterfactual (off by default; see
     /// [`radius_counterfactual`](Self::radius_counterfactual)).
     pub fn with_radius_counterfactual(mut self, enabled: bool) -> Self {
         self.radius_counterfactual = enabled;
+        self
+    }
+
+    /// Set the radius-counterfactual re-exploration risk in `[0, 1]` (clamped). See
+    /// [`radius_reexploration_risk`](Self::radius_reexploration_risk).
+    pub fn with_radius_risk(mut self, risk: f64) -> Self {
+        self.radius_reexploration_risk = risk.clamp(0.0, 1.0);
         self
     }
 
@@ -573,7 +612,7 @@ async fn run_loop(
         total.accumulate(&turn.usage);
 
         if let Some(budget) = config.token_budget {
-            if total.total() > budget {
+            if total.cost(&config.cost_weights) > budget {
                 obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
                 let _ = tx.unbounded_send(Err(AgentError::BudgetExceeded));
                 return;
@@ -706,7 +745,7 @@ async fn run_loop(
             results.push(budget_note(
                 round_trips,
                 config.max_steps,
-                total.total(),
+                total.cost(&config.cost_weights),
                 config.token_budget,
             ));
         }
@@ -748,7 +787,7 @@ impl Observation<'_> {
         radius_traces: &[RadiusTrace],
     ) {
         let realised = Outcome {
-            total_tokens: total.total(),
+            total_tokens: total.cost(&self.config.cost_weights),
             round_trips,
             cache_hit_rate: total.cache_hit_rate(),
             success,
@@ -763,6 +802,8 @@ impl Observation<'_> {
             radius_traces,
             round_trips,
             self.ctx.caps.prompt_caching,
+            &self.config.cost_weights,
+            self.config.radius_reexploration_risk,
         );
         if let Some(sink) = self.telemetry {
             sink.record(&TaskTelemetry {
@@ -783,17 +824,27 @@ impl Observation<'_> {
 ///
 /// For each radius `t` strictly below the one used, re-extract every captured outline skeleton at
 /// `t` and sum how many tokens a smaller radius would have saved versus the radius actually used,
-/// then credit `Knobs { skeleton_radius: t, .. }` with `(realised.total − saving, realised.success)`.
+/// then credit `Knobs { skeleton_radius: t, .. }` with an estimated `(cost, success)`.
 ///
 /// **Downstream-effect model (`docs/ATO.md` §6).** A skeleton injected into history is re-sent on
 /// every later round-trip until compaction, so its per-skeleton delta recurs. Without prompt
 /// caching each resend is fresh input, so the saving is scaled by the skeleton's *residency* (how
 /// many round-trips from its capture to task end). With caching those resends are `cache_read`, not
 /// new `total_tokens`, so residency collapses to 1 — modelling that the smaller skeleton only saves
-/// on its single cache-creation send. The estimate is real (re-extracted); the **success bit is
-/// optimistically transferred** (we can't prove less context wouldn't have failed), which is why
-/// this is opt-in. `max_tool_result_bytes` is cleared so it doesn't compound with the learner's
-/// (exact) truncate counterfactual. No-op when no traces were captured or radius is 0.
+/// on its single cache-creation send.
+///
+/// **Reasoning-effect model (`docs/ATO.md` §10).** The raw saving is the input-byte delta only; it
+/// ignores that the model's *reasoning* changes on a thinner skeleton — it may have to re-acquire
+/// the stripped dependency context (an extra read/think round-trip), or fail. `risk` ∈ `[0,1]`
+/// models that: a fraction `risk × removed_frac` of the saving is clawed back as expected
+/// re-acquisition cost (where `removed_frac` is how much of the dependency skeleton the smaller
+/// radius cut), so an aggressive cut is credited with *less* net benefit than a gentle one. And when
+/// a radius strips more than [`RADIUS_SUCCESS_CUT_FLOOR`] of the context, the realised success bit is
+/// **not transferred** (the counterfactual is skipped for that radius) — claiming success on a
+/// near-empty skeleton is indefensible. `risk = 0` restores the old pure-saving, always-transfer
+/// behaviour. `max_tool_result_bytes` is cleared so it doesn't compound with the learner's (exact)
+/// truncate counterfactual. No-op when no traces were captured or radius is 0.
+#[allow(clippy::too_many_arguments)]
 fn emit_radius_counterfactuals(
     tuner: &Arc<dyn Tuner>,
     ctx: &TaskContext,
@@ -802,25 +853,55 @@ fn emit_radius_counterfactuals(
     radius_traces: &[RadiusTrace],
     final_round: u32,
     caching: bool,
+    weights: &CostWeights,
+    risk: f64,
 ) {
     let used = knobs.skeleton_radius;
     if radius_traces.is_empty() || used == 0 {
         return;
     }
+    // The saving is a count of skeleton tokens not sent. Express it in the same cost-weighted
+    // units as `realised.total_tokens`: under caching the skeleton's single send is a cache
+    // *write* (residency already collapsed to 1); otherwise each resend is fresh input.
+    let unit = if caching {
+        weights.cache_creation
+    } else {
+        weights.input
+    };
+    // Total dependency-skeleton tokens at the radius actually used — the denominator for "how much
+    // of the context did the smaller radius remove?" (the reasoning-effect model).
+    let base_tokens: u64 = radius_traces.iter().map(|tr| tr.tokens_at(used)).sum();
     for t in 0..used {
-        let saving: u64 = radius_traces
+        let cut_tokens: u64 = radius_traces
+            .iter()
+            .map(|tr| tr.tokens_at(used).saturating_sub(tr.tokens_at(t)))
+            .sum();
+        let removed_frac = if base_tokens == 0 {
+            0.0
+        } else {
+            (cut_tokens as f64 / base_tokens as f64).clamp(0.0, 1.0)
+        };
+        // Refuse to transfer success when the cut is too aggressive to credibly claim it.
+        if removed_frac > RADIUS_SUCCESS_CUT_FLOOR {
+            continue;
+        }
+        let saving_tokens: u64 = radius_traces
             .iter()
             .map(|tr| {
                 let per_send = tr.tokens_at(used).saturating_sub(tr.tokens_at(t));
                 per_send * tr.residency(final_round, caching)
             })
             .sum();
+        // Claw back the expected re-acquisition cost: the thinner the skeleton, the more of its
+        // saving we assume is spent recovering context (`risk = 0` ⇒ no clawback).
+        let clawback_frac = (risk * removed_frac).clamp(0.0, 1.0);
+        let net_saving = (saving_tokens as f64 * unit * (1.0 - clawback_frac)).round() as u64;
         let cf_knobs = Knobs {
             skeleton_radius: t,
             ..*knobs
         };
         let cf = Outcome {
-            total_tokens: realised.total_tokens.saturating_sub(saving),
+            total_tokens: realised.total_tokens.saturating_sub(net_saving),
             round_trips: realised.round_trips,
             cache_hit_rate: realised.cache_hit_rate,
             success: realised.success,
@@ -2379,6 +2460,8 @@ fn target() -> u32 { helper() + 10 }
         };
         // Uncached, 4 round-trips: the skeleton (captured at round 0) has residency 4, so the
         // saving is scaled by it — a larger downstream estimate than a single send.
+        // Flat weights so the cost-unit scaling is 1×, and risk 0 so the saving asserts in raw
+        // tokens (the reasoning-effect clawback is exercised by its own test below).
         emit_radius_counterfactuals(
             &tuner,
             &ctx,
@@ -2387,6 +2470,8 @@ fn target() -> u32 { helper() + 10 }
             std::slice::from_ref(&trace),
             4,
             false,
+            &CostWeights::flat(),
+            0.0,
         );
 
         let seen = rec.seen.lock().unwrap();
@@ -2399,6 +2484,111 @@ fn target() -> u32 { helper() + 10 }
         assert_eq!(cf_out.total_tokens, 1000 - per_send * 4);
         assert!(cf_out.success);
         assert!(cf_out.max_tool_result_bytes.is_none());
+    }
+
+    #[test]
+    fn radius_risk_claws_back_part_of_the_saving_modelling_altered_reasoning() {
+        // Same trace as the credits test: radius 1 keeps a dependency body, radius 0 drops it.
+        let source = "\
+fn helper() -> u32 { let a = 1; let b = 2; a + b + 3 + 4 + 5 }
+fn target() -> u32 { helper() + 10 }
+"
+        .to_string();
+        let trace = RadiusTrace {
+            source,
+            lang: Lang::Rust,
+            focus: "target".into(),
+            captured_at_round: 0,
+        };
+        let ctx = test_ctx();
+        let used = Knobs::default();
+        let realised = Outcome {
+            total_tokens: 1000,
+            round_trips: 1,
+            cache_hit_rate: 0.0,
+            success: true,
+            max_tool_result_bytes: None,
+        };
+        let credited = |risk: f64| {
+            let rec = Arc::new(RecordingTuner::default());
+            let tuner: Arc<dyn Tuner> = rec.clone();
+            // residency 1 (final_round == captured round) so the assertion isolates the clawback.
+            emit_radius_counterfactuals(
+                &tuner,
+                &ctx,
+                &used,
+                &realised,
+                std::slice::from_ref(&trace),
+                0,
+                false,
+                &CostWeights::flat(),
+                risk,
+            );
+            let seen = rec.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            seen[0].1.total_tokens
+        };
+        // Risk 0 credits the full saving (lowest cost); higher risk claws some back (higher cost),
+        // and 1.0 claws back the most — strictly monotone, but never below risk-0's *baseline* cost.
+        let c0 = credited(0.0);
+        let c_half = credited(0.5);
+        let c_full = credited(1.0);
+        assert!(
+            c0 < c_half,
+            "risk should reduce the credited saving: {c0} !< {c_half}"
+        );
+        assert!(
+            c_half < c_full,
+            "more risk should claw back more: {c_half} !< {c_full}"
+        );
+        assert!(
+            c_full <= 1000,
+            "clawback can erase the saving but not invent cost"
+        );
+    }
+
+    #[test]
+    fn radius_risk_suppresses_success_transfer_when_the_cut_is_too_aggressive() {
+        // A focus symbol with a large dependency body: radius 0 strips almost all of the skeleton,
+        // so `removed_frac` clears RADIUS_SUCCESS_CUT_FLOOR and the counterfactual is suppressed.
+        let big_body = (0..400).map(|i| format!("x{i} + ")).collect::<String>();
+        let source =
+            format!("fn helper() -> u32 {{ {big_body} 1 }}\nfn target() -> u32 {{ helper() }}\n");
+        let trace = RadiusTrace {
+            source,
+            lang: Lang::Rust,
+            focus: "target".into(),
+            captured_at_round: 0,
+        };
+        // Sanity: radius 0 removes >90% of the radius-1 skeleton tokens.
+        let removed = (trace.tokens_at(1) - trace.tokens_at(0)) as f64 / trace.tokens_at(1) as f64;
+        assert!(
+            removed > RADIUS_SUCCESS_CUT_FLOOR,
+            "cut not aggressive enough: {removed}"
+        );
+
+        let rec = Arc::new(RecordingTuner::default());
+        let tuner: Arc<dyn Tuner> = rec.clone();
+        let ctx = test_ctx();
+        emit_radius_counterfactuals(
+            &tuner,
+            &ctx,
+            &Knobs::default(),
+            &Outcome {
+                total_tokens: 1000,
+                round_trips: 1,
+                cache_hit_rate: 0.0,
+                success: true,
+                max_tool_result_bytes: None,
+            },
+            std::slice::from_ref(&trace),
+            0,
+            false,
+            &CostWeights::flat(),
+            0.5,
+        );
+        // Radius 0 was suppressed (too much context cut to credibly transfer success).
+        assert!(rec.seen.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2432,7 +2622,17 @@ fn target() -> u32 { helper() + 10 }
         let ctx = test_ctx();
         let realised = Outcome::default();
         // No traces → nothing emitted.
-        emit_radius_counterfactuals(&tuner, &ctx, &Knobs::default(), &realised, &[], 1, false);
+        emit_radius_counterfactuals(
+            &tuner,
+            &ctx,
+            &Knobs::default(),
+            &realised,
+            &[],
+            1,
+            false,
+            &CostWeights::flat(),
+            0.0,
+        );
         // Radius 0 → no smaller radius to credit, even with a trace.
         let trace = RadiusTrace {
             source: "fn a() {}".into(),
@@ -2452,6 +2652,8 @@ fn target() -> u32 { helper() + 10 }
             std::slice::from_ref(&trace),
             1,
             false,
+            &CostWeights::flat(),
+            0.0,
         );
         assert!(rec.seen.lock().unwrap().is_empty());
     }

@@ -221,9 +221,13 @@ sequential workflows that accumulate ≥3 turn-pairs.)
     `--tune`, precedence over it). It **persists** like the hill-climb: `BayesTuner::save`/`load`
     snapshot the posteriors, so `--tune-state` works with `--tune-bayes` too (both via the shared
     `PersistableTuner` wrapper). Pair `--tune` with `--verify-cmd` for a production-grade signal;
-    `--tune`/`--tune-bayes` alone (and `--radius-counterfactual`) stay experimental. Only deferred
-    now: the radius counterfactual modelling the model's altered *reasoning* (not just
-    skeleton-input bytes).
+    `--tune`/`--tune-bayes` alone (and `--radius-counterfactual`) stay experimental. The radius
+    counterfactual now also models the **altered reasoning** on a thinner skeleton (not just the
+    input-byte delta): `--radius-risk <F>` (default 0.5) claws back `risk × fraction-of-context-cut`
+    of the estimated saving as expected re-acquisition cost, and a radius that strips >90% of the
+    dependency context no longer has the success bit transferred (`--radius-risk 0` restores the old
+    pure-saving estimate). Only deferred now: full module-qualified symbol resolution (see the
+    skeleton-fidelity debt).
   - **`lvz-claude-cli` — built, off by default.** A `Provider` shelling out to `claude -p`
     (`--output-format stream-json`), stream-json → `Event`; `Capabilities` all false (no
     caching). Selected only via `--provider claude-cli` (default model `sonnet`; `CLAUDE_CLI_BIN`
@@ -250,8 +254,11 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   model call (`--classify-with-model`, opt-in, routed to `--summary-model`). The default tuner is
   still `NoopTuner` (ATO is opt-in via `--tune`, or `--tune-bayes` for the Thompson-sampling
   variant). The §10 roadmap is fully landed (per-repo keying, observation decay, the radius
-  counterfactual's residency-scaled downstream model, and Bayesian optimisation); only on-disk
-  `BayesTuner` persistence and deeper (reasoning-level) radius modelling remain (`docs/ATO.md` §10).
+  counterfactual's residency-scaled downstream model + **reasoning-effect clawback** (`--radius-risk`),
+  on-disk `BayesTuner` persistence (`save`/`load` + `--tune-state`), Bayesian optimisation, and a
+  **cost-weighted objective** — the budget and ATO minimise `Usage::cost(&CostWeights)`, not flat
+  tokens, so caching/output cost register). Only deferred: full module-qualified symbol resolution
+  (see the skeleton-fidelity debt; `docs/ATO.md` §10).
 - **Telemetry (§6.4).** Usage is aggregated, the `--budget` ceiling is enforced, the
   **HTTP gateway exports Prometheus `/metrics`** (tokens, cache read/creation, turns,
   errors, summed latency, **plus a derived `lavoisier_cache_hit_rate` gauge** — cache_read ÷
@@ -265,10 +272,16 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   re-indents the placeholder). The symbol-dependency graph is now **AST-resolved + scope-aware**:
   edges come from real `identifier`/`type_identifier` nodes (not substring search) minus
   locally-bound names, so names in strings/comments and shadowing locals no longer create spurious
-  edges (`lvz-context::symbols`, per-language `ref_ident_kinds`/`binder_kinds`). Still name-keyed,
-  not a full semantic index — same-named symbols across files merge and there's no import/visibility
-  resolution (fine for `N`). `outline_file --focus` builds a single-file graph (the multi-file graph
-  is used by the budget loop, not the tool).
+  edges (`lvz-context::symbols`, per-language `ref_ident_kinds`/`binder_kinds`). Cross-file
+  resolution is now **scope-aware**: the graph is keyed by `(file, name)`, so a reference binds to a
+  *same-file* definition before falling back to a cross-file one by name — two files that each define
+  `helper` no longer merge on the target side (`neighbors_within_by_file` keeps a body only in its
+  owning file; the budget loop uses it). Still **not** module-qualified — two same-named
+  *definitions* share one out-edge key and there's no `use`/`import` path resolution (the budget
+  loop's deterministic name-based cross-file linking relies on that, and full qualification would
+  need module identity threaded through the public API + skeletoniser + rebaselined ceilings; fine
+  for `N`). `outline_file --focus` builds a single-file graph (the multi-file graph is used by the
+  budget loop, not the tool).
 - **Multi-file batching (§6.1)** is implemented: `read_files`/`outline_files` batch tools (take a
   `paths` array, return per-file sections under `===== <path> =====` headers, inline per-file
   read errors), the `batch_width` knob caps the `paths` array agent-side (`apply_knobs_to_args`),
@@ -440,9 +453,12 @@ implementing the context/agent/protocol layers, preserve these:
   test: the budget-awareness progress note lives only in the conversation tail).
 - File-skeleton extraction, symbol-dependency tracking, hash-anchored/AST-native edits, and
   token-efficient diffs over full-file rewrites (`lvz-context`).
-- The optimisation metric is **total task tokens across all round-trips**, never per-call
-  input. The skeleton-depth knob `N` is tuned against the budget-fixture CI loop (§6.5), not
-  guessed.
+- The optimisation metric is the **cost-weighted task total across all round-trips** (never
+  per-call input): the agent budget and the ATO tuner minimise `Usage::cost(&CostWeights)` —
+  input·1 + output·~5 + cache_write·1.25 + cache_read·0.1 (provider presets; `CostWeights::flat()`
+  for raw tokens) — so prompt caching (the #1 cost lever) and output cost actually register, and a
+  cache-churning run is no longer mistaken for a cheap one. The skeleton-depth knob `N` is tuned
+  against the budget-fixture CI loop (§6.5), not guessed.
 
 ## Commands
 
@@ -470,8 +486,9 @@ in-memory), `--serve-matrix` (Matrix gateway), `--api-key <KEY>` (repeatable) / 
 `--summary-model`/`--compact-after`/`--context-limit` (agent efficiency knobs), `--tune`
 (ε-greedy ATO learner) or `--tune-bayes` (Thompson-sampling variant) with `--verify-cmd <cmd>`
 (post-task success gate), `--tune-state <path>` (persist learned profiles; `--tune` only),
-`--tune-decay <F>` (observation-decay EWMA) and `--radius-counterfactual` (opt-in, unsound radius
-counterfactual), `--telemetry` (per-task stderr summary), `--classify-with-model` (model archetype
+`--tune-decay <F>` (observation-decay EWMA), `--radius-counterfactual` (opt-in, unsound radius
+counterfactual) with `--radius-risk <F>` (reasoning-effect clawback, default 0.5; 0 = old
+pure-saving estimate), `--telemetry` (per-task stderr summary), `--classify-with-model` (model archetype
 classification), `--repo-skeleton <TOKENS>` (cache-aware repo-skeleton prefix, §6.1),
 `--no-batch-edit` (opt out of the `batch_edit` fan-out tool — independent mechanical edits via the
 provider's discounted batch API; on by default, Anthropic/Google only),
@@ -504,8 +521,10 @@ roadmap landed, both counterfactuals shipped), `lvz-claude-cli`, and advisor mod
 gateway is **out of scope** (dropped at user request — do not build it). Remaining: live
 verification of `lvz-claude-cli` (needs a subscription) and the Matrix gateway (needs a
 homeserver); the M10 AWS apply itself (artifacts ship local-verified — run `infra/README.md`
-against a real account); and the deferred polish (Python docstring fidelity, on-disk `BayesTuner`
-persistence, deeper reasoning-level radius modelling).
+against a real account); and the one remaining deferred item — full **module-qualified** symbol
+resolution (the cross-file graph is now scope-aware but not import-path resolved; see the
+skeleton-fidelity debt). (Cost-weighted objective, reasoning-effect radius modelling, and on-disk
+`BayesTuner` persistence have since shipped.)
 
 ## Conventions
 

@@ -298,8 +298,20 @@ pair the two for a production-grade signal.
 - **Downstream-effect modelling in the radius counterfactual** (§6) — each `RadiusTrace` records
   the round it was captured at; `emit_radius_counterfactuals` now scales the per-send saving by a
   **residency** factor (how many subsequent turns re-sent that skeleton), and collapses residency
-  to 1 when caching is on (cached resends bill as `cache_read`, outside `total_tokens`). It still
-  models only the skeleton-input delta, not the model's altered *reasoning* on a smaller skeleton.
+  to 1 when caching is on (cached resends bill as `cache_read`, outside `total_tokens`).
+- **Reasoning-effect modelling in the radius counterfactual** (§6, §10) — the counterfactual no
+  longer credits a smaller radius with its *full* input saving and the realised success bit
+  unconditionally. A `radius_reexploration_risk` factor (CLI `--radius-risk`, default 0.5) claws
+  back `risk × removed_frac` of the saving as expected re-acquisition cost (`removed_frac` = the
+  fraction of dependency-skeleton tokens the smaller radius stripped), so an aggressive cut is
+  credited with less net benefit; and when a radius strips more than `RADIUS_SUCCESS_CUT_FLOOR`
+  (90%) of the context, the success bit is **not transferred at all**. `--radius-risk 0` restores
+  the old pure-saving, always-transfer estimate. This models that the model's *reasoning* changes
+  on a thinner skeleton (it may re-read stripped context or fail), not just the input-byte delta.
+- **Cost-weighted objective** (§5) — the budget ceiling and the ATO objective optimise a
+  cost-weighted `Usage::cost(&CostWeights)` (fresh-input-token-equivalent units) instead of a flat
+  `input + output` count, so prompt caching (cheap reads, pricier writes) and output cost all
+  register. The CLI sets provider-appropriate weights; `CostWeights::flat()` restores raw tokens.
 - **Bayesian optimisation** (§10, below) — `BayesTuner`, a Thompson-sampling alternative to the
   ε-greedy hill-climb, ships behind `--tune-bayes`. (`--tune`'s hill-climb remains the default ATO
   tuner; the simple version suffices for most workloads, but the Bayesian one explores more
@@ -332,8 +344,13 @@ but no longer in-memory-only.
 
 **Still deferred.**
 
-- The radius counterfactual modelling the model's altered *subsequent reasoning* on a smaller
-  skeleton (not just the skeleton-input byte delta).
+- Full **module-qualified** semantic resolution of the symbol-dependency graph. Cross-file
+  resolution is now scope-aware (a reference binds to a same-file definition before falling back to
+  a cross-file one by name, so same-named symbols no longer silently merge on the target side), but
+  two same-named *definitions* still share one out-edge key and there is no `use`/`import` path
+  resolution — the budget loop's deterministic name-based cross-file linking depends on that, and
+  full qualification would need module identity threaded through the public API + skeletoniser +
+  rebaselined §6.5 ceilings. (`fine for N`, per the design notes.)
 
 ---
 

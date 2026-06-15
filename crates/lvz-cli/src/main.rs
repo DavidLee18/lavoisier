@@ -24,8 +24,8 @@ use lvz_gw_http::{GatewayConfig, HttpGateway};
 use lvz_gw_matrix::MatrixGateway;
 use lvz_memory::{InMemoryStore, SessionAgent};
 use lvz_protocol::{
-    AgentHandle, BatchProvider, ChatRequest, Event, Gateway, Knobs, Message, Outcome, Provider,
-    TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, Tuner,
+    AgentHandle, BatchProvider, ChatRequest, CostWeights, Event, Gateway, Knobs, Message, Outcome,
+    Provider, TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, Tuner,
 };
 use lvz_tools::{BatchEditTool, ToolRegistry};
 use lvz_tune::{BayesTuner, LearningTuner, PersistableTuner, TuneConfig};
@@ -204,6 +204,14 @@ struct Cli {
     #[arg(long)]
     radius_counterfactual: bool,
 
+    /// Radius-counterfactual **re-exploration risk** in `[0,1]` (`docs/ATO.md` §10; default 0.5).
+    /// Models the model's altered reasoning on a thinner skeleton: a smaller radius is credited with
+    /// less of its raw input saving (a fraction is assumed clawed back re-acquiring stripped
+    /// context), and a radius that strips most of the context isn't credited with success at all.
+    /// `0` restores the old pure-saving estimate. Only used with `--radius-counterfactual`.
+    #[arg(long)]
+    radius_risk: Option<f64>,
+
     /// Print a per-task telemetry line to stderr after an `--agent` run (tokens, cache-hit rate,
     /// round-trips, success, latency, chosen knobs) — the one-shot equivalent of the gateway's
     /// `/metrics` (`RECIPE.md` §6.4).
@@ -276,6 +284,17 @@ impl ProviderKind {
             ProviderKind::Anthropic => "claude-sonnet-4-6",
             ProviderKind::Google => "gemini-3-flash-preview",
             ProviderKind::ClaudeCli => "sonnet",
+        }
+    }
+
+    /// Provider-appropriate [`CostWeights`] for the cost-weighted budget/ATO objective. The
+    /// non-caching claude-cli path uses flat weights (no cache classes to value).
+    fn cost_weights(self) -> CostWeights {
+        match self {
+            ProviderKind::Xai => CostWeights::xai(),
+            ProviderKind::Anthropic => CostWeights::anthropic(),
+            ProviderKind::Google => CostWeights::google(),
+            ProviderKind::ClaudeCli => CostWeights::flat(),
         }
     }
 
@@ -422,7 +441,9 @@ fn build_agent(
     cli: &Cli,
 ) -> Agent {
     let editor_model = model.clone();
-    let mut config = AgentConfig::default().with_model(model);
+    let mut config = AgentConfig::default()
+        .with_model(model)
+        .with_cost_weights(cli.provider.cost_weights());
     config.max_tokens = cli.max_tokens;
     if let Some(max_steps) = cli.max_steps {
         config.max_steps = max_steps;
@@ -466,6 +487,9 @@ fn build_agent(
     }
     if cli.radius_counterfactual {
         config = config.with_radius_counterfactual(true);
+    }
+    if let Some(risk) = cli.radius_risk {
+        config = config.with_radius_risk(risk);
     }
     if cli.classify_with_model {
         config = config.with_model_classification(true);

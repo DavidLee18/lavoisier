@@ -12,6 +12,8 @@
 //! behaviour and belongs to runtime ATO (§6.6); the fixtures here set its safe priors and the
 //! regression floor.
 
+use std::collections::HashSet;
+
 use crate::symbols::SymbolGraph;
 use crate::tokens::estimate_tokens;
 use crate::{skeleton, Lang};
@@ -50,10 +52,13 @@ impl Fixture {
     /// whole snapshot.
     pub fn context_at(&self, radius: u8) -> String {
         let graph = SymbolGraph::from_sources(self.files.iter().map(|(l, s)| (*l, s.as_str())));
-        let keep = graph.neighbors_within(&self.target, radius);
+        // Keep bodies per file (scope-aware), so a same-named symbol's body is kept only in the
+        // file that actually owns the reached definition.
+        let keep = graph.neighbors_within_by_file(&self.target, radius);
         self.files
             .iter()
-            .map(|(lang, source)| skeleton::skeletonize(source, *lang, &keep))
+            .enumerate()
+            .map(|(i, (lang, source))| skeleton::skeletonize(source, *lang, &keep[i]))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -61,17 +66,18 @@ impl Fixture {
     /// Measure estimated context tokens and kept-symbol count at `radius`.
     pub fn measure(&self, radius: u8) -> BudgetReport {
         let graph = SymbolGraph::from_sources(self.files.iter().map(|(l, s)| (*l, s.as_str())));
-        let keep = graph.neighbors_within(&self.target, radius);
+        let keep = graph.neighbors_within_by_file(&self.target, radius);
         let context = self
             .files
             .iter()
-            .map(|(lang, source)| skeleton::skeletonize(source, *lang, &keep))
+            .enumerate()
+            .map(|(i, (lang, source))| skeleton::skeletonize(source, *lang, &keep[i]))
             .collect::<Vec<_>>()
             .join("\n");
         BudgetReport {
             radius,
             est_tokens: estimate_tokens(&context),
-            kept_symbols: keep.len(),
+            kept_symbols: keep.iter().map(HashSet::len).sum(),
         }
     }
 

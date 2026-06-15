@@ -96,7 +96,11 @@ impl Default for Knobs {
 /// `success` is the non-negotiable constraint (`RECIPE.md` §6.6).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Outcome {
-    /// Total task tokens across ALL round-trips — the metric ATO minimises.
+    /// The **cost-weighted** task total across ALL round-trips (in fresh-input-token-equivalent
+    /// units, [`Usage::cost`](crate::Usage::cost)) — the metric ATO minimises. Cost-weighted
+    /// rather than a flat token count so caching (cheap reads, pricier writes) and output cost
+    /// register in the objective; with flat [`CostWeights`](crate::CostWeights) it collapses to
+    /// the raw token sum.
     pub total_tokens: u64,
     /// Round-trip count (diagnostic).
     pub round_trips: u32,

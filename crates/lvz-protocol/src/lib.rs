@@ -25,7 +25,7 @@ mod tune;
 
 pub use agent::{AgentError, AgentHandle, TurnRequest};
 pub use batch::{BatchItem, BatchProvider, BatchTask};
-pub use event::{Event, StopReason, Usage};
+pub use event::{CostWeights, Event, StopReason, Usage};
 pub use gateway::{Gateway, GatewayError};
 pub use message::{
     BuiltinTool, ChatRequest, ContentBlock, McpServer, MediaSource, Message, OutputFormat, Role,

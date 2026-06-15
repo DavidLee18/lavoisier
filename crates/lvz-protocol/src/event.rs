@@ -57,10 +57,87 @@ pub struct Usage {
     pub cache_read_tokens: u64,
 }
 
+/// Per-token-class cost multipliers, expressed relative to a fresh input token (= 1.0).
+///
+/// Turns a raw [`Usage`] into a single **cost-weighted** objective ([`Usage::cost`]) so the
+/// agent's budget and the ATO tuner optimise *actual spend*, not a flat token count. This is
+/// what makes prompt caching — the project's biggest cost lever (`RECIPE.md` §6) — visible to
+/// optimisation: a fresh input token, an output token, a cache *write*, and a cache *read* all
+/// cost different amounts, and a flat sum (or one that ignores cache classes outright) hides
+/// that. The defaults match Anthropic/xAI list-price ratios, which are also a sensible
+/// cross-provider baseline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CostWeights {
+    pub input: f64,
+    pub output: f64,
+    pub cache_creation: f64,
+    pub cache_read: f64,
+}
+
+impl Default for CostWeights {
+    /// Anthropic/xAI ratios: output ≈ 5× input, a cache write ≈ 1.25× input, a cache read ≈
+    /// 0.1× input. A reasonable default for any caching provider.
+    fn default() -> Self {
+        Self {
+            input: 1.0,
+            output: 5.0,
+            cache_creation: 1.25,
+            cache_read: 0.1,
+        }
+    }
+}
+
+impl CostWeights {
+    /// Anthropic list-price ratios (Sonnet/Haiku/Opus all share 1 / 5 / 1.25 / 0.1).
+    pub fn anthropic() -> Self {
+        Self::default()
+    }
+
+    /// xAI (grok) ratios — same input/output 1:5 shape; xAI caches automatically and bills the
+    /// cached read cheaply, with no separate request-side cache-write line.
+    pub fn xai() -> Self {
+        Self::default()
+    }
+
+    /// Gemini ratios: a wider output:input spread and a pricier cache read than Anthropic.
+    pub fn google() -> Self {
+        Self {
+            input: 1.0,
+            output: 8.0,
+            cache_creation: 1.0,
+            cache_read: 0.25,
+        }
+    }
+
+    /// Flat weights — every token class counts the same. Restores the legacy raw-token
+    /// objective (and is what providers without real caching effectively use).
+    pub fn flat() -> Self {
+        Self {
+            input: 1.0,
+            output: 1.0,
+            cache_creation: 1.0,
+            cache_read: 1.0,
+        }
+    }
+}
+
 impl Usage {
-    /// Total billable input + output tokens (cache-creation counted as input).
+    /// Raw billable input + output tokens. A flat count for display/diagnostics; the budget and
+    /// the ATO objective use the cost-weighted [`cost`](Self::cost) instead. Note this does
+    /// **not** include the cache classes (which a caching provider reports separately).
     pub fn total(&self) -> u64 {
         self.input_tokens + self.output_tokens
+    }
+
+    /// Cost-weighted total in *fresh-input-token-equivalent* units (rounded). This — not the
+    /// flat [`total`](Self::total) — is the objective the agent budget enforces and the ATO
+    /// tuner minimises, so caching (cheap reads, pricier writes) and output cost all register.
+    pub fn cost(&self, w: &CostWeights) -> u64 {
+        (self.input_tokens as f64 * w.input
+            + self.output_tokens as f64 * w.output
+            + self.cache_creation_tokens as f64 * w.cache_creation
+            + self.cache_read_tokens as f64 * w.cache_read)
+            .round() as u64
     }
 
     /// Add another turn's usage into this one — the running total across round-trips (§6.4).
@@ -141,6 +218,32 @@ mod tests {
             let back: Event = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(ev, back, "roundtrip mismatch for {json}");
         }
+    }
+
+    #[test]
+    fn cost_weights_make_caching_visible() {
+        let w = CostWeights::default();
+        // 100 fresh input + 20 output + 1000 cache write + 5000 cache read.
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_creation_tokens: 1000,
+            cache_read_tokens: 5000,
+        };
+        // Flat total ignores both cache classes entirely.
+        assert_eq!(usage.total(), 120);
+        // Cost: 100*1 + 20*5 + 1000*1.25 + 5000*0.1 = 100 + 100 + 1250 + 500 = 1950.
+        assert_eq!(usage.cost(&w), 1950);
+        // Flat weights reduce cost() to summing every class equally.
+        assert_eq!(usage.cost(&CostWeights::flat()), 100 + 20 + 1000 + 5000);
+        // A cache-churning run (re-writing instead of reading) is now strictly more expensive,
+        // which the flat total() could never show.
+        let churn = Usage {
+            cache_creation_tokens: 6000,
+            cache_read_tokens: 0,
+            ..usage
+        };
+        assert!(churn.cost(&w) > usage.cost(&w));
     }
 
     #[test]
