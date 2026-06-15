@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    Capabilities, ChatRequest, ContentBlock, Event, MediaSource, OutputFormat, Provider,
-    ProviderError, Role, ServerTool, StopReason, ThinkingLevel, ToolChoice, Usage,
+    retry_transient, Capabilities, ChatRequest, ContentBlock, Event, MediaSource, OutputFormat,
+    Provider, ProviderError, Role, ServerTool, StopReason, ThinkingLevel, ToolChoice, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -78,23 +78,33 @@ impl Provider for HttpTransport {
         };
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
-        let resp = self
-            .http
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message,
-            });
-        }
+        // Bounded exponential backoff on transient throttling (shared `retry_transient`): a burst of
+        // agent-loop calls can hit 429 (rate limit) or 503 (overloaded) on a healthy key; the send
+        // is idempotent (nothing is generated until the stream starts). Tunable via XAI_MAX_RETRIES.
+        let max_retries: u32 = std::env::var("XAI_MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        let resp = retry_transient(max_retries, || async {
+            let resp = self
+                .http
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            let status = resp.status();
+            if status.is_success() {
+                Ok(resp)
+            } else {
+                Err(ProviderError::Api {
+                    status: status.as_u16(),
+                    message: resp.text().await.unwrap_or_default(),
+                })
+            }
+        })
+        .await?;
 
         let state = SseState {
             body: resp.bytes_stream().boxed(),

@@ -20,8 +20,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    BuiltinTool, Capabilities, ChatRequest, ContentBlock, Event, MediaSource, Message,
-    OutputFormat, Provider, ProviderError, Role, ServerTool, SystemPrompt, ThinkingLevel,
+    retry_transient, BuiltinTool, Capabilities, ChatRequest, ContentBlock, Event, MediaSource,
+    Message, OutputFormat, Provider, ProviderError, Role, ServerTool, SystemPrompt, ThinkingLevel,
     ToolChoice, ToolDef,
 };
 use serde_json::{json, Value};
@@ -163,28 +163,41 @@ impl Provider for AnthropicProvider {
         }) {
             betas.push(FILES_BETA);
         }
-        let mut request = self
-            .http
-            .post(url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION);
-        if !betas.is_empty() {
-            request = request.header("anthropic-beta", betas.join(","));
-        }
-        let resp = request
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let beta_header = (!betas.is_empty()).then(|| betas.join(","));
 
-        let status = resp.status();
-        if !status.is_success() {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message,
-            });
-        }
+        // Bounded exponential backoff on transient throttling (shared `retry_transient`): Anthropic
+        // returns 429 when the per-minute token/request budget is exceeded and 503 when overloaded;
+        // the send is idempotent (nothing is generated until the stream starts), so a burst from the
+        // agent loop retries instead of failing the whole task. Tunable via ANTHROPIC_MAX_RETRIES.
+        let max_retries: u32 = std::env::var("ANTHROPIC_MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        let resp = retry_transient(max_retries, || async {
+            let mut request = self
+                .http
+                .post(&url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION);
+            if let Some(h) = &beta_header {
+                request = request.header("anthropic-beta", h);
+            }
+            let resp = request
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            let status = resp.status();
+            if status.is_success() {
+                Ok(resp)
+            } else {
+                Err(ProviderError::Api {
+                    status: status.as_u16(),
+                    message: resp.text().await.unwrap_or_default(),
+                })
+            }
+        })
+        .await?;
 
         let state = SseState {
             body: resp.bytes_stream().boxed(),

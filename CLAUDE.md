@@ -323,6 +323,13 @@ implemented per adapter.
 - `ServerTool` (`WebSearch`/`WebFetch`/`CodeExecution`) + `mcp_servers` — provider-executed tools,
   unified: WebSearch → Anthropic `web_search_20260209` / xAI **Live Search** / Gemini
   `googleSearch`; CodeExecution → each provider's built-in.
+- **Shared retry/backoff** (`lvz_protocol::retry_transient`) — a transport-agnostic combinator that
+  retries an idempotent send on transient failures (HTTP **429** rate-limit / **503** overload) with
+  bounded exponential backoff (2s→32s). Applied to **all** provider stream paths — Anthropic HTTP,
+  Google HTTP, **and both xAI transports** (HTTP + gRPC, where `status_to_err` maps gRPC
+  `ResourceExhausted`→429 / `Unavailable`→503) — so a burst from the agent loop no longer fails a
+  whole task on the first throttle (previously only `lvz-google` retried). Tunable per provider via
+  `{ANTHROPIC,GOOGLE,XAI}_MAX_RETRIES` (default 6).
 - **Auto-batch (`lvz_protocol::BatchProvider`)** — a unified primitive that runs a
   create→poll→results lifecycle over each provider's **discounted (~50%) batch API** for
   non-interactive bulk work. `run_batch(Vec<BatchTask>) -> Vec<BatchItem>` (each `BatchTask` =
@@ -335,8 +342,11 @@ implemented per adapter.
   (`lvz-tools`): the model fans a set of **independent, mechanical** per-file edits out to
   `run_batch` (~50% cost) instead of editing them one-by-one in the interactive loop — the natural
   fit for bulk-mechanical archetypes (rename across modules, one migration per file). Each edit is a
-  single-shot request (file + self-contained instruction → full-file rewrite, fence-stripped),
-  applied locally; unreadable files and per-item errors are reported, not fatal. Counted as an edit
+  single-shot request (file + self-contained instruction) whose response is **SEARCH/REPLACE diff
+  blocks** — applied locally so output tokens scale with the change, not the file — with a
+  **full-file-rewrite fallback** when the model returns no markers (and a per-file error when a
+  SEARCH block can't be located). Unreadable files and per-item errors are reported, not fatal.
+  Counted as an edit
   tool by the convergence/staleness levers (`EDIT_TOOLS`). **On by default** (Lavoisier is
   cost-first) whenever the provider has a batch API; `--no-batch-edit` opts out, and providers
   without one (xAI / claude-cli) simply never get it. **xAI has no cheaper batch path** — its
@@ -363,8 +373,9 @@ SSE `citations_delta`).
 **Google:** `functionCallingConfig`, `responseSchema`, sampling, multimodal, **explicit context
 caching** (`GoogleProvider::create_cached_content` + `with_cached_content` → `cachedContent`),
 Google Search grounding + code-execution tools, **`safetySettings`** (`with_safety_settings`,
-opt-in — no silent disabling), **Files upload** (`upload_file`, resumable → `fileUri`), and
-**batch mode** (`lvz_google::batch`, `batchGenerateContent`, 50% pricing). Reasoning Gemini models
+opt-in — no silent disabling), **Files upload** (`upload_file`, resumable → `fileUri`),
+**native token counting** (`Provider::count_tokens` → `models/{model}:countTokens`, live-verified),
+and **batch mode** (`lvz_google::batch`, `batchGenerateContent`, 50% pricing). Reasoning Gemini models
 (`gemini-3*`/`gemini-2.5*`) get a **configurable `maxOutputTokens` floor** (`effective_max_output`)
 so internal thinking can't consume the whole budget and leave the visible answer empty (a too-small
 cap is raised; a larger caller value is untouched). The floor defaults to

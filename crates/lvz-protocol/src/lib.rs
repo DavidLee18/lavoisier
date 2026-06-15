@@ -18,6 +18,7 @@ mod event;
 mod gateway;
 mod message;
 mod provider;
+mod retry;
 mod telemetry;
 mod tool;
 mod tune;
@@ -31,6 +32,7 @@ pub use message::{
     ServerTool, SystemPrompt, ThinkingLevel, ToolChoice, ToolDef,
 };
 pub use provider::{Capabilities, Provider, ProviderError};
+pub use retry::{is_transient_status, retry_transient};
 pub use telemetry::{TaskTelemetry, TelemetrySink};
 pub use tool::{Tool, ToolError, ToolOutput};
 pub use tune::{Archetype, Knobs, ModelTier, NoopTuner, Outcome, RepoProfile, TaskContext, Tuner};

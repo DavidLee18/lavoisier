@@ -21,17 +21,29 @@ use lvz_protocol::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-/// Default token ceiling per batched edit — generous, because each request returns the **complete**
-/// rewritten file (full-file rewrite is the robust MVP; a diff/search-replace form is a later
-/// refinement). Batch output is billed at the ~50% discount, so a roomy cap is cheap.
+/// Default token ceiling per batched edit. Generous because a near-total rewrite still returns the
+/// whole file; the SEARCH/REPLACE format keeps the common (small) edit far under this. Batch output
+/// is billed at the ~50% discount.
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
+/// SEARCH/REPLACE block markers (aider/diff convention). The model emits one or more of these so a
+/// small edit costs only the changed lines, not the whole file.
+const SEARCH_MARK: &str = "<<<<<<< SEARCH";
+const DIVIDER_MARK: &str = "=======";
+const REPLACE_MARK: &str = ">>>>>>> REPLACE";
+
 /// System prompt for each single-shot editor request. Kept terse and identical across every task in
-/// a batch so the cacheable prefix is stable.
+/// a batch so the cacheable prefix is stable. Asks for **diffs** (SEARCH/REPLACE blocks) to keep
+/// output tokens proportional to the change, with a full-file rewrite as the escape hatch.
 const EDITOR_SYSTEM: &str = "You are a precise code editor. You are given one file and one \
-instruction. Apply the instruction to the file and return the COMPLETE updated file contents and \
-nothing else — no explanations, no markdown code fences, no commentary. If the instruction does not \
-apply to this file, return the file unchanged.";
+instruction. Express your edit as one or more SEARCH/REPLACE blocks in exactly this format:\n\
+<<<<<<< SEARCH\n(the exact existing lines to find, copied verbatim)\n=======\n(the replacement \
+lines)\n>>>>>>> REPLACE\n\
+Each SEARCH section must match the current file content exactly (including indentation) and be \
+unique enough to locate. Use a separate block per disjoint change. Output ONLY the blocks — no \
+prose, no code fences. If the change rewrites most of the file, instead output the COMPLETE new \
+file contents with no SEARCH/REPLACE markers at all. If the instruction does not apply, output the \
+file unchanged with no markers.";
 
 /// `batch_edit` — run many independent mechanical edits as one discounted batch job.
 pub struct BatchEditTool {
@@ -181,11 +193,19 @@ are several independent edits."
                         lines.push(format!("{path}: batch error ({err})"));
                         continue;
                     }
-                    let new_content = strip_code_fence(&item.text);
-                    if new_content.trim().is_empty() {
+                    if item.text.trim().is_empty() {
                         lines.push(format!("{path}: skipped (model returned empty output)"));
                         continue;
                     }
+                    // Apply the response: SEARCH/REPLACE blocks when present (cheap diff), else treat
+                    // the whole response as a full-file rewrite (the fallback).
+                    let new_content = match apply_response(original, &item.text) {
+                        Ok(c) => c,
+                        Err(why) => {
+                            lines.push(format!("{path}: skipped ({why})"));
+                            continue;
+                        }
+                    };
                     if new_content == *original {
                         lines.push(format!("{path}: unchanged"));
                         continue;
@@ -227,8 +247,72 @@ fn editor_user_prompt(path: &str, content: &str, instruction: &str) -> String {
     format!("File `{path}`:\n```\n{content}\n```\n\nApply this change to the file above:\n{instruction}")
 }
 
-/// Defensively unwrap a single fenced block if the model wrapped the whole file in ``` despite the
-/// instruction. Only strips when the *entire* response is one fence; otherwise returns the text
+/// Turn an editor response into the new file contents. If the response contains SEARCH/REPLACE
+/// blocks, apply each to `original` (cheap diff path); otherwise treat the whole response as a
+/// full-file rewrite (the fallback, fence-stripped). Returns `Err` with a reason when a SEARCH
+/// section can't be located — the file is then left untouched and the model is told why.
+fn apply_response(original: &str, response: &str) -> Result<String, String> {
+    let blocks = parse_search_replace(response);
+    if blocks.is_empty() {
+        // No diff markers → the model returned the whole file (or judged a near-total rewrite
+        // simpler). Use it verbatim, defensively unwrapping a stray code fence.
+        return Ok(strip_code_fence(response));
+    }
+    let mut content = original.to_string();
+    for (i, (search, replace)) in blocks.iter().enumerate() {
+        if !content.contains(search) {
+            return Err(format!(
+                "SEARCH block {} did not match the file (it must copy the existing lines verbatim)",
+                i + 1
+            ));
+        }
+        content = content.replacen(search, replace, 1);
+    }
+    Ok(content)
+}
+
+/// Parse SEARCH/REPLACE blocks out of an editor response. Each block is the lines between the
+/// `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` markers. Malformed/partial blocks are ignored
+/// (so a response with no complete block yields none → caller falls back to full-file).
+fn parse_search_replace(response: &str) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
+    let mut lines = response.lines();
+    while let Some(line) = lines.next() {
+        if line.trim_end() != SEARCH_MARK {
+            continue;
+        }
+        let mut search = Vec::new();
+        let mut hit_divider = false;
+        for l in lines.by_ref() {
+            if l.trim_end() == DIVIDER_MARK {
+                hit_divider = true;
+                break;
+            }
+            search.push(l);
+        }
+        if !hit_divider {
+            break;
+        }
+        let mut replace = Vec::new();
+        let mut hit_close = false;
+        for l in lines.by_ref() {
+            if l.trim_end() == REPLACE_MARK {
+                hit_close = true;
+                break;
+            }
+            replace.push(l);
+        }
+        if !hit_close {
+            break;
+        }
+        // Reattach newlines; join with '\n' (block bodies are whole lines).
+        blocks.push((search.join("\n"), replace.join("\n")));
+    }
+    blocks
+}
+
+/// Defensively unwrap a single fenced block if the model wrapped a full-file rewrite in ``` despite
+/// the instruction. Only strips when the *entire* response is one fence; otherwise returns the text
 /// unchanged. Preserves a trailing newline on the inner content.
 fn strip_code_fence(text: &str) -> String {
     let trimmed = text.trim();
@@ -366,5 +450,43 @@ mod tests {
         assert_eq!(strip_code_fence("```\nplain\n```\n"), "plain\n");
         // Not a whole-block fence — left untouched.
         assert_eq!(strip_code_fence("no fences here"), "no fences here");
+    }
+
+    #[test]
+    fn apply_response_applies_search_replace_blocks() {
+        let original = "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n";
+        let response = "<<<<<<< SEARCH\n    let x = 1;\n=======\n    let x = 2;\n>>>>>>> REPLACE";
+        let out = apply_response(original, response).unwrap();
+        assert!(out.contains("let x = 2;"));
+        assert!(!out.contains("let x = 1;"));
+        // Only the targeted line changed.
+        assert!(out.contains("fn main()") && out.contains("println!"));
+    }
+
+    #[test]
+    fn apply_response_supports_multiple_blocks() {
+        let original = "a\nb\nc\n";
+        let response = "<<<<<<< SEARCH\na\n=======\nA\n>>>>>>> REPLACE\n\
+                        <<<<<<< SEARCH\nc\n=======\nC\n>>>>>>> REPLACE";
+        assert_eq!(apply_response(original, response).unwrap(), "A\nb\nC\n");
+    }
+
+    #[test]
+    fn apply_response_errors_when_search_does_not_match() {
+        let original = "hello world\n";
+        let response = "<<<<<<< SEARCH\nnot present\n=======\nx\n>>>>>>> REPLACE";
+        let err = apply_response(original, response).unwrap_err();
+        assert!(err.contains("did not match"));
+    }
+
+    #[test]
+    fn apply_response_falls_back_to_full_file_when_no_markers() {
+        let original = "old contents\n";
+        // A near-total rewrite arrives as the whole file (no SEARCH/REPLACE markers).
+        let response = "brand new\ncontents\n";
+        assert_eq!(
+            apply_response(original, response).unwrap(),
+            "brand new\ncontents\n"
+        );
     }
 }

@@ -24,8 +24,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    Capabilities, ChatRequest, ContentBlock, Event, MediaSource, Message, OutputFormat, Provider,
-    ProviderError, Role, ServerTool, ThinkingLevel, ToolChoice,
+    retry_transient, Capabilities, ChatRequest, ContentBlock, Event, MediaSource, Message,
+    OutputFormat, Provider, ProviderError, Role, ServerTool, ThinkingLevel, ToolChoice,
 };
 use serde_json::{json, Value};
 
@@ -324,17 +324,16 @@ impl Provider for GoogleProvider {
             req.model,
         );
 
-        // Send with bounded exponential backoff on transient throttling. The Generative Language
-        // API rate-limits per minute, and the agent issues many calls in quick succession, so a
-        // burst hits 429 (RESOURCE_EXHAUSTED) even when the key is healthy; 503 (overloaded) is the
-        // other transient case. We retry those (the request is idempotent — nothing was generated)
-        // and surface every other status immediately. Tunable via GOOGLE_MAX_RETRIES (default 6).
+        // Send with bounded exponential backoff on transient throttling (shared `retry_transient`).
+        // The Generative Language API rate-limits per minute, and the agent issues many calls in
+        // quick succession, so a burst hits 429 (RESOURCE_EXHAUSTED) even when the key is healthy;
+        // 503 (overloaded) is the other transient case. The send is idempotent (nothing is generated
+        // until the stream starts), so retrying is safe. Tunable via GOOGLE_MAX_RETRIES (default 6).
         let max_retries: u32 = std::env::var("GOOGLE_MAX_RETRIES")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(6);
-        let mut attempt: u32 = 0;
-        let resp = loop {
+        let resp = retry_transient(max_retries, || async {
             let resp = self
                 .http
                 .post(&url)
@@ -343,26 +342,17 @@ impl Provider for GoogleProvider {
                 .send()
                 .await
                 .map_err(|e| ProviderError::Transport(e.to_string()))?;
-
             let status = resp.status();
             if status.is_success() {
-                break resp;
+                Ok(resp)
+            } else {
+                Err(ProviderError::Api {
+                    status: status.as_u16(),
+                    message: resp.text().await.unwrap_or_default(),
+                })
             }
-            let retryable = status.as_u16() == 429 || status.as_u16() == 503;
-            if retryable && attempt < max_retries {
-                // 2s, 4s, 8s … capped at 32s — long enough to refill a per-minute window.
-                let backoff =
-                    std::time::Duration::from_secs(2u64.saturating_pow(attempt + 1).min(32));
-                attempt += 1;
-                tokio::time::sleep(backoff).await;
-                continue;
-            }
-            let message = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message,
-            });
-        };
+        })
+        .await?;
 
         let state = SseState {
             body: resp.bytes_stream().boxed(),
@@ -407,6 +397,44 @@ impl Provider for GoogleProvider {
             server_side_tools: false,
             vision: true,
         }
+    }
+
+    /// Native token counting via `models/{model}:countTokens` (the Generative Language API's own
+    /// counter), so pre-flight budgeting is exact rather than estimated.
+    async fn count_tokens(&self, req: &ChatRequest) -> Result<Option<u64>, ProviderError> {
+        let body = json!({ "contents": build_contents(&req.messages) });
+        let url = format!(
+            "{}/v1beta/models/{}:countTokens",
+            self.base_url.trim_end_matches('/'),
+            req.model,
+        );
+        let max_retries: u32 = std::env::var("GOOGLE_MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        let v = retry_transient(max_retries, || async {
+            let resp = self
+                .http
+                .post(&url)
+                .header("x-goog-api-key", &self.api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            let status = resp.status();
+            if status.is_success() {
+                resp.json::<Value>()
+                    .await
+                    .map_err(|e| ProviderError::Decode(e.to_string()))
+            } else {
+                Err(ProviderError::Api {
+                    status: status.as_u16(),
+                    message: resp.text().await.unwrap_or_default(),
+                })
+            }
+        })
+        .await?;
+        Ok(v["totalTokens"].as_u64())
     }
 }
 

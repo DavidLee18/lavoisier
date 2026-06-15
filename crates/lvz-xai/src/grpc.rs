@@ -13,8 +13,9 @@ use std::collections::VecDeque;
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    Capabilities, ChatRequest, ContentBlock, Event, MediaSource, Message, OutputFormat, Provider,
-    ProviderError, Role, ServerTool, StopReason, ThinkingLevel, ToolChoice, Usage,
+    retry_transient, Capabilities, ChatRequest, ContentBlock, Event, MediaSource, Message,
+    OutputFormat, Provider, ProviderError, Role, ServerTool, StopReason, ThinkingLevel, ToolChoice,
+    Usage,
 };
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
@@ -128,14 +129,25 @@ impl Provider for GrpcTransport {
         req: ChatRequest,
     ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
         let grpc_req = build_request(req);
-        let mut client = self.connect().await?;
-        let request = self.authed(grpc_req)?;
 
-        let streaming = client
-            .get_completion_chunk(request)
-            .await
-            .map_err(status_to_err)?
-            .into_inner();
+        // Bounded exponential backoff on transient throttling (shared `retry_transient`): xAI returns
+        // gRPC ResourceExhausted (→429) when rate-limited and Unavailable (→503) when overloaded;
+        // `status_to_err` maps those onto the HTTP statuses the shared policy retries. The call is
+        // idempotent (nothing is generated until the stream starts). Tunable via XAI_MAX_RETRIES.
+        let max_retries: u32 = std::env::var("XAI_MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        let streaming = retry_transient(max_retries, || async {
+            let mut client = self.connect().await?;
+            let request = self.authed(grpc_req.clone())?;
+            client
+                .get_completion_chunk(request)
+                .await
+                .map_err(status_to_err)
+                .map(|r| r.into_inner())
+        })
+        .await?;
 
         let state = GrpcState {
             streaming,
@@ -344,8 +356,16 @@ fn events_from_response(resp: pb::GetChatCompletionResponse) -> Vec<Event> {
 }
 
 fn status_to_err(status: tonic::Status) -> ProviderError {
+    // Map the two transient gRPC codes onto their HTTP equivalents so the shared retry policy
+    // (`is_transient_status`) treats them uniformly with the HTTP provider paths; other codes keep
+    // their raw gRPC value.
+    let status_code = match status.code() {
+        tonic::Code::ResourceExhausted => 429,
+        tonic::Code::Unavailable => 503,
+        other => other as u16,
+    };
     ProviderError::Api {
-        status: status.code() as u16,
+        status: status_code,
         message: status.message().to_string(),
     }
 }

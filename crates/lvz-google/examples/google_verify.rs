@@ -29,8 +29,23 @@ async fn main() {
     a10_files(&key).await;
     a11_batch(&key).await;
     auto_batch(&key).await;
+    count_tokens(&key).await;
 
     println!("\n== live verify complete ==");
+}
+
+/// Native token counting — `models/{model}:countTokens` returns an exact input-token count.
+async fn count_tokens(key: &str) {
+    println!("\n--- count_tokens (gemini native counter) ---");
+    let provider = GoogleProvider::new(key);
+    let req = ChatRequest::new(MODEL).push(Message::user(
+        "The quick brown fox jumps over the lazy dog.",
+    ));
+    match provider.count_tokens(&req).await {
+        Ok(Some(n)) => println!("  => count_tokens VERIFIED (totalTokens={n})"),
+        Ok(None) => println!("  => no count returned (unexpected)"),
+        Err(e) => println!("  count_tokens error: {e:?}"),
+    }
 }
 
 /// Auto-batch — run two requests through the unified `BatchProvider::run_batch` (create → poll →
