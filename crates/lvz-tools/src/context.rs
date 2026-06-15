@@ -287,17 +287,21 @@ impl Tool for EditAnchoredTool {
         }
 
         let diff = unified_diff(&original, &updated, 2);
-        Ok(ToolOutput::ok(format!(
-            "applied {} edit(s) to {path}\n{diff}",
-            edits.len()
-        )))
+        Ok(
+            ToolOutput::ok(format!("applied {} edit(s) to {path}\n{diff}", edits.len()))
+                .changed(updated != original),
+        )
     }
 }
 
-/// Apply anchored edits to one file (read → apply → write), returning a one-line summary + diff on
-/// success, or an error string on failure. The whole-file apply is atomic: if any anchor is missing
-/// or ambiguous, nothing is written. Shared by the `edit_files` batch tool.
-async fn apply_anchored_to_file(path: &str, specs: Vec<EditSpec>) -> Result<String, String> {
+/// Apply anchored edits to one file (read → apply → write), returning `(summary + diff, changed)`
+/// on success or an error string on failure. `changed` is whether the write actually altered the
+/// file. The whole-file apply is atomic: if any anchor is missing or ambiguous, nothing is written.
+/// Shared by the `edit_files` batch tool.
+async fn apply_anchored_to_file(
+    path: &str,
+    specs: Vec<EditSpec>,
+) -> Result<(String, bool), String> {
     let edits: Vec<Edit> = specs
         .into_iter()
         .map(EditSpec::into_edit)
@@ -311,7 +315,11 @@ async fn apply_anchored_to_file(path: &str, specs: Vec<EditSpec>) -> Result<Stri
         .await
         .map_err(|e| format!("{path}: {e}"))?;
     let diff = unified_diff(&original, &updated, 2);
-    Ok(format!("applied {} edit(s) to {path}\n{diff}", edits.len()))
+    let changed = updated != original;
+    Ok((
+        format!("applied {} edit(s) to {path}\n{diff}", edits.len()),
+        changed,
+    ))
 }
 
 /// `edit_files` — apply anchored edits across several files in one round-trip (the write-side
@@ -383,10 +391,12 @@ impl Tool for EditFilesTool {
         let mut sections = Vec::with_capacity(files.len());
         let mut applied = 0usize;
         let mut failed = 0usize;
+        let mut any_changed = false;
         for FileEdits { path, edits } in files {
             let body = match apply_anchored_to_file(&path, edits).await {
-                Ok(summary) => {
+                Ok((summary, changed)) => {
                     applied += 1;
+                    any_changed |= changed;
                     summary
                 }
                 Err(e) => {
@@ -398,10 +408,12 @@ impl Tool for EditFilesTool {
         }
         let header = format!("edit_files: applied {applied} file(s), {failed} failed.\n");
         let content = format!("{header}\n{}", sections.join("\n\n"));
-        // Surface a batch with any failure as an error so the model retries just those files.
+        // Surface a batch with any failure as an error so the model retries just those files;
+        // `changed` reflects whether at least one file was actually modified (drives convergence).
         Ok(ToolOutput {
             content,
             is_error: failed > 0,
+            changed: any_changed,
         })
     }
 }

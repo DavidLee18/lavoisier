@@ -147,8 +147,15 @@ impl Tool for WriteFileTool {
             }
         }
         let bytes = content.len();
+        // Whether this write actually mutates the workspace: a new file, or content that differs
+        // from what's already there. A no-op rewrite (same bytes) is not progress (drives the
+        // agent's convergence levers).
+        let changed = match tokio::fs::read_to_string(&path).await {
+            Ok(existing) => existing != content,
+            Err(_) => true,
+        };
         match tokio::fs::write(&path, content).await {
-            Ok(()) => Ok(ToolOutput::ok(format!("wrote {bytes} bytes to {path}"))),
+            Ok(()) => Ok(ToolOutput::ok(format!("wrote {bytes} bytes to {path}")).changed(changed)),
             Err(e) => Ok(ToolOutput::error(format!("write_file {path}: {e}"))),
         }
     }
@@ -253,6 +260,9 @@ impl Tool for ShellTool {
         Ok(ToolOutput {
             content: rendered,
             is_error: !output.status.success(),
+            // The shell is not one of the agent's tracked edit tools, so its mutation (if any) is
+            // not used as a convergence signal; leave `changed` false.
+            changed: false,
         })
     }
 }

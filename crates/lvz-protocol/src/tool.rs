@@ -29,14 +29,21 @@ pub trait Tool: Send + Sync {
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    /// Whether this invocation **actually mutated the workspace** (an edit tool that wrote a real
+    /// change to a file). `false` for read-only tools and for edit tools that no-op'd — e.g. an
+    /// anchored edit whose anchors didn't match, so nothing was written. The agent keys its
+    /// convergence levers on this, not merely on which tool was called, so a failed/empty edit
+    /// can't be mistaken for progress (`RECIPE.md` §6.6 convergence). Default `false`.
+    pub changed: bool,
 }
 
 impl ToolOutput {
-    /// A successful result.
+    /// A successful result (no workspace mutation by default; edit tools call [`changed`]).
     pub fn ok(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             is_error: false,
+            changed: false,
         }
     }
 
@@ -45,7 +52,14 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: true,
+            changed: false,
         }
+    }
+
+    /// Mark whether this invocation actually changed a file (builder). See [`ToolOutput::changed`].
+    pub fn changed(mut self, changed: bool) -> Self {
+        self.changed = changed;
+        self
     }
 }
 

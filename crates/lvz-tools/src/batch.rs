@@ -237,7 +237,9 @@ in={} out={}).\n{}",
             total.output_tokens,
             lines.join("\n")
         );
-        Ok(ToolOutput::ok(summary))
+        // `applied` counts only writes that actually changed a file (unchanged/failed are skipped),
+        // so it is the real-mutation signal the agent's convergence levers key on.
+        Ok(ToolOutput::ok(summary).changed(applied > 0))
     }
 }
 

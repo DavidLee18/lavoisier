@@ -659,6 +659,10 @@ async fn run_loop(
         history.push(turn.to_assistant_message());
 
         let mut results = Vec::with_capacity(turn.tool_calls.len());
+        // Did an edit tool *actually* mutate a file this turn? Keyed off the tool's `changed`
+        // signal, not merely which tool was called — so a failed/no-op edit (e.g. anchors that
+        // didn't match) is not mistaken for progress by the convergence levers (§6.6).
+        let mut made_real_edit = false;
         for call in &turn.tool_calls {
             // Enforce the agent-side knobs (§6.6/§6.1): inject the tuner's skeleton radius into
             // focused outlines and cap batch `paths` to batch_width.
@@ -681,6 +685,7 @@ async fn run_loop(
                     // Record the pre-truncation size for counterfactual truncate-knob crediting.
                     let len = out.content.len();
                     max_result_bytes = Some(max_result_bytes.map_or(len, |m| m.max(len)));
+                    made_real_edit |= out.changed && is_edit_tool(&call.name);
                     ContentBlock::ToolResult {
                         tool_use_id: call.id.clone(),
                         content: truncate(&out.content, knobs.truncate_bytes),
@@ -697,7 +702,10 @@ async fn run_loop(
         }
 
         // --- Convergence levers (act on turns that made tool calls) ---
-        let made_edit = turn.tool_calls.iter().any(|c| is_edit_tool(&c.name));
+        // "Made an edit" means a file actually changed this turn — an edit tool that no-op'd
+        // (anchors didn't match, identical rewrite) is *not* progress, so it neither resets the
+        // no-progress streak nor lets in-loop-verify declare the task done on an unchanged tree.
+        let made_edit = made_real_edit;
         if made_edit {
             edit_free_streak = 0;
             nudged_at = None;
@@ -2170,6 +2178,51 @@ mod tests {
             1,
             "stop right after the first edit turn whose verify passes"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn in_loop_verify_ignores_a_no_op_edit() {
+        // Regression (benchmark-surfaced): an edit tool that is *called* but changes nothing must
+        // not let in-loop-verify declare the task done on an unchanged tree. Here write_file rewrites
+        // a file with its existing content (changed=false), and the verify command passes anyway —
+        // the loop must NOT stop; it must continue to the next model turn.
+        let dir = std::env::temp_dir().join(format!("lvz_noop_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("f.txt").to_string_lossy().to_string();
+        std::fs::write(&p, "same").unwrap(); // pre-existing content the model will "rewrite" verbatim
+        let noop_edit = vec![
+            Event::ToolUseStart {
+                id: "e1".into(),
+                name: "write_file".into(),
+            },
+            Event::ToolUseDelta {
+                id: "e1".into(),
+                json: format!("{{\"path\":\"{p}\",\"content\":\"same\"}}"),
+            },
+            Event::ToolUseEnd { id: "e1".into() },
+            Event::Done(StopReason::ToolUse),
+        ];
+        let provider = ScriptedProvider::new(vec![
+            noop_edit,
+            vec![
+                Event::TextDelta("continued".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+        ]);
+        let config = AgentConfig::default()
+            .with_in_loop_verify(true)
+            .with_verify_command("exit 0"); // passes, but the edit was a no-op
+        let agent = Agent::new(provider.clone(), ToolRegistry::with_builtins(), config);
+        let events = collect(agent.run("rewrite it identically")).await;
+        // The loop reached the second turn instead of false-stopping on the no-op edit.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::TextDelta(t) if t == "continued")),
+            "no-op edit must not trigger in-loop-verify: {events:?}"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
