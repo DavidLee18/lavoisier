@@ -54,6 +54,12 @@ to double-check. When a change spans several files, apply them with one edit_fil
 (batching per-file anchored edits) instead of one edit_anchored call per file. When several tool \
 calls are independent, issue them together in a single turn (parallel tool use) rather than one \
 per turn — e.g. read_files/outline_files for many files at once, and edit_files for many edits. \
+Anchored edits target a line by the opaque ANCHOR token shown by read_anchored (the part before \
+'│'), NOT the line's text. They cannot target identical lines: for a project-wide rename of an \
+identifier that recurs on many byte-identical lines (e.g. a method defined in several classes), \
+do not loop on edit_anchored — apply it in ONE shell call, `sed -i 's/old_name/new_name/g' <files>` \
+across the affected files. If an anchored edit ever reports 'ambiguous' or 'no line matches', do \
+not retry the same anchor: switch to a unique nearby anchor or to shell sed. \
 Take minimal, targeted actions; do not narrate. Do not echo file contents or \
 tool output back in your replies; reference line anchors and let edit_anchored's diff stand \
 as the record of changes. When the task is complete, give a one-line summary.";

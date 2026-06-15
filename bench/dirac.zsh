@@ -48,7 +48,7 @@ RESULTS=$SCRIPT_DIR/results/dirac-$STAMP
 REPOS=$SCRIPT_DIR/repos
 mkdir -p $RESULTS $REPOS
 SUMMARY=$RESULTS/summary.tsv
-print "task\tverify\tdirac_cost_usd" > $SUMMARY
+print "task\tpass\tchanged\tdirac_cost_usd" > $SUMMARY
 print -u2 "Reminder: set thinking=HIGH in Dirac's model settings; record per-task cost from \`dirac history\`.\n"
 
 # Robust clone for huge repos: shallow + single-branch over HTTP/1.1, with retries (macOS system
@@ -97,15 +97,21 @@ for f in $SCRIPT_DIR/tasks/*.task(N); do
   print -u2 "  running: $DIRAC $DIRAC_FLAGS --model $MODEL  (plan mode is interactive if -p)"
   ( cd $repo; $DIRAC ${=DIRAC_FLAGS} --model $MODEL "$instruction" ) 2>&1 | tee $log
 
-  # Grade with the SAME verify-cmd the Lavoisier harness uses.
+  # Capture Dirac's actual changes BEFORE grading, so a pass can be validated against a real diff
+  # (parity with run.zsh; guards against a lint-only verify passing on an unchanged tree).
+  ( cd $repo; git add -A -N >/dev/null 2>&1; git diff > $RESULTS/$id.patch 2>/dev/null )
+
+  # Grade with the SAME rule as run.zsh: a REAL pass needs an actual change AND the verify gate
+  # passing (a lint that passes on an unchanged tree is not a pass).
+  changed=no; [[ -s $RESULTS/$id.patch ]] && changed=yes
   verdict=fail
-  if ( cd $repo; eval "$VERIFY" ) >>$log 2>&1; then verdict=pass; (( pass++ )); fi
+  if [[ $changed == yes ]] && ( cd $repo; eval "$VERIFY" ) >>$log 2>&1; then verdict=pass; (( pass++ )); fi
   (( count++ ))
 
   # Best-effort cost scrape from Dirac's output (confirm with `dirac history`).
   cost=$(grep -oiE '\$[0-9]+\.[0-9]+' $log | tail -1)
-  print "$id\t$verdict\t${cost:-?}" >> $SUMMARY
-  print -u2 "  → verify=$verdict  dirac_cost=${cost:-'(read from dirac history)'}"
+  print "$id\t$verdict\t$changed\t${cost:-?}" >> $SUMMARY
+  print -u2 "  → pass=$verdict (changed=$changed)  dirac_cost=${cost:-'(read from dirac history)'}"
 done
 
 print -u2 "\n==== DIRAC SUMMARY (model=$MODEL flags=$DIRAC_FLAGS) ===="

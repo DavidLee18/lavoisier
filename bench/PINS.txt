@@ -1,0 +1,8 @@
+# Pinned repo commits for the GA head-to-head benchmark (2026-06-15).
+# The local clones under bench/repos/ are frozen at these SHAs (the harness never fetches),
+# so Lavoisier and Dirac run on identical inputs. To reproduce on a fresh machine, full-clone
+# each repo and `git checkout <sha>` (a shallow --depth 1 clone won't contain an arbitrary sha).
+
+django        f1440a752ec034277ccdad914995c3f164308e41
+transformers  801413961815dad5f943b77bb83645c5ef7bcc82
+vscode        588cbae5ac25eda4c1f07e9a64e9bd96d2e49bad

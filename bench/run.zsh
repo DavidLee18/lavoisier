@@ -78,7 +78,7 @@ RESULTS=$SCRIPT_DIR/results/$STAMP
 REPOS=$SCRIPT_DIR/repos
 mkdir -p $RESULTS $REPOS
 SUMMARY=$RESULTS/summary.tsv
-print "task\tsuccess\tin\tout\tcache_read\tcache_creation\tround_trips\tcost_usd" > $SUMMARY
+print "task\tpass\tchanged\tverify\tagent_ok\tin\tout\tcache_read\tcache_creation\tround_trips\tcost_usd" > $SUMMARY
 
 typeset -F total_cost=0
 pass=0 count=0
@@ -130,10 +130,16 @@ run_one() {
   parse_telemetry $log
   local c=$(cost_usd)
   [[ -n $c ]] && total_cost=$(( total_cost + c ))
-  print "$id\t$T_OK\t$T_IN\t$T_OUT\t$T_CR\t$T_CW\t$T_RT\t$c" >> $SUMMARY
-  [[ $T_OK == true ]] && (( pass++ ))
+  # Independent grade: a REAL pass requires an actual workspace change AND the verify gate passing.
+  # A lint that passes on an unchanged tree (empty patch) is NOT a pass — this is what makes the
+  # number trustworthy regardless of which tool the agent used (or whether it false-stopped).
+  local changed=no; [[ -s $RESULTS/$id.patch ]] && changed=yes
+  local vpass=no; ( cd $repo; eval "$verify" ) >>$log 2>&1 && vpass=yes
+  local realpass=false; [[ $changed == yes && $vpass == yes ]] && realpass=true
+  print "$id\t$realpass\t$changed\t$vpass\t$T_OK\t$T_IN\t$T_OUT\t$T_CR\t$T_CW\t$T_RT\t$c" >> $SUMMARY
+  [[ $realpass == true ]] && (( pass++ ))
   (( count++ ))
-  print -u2 "  → success=$T_OK  cost=\$$c  (in=$T_IN out=$T_OUT cache_read=$T_CR cache_creation=$T_CW rt=$T_RT)"
+  print -u2 "  → pass=$realpass (changed=$changed verify=$vpass agent_said=$T_OK)  cost=\$$c  (in=$T_IN out=$T_OUT cache_read=$T_CR cache_creation=$T_CW rt=$T_RT)"
 }
 
 # --- smoke mode: a throwaway repo + trivial task, to validate the whole pipeline cheaply ---
