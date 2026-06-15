@@ -166,6 +166,15 @@ async fn metrics_endpoint_reports_turn_telemetry() {
         after.contains("lavoisier_output_tokens_total 1"),
         "metrics:\n{after}"
     );
+    // The derived cache-hit-rate gauge is exported; EchoAgent bills no cache tokens ⇒ 0.
+    assert!(
+        after.contains("# TYPE lavoisier_cache_hit_rate gauge"),
+        "metrics:\n{after}"
+    );
+    assert!(
+        after.contains("lavoisier_cache_hit_rate 0\n"),
+        "metrics:\n{after}"
+    );
 }
 
 #[tokio::test]

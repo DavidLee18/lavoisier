@@ -325,6 +325,24 @@ impl Metrics {
             "Summed wall-clock turn latency, microseconds.",
             g(&self.turn_duration_micros_total),
         );
+        // Derived gauge: the share of prompt tokens served from cache. Total prompt tokens =
+        // fresh input + cache reads + cache writes; the ratio is the single number operators
+        // watch to confirm the caching levers (§6.1) are paying off. 0.0 until any prompt
+        // tokens are billed (avoids a NaN from 0/0).
+        let cache_read = g(&self.cache_read_tokens_total);
+        let prompt_total =
+            g(&self.input_tokens_total) + cache_read + g(&self.cache_creation_tokens_total);
+        let hit_rate = if prompt_total == 0 {
+            0.0
+        } else {
+            cache_read as f64 / prompt_total as f64
+        };
+        s.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {hit_rate}\n",
+            name = "lavoisier_cache_hit_rate",
+            help =
+                "Fraction of prompt tokens served from cache (cache_read / total prompt tokens)."
+        ));
         s
     }
 }
@@ -550,6 +568,29 @@ mod tests {
 
         let done = to_json(Ok(Event::Done(StopReason::EndTurn)));
         assert!(done.contains("done") && done.contains("end_turn"));
+    }
+
+    #[test]
+    fn cache_hit_rate_gauge_reflects_recorded_usage() {
+        let metrics = Metrics::default();
+        // Empty: gauge present and 0.0 (no division by zero).
+        let empty = metrics.render_prometheus();
+        assert!(empty.contains("# TYPE lavoisier_cache_hit_rate gauge"));
+        assert!(empty.contains("lavoisier_cache_hit_rate 0\n"));
+
+        // 30 fresh input + 60 cache reads + 10 cache writes ⇒ 60/100 = 0.6.
+        metrics.record_turn(
+            &Usage {
+                input_tokens: 30,
+                cache_read_tokens: 60,
+                cache_creation_tokens: 10,
+                ..Default::default()
+            },
+            Duration::ZERO,
+            false,
+        );
+        let out = metrics.render_prometheus();
+        assert!(out.contains("lavoisier_cache_hit_rate 0.6\n"), "got: {out}");
     }
 
     #[test]

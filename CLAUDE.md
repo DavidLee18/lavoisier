@@ -254,11 +254,12 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   `BayesTuner` persistence and deeper (reasoning-level) radius modelling remain (`docs/ATO.md` §10).
 - **Telemetry (§6.4).** Usage is aggregated, the `--budget` ceiling is enforced, the
   **HTTP gateway exports Prometheus `/metrics`** (tokens, cache read/creation, turns,
-  errors, summed latency), and the **CLI/agent path now has an in-process hook** —
-  `Agent::with_telemetry(Arc<dyn TelemetrySink>)` emits a per-task `TaskTelemetry`, surfaced
-  by `--telemetry` (one-shot `--agent` runs print a stderr summary line). The per-task ATO
-  success signal exists (`--verify-cmd`). Still missing: cache-hit-rate as its own `/metrics`
-  gauge (it's derivable from the exported counters but not surfaced separately).
+  errors, summed latency, **plus a derived `lavoisier_cache_hit_rate` gauge** — cache_read ÷
+  total prompt tokens, the single number for confirming the §6.1 caching levers are paying
+  off; 0.0 until any prompt tokens are billed), and the **CLI/agent path now has an in-process
+  hook** — `Agent::with_telemetry(Arc<dyn TelemetrySink>)` emits a per-task `TaskTelemetry`,
+  surfaced by `--telemetry` (one-shot `--agent` runs print a stderr summary line). The per-task
+  ATO success signal exists (`--verify-cmd`).
 - **Skeleton fidelity.** Python docstrings are now **kept** when a body is elided
   (`LangSpec.keeps_docstring`; the skeletoniser elides only the post-docstring range and
   re-indents the placeholder). The symbol-dependency graph is now **AST-resolved + scope-aware**:
