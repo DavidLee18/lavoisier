@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use crate::event::Usage;
+use crate::event::{CostWeights, Usage};
 use crate::tune::{Archetype, Knobs, ModelTier};
 
 /// What a task cost and how it ended — emitted once per task to a [`TelemetrySink`].
@@ -24,6 +24,9 @@ pub struct TaskTelemetry {
     pub knobs: Knobs,
     /// Token usage summed across every round-trip (incl. compaction/advisor calls).
     pub usage: Usage,
+    /// The cost weights the task's budget/ATO objective used — so a sink can report the same
+    /// cost-weighted figure ([`cost`](Self::cost)) the agent optimised, not just raw tokens.
+    pub cost_weights: CostWeights,
     /// Number of model round-trips the task took.
     pub round_trips: u32,
     /// Whether the task succeeded (the ATO constraint signal; see [`crate::Outcome::success`]).
@@ -33,6 +36,12 @@ pub struct TaskTelemetry {
 }
 
 impl TaskTelemetry {
+    /// The cost-weighted task total ([`Usage::cost`]) under [`cost_weights`](Self::cost_weights) —
+    /// the figure the budget ceiling and the ATO tuner actually minimised.
+    pub fn cost(&self) -> u64 {
+        self.usage.cost(&self.cost_weights)
+    }
+
     /// Fraction of input tokens served from cache this task (0 when nothing was read/cacheable).
     pub fn cache_hit_rate(&self) -> f32 {
         let cacheable = self.usage.input_tokens + self.usage.cache_read_tokens;

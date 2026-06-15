@@ -264,9 +264,11 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   errors, summed latency, **plus a derived `lavoisier_cache_hit_rate` gauge** — cache_read ÷
   total prompt tokens, the single number for confirming the §6.1 caching levers are paying
   off; 0.0 until any prompt tokens are billed), and the **CLI/agent path now has an in-process
-  hook** — `Agent::with_telemetry(Arc<dyn TelemetrySink>)` emits a per-task `TaskTelemetry`,
-  surfaced by `--telemetry` (one-shot `--agent` runs print a stderr summary line). The per-task
-  ATO success signal exists (`--verify-cmd`).
+  hook** — `Agent::with_telemetry(Arc<dyn TelemetrySink>)` emits a per-task `TaskTelemetry`
+  (which now carries `cost_weights` + a `cost()` helper), surfaced by `--telemetry` (one-shot
+  `--agent` runs print a stderr summary line reporting both the **cost-weighted `cost=`** — the
+  figure the budget/ATO objective minimised — and raw `tokens=`). The per-task ATO success signal
+  exists (`--verify-cmd`).
 - **Skeleton fidelity.** Python docstrings are now **kept** when a body is elided
   (`LangSpec.keeps_docstring`; the skeletoniser elides only the post-docstring range and
   re-indents the placeholder). The symbol-dependency graph is now **AST-resolved + scope-aware**:
@@ -297,18 +299,24 @@ sequential workflows that accumulate ≥3 turn-pairs.)
   of them" signal — see `bench/README.md` Findings #2); the default system prompt now steers to it
   and tells the model to stop once it has the full set. Unit-tested + scale-smoked vs the django
   checkout (`#[ignore]`d `find_references_scale_smoke`, `LVZ_SMOKE_DIR`/`LVZ_SMOKE_NAME`).
-- **Cache-aware repo-skeleton prefix (§6.1) — implemented.** `AgentConfig.repo_skeleton:
-  Option<usize>` (CLI `--repo-skeleton <TOKENS>`): `build_repo_skeleton` does a bounded, sorted
-  (deterministic ⇒ byte-stable) walk of `repo_root`, tree-sitter–skeletonises every source file to
-  a token budget, and the result is built **once** (memoised in an `Arc<OnceLock>` on the `Agent`)
-  and injected by `build_request` as the **first content block of the first user message**, marked
-  cacheable. Ordered immutable→stable→volatile, it extends the cached prefix (system + tool defs +
-  skeleton) ahead of the volatile conversation, so a caching provider pays for it once and re-reads
-  it cheaply each later round-trip / same-repo task. Off by default; most valuable with Anthropic
-  caching + a long-running `--serve`. Unit-tested (determinism, budget, cached-prefix injection)
-  and **live-verified vs Anthropic** (`claude-haiku-4-5`, `--repo-skeleton 4000`): a 2-round-trip
-  task showed the prefix `cache_creation` on turn 1 then `cache_read` on turn 2 (~99% cache hit).
-  Caching now marks the system prompt, the last tool def, **and** the repo-skeleton block.
+- **Cache-aware repo-skeleton prefix (§6.1) — implemented, relevance-ranked.** `AgentConfig.repo_skeleton:
+  Option<usize>` (CLI `--repo-skeleton <TOKENS>`). Two stages: `collect_repo_skeletons` does a
+  bounded, sorted walk of `repo_root` and tree-sitter–skeletonises **every** source file once
+  (memoised in an `Arc<OnceLock>` on the `Agent`, so a long-running `--serve` walks the repo only
+  once); then per task `assemble_repo_skeleton` **relevance-ranks** those files against the task
+  prompt (distinct query terms ≥3 chars matched in path — weighted 2× — + skeleton) and accumulates
+  `===== <path> =====` sections to the token budget. So a limited budget is spent on the code most
+  likely to matter instead of alphabetical order; an empty/short prompt falls back to sorted path
+  order (the prior behaviour). `build_request` injects the result as the **first content block of
+  the first user message**, marked cacheable. Ordered immutable→stable→volatile, it extends the
+  cached prefix (system + tool defs + skeleton) ahead of the volatile conversation. The assembled
+  prefix is stable for a fixed task ⇒ caches across that task's round-trips; ranking is per-task, so
+  in `--serve` different tasks get different (relevant-to-them) prefixes — the cross-task skeleton
+  re-use is traded for relevance, while the system+tools prefix still caches. Off by default; most
+  valuable with Anthropic caching. Unit-tested (determinism, budget, **relevance ranking**,
+  cached-prefix injection) and **live-verified vs Anthropic** (`claude-haiku-4-5`, `--repo-skeleton
+  4000`): the prefix `cache_creation` on turn 1 then `cache_read` on turn 2 (~99% cache hit).
+  Caching marks the system prompt, the last tool def, **and** the repo-skeleton block.
 
 ### Gotchas
 

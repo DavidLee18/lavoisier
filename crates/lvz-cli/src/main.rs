@@ -600,10 +600,11 @@ struct StderrTelemetry;
 impl TelemetrySink for StderrTelemetry {
     fn record(&self, t: &TaskTelemetry) {
         eprintln!(
-            "[telemetry] archetype={:?} model={} tokens={} (in={} out={} cache_read={} cache_creation={}) \
+            "[telemetry] archetype={:?} model={} cost={} tokens={} (in={} out={} cache_read={} cache_creation={}) \
 cache_hit={:.0}% round_trips={} success={} elapsed={}ms radius={} truncate={} compact_after={} batch={}",
             t.archetype,
             t.model,
+            t.cost(),
             t.usage.total(),
             t.usage.input_tokens,
             t.usage.output_tokens,

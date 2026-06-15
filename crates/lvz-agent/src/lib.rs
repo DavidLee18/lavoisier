@@ -362,10 +362,13 @@ pub struct Agent {
     config: AgentConfig,
     tuner: Arc<dyn Tuner>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
-    /// Lazily-built, shared cache of the repo-skeleton prefix (§6.1): built once on the first
-    /// turn that needs it, reused verbatim afterwards so a long-running `--serve` walks the repo
-    /// only once and the cached prefix stays byte-identical across turns.
-    repo_skeleton: Arc<OnceLock<Option<String>>>,
+    /// Lazily-built, shared cache of the per-file repo skeletons (§6.1): the expensive walk +
+    /// tree-sitter skeletonisation of every source file (`(relative path, skeleton)`) runs once on
+    /// the first turn that needs it, so a long-running `--serve` walks the repo only once. The
+    /// per-task prefix is then *assembled* from this (relevance-ranked against the task, cut to the
+    /// token budget) by [`assemble_repo_skeleton`] — cheap string work, stable within a task so the
+    /// cached prefix stays byte-identical across that task's round-trips.
+    repo_skeleton: Arc<OnceLock<Vec<(String, String)>>>,
 }
 
 impl Agent {
@@ -458,24 +461,28 @@ async fn run_loop(
     config: AgentConfig,
     tuner: Arc<dyn Tuner>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
-    skeleton_cell: Arc<OnceLock<Option<String>>>,
+    skeleton_cell: Arc<OnceLock<Vec<(String, String)>>>,
     mut history: Vec<Message>,
     tx: &Sink,
 ) {
     let started = std::time::Instant::now();
     let tool_defs = tools.defs();
     let caps = provider.capabilities();
-    // Cache-aware repo-skeleton prefix (§6.1): build the bounded whole-repo skeleton once (shared
-    // across turns via the `OnceLock`), then inject it as the cached first block of each request.
-    let repo_skeleton: Option<&str> = match (config.repo_skeleton, config.repo_root.as_deref()) {
-        (Some(budget), Some(root)) => skeleton_cell
-            .get_or_init(|| build_repo_skeleton(root, budget))
-            .as_deref(),
-        _ => None,
-    };
-    let mut total = Usage::default();
     // Classify against the latest user turn (the task); earlier seeded turns are context.
     let task_text = history.last().map(|m| m.text()).unwrap_or_default();
+    // Cache-aware repo-skeleton prefix (§6.1): skeletonise the whole repo once (memoised in the
+    // `OnceLock`), then assemble this task's prefix from it — files relevance-ranked against the
+    // task prompt so a limited token budget is spent on the code most likely to matter, then cut to
+    // budget. Stable for the whole task ⇒ caches across its round-trips.
+    let repo_skeleton: Option<String> = match (config.repo_skeleton, config.repo_root.as_deref()) {
+        (Some(budget), Some(root)) => {
+            let files = skeleton_cell.get_or_init(|| collect_repo_skeletons(root));
+            assemble_repo_skeleton(files, budget, &task_text)
+        }
+        _ => None,
+    };
+    let repo_skeleton: Option<&str> = repo_skeleton.as_deref();
+    let mut total = Usage::default();
     // Archetype prior: a model call when enabled (its tokens count toward the task total),
     // otherwise the free keyword heuristic; the model path falls back to the heuristic.
     let archetype = match config.classify_with_model {
@@ -812,6 +819,7 @@ impl Observation<'_> {
                 model_tier: self.config.model_tier,
                 knobs: *self.knobs,
                 usage: *total,
+                cost_weights: self.config.cost_weights,
                 round_trips,
                 success,
                 elapsed: self.started.elapsed(),
@@ -1633,13 +1641,12 @@ fn profile_repo(root: &Path) -> RepoProfile {
     }
 }
 
-/// Build the cache-aware repo-skeleton prefix (§6.1): a deterministic, token-bounded outline of
-/// every recognised source file under `root`. Each file is tree-sitter–skeletonised (signatures
-/// only, bodies elided) and emitted under a `===== <relative path> =====` header. Files are
-/// visited in **sorted path order** so the result is byte-identical across runs (a moving prefix
-/// would never cache); accumulation stops once the estimated token count reaches `token_budget`.
-/// Returns `None` when nothing skeletonisable is found. Best-effort: unreadable files are skipped.
-fn build_repo_skeleton(root: &Path, token_budget: usize) -> Option<String> {
+/// Walk `root` once and tree-sitter–skeletonise every recognised source file (signatures only,
+/// bodies elided), returning `(relative path, skeleton)` in **sorted path order** (deterministic).
+/// Bounded by `MAX_FILES`; best-effort (unreadable/unparseable files are skipped). This is the
+/// expensive half of the §6.1 repo-skeleton prefix and is memoised once per [`Agent`];
+/// [`assemble_repo_skeleton`] turns it into a per-task, budget-bounded prefix.
+fn collect_repo_skeletons(root: &Path) -> Vec<(String, String)> {
     const MAX_FILES: usize = 20_000;
     fn skip_dir(name: &str) -> bool {
         name.starts_with('.')
@@ -1649,7 +1656,6 @@ fn build_repo_skeleton(root: &Path, token_budget: usize) -> Option<String> {
             )
     }
 
-    // Collect candidate source-file paths (bounded), then sort for a stable prefix.
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -1673,7 +1679,7 @@ fn build_repo_skeleton(root: &Path, token_budget: usize) -> Option<String> {
     }
     paths.sort();
 
-    let mut out = String::new();
+    let mut files = Vec::new();
     for path in &paths {
         let Some(rel) = path.strip_prefix(root).ok().and_then(Path::to_str) else {
             continue;
@@ -1687,18 +1693,70 @@ fn build_repo_skeleton(root: &Path, token_budget: usize) -> Option<String> {
         else {
             continue;
         };
+        files.push((rel.to_string(), skel));
+    }
+    files
+}
+
+/// Assemble the §6.1 repo-skeleton prefix for one task from the memoised per-file skeletons:
+/// **relevance-rank** the files against the task `query` (so a limited budget is spent on the code
+/// most likely to matter), then accumulate `===== <path> =====` sections until the estimated token
+/// count reaches `token_budget`. Files are scored by how many distinct query terms appear in their
+/// path + skeleton; ties (and an empty query) fall back to **sorted path order**, so the result is
+/// deterministic and — for a fixed query — byte-identical across a task's round-trips (cacheable).
+/// `None` when nothing is left after assembly.
+fn assemble_repo_skeleton(
+    files: &[(String, String)],
+    token_budget: usize,
+    query: &str,
+) -> Option<String> {
+    let terms = query_terms(query);
+    // Stable relevance order: higher term-overlap first, ties broken by path (sorted-order floor).
+    let mut ranked: Vec<&(String, String)> = files.iter().collect();
+    ranked.sort_by(|a, b| {
+        let sa = relevance_score(&a.0, &a.1, &terms);
+        let sb = relevance_score(&b.0, &b.1, &terms);
+        sb.cmp(&sa).then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut out = String::new();
+    for (rel, skel) in ranked {
         let _ = write!(out, "===== {rel} =====\n{skel}\n\n");
         if estimate_tokens(&out) >= token_budget {
             break;
         }
     }
-
     let out = out.trim_end().to_string();
     if out.is_empty() {
         None
     } else {
         Some(out)
     }
+}
+
+/// Distinct lowercase query terms (alphanumeric runs of length ≥ 3) — the relevance vocabulary.
+/// Short/stop-ish fragments are dropped so common words don't dominate the score.
+fn query_terms(query: &str) -> HashSet<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .map(|t| t.to_lowercase())
+        .collect()
+}
+
+/// How many distinct `terms` appear (case-insensitively) in a file's relative path or skeleton.
+/// A path hit is the strongest signal (file names track intent: `auth.rs`, `user_handler.py`), so
+/// it is weighted double. Returns 0 when there are no terms — yielding the sorted-path fallback.
+fn relevance_score(rel: &str, skel: &str, terms: &HashSet<String>) -> usize {
+    if terms.is_empty() {
+        return 0;
+    }
+    let path_l = rel.to_lowercase();
+    let skel_l = skel.to_lowercase();
+    terms
+        .iter()
+        .map(|t| 2 * usize::from(path_l.contains(t)) + usize::from(skel_l.contains(t)))
+        .sum()
 }
 
 /// Assemble a request, marking the stable prefix cacheable iff the provider supports caching.
@@ -2926,9 +2984,10 @@ fn target() -> u32 { helper() + 10 }
         std::fs::write(dir.join("README.md"), "# not source\n").unwrap();
         std::fs::write(dir.join("target/debug/junk.rs"), "fn junk() {}\n").unwrap();
 
-        let s1 = build_repo_skeleton(&dir, 10_000).expect("some skeleton");
-        let s2 = build_repo_skeleton(&dir, 10_000).expect("some skeleton");
-        // Byte-identical across runs (sorted walk) — required for a stable cache prefix.
+        let files = collect_repo_skeletons(&dir);
+        let s1 = assemble_repo_skeleton(&files, 10_000, "").expect("some skeleton");
+        let s2 = assemble_repo_skeleton(&collect_repo_skeletons(&dir), 10_000, "").expect("skel");
+        // Byte-identical across runs (sorted walk + empty-query sorted assembly) — stable cache.
         assert_eq!(s1, s2);
         // Signatures kept, bodies elided; both source files present, target/ skipped.
         assert!(s1.contains("pub fn alpha(x: i32) -> i32"));
@@ -2953,12 +3012,50 @@ fn target() -> u32 { helper() + 10 }
             )
             .unwrap();
         }
-        // A tiny budget must stop early — far short of skeletonising all 50 files.
-        let skel = build_repo_skeleton(&dir, 30).expect("some skeleton");
+        // A tiny budget must stop early — far short of emitting all 50 files.
+        let skel = assemble_repo_skeleton(&collect_repo_skeletons(&dir), 30, "").expect("skel");
         assert!(estimate_tokens(&skel) < 80, "budget not respected: {skel}");
         assert!(skel.contains("func_0"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_skeleton_relevance_ranks_matching_files_into_a_tight_budget() {
+        let dir = std::env::temp_dir().join(format!("lvz_skelrank_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Alphabetically, `auth.rs` sorts last; a tiny budget under sorted order would never reach
+        // it. A relevance query about authentication must pull it in first regardless.
+        std::fs::write(dir.join("aaa.rs"), "pub fn aaa() -> i32 { 1 }\n").unwrap();
+        std::fs::write(dir.join("bbb.rs"), "pub fn bbb() -> i32 { 2 }\n").unwrap();
+        std::fs::write(
+            dir.join("zzz_auth.rs"),
+            "pub fn authenticate(user: i32) -> bool { true }\n",
+        )
+        .unwrap();
+        let files = collect_repo_skeletons(&dir);
+
+        // Empty query → sorted order → the tiny budget stops before the last file.
+        let plain = assemble_repo_skeleton(&files, 18, "").expect("skel");
+        assert!(
+            !plain.contains("zzz_auth.rs"),
+            "sorted order should not reach the last file at this budget: {plain}"
+        );
+        // A relevant query ranks the auth file first, so it lands inside the same budget.
+        let ranked = assemble_repo_skeleton(&files, 18, "fix the authenticate flow for a user")
+            .expect("skel");
+        assert!(
+            ranked.contains("zzz_auth.rs"),
+            "relevance ranking should surface the matching file: {ranked}"
+        );
+    }
+
+    #[test]
+    fn query_terms_drop_short_fragments_and_lowercase() {
+        let terms = query_terms("Fix the AUTH on a UserRepo!!");
+        assert!(terms.contains("fix") && terms.contains("auth") && terms.contains("userrepo"));
+        assert!(!terms.contains("on") && !terms.contains("a")); // < 3 chars dropped
     }
 
     #[test]
