@@ -878,6 +878,7 @@ dependencies = [
  "lvz-tools",
  "lvz-tune",
  "lvz-xai",
+ "serde_json",
  "tokio",
 ]
 

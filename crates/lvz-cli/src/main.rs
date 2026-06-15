@@ -224,13 +224,14 @@ struct Cli {
     #[arg(long, value_name = "TOKENS")]
     repo_skeleton: Option<usize>,
 
-    /// Offer the `batch_edit` tool (--agent/--serve): the model can fan a set of INDEPENDENT,
-    /// mechanical per-file edits out to the provider's discounted async batch API (~50% token
-    /// cost) instead of editing them one-by-one in the loop. Requires a batch-capable provider
-    /// (Anthropic / Google); ignored (with a warning) on xAI / claude-cli. Trades latency for cost,
-    /// so it is opt-in.
+    /// Disable the `batch_edit` fan-out tool (--agent/--serve). By default the model is offered
+    /// `batch_edit` whenever the provider has a discounted batch API (Anthropic / Google), letting
+    /// it run a set of INDEPENDENT, mechanical per-file edits as one async batch (~50% token cost)
+    /// instead of editing them one-by-one — Lavoisier is cost-first, so this is on by default. It
+    /// trades latency for cost; pass `--no-batch-edit` to keep every edit in the interactive loop.
+    /// (No effect on xAI / claude-cli, which have no batch API.)
     #[arg(long)]
-    batch_edit: bool,
+    no_batch_edit: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
@@ -264,6 +265,10 @@ impl From<ThinkingBudgetArg> for ThinkingLevel {
     }
 }
 
+/// A built streaming provider, plus an optional handle to the same instance as a [`BatchProvider`]
+/// (present only for providers with a discounted batch API: Anthropic / Google).
+type BuiltProvider = (Arc<dyn Provider>, Option<Arc<dyn BatchProvider>>);
+
 impl ProviderKind {
     fn default_model(self) -> &'static str {
         match self {
@@ -281,8 +286,7 @@ impl ProviderKind {
         self,
         thinking: Option<&str>,
         extended_cache_ttl: bool,
-    ) -> Result<(Arc<dyn Provider>, Option<Arc<dyn BatchProvider>>), lvz_protocol::ProviderError>
-    {
+    ) -> Result<BuiltProvider, lvz_protocol::ProviderError> {
         Ok(match self {
             ProviderKind::Xai => (Arc::new(XaiProvider::from_env()?), None),
             ProviderKind::Anthropic => {
@@ -323,12 +327,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Long-running gateways (HTTP/Matrix) get the 1-hour cache TTL on the immutable prefix.
     let serving = cli.serve.is_some() || cli.serve_matrix;
     let (provider, batch_provider) = cli.provider.build(cli.thinking.as_deref(), serving)?;
-    if cli.batch_edit && batch_provider.is_none() {
-        eprintln!(
-            "lavoisier: --batch-edit ignored: provider {:?} has no batch API (use Anthropic or Google)",
-            cli.provider
-        );
-    }
     let model = cli
         .model
         .clone()
@@ -480,9 +478,11 @@ fn build_agent(
         config = config.with_repo_root(cwd);
     }
     let mut registry = ToolRegistry::with_builtins();
-    // `batch_edit` fan-out tool (opt-in, only when the provider has a batch API). Lets the model
-    // run independent mechanical edits as one discounted async batch instead of looping over them.
-    if cli.batch_edit {
+    // `batch_edit` fan-out tool: on by default (Lavoisier is cost-first), registered whenever the
+    // provider has a batch API. Lets the model run independent mechanical edits as one discounted
+    // async batch instead of looping over them. `--no-batch-edit` opts out; providers without a
+    // batch API (xAI/claude-cli) simply never get it.
+    if !cli.no_batch_edit {
         if let Some(batch) = batch_provider {
             registry.register(Arc::new(BatchEditTool::new(batch, editor_model)));
         }
