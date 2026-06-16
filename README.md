@@ -32,8 +32,12 @@ goal at every layer:
   executor) for long tasks.
 - A **budget-fixture CI loop** that gates skeleton-size regressions against committed token ceilings.
 
-See [`bench/README.md`](bench/README.md) for the measured head-to-head vs. the Dirac agent (cost +
-real-upstream-test correctness, plus the harness) and [`ATO.md`](ATO.md) for the tuner internals.
+**Two modes.** By default Lavoisier is **efficiency-first** — lean context, caching, minimal
+round-trips. When you have a real test gate, opt into **accuracy-mode** (`--verify-cmd <tests>
+--require-edit --verify-and-fix`): the agent iterates until the tests pass. In the measured
+head-to-head this matches or beats the comparison agent on task completion *while costing less per
+completed task* — see [`bench/README.md`](bench/README.md) (cost + reproducible correctness via
+`bench/verify.zsh`). Tuner internals: [`ATO.md`](ATO.md).
 
 ## Architecture
 
