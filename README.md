@@ -74,6 +74,11 @@ ATO: `--tune` (ε-greedy) or `--tune-bayes` (Thompson sampling) · `--verify-cmd
 success gate, e.g. `cargo test`) · `--tune-state <path>` (persist learned profiles) · `--tune-decay`
 · `--telemetry` (per-task token/cost summary to stderr).
 
+Accuracy levers (opt-in — Lavoisier is efficient by default, so these trade cost for completion and
+are **off** unless asked for): `--require-edit` (don't let an edit task finish having changed nothing)
+· `--verify-and-fix` (when finishing, if `--verify-cmd` fails, feed the failure back and keep fixing,
+bounded — best with a real test gate).
+
 Gateway: `--api-key <KEY>` (repeatable) · `--rate-limit <N per 60s>`.
 
 Env: `XAI_API_KEY` / `XAI_TRANSPORT=grpc|http` (default `grpc`) / `XAI_GRPC_ENDPOINT` /

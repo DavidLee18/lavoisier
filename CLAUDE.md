@@ -106,4 +106,6 @@ XAI_API_KEY=…       cargo run -p lvz-cli -- --serve 127.0.0.1:8080   # HTTP/WS
 Key flags: `--agent`, `--serve`/`--serve-matrix`, `--provider xai|anthropic|google|claude-cli`,
 `--model`, `--thinking`, `--budget`, `--repo-skeleton`, `--tune`/`--tune-bayes` + `--verify-cmd`,
 `--cheap-model`/`--advisor-model`, `--no-batch-edit`, `--telemetry`, gateway `--api-key`/
-`--rate-limit`. Full list and env vars in `README.md`. Deploy: `infra/README.md`.
+`--rate-limit`. **Efficiency-by-default: accuracy levers are opt-in** — `--require-edit` (don't finish
+an edit task with no change) and `--verify-and-fix` (don't finish while `--verify-cmd` fails, bounded).
+Full list and env vars in `README.md`. Deploy: `infra/README.md`.

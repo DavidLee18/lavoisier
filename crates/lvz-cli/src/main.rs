@@ -123,6 +123,18 @@ struct Cli {
     #[arg(long)]
     no_converge: bool,
 
+    /// **Accuracy lever, opt-in** (--agent mode): no-edit completion guard — don't let an edit task
+    /// finish having changed no files (nudge it to act, bounded). Trades efficiency for completion,
+    /// so it is OFF by default.
+    #[arg(long)]
+    require_edit: bool,
+
+    /// **Accuracy lever, opt-in** (--agent mode): verify-and-fix — when finishing, if --verify-cmd
+    /// fails, feed the failure back and keep fixing (bounded) instead of shipping an incomplete
+    /// change. Needs --verify-cmd; trades efficiency for completeness, so it is OFF by default.
+    #[arg(long)]
+    verify_and_fix: bool,
+
     /// Cheap model to run the first turns on, escalating to --model after --escalate-after
     /// round-trips (--agent/--serve; §8 cost reduction, e.g. claude-haiku-4-5 → claude-sonnet-4-6).
     #[arg(long, value_name = "MODEL")]
@@ -458,7 +470,9 @@ fn build_agent(
         config = config.with_no_progress_limit(n);
     }
     config = config.with_budget_awareness(cli.budget_awareness || converge);
-    config = config.with_require_edit(converge);
+    // Accuracy levers stay opt-in (efficiency-by-default): only on when explicitly requested.
+    config = config.with_require_edit(cli.require_edit);
+    config = config.with_verify_and_fix(cli.verify_and_fix);
     if let Some(tb) = cli.thinking_budget {
         config = config.with_forced_thinking(tb.into());
     }

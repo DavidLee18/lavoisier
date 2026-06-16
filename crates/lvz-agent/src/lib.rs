@@ -88,6 +88,13 @@ const KEEP_RECENT_TURNS: usize = 2;
 /// edit task before accepting an empty result — so a genuinely no-edit task still terminates.
 const MAX_EDIT_NUDGES: usize = 2;
 
+/// Most times the verify-and-fix gate ([`AgentConfig::verify_and_fix`]) feeds a failing verify back
+/// before giving up — bounds the extra cost so a never-passing verify can't loop forever.
+const MAX_FIX_ATTEMPTS: usize = 3;
+
+/// Verify output fed back to the model is capped to this many bytes (keeps fix turns token-bounded).
+const VERIFY_OUTPUT_CAP: usize = 4096;
+
 /// Maximum silence between streamed events before the agent treats the provider stream as stalled
 /// and aborts the turn (no provider sets an HTTP timeout, so a hung/throttled connection would
 /// otherwise block forever). Bounds the gap *between* events, not the whole turn, so a slow but
@@ -177,9 +184,18 @@ pub struct AgentConfig {
     /// task (any [`Archetype`] except `Other`) having changed **no** files — almost always
     /// disengagement (it answered or planned instead of acting). Instead of accepting the empty
     /// result, inject a bounded nudge to make the edit and continue. Bounded by [`MAX_EDIT_NUDGES`]
-    /// so a genuinely no-edit task (e.g. a question) still terminates. Off by default; the CLI turns
-    /// it on with the other convergence levers. Skipped for the `Other` archetype (likely Q&A).
+    /// so a genuinely no-edit task (e.g. a question) still terminates. **Opt-in** (`--require-edit`):
+    /// it trades efficiency (extra turns) for completion, so it is off unless asked for. Skipped for
+    /// the `Other` archetype (likely Q&A).
     pub require_edit: bool,
+    /// **Verify-and-fix completion gate** (accuracy lever): when the model tries to finish but the
+    /// [`verify_command`](Self::verify_command) **fails**, don't accept it — feed the failure output
+    /// back and keep working until verify passes (bounded by [`MAX_FIX_ATTEMPTS`]). Catches
+    /// *incomplete* changes (a refactor that broke call sites, a partial rename) that the model
+    /// thought were done. **Opt-in** (`--verify-and-fix`, needs `--verify-cmd`): it trades efficiency
+    /// (re-running verify + extra fix turns) for completeness, so it is off by default. Only as strong
+    /// as the verify command — a noisy lint can make it chase pre-existing issues.
+    pub verify_and_fix: bool,
     /// **Budget awareness** (convergence lever): append a short `[progress: turn x/max …]` note to
     /// each tool-result message so the model knows how close it is to the step/token ceiling and can
     /// wrap up deliberately rather than being truncated. Off by default. Lives in the volatile tail,
@@ -237,6 +253,7 @@ impl Default for AgentConfig {
             in_loop_verify: false,
             no_progress_limit: None,
             require_edit: false,
+            verify_and_fix: false,
             budget_awareness: false,
             forced_thinking: None,
             cost_weights: CostWeights::default(),
@@ -318,6 +335,12 @@ impl AgentConfig {
     /// Enable the no-edit completion guard (don't let an edit task finish with zero file changes).
     pub fn with_require_edit(mut self, on: bool) -> Self {
         self.require_edit = on;
+        self
+    }
+
+    /// Enable the verify-and-fix completion gate (don't finish while the verify command fails).
+    pub fn with_verify_and_fix(mut self, on: bool) -> Self {
+        self.verify_and_fix = on;
         self
     }
 
@@ -554,10 +577,12 @@ async fn run_loop(
     // Consecutive tool-call turns that edited nothing — drives the no-progress circuit-breaker.
     let mut edit_free_streak: usize = 0;
     let mut nudged_at: Option<usize> = None;
-    // Whether *any* turn this task actually changed a file, and how many times the no-edit
-    // completion guard has nudged a disengaged finish.
+    // Whether *any* turn this task actually changed a file, how many times the no-edit completion
+    // guard has nudged a disengaged finish, and how many times the verify-and-fix gate has bounced
+    // a failing finish back.
     let mut task_edited = false;
     let mut edit_nudges: usize = 0;
+    let mut fix_attempts: usize = 0;
     // Largest untruncated tool-result seen, for the learner's safe counterfactual crediting
     // (§6.6 / `ATO.md` §3). `None` until the first tool runs.
     let mut max_result_bytes: Option<usize> = None;
@@ -719,6 +744,23 @@ async fn run_loop(
                     )],
                 });
                 continue;
+            }
+            // Verify-and-fix completion gate (opt-in, accuracy > efficiency): if the model tries to
+            // finish but the verify command FAILS, feed the failure back and keep working (bounded by
+            // MAX_FIX_ATTEMPTS) — catches incomplete changes the model thought were done.
+            if config.verify_and_fix && fix_attempts < MAX_FIX_ATTEMPTS {
+                if let Some((false, output)) = run_verify_output(&config).await {
+                    fix_attempts += 1;
+                    history.push(turn.to_assistant_message());
+                    history.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::text(format!(
+                            "Verification failed — the task is not complete. Fix the issues below, \
+                             then finish only once it passes.\n\n{output}"
+                        ))],
+                    });
+                    continue;
+                }
             }
             let stop = turn.stop.unwrap_or(StopReason::EndTurn);
             // Real ATO success signal (§6.6): a clean completion is only counted successful if
@@ -1031,6 +1073,29 @@ async fn run_verify(config: &AgentConfig) -> bool {
         command.current_dir(root);
     }
     matches!(command.status().await, Ok(status) if status.success())
+}
+
+/// Like [`run_verify`] but **captures** the command's combined output, for the verify-and-fix gate.
+/// `None` when no command is configured; else `Some((passed, output))` with the output capped to
+/// [`VERIFY_OUTPUT_CAP`] bytes so feeding it back stays token-bounded.
+async fn run_verify_output(config: &AgentConfig) -> Option<(bool, String)> {
+    let cmd = config.verify_command.as_ref()?;
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(cmd)
+        .stdin(std::process::Stdio::null());
+    if let Some(root) = &config.repo_root {
+        command.current_dir(root);
+    }
+    match command.output().await {
+        Ok(out) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            Some((out.status.success(), truncate(&text, VERIFY_OUTPUT_CAP)))
+        }
+        Err(e) => Some((false, format!("verify command failed to run: {e}"))),
+    }
 }
 
 /// Tool names that mutate files — used by the no-progress / in-loop-verify convergence levers to
@@ -2412,6 +2477,39 @@ mod tests {
         let config = AgentConfig::default().with_require_edit(true);
         let agent = Agent::new(provider.clone(), ToolRegistry::with_builtins(), config);
         let _ = collect(agent.run("what is 2 plus 2")).await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn verify_and_fix_bounces_a_failing_finish_until_bounded() {
+        // verify always fails: each finish attempt is fed back and retried, bounded by
+        // MAX_FIX_ATTEMPTS (3) — so the loop bounces 3 times then accepts the 4th finish.
+        let finish = || {
+            vec![
+                Event::TextDelta("I think it's done.".into()),
+                Event::Done(StopReason::EndTurn),
+            ]
+        };
+        let provider = ScriptedProvider::new(vec![finish(), finish(), finish(), finish()]);
+        let config = AgentConfig::default()
+            .with_verify_and_fix(true)
+            .with_verify_command("exit 1");
+        let agent = Agent::new(provider.clone(), ToolRegistry::with_builtins(), config);
+        let _ = collect(agent.run("do the thing")).await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), MAX_FIX_ATTEMPTS + 1);
+    }
+
+    #[tokio::test]
+    async fn verify_and_fix_accepts_a_passing_finish_immediately() {
+        let provider = ScriptedProvider::new(vec![vec![
+            Event::TextDelta("done".into()),
+            Event::Done(StopReason::EndTurn),
+        ]]);
+        let config = AgentConfig::default()
+            .with_verify_and_fix(true)
+            .with_verify_command("exit 0");
+        let agent = Agent::new(provider.clone(), ToolRegistry::with_builtins(), config);
+        let _ = collect(agent.run("do the thing")).await;
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 
