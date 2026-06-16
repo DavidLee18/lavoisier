@@ -25,16 +25,26 @@ for c in lvz-protocol lvz-context lvz-anthropic lvz-google lvz-xai lvz-claude-cl
 done
 ```
 
-Then publish for real, waiting for each to index before the next (crates.io is usually ready within
-a few seconds; `cargo publish` will retry/resolve):
+Then publish for real, **in this order**. Two limits to know:
+- `cargo publish` already waits for each version to index before returning, so deps resolve.
+- crates.io rate-limits **brand-new crate names** to ~1 per 10 minutes (after a small burst). On a
+  fresh workspace the first ~5 publish immediately, then you'll get `429 Too Many Requests` with a
+  "try again after" time. The loop below **waits out the 429 and retries**, so the whole set
+  (~13 new crates) completes hands-off in roughly 1.5 hours:
 
 ```sh
 for c in lvz-protocol lvz-context lvz-anthropic lvz-google lvz-xai lvz-claude-cli \
          lvz-tune lvz-gw-http lvz-gw-matrix lvz-tools lvz-agent lvz-memory lavoisier; do
-  cargo publish -p "$c" || { echo "stopped at $c"; break; }
-  sleep 20
+  until out=$(cargo publish -p "$c" 2>&1); do
+    echo "$out" | grep -qiE '429|Too Many Requests' || { echo "$out" | tail; echo "HARD FAIL: $c"; exit 1; }
+    echo "rate-limited on $c — sleeping 11m…"; sleep 660
+  done
 done
 ```
+
+(Once published, *version bumps* are not new-crate publishes, so they are not subject to this
+limit — only the initial publish of each new name is. A higher limit can be requested from
+help@crates.io.)
 
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump the version (all crates share `0.1.0`; keep them in lockstep) before re-publishing.
