@@ -458,6 +458,7 @@ fn build_agent(
         config = config.with_no_progress_limit(n);
     }
     config = config.with_budget_awareness(cli.budget_awareness || converge);
+    config = config.with_require_edit(converge);
     if let Some(tb) = cli.thinking_budget {
         config = config.with_forced_thinking(tb.into());
     }

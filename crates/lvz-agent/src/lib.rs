@@ -84,6 +84,10 @@ const ADVISOR_MAX_TOKENS: u32 = 512;
 /// Number of trailing (assistant, tool-result) turn-pairs kept verbatim when compacting.
 const KEEP_RECENT_TURNS: usize = 2;
 
+/// Most times the no-edit completion guard ([`AgentConfig::require_edit`]) nudges a disengaged
+/// edit task before accepting an empty result — so a genuinely no-edit task still terminates.
+const MAX_EDIT_NUDGES: usize = 2;
+
 /// Maximum silence between streamed events before the agent treats the provider stream as stalled
 /// and aborts the turn (no provider sets an HTTP timeout, so a hung/throttled connection would
 /// otherwise block forever). Bounds the gap *between* events, not the whole turn, so a slow but
@@ -169,6 +173,13 @@ pub struct AgentConfig {
     /// tool-call turns that edited nothing, inject a one-time nudge to act; after `2n`, hard-stop the
     /// loop (`Done(Other("no_progress"))`). Breaks the explore-forever paralysis. `None` disables it.
     pub no_progress_limit: Option<usize>,
+    /// **No-edit completion guard** (convergence lever): refuse to let the model "finish" an *edit*
+    /// task (any [`Archetype`] except `Other`) having changed **no** files — almost always
+    /// disengagement (it answered or planned instead of acting). Instead of accepting the empty
+    /// result, inject a bounded nudge to make the edit and continue. Bounded by [`MAX_EDIT_NUDGES`]
+    /// so a genuinely no-edit task (e.g. a question) still terminates. Off by default; the CLI turns
+    /// it on with the other convergence levers. Skipped for the `Other` archetype (likely Q&A).
+    pub require_edit: bool,
     /// **Budget awareness** (convergence lever): append a short `[progress: turn x/max …]` note to
     /// each tool-result message so the model knows how close it is to the step/token ceiling and can
     /// wrap up deliberately rather than being truncated. Off by default. Lives in the volatile tail,
@@ -225,6 +236,7 @@ impl Default for AgentConfig {
             repo_skeleton: None,
             in_loop_verify: false,
             no_progress_limit: None,
+            require_edit: false,
             budget_awareness: false,
             forced_thinking: None,
             cost_weights: CostWeights::default(),
@@ -300,6 +312,12 @@ impl AgentConfig {
     /// Set the no-progress circuit-breaker limit: nudge after `n` edit-free turns, stop after `2n`.
     pub fn with_no_progress_limit(mut self, n: usize) -> Self {
         self.no_progress_limit = Some(n);
+        self
+    }
+
+    /// Enable the no-edit completion guard (don't let an edit task finish with zero file changes).
+    pub fn with_require_edit(mut self, on: bool) -> Self {
+        self.require_edit = on;
         self
     }
 
@@ -536,6 +554,10 @@ async fn run_loop(
     // Consecutive tool-call turns that edited nothing — drives the no-progress circuit-breaker.
     let mut edit_free_streak: usize = 0;
     let mut nudged_at: Option<usize> = None;
+    // Whether *any* turn this task actually changed a file, and how many times the no-edit
+    // completion guard has nudged a disengaged finish.
+    let mut task_edited = false;
+    let mut edit_nudges: usize = 0;
     // Largest untruncated tool-result seen, for the learner's safe counterfactual crediting
     // (§6.6 / `ATO.md` §3). `None` until the first tool runs.
     let mut max_result_bytes: Option<usize> = None;
@@ -677,6 +699,27 @@ async fn run_loop(
         }
 
         if turn.tool_calls.is_empty() {
+            // No-edit completion guard (convergence): an edit task that finishes having changed
+            // nothing is almost always disengagement — the model answered/planned instead of acting.
+            // Nudge it to actually edit (bounded by MAX_EDIT_NUDGES) rather than accept an empty
+            // result. Skipped for the `Other` archetype (likely a question, no edit expected).
+            if config.require_edit
+                && !task_edited
+                && ctx.archetype != Archetype::Other
+                && edit_nudges < MAX_EDIT_NUDGES
+            {
+                edit_nudges += 1;
+                history.push(turn.to_assistant_message());
+                history.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::text(
+                        "You haven't changed any files yet, but this task requires edits. Make the \
+                         necessary change(s) now with str_replace — or, if no change is genuinely \
+                         needed, say so explicitly and why.",
+                    )],
+                });
+                continue;
+            }
             let stop = turn.stop.unwrap_or(StopReason::EndTurn);
             // Real ATO success signal (§6.6): a clean completion is only counted successful if
             // the optional verify command also passes (exit 0). With no command set this is the
@@ -745,6 +788,7 @@ async fn run_loop(
         // (anchors didn't match, identical rewrite) is *not* progress, so it neither resets the
         // no-progress streak nor lets in-loop-verify declare the task done on an unchanged tree.
         let made_edit = made_real_edit;
+        task_edited |= made_real_edit;
         if made_edit {
             edit_free_streak = 0;
             nudged_at = None;
@@ -2316,6 +2360,59 @@ mod tests {
         );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn require_edit_nudges_a_disengaged_edit_task_instead_of_finishing_empty() {
+        let dir = std::env::temp_dir().join(format!("lvz_req_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("f.txt").to_string_lossy().to_string();
+        std::fs::write(&p, "old\n").unwrap();
+        // Turn 1: the model tries to finish with NO edit (disengagement). Turn 2: after the nudge it
+        // makes a real edit. Turn 3: it finishes for real.
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                Event::TextDelta("Looks fine already.".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+            vec![
+                Event::ToolUseStart {
+                    id: "e1".into(),
+                    name: "str_replace".into(),
+                },
+                Event::ToolUseDelta {
+                    id: "e1".into(),
+                    json: format!("{{\"path\":\"{p}\",\"old\":\"old\",\"new\":\"new\"}}"),
+                },
+                Event::ToolUseEnd { id: "e1".into() },
+                Event::Done(StopReason::ToolUse),
+            ],
+            vec![
+                Event::TextDelta("done".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+        ]);
+        // "rename …" classifies as an edit archetype, so the guard applies.
+        let config = AgentConfig::default().with_require_edit(true);
+        let agent = Agent::new(provider.clone(), ToolRegistry::with_builtins(), config);
+        let _ = collect(agent.run("rename old to new in f.txt")).await;
+        // The empty turn-1 finish was nudged, not accepted: it reached the edit and the real finish.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "new\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn require_edit_does_not_nudge_a_non_edit_question() {
+        // No edit keyword → `Other` archetype → guard skipped; an empty finish is accepted at once.
+        let provider = ScriptedProvider::new(vec![vec![
+            Event::TextDelta("The answer is 4.".into()),
+            Event::Done(StopReason::EndTurn),
+        ]]);
+        let config = AgentConfig::default().with_require_edit(true);
+        let agent = Agent::new(provider.clone(), ToolRegistry::with_builtins(), config);
+        let _ = collect(agent.run("what is 2 plus 2")).await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
