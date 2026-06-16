@@ -27,13 +27,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install protoc (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
-
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
+      # Pinned modern protoc on every runner — Ubuntu's apt protoc (3.12) is too old: it rejects
+      # the proto3 `optional` fields in the vendored xAI protos. setup-protoc bundles the
+      # well-known types (timestamp.proto), which the protoc resolves built-in.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
