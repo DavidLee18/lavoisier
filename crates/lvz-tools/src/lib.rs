@@ -19,6 +19,7 @@ pub use batch::BatchEditTool;
 pub use builtins::{ListDirTool, ReadFileTool, ReadFilesTool, ShellTool, WriteFileTool};
 pub use context::{
     EditAnchoredTool, EditFilesTool, OutlineFileTool, OutlineFilesTool, ReadAnchoredTool,
+    StrReplaceTool,
 };
 pub use search::FindReferencesTool;
 
@@ -48,6 +49,8 @@ impl ToolRegistry {
         registry.register(Arc::new(OutlineFileTool));
         registry.register(Arc::new(OutlineFilesTool));
         registry.register(Arc::new(ReadAnchoredTool));
+        // str_replace: the primary, unambiguous exact-string edit (no opaque anchors).
+        registry.register(Arc::new(StrReplaceTool));
         registry.register(Arc::new(EditAnchoredTool));
         registry.register(Arc::new(EditFilesTool));
         // Repo-wide reference search — the structured replacement for ad-hoc `grep -r`.
@@ -112,13 +115,14 @@ mod tests {
             "outline_file",
             "outline_files",
             "read_anchored",
+            "str_replace",
             "edit_anchored",
             "edit_files",
             "find_references",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
-        assert_eq!(defs.len(), 11);
+        assert_eq!(defs.len(), 12);
     }
 
     #[tokio::test]

@@ -418,6 +418,132 @@ impl Tool for EditFilesTool {
     }
 }
 
+/// `str_replace` — the primary edit tool: find an **exact string** and replace it. Unlike the
+/// hash-anchored tools, there are no opaque anchors — you pass the literal text — which is the most
+/// reliable edit primitive for models. **Accuracy first:** by default `old` must occur *exactly
+/// once* in the file; a zero or non-unique match is a hard error (it never guesses or edits the wrong
+/// occurrence), so the model must add surrounding context to disambiguate or pass `replace_all`.
+/// `replace_all` replaces every occurrence (a rename), and `paths` applies the same edit to several
+/// files in one call — so a project-wide rename is a single round-trip.
+pub struct StrReplaceTool;
+
+#[derive(Deserialize)]
+struct StrReplaceArgs {
+    /// One file to edit. Use this or `paths`.
+    #[serde(default)]
+    path: Option<String>,
+    /// Several files to apply the same replacement to (e.g. a project-wide rename). Use this or `path`.
+    #[serde(default)]
+    paths: Option<Vec<String>>,
+    /// The exact text to find (verbatim, including indentation/newlines).
+    old: String,
+    /// The replacement text.
+    new: String,
+    /// Replace every occurrence instead of requiring a unique match.
+    #[serde(default)]
+    replace_all: bool,
+}
+
+#[async_trait]
+impl Tool for StrReplaceTool {
+    fn name(&self) -> &str {
+        "str_replace"
+    }
+
+    fn description(&self) -> &str {
+        "Edit a file by exact-string replacement — the preferred edit tool. Pass `old` (verbatim text \
+         to find, including indentation) and `new`. By default `old` must match exactly once (a \
+         missing or non-unique match is an error — add surrounding context to disambiguate). Pass \
+         `replace_all: true` to replace every occurrence (e.g. a rename), and `paths` (instead of \
+         `path`) to apply the same replacement across several files in one call — ideal for a \
+         project-wide rename after find_references. Returns a per-file count."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to edit (use this or paths)" },
+                "paths": { "type": "array", "items": { "type": "string" }, "description": "Files to apply the same edit to (use this or path)" },
+                "old": { "type": "string", "description": "Exact text to find (verbatim)" },
+                "new": { "type": "string", "description": "Replacement text" },
+                "replace_all": { "type": "boolean", "description": "Replace every occurrence (default false: require a unique match)" }
+            },
+            "required": ["old", "new"]
+        })
+    }
+
+    async fn invoke(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let StrReplaceArgs {
+            path,
+            paths,
+            old,
+            new,
+            replace_all,
+        } = parse_args(args)?;
+        if old.is_empty() {
+            return Ok(ToolOutput::error("str_replace: `old` must not be empty"));
+        }
+        let targets: Vec<String> = match (path, paths) {
+            (Some(p), None) => vec![p],
+            (None, Some(ps)) => ps,
+            (Some(p), Some(mut ps)) => {
+                ps.push(p);
+                ps
+            }
+            (None, None) => return Ok(ToolOutput::error("str_replace: provide `path` or `paths`")),
+        };
+
+        let mut lines = Vec::with_capacity(targets.len());
+        let mut any_changed = false;
+        let mut any_error = false;
+        for p in &targets {
+            let original = match tokio::fs::read_to_string(p).await {
+                Ok(s) => s,
+                Err(e) => {
+                    any_error = true;
+                    lines.push(format!("{p}: read error ({e})"));
+                    continue;
+                }
+            };
+            let count = original.matches(&old).count();
+            if count == 0 {
+                any_error = true;
+                lines.push(format!("{p}: `old` not found"));
+                continue;
+            }
+            if count > 1 && !replace_all {
+                any_error = true;
+                lines.push(format!(
+                    "{p}: `old` occurs {count}× — pass replace_all, or include more context to make it unique"
+                ));
+                continue;
+            }
+            let updated = if replace_all {
+                original.replace(&old, &new)
+            } else {
+                original.replacen(&old, &new, 1)
+            };
+            if updated == original {
+                lines.push(format!("{p}: no change (replacement equals original)"));
+                continue;
+            }
+            if let Err(e) = tokio::fs::write(p, &updated).await {
+                any_error = true;
+                lines.push(format!("{p}: write error ({e})"));
+                continue;
+            }
+            any_changed = true;
+            lines.push(format!("{p}: replaced {count} occurrence(s)"));
+        }
+        Ok(ToolOutput {
+            content: format!("str_replace:\n{}", lines.join("\n")),
+            is_error: any_error,
+            changed: any_changed,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,6 +700,82 @@ mod tests {
             tokio::fs::read_to_string(&path).await.unwrap(),
             "one\ntwo\n"
         );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn str_replace_unique_match_edits_and_reports_changed() {
+        let dir = std::env::temp_dir().join(format!("lvz_sr_uniq_{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let p = dir.join("f.rs").to_string_lossy().to_string();
+        tokio::fs::write(&p, "fn a() {}\nfn b() {}\n")
+            .await
+            .unwrap();
+        let out = StrReplaceTool
+            .invoke(json!({ "path": p, "old": "fn b()", "new": "fn c()" }))
+            .await
+            .unwrap();
+        assert!(!out.is_error && out.changed, "{}", out.content);
+        assert_eq!(
+            tokio::fs::read_to_string(&p).await.unwrap(),
+            "fn a() {}\nfn c() {}\n"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn str_replace_non_unique_is_an_error_and_no_write() {
+        // Accuracy first: an ambiguous match must NOT edit (it could change the wrong site).
+        let dir = std::env::temp_dir().join(format!("lvz_sr_amb_{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let p = dir.join("f.py").to_string_lossy().to_string();
+        tokio::fs::write(&p, "x = 1\nx = 1\n").await.unwrap();
+        let out = StrReplaceTool
+            .invoke(json!({ "path": p, "old": "x = 1", "new": "x = 2" }))
+            .await
+            .unwrap();
+        assert!(out.is_error && !out.changed);
+        assert!(out.content.contains("occurs 2"));
+        assert_eq!(
+            tokio::fs::read_to_string(&p).await.unwrap(),
+            "x = 1\nx = 1\n"
+        ); // untouched
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn str_replace_not_found_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("lvz_sr_nf_{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let p = dir.join("f.txt").to_string_lossy().to_string();
+        tokio::fs::write(&p, "hello\n").await.unwrap();
+        let out = StrReplaceTool
+            .invoke(json!({ "path": p, "old": "absent", "new": "x" }))
+            .await
+            .unwrap();
+        assert!(out.is_error && !out.changed);
+        assert!(out.content.contains("not found"));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn str_replace_all_across_paths_renames_in_one_call() {
+        // The repeated-symbol rename the hash-anchored tools can't do: one call, every file.
+        let dir = std::env::temp_dir().join(format!("lvz_sr_all_{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let a = dir.join("a.py").to_string_lossy().to_string();
+        let b = dir.join("b.py").to_string_lossy().to_string();
+        tokio::fs::write(&a, "def old(): pass\nold()\nold()\n")
+            .await
+            .unwrap();
+        tokio::fs::write(&b, "old()\n").await.unwrap();
+        let out = StrReplaceTool
+            .invoke(json!({ "paths": [a.clone(), b.clone()], "old": "old", "new": "new", "replace_all": true }))
+            .await
+            .unwrap();
+        assert!(!out.is_error && out.changed, "{}", out.content);
+        assert!(!tokio::fs::read_to_string(&a).await.unwrap().contains("old"));
+        assert_eq!(tokio::fs::read_to_string(&b).await.unwrap(), "new()\n");
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
