@@ -30,6 +30,7 @@ BUDGET=4000000      # per-task token ceiling (safety net against a runaway loop)
 MAX_STEPS=60        # agent round-trip ceiling — real refactors need many explore→edit turns
 MAX_TOKENS=16384    # per-turn output cap — thinking=high needs headroom or turns truncate (MaxTokens)
 CONVERGE=1          # convergence levers: in-loop verify + no-progress breaker + budget awareness
+ACCEPTANCE_GATE=0   # use bench/acceptance.zsh as the agent's --verify-cmd (real completeness gate)
 BIN=""
 SMOKE=0
 
@@ -44,6 +45,7 @@ while [[ $# -gt 0 ]]; do
     --max-steps) MAX_STEPS=$2; shift 2;;
     --max-tokens) MAX_TOKENS=$2; shift 2;;
     --no-converge) CONVERGE=0; shift;;
+    --acceptance-gate) ACCEPTANCE_GATE=1; shift;;
     --bin)       BIN=$2; shift 2;;
     --smoke)     SMOKE=1; shift;;
     -h|--help)  sed -n '2,20p' $0; exit 0;;
@@ -110,6 +112,10 @@ cost_usd() {
 run_one() {
   local id=$1 repo=$2 verify=$3 skeleton=$4 instruction=$5
   local log=$RESULTS/$id.log
+  # Real completeness gate (--acceptance-gate): replace the noisy lint --verify-cmd with the
+  # per-task acceptance check, so --verify-and-fix iterates against what the task actually requires.
+  local num=${id%%_*}
+  if (( ACCEPTANCE_GATE )); then verify="zsh $SCRIPT_DIR/acceptance.zsh ${num#0}"; fi
   # Convergence levers (default on in the CLI too): in-loop verify, no-progress breaker
   # (nudge@8/stop@16), budget awareness. For the A/B baseline we must pass --no-converge
   # explicitly, since omitting the flags no longer disables them (the binary defaults them on).
