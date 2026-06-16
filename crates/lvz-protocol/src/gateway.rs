@@ -1,7 +1,7 @@
 //! The [`Gateway`] contract [Hermes tier]. A gateway is a frontend/channel (CLI, HTTP,
 //! Matrix) that drives the shared agent via an [`AgentHandle`](crate::AgentHandle).
 //! Adding a channel means one new `lvz-gw-*` crate; the agent core stays unaware of it
-//! (`RECIPE.md` §5.5, §7).
+//! (§5.5, §7).
 
 use std::sync::Arc;
 

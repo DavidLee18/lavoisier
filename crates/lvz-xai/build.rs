@@ -1,4 +1,4 @@
-//! Codegen for the xAI gRPC client (`RECIPE.md` §8): compile the vendored
+//! Codegen for the xAI gRPC client (§8): compile the vendored
 //! `xai-org/xai-proto` chat service (and its transitive imports) with `tonic-prost-build`.
 //!
 //! Requires `protoc` on the build machine (e.g. `brew install protobuf`). The vendored

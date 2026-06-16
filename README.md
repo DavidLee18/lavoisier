@@ -4,11 +4,11 @@ A modular, **token-efficient** CLI coding agent in Rust with a provider-agnostic
 (**Anthropic + xAI native, plus Google Gemini**). The same agent brain drives the CLI today and a
 multi-gateway "Hermes" service (HTTP/WebSocket, Matrix) tomorrow.
 
-> Status: **M0–M10 complete** plus the optional tracks — the full [build blueprint](RECIPE.md)
-> is implemented and tested (provider streaming over SSE **and** xAI gRPC, the agent loop, fs/
-> shell/context tools, the token-efficiency engine, session memory, gateways, AWS packaging, and
-> the adaptive-token-optimisation learner). Live-verified against real `XAI_API_KEY` and
-> `ANTHROPIC_API_KEY`. See [`RECIPE.md`](RECIPE.md) for the full design and milestone log.
+> Status: **complete** — provider streaming over SSE **and** xAI gRPC, the agent loop, fs/shell/
+> context tools, the token-efficiency engine, session memory, gateways, AWS packaging, and the
+> adaptive-token-optimisation learner are all implemented and tested. Live-verified against real
+> `XAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY`. See [`ARCHITECTURE.md`](ARCHITECTURE.md)
+> for the design.
 
 ## Why
 
@@ -33,30 +33,13 @@ goal at every layer:
 - A **budget-fixture CI loop** that gates skeleton-size regressions against committed token ceilings.
 
 See [`bench/README.md`](bench/README.md) for the measured head-to-head vs. the Dirac agent (cost +
-real-upstream-test correctness, plus the harness) and [`docs/ATO.md`](docs/ATO.md) for the tuner internals.
+real-upstream-test correctness, plus the harness) and [`ATO.md`](ATO.md) for the tuner internals.
 
 ## Architecture
 
-A Cargo workspace, trait-segmented so the agent core never depends on a wire protocol or a
-frontend. The keystone is `lvz-protocol`; **dependencies point inward only** — provider adapters and
-gateways depend on the core, never the reverse, and each transport (gRPC vs SSE vs OpenAI-compat)
-is contained behind the normalised `Event` stream + `Capabilities`.
-
-| Crate | Role |
-|---|---|
-| `lvz-protocol` | Normalised contracts: `Event` stream, `Provider`, `Tool`, `Gateway`, `Tuner`, `Capabilities`, telemetry. Zero provider/gateway deps. |
-| `lvz-xai` | xAI provider: native **gRPC** (tonic, default) with an OpenAI-compat SSE fallback. |
-| `lvz-anthropic` | Anthropic provider: native Messages API over SSE, prompt caching, extended thinking. |
-| `lvz-google` | Google Gemini provider: native Generative Language API over SSE, configurable thinking effort. |
-| `lvz-claude-cli` | Optional provider shelling out to `claude -p` (subscription; no caching). Off by default. |
-| `lvz-context` | Token engine: tree-sitter skeletons, AST symbol-dependency graph (radius `N`), hash-anchored edits, diffs, budget-fixture loop. |
-| `lvz-tools` | Tool registry + built-ins: `read_file(s)`, `write_file`, `list_dir`, `shell`, `outline_file(s)`, `read_anchored`, `edit_anchored`. |
-| `lvz-agent` | The plan→act→observe loop: tool dispatch, capability-gated caching, compaction, model routing, per-task budget, telemetry. |
-| `lvz-memory` | Session continuity: a `SessionStore` + `SessionAgent` so each session keeps its own transcript. |
-| `lvz-tune` | The ATO learner: `LearningTuner` (ε-greedy) and `BayesTuner` (Thompson sampling), with on-disk persistence. |
-| `lvz-gw-http` | HTTP/WebSocket gateway (axum): `/v1/turns` (SSE), `/v1/ws`, `/health`, Prometheus `/metrics`, API-key auth + rate limits. |
-| `lvz-gw-matrix` | Matrix gateway (one room per session). |
-| `lvz-cli` | The `lavoisier` binary — the first gateway. |
+A Cargo workspace, trait-segmented so the agent core never depends on a wire protocol or a frontend.
+The keystone is `lvz-protocol`; dependencies point inward only. See [`ARCHITECTURE.md`](ARCHITECTURE.md)
+for the crate map, the invariants, and the key design decisions.
 
 ## Quickstart
 

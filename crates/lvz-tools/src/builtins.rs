@@ -1,7 +1,7 @@
 //! Built-in tools: `read_file`, `write_file`, `list_dir`, and `shell`.
 //!
 //! These act on the process's working directory. Blast-radius constraints (sandboxing,
-//! path allow-lists) are a deliberately later concern (`RECIPE.md` §7.3); for now the tools
+//! path allow-lists) are a deliberately later concern (§7.3); for now the tools
 //! are thin wrappers over `tokio::fs` / `tokio::process` that report failures back to the
 //! model as error results rather than aborting the turn.
 
@@ -50,7 +50,7 @@ impl Tool for ReadFileTool {
     }
 }
 
-/// `read_files` — read several files in one round-trip (`RECIPE.md` §6.1 multi-file batching).
+/// `read_files` — read several files in one round-trip (§6.1 multi-file batching).
 pub struct ReadFilesTool;
 
 #[derive(Deserialize)]

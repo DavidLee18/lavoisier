@@ -1,7 +1,7 @@
 //! The normalised event stream — the semantic layer every provider maps onto.
 //!
 //! Each provider adapter is the *only* place that translates its wire format into these
-//! variants (`RECIPE.md` §5.2): Anthropic SSE `content_block_delta`, xAI gRPC v6 outputs,
+//! variants (§5.2): Anthropic SSE `content_block_delta`, xAI gRPC v6 outputs,
 //! and the OpenAI-compat fallback all converge here. Nothing downstream of a provider sees
 //! a wire protocol.
 
@@ -61,7 +61,7 @@ pub struct Usage {
 ///
 /// Turns a raw [`Usage`] into a single **cost-weighted** objective ([`Usage::cost`]) so the
 /// agent's budget and the ATO tuner optimise *actual spend*, not a flat token count. This is
-/// what makes prompt caching — the project's biggest cost lever (`RECIPE.md` §6) — visible to
+/// what makes prompt caching — the project's biggest cost lever (§6) — visible to
 /// optimisation: a fresh input token, an output token, a cache *write*, and a cache *read* all
 /// cost different amounts, and a flat sum (or one that ignores cache classes outright) hides
 /// that. The defaults match Anthropic/xAI list-price ratios, which are also a sensible

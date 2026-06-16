@@ -1,4 +1,4 @@
-//! `lvz-tune` — adaptive token optimisation (ATO, `RECIPE.md` §6.6).
+//! `lvz-tune` — adaptive token optimisation (ATO, §6.6).
 //!
 //! [`LearningTuner`] is the online half of the knob-tuning loop: it implements the
 //! [`Tuner`] contract so `lvz-agent` can swap it in for the default [`NoopTuner`] with no
@@ -19,7 +19,7 @@
 //! controller is pure in-memory bookkeeping (no extra dependencies, negligible overhead) and
 //! its `select`/`observe` are synchronous, matching the trait.
 //!
-//! Now wired (see `docs/ATO.md`): a real success signal (`--verify-cmd`), model-version + per-repo
+//! Now wired (see `ATO.md`): a real success signal (`--verify-cmd`), model-version + per-repo
 //! keying (`ContextKey` carries `model_id` and `repo_id`), observation decay (`TuneConfig.decay`,
 //! an EWMA for non-stationarity), the exact byte-identical truncate counterfactual, the opt-in
 //! estimated radius counterfactual with a downstream-residency model (emitted by `lvz-agent`; this
@@ -66,7 +66,7 @@ pub struct TuneConfig {
     pub success_target: f32,
     /// Minimum trials before a candidate is trusted (avoids chasing lucky one-offs).
     pub min_trials: u32,
-    /// Per-observation decay in `(0, 1]` for **non-stationarity** (`docs/ATO.md` §6.6): before a
+    /// Per-observation decay in `(0, 1]` for **non-stationarity** (`ATO.md` §6.6): before a
     /// candidate folds in a new sample, its accumulated stats are multiplied by this factor, so
     /// recent outcomes weigh more and a stale optimum (e.g. after a model/codebase shift) fades.
     /// `1.0` = no decay (plain running totals); `0.9` ≈ a soft ~10-sample memory.
@@ -85,7 +85,7 @@ impl Default for TuneConfig {
 }
 
 /// Profile key: the context features knob optima depend on. Caching is carried explicitly
-/// because it is the dominant confounder (`RECIPE.md` §6.6); the concrete `model_id` is keyed
+/// because it is the dominant confounder (§6.6); the concrete `model_id` is keyed
 /// alongside the coarse tier so a model upgrade (non-stationarity, §6.6) starts a fresh profile
 /// rather than averaging a shifted optimum into the old one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -190,7 +190,7 @@ struct Snapshot {
 
 impl LearningTuner {
     /// Serialise the learned profiles (and PRNG cursor) to `path` as JSON, so a long-running or
-    /// restarted gateway keeps what it learned (`docs/ATO.md` §10 profile persistence).
+    /// restarted gateway keeps what it learned (`ATO.md` §10 profile persistence).
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let guard = self.state.lock().expect("tuner state poisoned");
         let rows = guard
@@ -277,7 +277,7 @@ impl Tuner for LearningTuner {
         let decay = self.cfg.decay;
         record(candidates.entry(*used).or_default(), out, decay);
 
-        // Safe counterfactual (§6.6 / `docs/ATO.md` §3): if nothing in the task exceeded the
+        // Safe counterfactual (§6.6 / `ATO.md` §3): if nothing in the task exceeded the
         // truncate limit actually used, then every *cheaper* grid value that still ≥ the largest
         // result would have produced a byte-identical transcript — identical tokens, identical
         // success. Credit those provably-equivalent vectors so the learner discovers cheaper

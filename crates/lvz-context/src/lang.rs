@@ -24,7 +24,7 @@ pub(crate) struct LangSpec {
     /// Named-definition node kinds that become nodes in the symbol-dependency graph.
     pub symbol_kinds: &'static [&'static str],
     /// Keep a leading docstring (a bare string statement as the body's first item) when eliding
-    /// the rest of the body — `RECIPE.md` §6.1 wants docstrings retained as high-signal context.
+    /// the rest of the body — §6.1 wants docstrings retained as high-signal context.
     /// True only for Python, whose `def` bodies conventionally open with a `"""…"""` docstring.
     pub keeps_docstring: bool,
     /// Leaf node kinds that count as a *reference* to a name when resolving symbol-dependency

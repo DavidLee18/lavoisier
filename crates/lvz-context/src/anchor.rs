@@ -1,4 +1,4 @@
-//! Hash-anchored edits (`RECIPE.md` §6.1): address a line by a short stable hash of its
+//! Hash-anchored edits (§6.1): address a line by a short stable hash of its
 //! content instead of resending the whole file. The model reads anchored lines once, then
 //! targets edits by anchor — no full-file round-trips, and an edit that no longer matches is
 //! rejected rather than silently misapplied.

@@ -1,4 +1,4 @@
-//! `lvz-context` — the token-efficiency engine (`RECIPE.md` §6.1).
+//! `lvz-context` — the token-efficiency engine (§6.1).
 //!
 //! This crate holds the largest token levers, all usable offline and independent of any
 //! provider:
@@ -14,7 +14,7 @@
 //!   that gates skeleton-radius regressions in CI.
 //!
 //! These are the primitives the agent uses to read less and write less; the skeleton-radius
-//! knob `N` (`RECIPE.md` §6.5) drives [`skeleton::skeletonize`]'s `keep_bodies` set.
+//! knob `N` (§6.5) drives [`skeleton::skeletonize`]'s `keep_bodies` set.
 
 pub mod anchor;
 pub mod budget;

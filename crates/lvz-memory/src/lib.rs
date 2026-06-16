@@ -1,4 +1,4 @@
-//! `lvz-memory` — session memory for the Hermes tier (`RECIPE.md` §7.3).
+//! `lvz-memory` — session memory for the Hermes tier (§7.3).
 //!
 //! The agent core is per-turn stateless: [`Agent::submit`](lvz_agent::Agent) ignores
 //! `TurnRequest::session`. This crate adds the *session* dimension behind a trait without

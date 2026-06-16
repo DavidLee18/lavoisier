@@ -1,5 +1,5 @@
 //! `lvz-claude-cli` — an **optional** [`Provider`] that rides Claude Code's `claude -p`
-//! (subscription OAuth) instead of the Anthropic API (`RECIPE.md` §8).
+//! (subscription OAuth) instead of the Anthropic API (§8).
 //!
 //! It spawns `claude -p --output-format stream-json`, feeds the rendered conversation on
 //! stdin, and normalises the newline-delimited JSON event stream into [`Event`]s. `claude -p`
@@ -7,7 +7,7 @@
 //! completion: it surfaces assistant **text** and **thinking** and the final **usage**, and
 //! ignores the internal tool traffic.
 //!
-//! Caveats (RECIPE §8), all reflected in [`Capabilities`]:
+//! Caveats (§8), all reflected in [`Capabilities`]:
 //! - **No prompt caching** — subscription tokens can't use `cache_control`.
 //! - Capped by the monthly Agent SDK credit (from 2026-06-15), then API rates; policy-fragile.
 //! - **Personal / low-volume convenience only — never Hermes.** Off by default; the CLI only

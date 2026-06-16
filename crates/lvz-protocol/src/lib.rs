@@ -4,7 +4,7 @@
 //! [`Gateway`], and [`Tuner`] traits and their supporting types. It performs **no I/O**
 //! and has **zero** provider- or gateway-specific knowledge: every other crate depends on
 //! it, and it depends on nothing of theirs. Swapping a transport, adding a provider, or
-//! adding a gateway never touches this crate (see `RECIPE.md` §3–§5).
+//! adding a gateway never touches this crate (see §3–§5).
 //!
 //! ```text
 //!   gateways ─┐

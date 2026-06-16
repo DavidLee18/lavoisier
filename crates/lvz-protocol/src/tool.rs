@@ -1,6 +1,6 @@
 //! The [`Tool`] contract. Built-in tools (filesystem, shell, browser) live in `lvz-tools`;
 //! the agent dispatches calls through this trait without knowing their concrete types
-//! (`RECIPE.md` §5.4).
+//! (§5.4).
 
 use async_trait::async_trait;
 
@@ -33,7 +33,7 @@ pub struct ToolOutput {
     /// change to a file). `false` for read-only tools and for edit tools that no-op'd — e.g. an
     /// anchored edit whose anchors didn't match, so nothing was written. The agent keys its
     /// convergence levers on this, not merely on which tool was called, so a failed/empty edit
-    /// can't be mistaken for progress (`RECIPE.md` §6.6 convergence). Default `false`.
+    /// can't be mistaken for progress (§6.6 convergence). Default `false`.
     pub changed: bool,
 }
 

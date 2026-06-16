@@ -1,7 +1,7 @@
 //! The gateway-facing facade over `lvz-agent`. A [`Gateway`](crate::Gateway) submits a turn
 //! and consumes the resulting [`Event`] stream; it never touches a [`Provider`](crate::Provider)
 //! or the agent's internals. The CLI, HTTP, and Matrix gateways all drive the same
-//! agent through this handle (`RECIPE.md` §5.5).
+//! agent through this handle (§5.5).
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -48,7 +48,7 @@ pub enum AgentError {
     #[error("tool error: {0}")]
     Tool(String),
 
-    /// The turn exceeded its configured token budget (`RECIPE.md` §6.4).
+    /// The turn exceeded its configured token budget (§6.4).
     #[error("token budget exceeded")]
     BudgetExceeded,
 

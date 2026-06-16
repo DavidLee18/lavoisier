@@ -1,5 +1,5 @@
 //! [`BayesTuner`] — a Thompson-sampling alternative to the ε-greedy [`LearningTuner`]
-//! (`docs/ATO.md` §10 Bayesian optimisation). Same `Tuner` contract, same discrete knob grid and
+//! (`ATO.md` §10 Bayesian optimisation). Same `Tuner` contract, same discrete knob grid and
 //! baseline floor, but selection is **Bayesian**: each candidate carries a Beta posterior over its
 //! success probability and a Gaussian posterior over its cost, and `select` *samples* from those
 //! posteriors and picks the cheapest sample that meets the success target. Posterior uncertainty
@@ -109,7 +109,7 @@ struct Snapshot {
 
 impl BayesTuner {
     /// Serialise the learned posteriors (and PRNG cursor) to `path` as JSON, so a restarted
-    /// gateway keeps what Thompson sampling has learned (`docs/ATO.md` §10.1 persistence).
+    /// gateway keeps what Thompson sampling has learned (`ATO.md` §10.1 persistence).
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let guard = self.state.lock().expect("bayes tuner state poisoned");
         let rows = guard

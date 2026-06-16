@@ -4,7 +4,7 @@
 //! (`POST /v1beta/models/{model}:streamGenerateContent?alt=sse`). Added so Lavoisier can run the
 //! *same* model other agents benchmark on (`gemini-3-flash-preview`) with the *same* thinking
 //! effort — see `bench/README.md`. This widens the original "Anthropic + xAI native only" scope
-//! at the project owner's explicit request (recorded in `RECIPE.md` §1 / `CLAUDE.md`).
+//! at the project owner's explicit request (recorded in §1 / `CLAUDE.md`).
 //!
 //! Like the other adapters this is a thin hand-rolled `reqwest` client — no `google-*` SDK — and it
 //! is the only place Gemini's wire format is mapped to the normalised [`Event`] stream. Gemini does

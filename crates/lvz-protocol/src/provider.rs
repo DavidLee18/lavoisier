@@ -9,7 +9,7 @@ use crate::message::ChatRequest;
 
 /// A model backend. Implemented once per transport (`lvz-anthropic`, `lvz-xai`,
 /// `lvz-claude-cli`). The agent core depends only on this trait, never on a concrete
-/// transport (`RECIPE.md` §5.1).
+/// transport (§5.1).
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Stream a chat turn as normalised events. The returned stream owns its state so it
@@ -33,7 +33,7 @@ pub trait Provider: Send + Sync {
 
 /// Optional features a provider may support. The agent conditions behaviour on these —
 /// e.g. it only attaches `cache_control` when [`prompt_caching`](Capabilities::prompt_caching)
-/// is true (`RECIPE.md` §5.3, §6.2).
+/// is true (§5.3, §6.2).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Capabilities {
     /// Ephemeral prompt caching on stable prefixes. Anthropic: true; claude-cli: false.

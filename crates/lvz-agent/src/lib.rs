@@ -1,4 +1,4 @@
-//! `lvz-agent` — the reasoning loop (`RECIPE.md` §4, §6.3).
+//! `lvz-agent` — the reasoning loop (§4, §6.3).
 //!
 //! The agent runs a **plan → act → observe** cycle: ask the provider for a turn, and if the
 //! model called tools, execute them, append the results to history, and ask again — until
@@ -134,17 +134,17 @@ pub struct AgentConfig {
     pub advisor_model: Option<String>,
     /// Optional shell command run (in [`repo_root`](Self::repo_root)) after a task completes
     /// normally; exit 0 means the change is good. This is the real ATO **success signal**
-    /// (`RECIPE.md` §6.6, `docs/ATO.md`) — e.g. `"cargo test --quiet"`. When `None`, success
+    /// (§6.6, `ATO.md`) — e.g. `"cargo test --quiet"`. When `None`, success
     /// falls back to the coarse "completed without error" signal. Only run on otherwise-clean
     /// completion (not after a provider error / budget overrun / step-cap).
     pub verify_command: Option<String>,
     /// Classify the task [`Archetype`] with a **model call** instead of the free keyword
-    /// heuristic (`RECIPE.md` §6.3/§6.5). Off by default — it costs one extra tool-less round-trip
+    /// heuristic (§6.3/§6.5). Off by default — it costs one extra tool-less round-trip
     /// (routed to [`summary_model`](Self::summary_model) when set, else [`model`](Self::model);
     /// its tokens count toward the task total). On a parse failure it falls back to the heuristic.
     /// Only worth enabling with a learning tuner, where a sharper archetype key helps.
     pub classify_with_model: bool,
-    /// Enable the **trace-based skeleton-radius counterfactual** (`docs/ATO.md` §6, §10).
+    /// Enable the **trace-based skeleton-radius counterfactual** (`ATO.md` §6, §10).
     /// **Off by default and unsound** — unlike the always-on truncate counterfactual (which is
     /// exact), this *estimates* the tokens a smaller [`skeleton_radius`](Knobs::skeleton_radius)
     /// would have cost (by re-extracting the captured skeletons at each smaller radius) and
@@ -152,7 +152,7 @@ pub struct AgentConfig {
     /// prove the model wouldn't have failed with less context. It lets ATO discover smaller radii
     /// faster, at the risk of crediting a starved setting. Only meaningful with a learning tuner.
     pub radius_counterfactual: bool,
-    /// Inject a **cache-aware repo-skeleton prefix** (`RECIPE.md` §6.1): when `Some(budget)`, a
+    /// Inject a **cache-aware repo-skeleton prefix** (§6.1): when `Some(budget)`, a
     /// token-bounded skeleton of the whole repo (tree-sitter outlines of every source file under
     /// [`repo_root`](Self::repo_root), to `budget` estimated tokens) is built **once** and placed
     /// as the first content block of the first user message, marked cacheable. Ordered
@@ -188,7 +188,7 @@ pub struct AgentConfig {
     /// Anthropic/xAI ratios; the CLI sets the provider-appropriate preset. Use
     /// [`CostWeights::flat`] to restore the legacy raw-token objective.
     pub cost_weights: CostWeights,
-    /// **Radius-counterfactual re-exploration risk** in `[0, 1]` (`docs/ATO.md` §6, §10). The
+    /// **Radius-counterfactual re-exploration risk** in `[0, 1]` (`ATO.md` §6, §10). The
     /// estimate-based radius counterfactual ([`radius_counterfactual`](Self::radius_counterfactual))
     /// used to credit a smaller skeleton with the *full* input saving and the realised success bit —
     /// modelling only the input-byte delta, never that the model's *reasoning* changes on a thinner
@@ -202,7 +202,7 @@ pub struct AgentConfig {
 }
 
 /// Above this fraction of dependency context removed, the estimate-based radius counterfactual
-/// refuses to transfer the realised success bit to the smaller radius (`docs/ATO.md` §6, §10) —
+/// refuses to transfer the realised success bit to the smaller radius (`ATO.md` §6, §10) —
 /// claiming a task would still have succeeded on a near-empty skeleton is the least defensible
 /// part of the (already opt-in, unsound) counterfactual, so it is suppressed there.
 pub const RADIUS_SUCCESS_CUT_FLOOR: f64 = 0.9;
@@ -403,7 +403,7 @@ impl Agent {
     }
 
     /// Install a [`TelemetrySink`] that receives one [`TaskTelemetry`] record per completed task
-    /// (`RECIPE.md` §6.4). Without one, no telemetry is emitted.
+    /// (§6.4). Without one, no telemetry is emitted.
     pub fn with_telemetry(mut self, sink: Arc<dyn TelemetrySink>) -> Self {
         self.telemetry = Some(sink);
         self
@@ -420,7 +420,7 @@ impl Agent {
     /// Like [`run`](Self::run), but seeded with a prior conversation transcript (the last
     /// message is the new user turn). This is how a session-aware caller (`lvz-memory`)
     /// continues a multi-turn conversation: the agent classifies + runs against the latest
-    /// user message while the earlier turns provide context (`RECIPE.md` §7.3).
+    /// user message while the earlier turns provide context (§7.3).
     pub fn run_seeded(
         &self,
         history: Vec<Message>,
@@ -540,7 +540,7 @@ async fn run_loop(
     let mut edit_free_streak: usize = 0;
     let mut nudged_at: Option<usize> = None;
     // Largest untruncated tool-result seen, for the learner's safe counterfactual crediting
-    // (§6.6 / `docs/ATO.md` §3). `None` until the first tool runs.
+    // (§6.6 / `ATO.md` §3). `None` until the first tool runs.
     let mut max_result_bytes: Option<usize> = None;
     // Captured outline skeletons for the (opt-in, unsound) radius counterfactual (§6). Empty
     // unless `config.radius_counterfactual` is set.
@@ -833,7 +833,7 @@ struct Observation<'a> {
 }
 
 impl Observation<'_> {
-    /// Report the realised task outcome to the tuner (`RECIPE.md` §6.6), emit any opt-in radius
+    /// Report the realised task outcome to the tuner (§6.6), emit any opt-in radius
     /// counterfactuals, and push a [`TaskTelemetry`] record to the sink if one is installed.
     fn record(
         &self,
@@ -878,20 +878,20 @@ impl Observation<'_> {
     }
 }
 
-/// Emit the **unsound, estimate-based** skeleton-radius counterfactual (`docs/ATO.md` §6, §10).
+/// Emit the **unsound, estimate-based** skeleton-radius counterfactual (`ATO.md` §6, §10).
 ///
 /// For each radius `t` strictly below the one used, re-extract every captured outline skeleton at
 /// `t` and sum how many tokens a smaller radius would have saved versus the radius actually used,
 /// then credit `Knobs { skeleton_radius: t, .. }` with an estimated `(cost, success)`.
 ///
-/// **Downstream-effect model (`docs/ATO.md` §6).** A skeleton injected into history is re-sent on
+/// **Downstream-effect model (`ATO.md` §6).** A skeleton injected into history is re-sent on
 /// every later round-trip until compaction, so its per-skeleton delta recurs. Without prompt
 /// caching each resend is fresh input, so the saving is scaled by the skeleton's *residency* (how
 /// many round-trips from its capture to task end). With caching those resends are `cache_read`, not
 /// new `total_tokens`, so residency collapses to 1 — modelling that the smaller skeleton only saves
 /// on its single cache-creation send.
 ///
-/// **Reasoning-effect model (`docs/ATO.md` §10).** The raw saving is the input-byte delta only; it
+/// **Reasoning-effect model (`ATO.md` §10).** The raw saving is the input-byte delta only; it
 /// ignores that the model's *reasoning* changes on a thinner skeleton — it may have to re-acquire
 /// the stripped dependency context (an extra read/think round-trip), or fail. `risk` ∈ `[0,1]`
 /// models that: a fraction `risk × removed_frac` of the saving is clawed back as expected
@@ -1069,14 +1069,14 @@ fn apply_knobs_to_args(tool: &str, mut args: Value, knobs: &Knobs) -> Value {
 
 /// A captured `outline_file` skeleton, kept (only when the radius counterfactual is enabled) so
 /// the realised skeleton can be re-extracted at *smaller* radii after the task to estimate what
-/// a tighter [`skeleton_radius`](Knobs::skeleton_radius) would have cost (`docs/ATO.md` §6). The
+/// a tighter [`skeleton_radius`](Knobs::skeleton_radius) would have cost (`ATO.md` §6). The
 /// source is snapshotted at outline time because the agent may edit the file later in the task.
 struct RadiusTrace {
     source: String,
     lang: Lang,
     focus: String,
     /// Round-trip index at which this skeleton entered history. Used to estimate how many later
-    /// round-trips re-sent it (its *residency*) for the downstream-effect model (`docs/ATO.md` §6).
+    /// round-trips re-sent it (its *residency*) for the downstream-effect model (`ATO.md` §6).
     captured_at_round: u32,
 }
 
@@ -1320,7 +1320,7 @@ fn collect_paths(v: &Value, out: &mut Vec<String>) {
     }
 }
 
-/// Staleness-aware eviction (`RECIPE.md` §6.3). Once a file has been *edited*, any earlier read or
+/// Staleness-aware eviction (§6.3). Once a file has been *edited*, any earlier read or
 /// outline of that same file in the transcript is out of date — carrying its (now-wrong) bytes
 /// wastes tokens and can mislead the model. Replace each such superseded read result with a short
 /// "[stale: …]" pointer telling the model to re-read if it needs the current contents. The most
@@ -1418,7 +1418,7 @@ fn mark_stale_reads(history: &mut [Message]) {
     }
 }
 
-/// Context deduplication (`RECIPE.md` §6.3). Collapse byte-identical tool-result content that
+/// Context deduplication (§6.3). Collapse byte-identical tool-result content that
 /// appears more than once — e.g. the same file outlined or read twice without change. Walking
 /// newest→oldest, the most recent copy is kept verbatim and earlier identical copies are
 /// replaced by a short pointer. Structure (so `tool_use`/`tool_result` pairing) is preserved;
@@ -1445,7 +1445,7 @@ fn dedup_tool_results(history: &mut [Message]) {
     }
 }
 
-/// Relevance-ranked context eviction (`RECIPE.md` §6.3). When the assembled history still
+/// Relevance-ranked context eviction (§6.3). When the assembled history still
 /// exceeds the per-request `limit` — typically because a single recent tool result is huge and
 /// compaction can't summarise the protected recent window — replace the *content* of the
 /// oldest tool-result blocks (oldest = least relevant) with a short placeholder, working
@@ -1524,7 +1524,7 @@ fn default_thinking(archetype: Archetype) -> Option<ThinkingLevel> {
     }
 }
 
-/// Cheap keyword classifier mapping a task prompt to an [`Archetype`] prior (`RECIPE.md`
+/// Cheap keyword classifier mapping a task prompt to an [`Archetype`] prior (the design notes
 /// §6.5/§6.6). Deterministic and free — a good-enough prior for keying tuner profiles, with
 /// no extra round-trip. Ordering is intentional: more specific intents win (a rename is a
 /// refactor, an "add" is more specific than a generic edit). A future version could route
@@ -1590,7 +1590,7 @@ fn parse_archetype(label: &str) -> Option<Archetype> {
     })
 }
 
-/// Classify the task with a tool-less model call (`RECIPE.md` §6.3), routed to the cheap
+/// Classify the task with a tool-less model call (§6.3), routed to the cheap
 /// [`summary_model`](AgentConfig::summary_model) when set. Returns the parsed [`Archetype`] and
 /// the call's [`Usage`] (so the caller can bill it to the task total). `None` on a provider error
 /// or an unparseable reply — the caller then uses the free keyword heuristic.
@@ -1623,7 +1623,7 @@ async fn classify_archetype_via_model(
 
 /// Build a [`RepoProfile`] by a bounded walk of `root`, skipping VCS/build/dependency dirs.
 /// Counts files, sums their bytes, and picks the most common recognised source language
-/// (`RECIPE.md` §6.6 — repo shape conditions knob selection). Best-effort: unreadable entries
+/// (§6.6 — repo shape conditions knob selection). Best-effort: unreadable entries
 /// are skipped and the walk is capped so a huge monorepo can't stall task start.
 fn profile_repo(root: &Path) -> RepoProfile {
     const MAX_FILES: u32 = 20_000;

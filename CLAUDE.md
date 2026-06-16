@@ -1,558 +1,109 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code working in this repository.
 
-## Status: M0–M10 complete + optional tracks (lvz-tune ATO learner, lvz-claude-cli, advisor mode)
+**Lavoisier** (binary `lavoisier`, alias `lav`) is a modular, token-efficient CLI coding agent in
+Rust with a provider-agnostic core (Anthropic + xAI native, plus Google Gemini). The same agent
+brain drives the CLI today and a multi-gateway "Hermes" service (HTTP/WebSocket, Matrix) tomorrow.
 
-`RECIPE.md` is the authoritative **build blueprint** for **Lavoisier** (binary `lavoisier`,
-alias `lav`) — a modular, token-efficient CLI coding agent in Rust with a provider-agnostic
-core. **Read it before any work**: the decision log (§1), crate responsibilities (§4), core
-contracts (§5), and milestone sequence (§9) define what to build and in what order. If a
-request conflicts with `RECIPE.md`, surface the conflict rather than silently diverging.
+Companion docs — read the relevant one before working in that area:
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — crate map, the dependency invariants, key design decisions.
+- [`ATO.md`](ATO.md) — the adaptive-token-optimisation tuner internals.
+- [`bench/README.md`](bench/README.md) — the measured head-to-head vs. the Dirac agent (cost +
+  verifiable correctness), the harness, and per-model pricing.
 
-Companion docs: `README.md` (user-facing overview + flags), `docs/ATO.md` (the tuner internals),
-and `bench/README.md` (the measured head-to-head vs. the Dirac agent + the benchmark harness —
-methodology, measured $/task on `gemini-3-flash-preview`, real-upstream-test correctness, and per-model
-re-pricing; re-derive from its §3 prices when they move).
+## Status
 
-Milestones done (per §9): **M0** workspace + `lvz-protocol` contracts · **M1** xAI
-OpenAI-compat first light · **M2** SSE streaming · **M3** `lvz-anthropic` native Messages API
-+ caching + thinking · **M4** `lvz-agent` plan→act→observe loop + `lvz-tools` (fs + shell),
-OpenAI tool-calling through `lvz-xai` · **M5** `lvz-context` token engine — tree-sitter
-skeletons (Rust/Python/JS/TS), **recursive symbol-dependency graph** driving the
-skeleton-radius knob `N`, hash-anchored edits, token-efficient diffs, plus the **budget-fixture
-CI loop (§6.5)** (`tests/budget.rs`, committed per-archetype token ceilings). Surfaced to the
-agent as `outline_file` (with optional `focus`/`radius`), `read_anchored`, `edit_anchored`.
+Complete and live-verified against real `XAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY`:
+all 13 crates, provider streaming (SSE + xAI gRPC), the agent loop, the token engine, session
+memory, the HTTP/Matrix gateways, AWS packaging (`infra/`), and the ATO learner. `cargo test`,
+`cargo clippy --all-targets`, and `cargo fmt --check` are kept green.
 
-Crates that exist today: `lvz-protocol`, `lvz-xai`, `lvz-anthropic`, `lvz-google`,
-`lvz-claude-cli`, `lvz-context`, `lvz-tools`, `lvz-agent`, `lvz-memory`, `lvz-tune`, `lvz-gw-http`,
-`lvz-gw-matrix`, `lvz-cli`. (A Discord gateway was considered and dropped — out of scope.
-`lvz-google` was added 2026-06-12, relaxing the Anthropic+xAI-only provider scope — see §1.)
-
-**Current state (saved 2026-06-09):** M0–M5 complete, committed and pushed to
-`origin/main` (initial commit + author/copyright set to Jaehyun Lee). 7 crates,
-**59 tests passing**, clippy clean, `cargo fmt` clean. Verified live against the real
-`XAI_API_KEY`: streaming turns, the agent tool loop, and the token-efficient
-outline→anchor→edit workflow. Anthropic path now **verified live** against the real
-`ANTHROPIC_API_KEY` (model `claude-sonnet-4-6`): a streaming turn plus the agent
-`read_anchored`→batched `edit_anchored` loop, with **prompt caching confirmed working**
-(non-zero `cache_read`/`cache_creation` once the system+tooldefs prefix clears the
-2048-token Sonnet cache minimum). Working tree clean.
-
-**M6 increment (2026-06-10):** `lvz-agent` now consults a `Tuner` (default `NoopTuner` =
-static §6.5 knobs; `FixedTuner` for explicit knobs) and reports the realised `Outcome` back,
-making `Knobs` live. **History compaction** is implemented — once estimated transcript tokens
-exceed `Knobs.compact_after`, the middle turns are summarised into one note via a **separate
-tool-less provider call routed to `AgentConfig.summary_model`** (model tiering for the
-summary workload), keeping the original task + last `KEEP_RECENT_TURNS` pairs verbatim on a
-turn boundary (never orphaning a `tool_use`/`tool_result`). The summary call's tokens count
-toward the task total/budget (§6.4). Tool-result truncation now reads `Knobs.truncate_bytes`.
-A **context-budget manager** (`AgentConfig.context_limit`) adds a soft *per-request* ceiling:
-when the assembled history still exceeds it after compaction, `evict_to_fit` replaces the
-oldest tool-result content with a `[evicted: N bytes …]` placeholder (oldest = least relevant),
-preserving the task, the recent window, and all `tool_use`/`tool_result` pairing. Exposed on
-the CLI as `--summary-model` / `--compact-after` / `--context-limit` (agent mode).
-The tuner's `TaskContext` is now **real**, not stubbed: `classify_archetype` maps the prompt
-to an `Archetype` via a deterministic keyword heuristic (no extra round-trip), and
-`profile_repo` does a bounded, build-dir-skipping walk of `AgentConfig.repo_root` (set to cwd
-by the CLI in agent mode) for a `RepoProfile` (file count, bytes, primary language). The
-optional §6.3 extras also landed: **deduplication** (`dedup_tool_results` collapses
-byte-identical repeated tool results, keeping the most recent copy) and **output
-minimisation** (the system prompt now tells the model not to echo file contents/tool output
-and to let `edit_anchored`'s diff stand as the change record). **64 tests passing**, clippy +
-fmt clean. **Compaction verified live** against Anthropic
-(`claude-sonnet-4-6` main,
-`claude-haiku-4-5` summaries): a sequential edit task triggered a real Haiku-routed summary
-call and the reshaped history (task + summary note + recent turns) was accepted by the API —
-the agent compacted, continued, and finished cleanly. (Note observed live: the model batches
-independent tool calls into one parallel turn, so compaction only fires on genuinely
-sequential workflows that accumulate ≥3 turn-pairs.)
-
-### What's left to do (milestone order, `RECIPE.md` §9)
-
-- **M6 — efficiency hardening (complete).** ✅ Tuner/Knobs wired into the agent, history
-  compaction (live-verified), model routing for summaries, tool-result truncation,
-  context-budget manager (relevance-ranked eviction), task classification + repo profiling
-  feeding a real `TaskContext`, and the optional §6.3 extras (context deduplication + output
-  minimisation). (`--summary-model`/`--compact-after`/`--context-limit` exposed; all
-  mechanisms unit-tested, compaction also live-verified.)
-- **M7 — xAI gRPC (complete, live-verified 2026-06-11).**
-  Done: `xai-org/xai-proto` vendored into `proto/` at pinned commit `543b901d` (Apache-2.0;
-  provenance + update procedure in `proto/VENDOR.md`); `tonic-prost-build` codegen in
-  `crates/lvz-xai/build.rs` (client-only tonic 0.14 stack:
-  `tonic`/`tonic-prost`/`prost`/`prost-types` workspace deps; **requires `protoc`**, e.g.
-  `brew install protobuf`; workspace **MSRV 1.88** for tonic 0.14); and the **gRPC transport
-  itself**. `lvz-xai` is now split into modules: `grpc.rs` (native path + `pub mod pb {
-  include_proto!("xai_api") }`), `http.rs` (the OpenAI-compat fallback, formerly `lib.rs`),
-  and a thin `lib.rs` dispatcher. `XaiProvider` is an `enum { Grpc(GrpcTransport),
-  Http(HttpTransport) }`; `from_env` reads **`XAI_TRANSPORT` (`grpc`|`http`, default `http`)**
-  plus `XAI_GRPC_ENDPOINT` (default `https://api.x.ai`) / `XAI_BASE_URL`. The gRPC path opens
-  a TLS `Channel` (`ClientTlsConfig::new().with_webpki_roots()`), calls server-streaming
-  `Chat.GetCompletionChunk` with a per-request `authorization: Bearer` metadata header, and a
-  `Decoder` normalises each `GetChatCompletionChunk`: `Delta{content}`→`TextDelta`,
-  `reasoning_content`→`Thinking`, `tool_calls` (correlated by id; arg-only chunks attach to
-  the last open id)→`ToolUseStart/Delta/End`, per-chunk cumulative `SamplingUsage`→`Usage`
-  (`cached_prompt_text_tokens`→`cache_read_tokens`; `input_tokens = prompt − cached`; agent
-  takes last-wins), `FinishReason`→`StopReason` (STOP→EndTurn, MAX_LEN/MAX_CONTEXT→MaxTokens,
-  TOOL_CALLS→ToolUse, TIME_LIMIT→Other). Request mapping: system→`ROLE_SYSTEM`,
-  assistant `ToolUse`→`tool_calls{FunctionCall}`, user `ToolResult`→`ROLE_TOOL` msg with
-  `tool_call_id`, tooldefs→`Tool{Function{parameters: JSON-string}}`. `Capabilities` on the
-  gRPC path: `server_side_tools=true`, `parallel_tool_use=true`, caching/thinking `false`
-  (xAI caches automatically; we don't echo request-side cache markers or thinking blocks).
-  **70 tests pass** (5 new gRPC mapping/decoder tests in `grpc.rs`), clippy + fmt clean; the
-  generated `pb` module carries `#[allow(clippy::all, dead_code, rustdoc::all)]` (full service
-  surface generated, only `Chat` streaming consumed). **Live-verified** against the real
-  `XAI_API_KEY` with `XAI_TRANSPORT=grpc` (model `grok-4`): `api.x.ai` **is** publicly
-  reachable over gRPC — a streaming turn produced text + reasoning(thinking) deltas, a
-  populated `cache_read` usage (xAI returned cached prompt tokens), and a clean
-  `Done(EndTurn)`; and the agent tool loop ran a `shell` call over gRPC (ToolUse args JSON
-  reassembled, `ROLE_TOOL` result fed back, final answer) end-to-end. **gRPC is now the
-  default transport** (`from_env` defaults `XAI_TRANSPORT` to `grpc`, per RECIPE §8 "primary
-  transport"); set `XAI_TRANSPORT=http` for the OpenAI-compat fallback. Possible follow-up: a
-  `--xai-transport` CLI flag (today it's env-only). Note: the protos' package is `xai_api`
-  (path `xai/api/v1`) — the "outputs"-style API RECIPE calls "proto v6"
-  (`repeated CompletionOutputChunk outputs`).
-- **M8 — gateway layer (complete, live-verified 2026-06-11).** `lvz-gw-http` is the first
-  concrete `Gateway`: an axum 0.8 HTTP server fronting the shared agent via `AgentHandle`,
-  depending **only** on `lvz-protocol` (not on any provider or on `lvz-agent` internals).
-  Surface: `GET /health`, `POST /v1/turns` (`{session?, input}` → the `Event` stream as
-  **SSE**, one JSON event per `data:` frame), `GET /v1/ws` (a **WebSocket**: one turn JSON
-  per message, events streamed back as JSON text frames, socket stays open for more turns).
-  The wire format required making `Event` serializable: it was **internally** tagged
-  (`#[serde(tag="kind")]`), which *errors at runtime* for newtype variants wrapping a
-  primitive (`TextDelta(String)`, `Done(StopReason)`) — switched to **adjacent tagging**
-  (`#[serde(tag="kind", content="data")]` → `{"kind":"text_delta","data":"hi"}`), with a
-  per-variant round-trip test in `event.rs`. The CLI gained **`--serve <host:port>`** (builds
-  the same tool-using agent as `--agent` via a shared `build_agent`, then runs the gateway;
-  no prompt needed). **Live-verified**: `lavoisier --serve` over the default xAI gRPC
-  transport answered a real `POST /v1/turns` with a correct SSE stream (thinking + text
-  deltas, usage incl. `cache_read`, `done`). 78 tests pass (6 new in `lvz-gw-http`: unit
-  encoders + a real-listener HTTP/SSE integration test against a stub `AgentHandle`), clippy +
-  fmt clean. **Note:** the agent is still per-turn stateless — `submit` ignores `turn.session`
-  (no persisted multi-session history yet; that's M9 `lvz-memory` + session isolation). No
-  auth/quotas yet (M9). A `lvz-gateway` registry crate was *not* needed (the `Gateway` trait
-  already lives in `lvz-protocol`).
-- **M9 — Hermes gateways + features (complete, 2026-06-11).** Four units,
-  each committed separately:
-  - **`lvz-memory` (session continuity).** `Agent::run_seeded(Vec<Message>)` lets a caller
-    seed a turn with prior history (`run` delegates to it; `run_loop` classifies against the
-    latest user turn). New feature crate over `lvz-agent` + `lvz-protocol`: a `SessionStore`
-    trait + `InMemoryStore`, and `SessionAgent` — an `AgentHandle` that loads a session's
-    transcript, seeds the turn, runs, and (on clean `Done`) appends the assistant answer and
-    persists. Transcript stays a clean user/assistant turn list (no intra-task tool blocks).
-    `--serve` wraps the agent in `SessionAgent`+`InMemoryStore`, so `turn.session` is finally
-    load-bearing. **Live-verified** over the HTTP gateway: same session recalled a fact across
-    turns; a different session stayed isolated.
-  - **Auth + quotas (`lvz-gw-http`).** `GatewayConfig{api_keys, rate_limit}` + a `route_layer`
-    guard on `/v1/turns`+`/v1/ws`: API-key auth (`Authorization: Bearer`; empty set = open)
-    then a per-principal fixed-window rate limiter (429 past quota). `/health`+`/metrics`
-    stay open. CLI `--api-key` (repeatable) / `--rate-limit <N per 60s>`.
-  - **Observability (`lvz-gw-http`).** A `Metrics` recorder (atomic counters: turns, errors,
-    input/output tokens, cache read/creation, summed latency) fed by a per-turn stream tap
-    (records the agent's single terminal `Usage`, last-wins). `GET /metrics` exposes
-    Prometheus text (v0.0.4) — scrape directly or bridge to OTLP at the collector, no heavy
-    exporter dep. *(This closes the §6.4 "no telemetry export" debt for the gateway path.)*
-  - **`lvz-gw-matrix` (Matrix gateway).** A **thin reqwest** client over the Matrix
-    client-server REST API (login + `/sync` long-poll + `m.room.message` send) — *not*
-    `matrix-sdk` (chosen to honour the minimal-deps convention; **unencrypted rooms only, no
-    E2EE**). Each inbound `m.text` from another user runs a turn with `session = room id`
-    (per-room continuity via `lvz-memory`); the answer posts back. Depends only on
-    `lvz-protocol`. CLI `--serve-matrix` (env `MATRIX_HOMESERVER`/`MATRIX_USER`/
-    `MATRIX_PASSWORD`). **Not live-verified** (needs a homeserver + bot account); the wire
-    mapping (sync→messages, self/non-text skipping, room-id encoding) is unit-tested.
-  86 tests pass; clippy + fmt clean.
-- **M10 — Hermes deployment (artifacts complete, local-verified 2026-06-11; AWS apply pending
-  the user).** Packaging + IaC for the HTTP gateway on **AWS Fargate, arm64, us-west-2**, per
-  RECIPE §10 (Podman not Docker; secrets via Secrets Manager). Deliverables:
-  - **`Containerfile`** (+ `.containerignore`): multi-stage `linux/arm64`. Builder
-    `rust:1.88-bookworm` installs `protoc` (needed by `lvz-xai/build.rs`) and `cargo build
-    --release -p lvz-cli`; runtime `distroless/cc-debian12:nonroot` (glibc/libgcc for `ring`,
-    CA certs, no shell; rustls/webpki so no OpenSSL), `CMD ["--serve","0.0.0.0:8080"]`.
-  - **`infra/terraform/`** (Terraform ≥1.5, AWS provider ~5): ECR repo; minimal public-subnet
-    VPC (2 AZs, IGW, no NAT — tasks get public IPs for egress); internet-facing ALB → target
-    group on :8080 with `/health` checks (WS upgrades pass through); ECS Fargate cluster +
-    task def with `runtime_platform.cpu_architecture = "ARM64"`, `awslogs`, env
-    (`XAI_TRANSPORT=grpc`, `LVZ_RATE_LIMIT`) + **secrets from Secrets Manager**
-    (`XAI_API_KEY`, `LVZ_API_KEYS`); service with `assign_public_ip`; locked SGs (ALB→task
-    only); IAM execution role with scoped `secretsmanager:GetSecretValue`. `terraform validate`
-    passes; `outputs` give the ALB DNS + ECR URL.
-  - **`infra/scripts/`**: `build-and-push.zsh` (`podman build --platform linux/arm64` + ECR
-    push) and `deploy.zsh` (`terraform apply` + force a fresh ECS deployment). **`infra/README.md`**
-    is the runbook (create secrets → `apply -target` ECR → build/push → deploy → smoke-test →
-    teardown), with cost + `/metrics`-exposure caveats.
-  - **Code:** `--api-key`/`--rate-limit`/`--serve` gained clap `env=`
-    (`LVZ_API_KEYS` comma-split / `LVZ_RATE_LIMIT` / `LVZ_SERVE_ADDR`) so Secrets Manager
-    injects via env, not the task command line.
-  - **Verified locally:** cargo build/test/clippy/fmt green (86 tests); `terraform fmt` +
-    `validate` clean; the arm64 image builds with Podman and `--serve` answers a real
-    `POST /v1/turns` over xAI gRPC (`/health`, `/metrics`, 401/429 all correct). **Not** applied
-    to AWS (no creds/spend here) — the runbook drives that. HTTP gateway only; Matrix deploy
-    deferred (no inbound port; separate service).
-- **Optional tracks (done; live AWS apply + live Matrix still pending).**
-  - **`lvz-tune` (ATO §6.6) — built, full §10 roadmap landed (incl. Bayesian opt).** `LearningTuner`:
-    an ε-greedy hill-climb bandit over `Knobs`, keyed by `(archetype, caching, model-tier,
-    model_id, repo_id)`, exploiting the cheapest *trusted* (success-rate ≥ target) vector — ties broken
-    toward least context carried — and exploring one-step neighbours on a discrete grid centred
-    on `Knobs::default()` (the floor it can't regress below). CLI `--tune` swaps it in (precedence
-    over `--compact-after`). **Full mechanism in `docs/ATO.md`.** The 2026-06-11 ATO-roadmap
-    increment wired the deferred items: **(1) a real success signal** — `--verify-cmd <cmd>` runs
-    a post-task shell gate (e.g. `cargo test`); exit 0 ⇒ `Outcome.success`, else the coarse
-    "completed without error" fallback; **(2) all four knobs now bite** — `skeleton_radius` is
-    injected into focused `outline_file` calls, `batch_width` drives a parallel-tool-use
-    system-prompt hint (alongside the already-live `compact_after`/`truncate_bytes`); **(3) two
-    counterfactuals** — (a) the **exact** truncate one (always on): when truncation never fired,
-    cheaper truncate-grid values still ≥ the largest tool result are credited with the identical
-    (byte-for-byte) outcome, no live trial (`Outcome.max_tool_result_bytes` carries the signal);
-    (b) the **estimated** radius one (opt-in `--radius-counterfactual`, off by default, *unsound*):
-    `lvz-agent` snapshots knob-governed `outline_file` skeletons and, post-task, re-extracts them
-    at smaller radii to estimate the saving and credits those radii with the optimistically-
-    transferred success bit; **(4) model-version keying** — `TaskContext.model_id` in the
-    `ContextKey` so a model upgrade starts a fresh profile; **(5) persistence** — `--tune-state
-    <path>` (JSON save/load of profiles + PRNG across restarts via a `PersistentTuner` wrapper).
-    Live-verified vs Anthropic: `--verify-cmd` exit-code gating (pass→successes 1, fail→0) and the
-    radius counterfactual (a `skeleton_radius:0` row credited alongside the realised `:1`). The
-    2026-06-12 batch closed the rest: **per-repo profiles** (`repo_id` in the `ContextKey`),
-    **observation decay** (`TuneConfig.decay` EWMA, CLI `--tune-decay`), **downstream-effect
-    modelling** (the radius counterfactual scales each saving by a *residency* factor — turns the
-    skeleton was re-sent — collapsing to 1 under caching), and **Bayesian optimisation**:
-    `BayesTuner` (`bayes.rs`), a Thompson-sampling alternative (Beta posterior over success +
-    Gaussian over cost per knob vector; samples and picks the cheapest feasible draw; hand-rolled
-    Box–Muller/Marsaglia–Tsang/Beta samplers, no extra deps), opt-in via `--tune-bayes` (implies
-    `--tune`, precedence over it). It **persists** like the hill-climb: `BayesTuner::save`/`load`
-    snapshot the posteriors, so `--tune-state` works with `--tune-bayes` too (both via the shared
-    `PersistableTuner` wrapper). Pair `--tune` with `--verify-cmd` for a production-grade signal;
-    `--tune`/`--tune-bayes` alone (and `--radius-counterfactual`) stay experimental. The radius
-    counterfactual now also models the **altered reasoning** on a thinner skeleton (not just the
-    input-byte delta): `--radius-risk <F>` (default 0.5) claws back `risk × fraction-of-context-cut`
-    of the estimated saving as expected re-acquisition cost, and a radius that strips >90% of the
-    dependency context no longer has the success bit transferred (`--radius-risk 0` restores the old
-    pure-saving estimate). Only deferred now: full module-qualified symbol resolution (see the
-    skeleton-fidelity debt).
-  - **`lvz-claude-cli` — built, off by default.** A `Provider` shelling out to `claude -p`
-    (`--output-format stream-json`), stream-json → `Event`; `Capabilities` all false (no
-    caching). Selected only via `--provider claude-cli` (default model `sonnet`; `CLAUDE_CLI_BIN`
-    overrides). Personal/low-volume only (Agent SDK credit cap, policy-fragile). Wire mapping
-    unit-tested; not live-verified (needs a `claude` install + subscription).
-  - **Advisor mode (§8 cost levers in `lvz-agent`) — built, live-verified vs Anthropic.**
-    *Cheap-model-first* (`cheap_model` + `escalate_after`): the loop runs the first N
-    round-trips on a cheap model, then escalates to `model`. *Advisor+executor split*
-    (`advisor_model`): a tool-less pre-pass on a **smarter, more expensive** model (e.g. Opus)
-    drafts a plan that seeds the **cheaper** executor (the main `model`, e.g. Sonnet) as its
-    opening move — the expensive model is paid for once while the cheap model runs the many
-    execution turns (advisor tokens count toward the task total). Provider-agnostic (model ids
-    only). CLI `--cheap-model` / `--escalate-after` / `--advisor-model`, composable, opt-in.
-
-### Known debts inside shipped code (pick up before/with the above)
-
-- **Tuner: all four knobs now wired; success signal can now be real.** `lvz-agent` calls
-  `Tuner::select`/`observe` with a **real** `TaskContext` (classified `Archetype` + walked
-  `RepoProfile` + `model_id`) and honours all of `compact_after`, `truncate_bytes`,
-  `skeleton_radius` (injected into focused `outline_file`/`outline_files` calls), and
-  `batch_width` (caps the `read_files`/`outline_files` `paths` array + steers the prompt). The
-  success signal is real when `--verify-cmd` is set (post-task exit-code gate), else the coarse
-  completion fallback. Archetype classification defaults to the keyword heuristic but can use a
-  model call (`--classify-with-model`, opt-in, routed to `--summary-model`). The default tuner is
-  still `NoopTuner` (ATO is opt-in via `--tune`, or `--tune-bayes` for the Thompson-sampling
-  variant). The §10 roadmap is fully landed (per-repo keying, observation decay, the radius
-  counterfactual's residency-scaled downstream model + **reasoning-effect clawback** (`--radius-risk`),
-  on-disk `BayesTuner` persistence (`save`/`load` + `--tune-state`), Bayesian optimisation, and a
-  **cost-weighted objective** — the budget and ATO minimise `Usage::cost(&CostWeights)`, not flat
-  tokens, so caching/output cost register). Only deferred: full module-qualified symbol resolution
-  (see the skeleton-fidelity debt; `docs/ATO.md` §10).
-- **Telemetry (§6.4).** Usage is aggregated, the `--budget` ceiling is enforced, the
-  **HTTP gateway exports Prometheus `/metrics`** (tokens, cache read/creation, turns,
-  errors, summed latency, **plus a derived `lavoisier_cache_hit_rate` gauge** — cache_read ÷
-  total prompt tokens, the single number for confirming the §6.1 caching levers are paying
-  off; 0.0 until any prompt tokens are billed), and the **CLI/agent path now has an in-process
-  hook** — `Agent::with_telemetry(Arc<dyn TelemetrySink>)` emits a per-task `TaskTelemetry`
-  (which now carries `cost_weights` + a `cost()` helper), surfaced by `--telemetry` (one-shot
-  `--agent` runs print a stderr summary line reporting both the **cost-weighted `cost=`** — the
-  figure the budget/ATO objective minimised — and raw `tokens=`). The per-task ATO success signal
-  exists (`--verify-cmd`).
-- **Skeleton fidelity.** Python docstrings are now **kept** when a body is elided
-  (`LangSpec.keeps_docstring`; the skeletoniser elides only the post-docstring range and
-  re-indents the placeholder). The symbol-dependency graph is now **AST-resolved + scope-aware**:
-  edges come from real `identifier`/`type_identifier` nodes (not substring search) minus
-  locally-bound names, so names in strings/comments and shadowing locals no longer create spurious
-  edges (`lvz-context::symbols`, per-language `ref_ident_kinds`/`binder_kinds`). Cross-file
-  resolution is now **scope-aware**: the graph is keyed by `(file, name)`, so a reference binds to a
-  *same-file* definition before falling back to a cross-file one by name — two files that each define
-  `helper` no longer merge on the target side (`neighbors_within_by_file` keeps a body only in its
-  owning file; the budget loop uses it). Still **not** module-qualified — two same-named
-  *definitions* share one out-edge key and there's no `use`/`import` path resolution (the budget
-  loop's deterministic name-based cross-file linking relies on that, and full qualification would
-  need module identity threaded through the public API + skeletoniser + rebaselined ceilings; fine
-  for `N`). `outline_file --focus` builds a single-file graph (the multi-file graph is used by the
-  budget loop, not the tool).
-- **Multi-file batching (§6.1)** is implemented: `read_files`/`outline_files` batch tools (take a
-  `paths` array, return per-file sections under `===== <path> =====` headers, inline per-file
-  read errors), the `batch_width` knob caps the `paths` array agent-side (`apply_knobs_to_args`),
-  and `system_with_knobs` steers the model to the batch tools. Live-verified (one `read_files`
-  call fetched 3 files in one round-trip).
-- **`find_references` tool (`lvz-tools::search`)** — repo-wide "where is this name used?" in one
-  call: a bounded, build-dir-skipping walk that returns the **complete** reference set grouped by
-  file with a total count. For known languages it matches identifier nodes via
-  `lvz_context::symbols::find_identifier_lines` (AST-precise — mentions in strings/comments don't
-  count; returns `Option`, `None` only on parse failure so callers don't text-fall-back on a clean
-  parse), with a word-boundary text scan for other files. Added to fix the **convergence gap** the
-  Dirac benchmark surfaced (the model otherwise loops on ad-hoc `grep -r`/`sed` with no "that's all
-  of them" signal — see `bench/README.md` Findings #2); the default system prompt now steers to it
-  and tells the model to stop once it has the full set. Unit-tested + scale-smoked vs the django
-  checkout (`#[ignore]`d `find_references_scale_smoke`, `LVZ_SMOKE_DIR`/`LVZ_SMOKE_NAME`).
-- **Cache-aware repo-skeleton prefix (§6.1) — implemented, relevance-ranked.** `AgentConfig.repo_skeleton:
-  Option<usize>` (CLI `--repo-skeleton <TOKENS>`). Two stages: `collect_repo_skeletons` does a
-  bounded, sorted walk of `repo_root` and tree-sitter–skeletonises **every** source file once
-  (memoised in an `Arc<OnceLock>` on the `Agent`, so a long-running `--serve` walks the repo only
-  once); then per task `assemble_repo_skeleton` **relevance-ranks** those files against the task
-  prompt (distinct query terms ≥3 chars matched in path — weighted 2× — + skeleton) and accumulates
-  `===== <path> =====` sections to the token budget. So a limited budget is spent on the code most
-  likely to matter instead of alphabetical order; an empty/short prompt falls back to sorted path
-  order (the prior behaviour). `build_request` injects the result as the **first content block of
-  the first user message**, marked cacheable. Ordered immutable→stable→volatile, it extends the
-  cached prefix (system + tool defs + skeleton) ahead of the volatile conversation. The assembled
-  prefix is stable for a fixed task ⇒ caches across that task's round-trips; ranking is per-task, so
-  in `--serve` different tasks get different (relevant-to-them) prefixes — the cross-task skeleton
-  re-use is traded for relevance, while the system+tools prefix still caches. Off by default; most
-  valuable with Anthropic caching. Unit-tested (determinism, budget, **relevance ranking**,
-  cached-prefix injection) and **live-verified vs Anthropic** (`claude-haiku-4-5`, `--repo-skeleton
-  4000`): the prefix `cache_creation` on turn 1 then `cache_read` on turn 2 (~99% cache hit).
-  Caching marks the system prompt, the last tool def, **and** the repo-skeleton block.
-
-### Gotchas
-
-- **Building `lvz-xai` requires `protoc`** (`brew install protobuf`) — `build.rs` compiles the
-  vendored `proto/xai/api/v1/chat.proto` via `tonic-prost-build`. Pinned upstream commit and
-  update procedure live in `proto/VENDOR.md`.
-- `lvz-context` parses with tree-sitter; grammar/core ABI versions are pinned in its
-  `Cargo.toml` — bump them together and re-run tests.
-- The budget loop's per-fixture ceilings in `crates/lvz-context/tests/budget.rs` are the
-  committed baseline; update them deliberately when skeleton output legitimately changes
-  (`cargo test -p lvz-context --test budget -- --nocapture` prints the trend line).
-
-## Native-API feature coverage
-
-Each provider adapter now covers its native API's major features. Cross-provider request features
-live in `lvz-protocol` and are mapped in all three adapters; provider-specific features are
-implemented per adapter.
-
-**Common (all three providers):**
-- `ChatRequest.tool_choice` (`ToolChoice` Auto/Required/None/Tool + `disable_parallel_tool_use`),
-  `top_p`/`top_k`/`stop_sequences`, `OutputFormat::JsonSchema` (structured outputs), `ToolDef.strict`.
-- Multimodal: `ContentBlock::Image`/`Document` + `MediaSource` (base64/url/**file_id**/**plain_text**) +
-  `Capabilities.vision`. Anthropic image/document `source`, Gemini `inlineData`/`fileData`, xAI
-  `image_url`/`FileContent`. `MediaSource::PlainText` is the lightweight text-document path for
-  Anthropic `citations` (maps to a `text`-type document source — no PDF needed; Gemini/xAI inline it).
-- `ServerTool` (`WebSearch`/`WebFetch`/`CodeExecution`) + `mcp_servers` — provider-executed tools,
-  unified: WebSearch → Anthropic `web_search_20260209` / xAI **Live Search** / Gemini
-  `googleSearch`; CodeExecution → each provider's built-in.
-- **Shared retry/backoff** (`lvz_protocol::retry_transient`) — a transport-agnostic combinator that
-  retries an idempotent send on transient failures (HTTP **429** rate-limit / **503** overload) with
-  bounded exponential backoff (2s→32s). Applied to **all** provider stream paths — Anthropic HTTP,
-  Google HTTP, **and both xAI transports** (HTTP + gRPC, where `status_to_err` maps gRPC
-  `ResourceExhausted`→429 / `Unavailable`→503) — so a burst from the agent loop no longer fails a
-  whole task on the first throttle (previously only `lvz-google` retried). Tunable per provider via
-  `{ANTHROPIC,GOOGLE,XAI}_MAX_RETRIES` (default 6).
-- **Auto-batch (`lvz_protocol::BatchProvider`)** — a unified primitive that runs a
-  create→poll→results lifecycle over each provider's **discounted (~50%) batch API** for
-  non-interactive bulk work. `run_batch(Vec<BatchTask>) -> Vec<BatchItem>` (each `BatchTask` =
-  `custom_id` + `ChatRequest`; each `BatchItem` carries the answer text, `Usage`, and an optional
-  per-item error). Implemented for **Anthropic** (`lvz_anthropic::batch`) and **Google**
-  (`lvz_google::batch`); both poll at 5s intervals (360-poll cap). xAI has no batch API — use its
-  **deferred completions** (`start_deferred`/`poll_deferred`) instead. Live-verified on Anthropic +
-  Google (the new `batch_edit` tool **live-verified** 2026-06-15 against the real Anthropic batch
-  API — 3 independent edits applied in one job). Surfaced to the agent as the **`batch_edit` tool**
-  (`lvz-tools`): the model fans a set of **independent, mechanical** per-file edits out to
-  `run_batch` (~50% cost) instead of editing them one-by-one in the interactive loop — the natural
-  fit for bulk-mechanical archetypes (rename across modules, one migration per file). Each edit is a
-  single-shot request (file + self-contained instruction) whose response is **SEARCH/REPLACE diff
-  blocks** — applied locally so output tokens scale with the change, not the file — with a
-  **full-file-rewrite fallback** when the model returns no markers (and a per-file error when a
-  SEARCH block can't be located). Unreadable files and per-item errors are reported, not fatal.
-  Counted as an edit
-  tool by the convergence/staleness levers (`EDIT_TOOLS`). **On by default** (Lavoisier is
-  cost-first) whenever the provider has a batch API; `--no-batch-edit` opts out, and providers
-  without one (xAI / claude-cli) simply never get it. **xAI has no cheaper batch path** — its
-  deferred completions share normal rate limits and pricing (an async/long-running mechanism, not a
-  discount), so batch fan-out is Anthropic/Google only.
-
-**Anthropic:** model-aware thinking — **adaptive + `output_config.effort`** on modern models
-(Sonnet 4.6, Opus 4.6/4.7/4.8, Fable 5), legacy `budget_tokens` on Haiku/older; sampling params
-stripped on the flagships that 400 on them. Native token counting (`Provider::count_tokens` →
-`/v1/messages/count_tokens`). **Batch API** (`lvz_anthropic::batch`, 50% pricing) incl.
-`create`/`get`/`results`/**`cancel`/`list`**. Server-side tools + MCP connector (`mcp_servers`) +
-Files API (`upload_file`) + **client builtin tools** (`BuiltinTool::Bash`/`TextEditor`/`Memory` →
-versioned `bash_20250124`/`text_editor_20250728`/`memory_20250818`, memory rides the
-context-management beta) with auto beta headers. `StopReason::Refusal`/`PauseTurn`; document
-`citations` request-side **and response-side** (`Event::Citation{cited_text,source}` from the
-SSE `citations_delta`).
-
-**xAI:** `reasoning_effort` (gRPC + HTTP), Live Search (`search_parameters`), `response_format`,
-`tool_choice`, vision (`image_url`/`FileContent`). **Deferred (async) completions**
-(`GrpcTransport::start_deferred`/`poll_deferred`). Server tools beyond web search:
-**X search** (`ServerTool::XSearch`, handle allow/block + ISO date window), **collections search**
-(`ServerTool::CollectionsSearch`), and **MCP** (`mcp_servers` → proto `Tool::Mcp`).
-
-**Google:** `functionCallingConfig`, `responseSchema`, sampling, multimodal, **explicit context
-caching** (`GoogleProvider::create_cached_content` + `with_cached_content` → `cachedContent`),
-Google Search grounding + code-execution tools, **`safetySettings`** (`with_safety_settings`,
-opt-in — no silent disabling), **Files upload** (`upload_file`, resumable → `fileUri`),
-**native token counting** (`Provider::count_tokens` → `models/{model}:countTokens`, live-verified),
-and **batch mode** (`lvz_google::batch`, `batchGenerateContent`, 50% pricing). Reasoning Gemini models
-(`gemini-3*`/`gemini-2.5*`) get a **configurable `maxOutputTokens` floor** (`effective_max_output`)
-so internal thinking can't consume the whole budget and leave the visible answer empty (a too-small
-cap is raised; a larger caller value is untouched). The floor defaults to
-`DEFAULT_REASONING_FLOOR` (8192) and is set via `GoogleProvider::with_reasoning_floor` or the
-`GOOGLE_REASONING_FLOOR` env var (`0` disables it).
+Remaining/deferred: full **module-qualified** symbol resolution (the cross-file graph is scope-aware
+but not import-path resolved — fine for the radius knob); an unambiguous line-range/occurrence edit
+path so weaker models can do repeated-symbol renames (today they're steered to `sed`); live
+verification of `lvz-claude-cli` (needs a subscription) and the Matrix gateway (needs a homeserver);
+and the actual AWS `terraform apply` (artifacts ship local-verified — run `infra/README.md`).
 
 ## Architecture invariants (do not violate)
 
-The whole design exists to keep one agent core reusable by the CLI today and a future
-multi-gateway "Hermes" agent tomorrow. Three rules enforce that:
+The whole design keeps one agent core reusable by every frontend. Full detail in
+[`ARCHITECTURE.md`](ARCHITECTURE.md); the rules in one line each:
 
-- **`lvz-protocol` is the keystone.** It defines the normalised `Event` stream, `Provider`,
-  `Tool`, `Gateway`, `Tuner`, and `Capabilities` contracts and has **zero** provider- or
-  gateway-specific dependencies. Everything depends on it; it depends on nothing.
-- **Dependencies point inward only.** Provider adapters (`lvz-anthropic`, `lvz-xai`,
-  `lvz-claude-cli`) and gateways (`lvz-gw-*`) depend on the core, never the reverse. A
-  transport/provider/gateway must never leak into `lvz-agent`. Each adapter is the *only*
-  place that maps its wire format to `Event`.
-- **Abstract at the semantic layer.** gRPC vs SSE vs OpenAI-compat is a contained transport
-  detail behind the `Event` stream + `Capabilities`. Anthropic has no gRPC, so gRPC must not
-  become an architectural assumption.
+1. **`lvz-protocol` is the keystone** — defines the `Event` stream + `Provider`/`Tool`/`Gateway`/
+   `Tuner`/`Capabilities` contracts, with zero provider/gateway deps.
+2. **Dependencies point inward only** — adapters and gateways depend on the core, never the reverse;
+   each adapter is the only place its wire format maps to `Event`.
+3. **Abstract at the semantic layer** — gRPC vs SSE vs OpenAI-compat is contained behind the `Event`
+   stream + `Capabilities`; gRPC is never an architectural assumption (Anthropic has none).
 
-Planned workspace (crates prefixed `lvz-`; see `RECIPE.md` §3–§4 for the full map):
-`lvz-protocol`, `lvz-anthropic`, `lvz-xai`, `lvz-context`, `lvz-agent`, `lvz-tools`,
-`lvz-cli`, plus optional/Hermes-tier `lvz-claude-cli`, `lvz-tune`, `lvz-gateway`, `lvz-gw-*`.
+## Token efficiency is the central design lever
 
-## Token efficiency is a first-class goal
+The optimisation metric is **cost-weighted total task tokens across all round-trips**
+(`Usage::cost(&CostWeights)` — input·1 + output·~5 + cache-write·1.25 + cache-read·0.1), never
+per-call input. Both the `--budget` ceiling and the ATO objective use it, so caching and output cost
+register. Mechanisms, all live:
 
-This is the project's central design lever (`RECIPE.md` §6), not an afterthought. When
-implementing the context/agent/protocol layers, preserve these:
+- **Prompt caching** (Anthropic native Messages API + `cache_control`) on stable prefixes, ordered
+  immutable → stable → volatile. A **rolling 4th breakpoint on the conversation tail** bills the
+  growing transcript as `cache_read`, not fresh input. Prior-turn thinking is dropped on resend
+  (zero tokens < cache-read). 1-hour TTL on the immutable prefix under `--serve`.
+- **Cache-aware repo-skeleton prefix** (`--repo-skeleton`) — whole-repo tree-sitter outline, built
+  once and relevance-ranked against the task, pinned in the cached prefix.
+- **File-skeleton extraction** + an **AST-resolved, scope-aware symbol-dependency graph** driving the
+  skeleton-radius knob `N`; **hash-anchored edits** and **diffs** over full-file rewrites.
+- **Multi-file batching** (`read_files`/`outline_files`/`edit_files`), **`find_references`** (one
+  AST-precise call for a complete reference set), **`batch_edit`** (independent mechanical edits via
+  the provider's discounted batch API; Anthropic/Google only, on by default).
+- **History compaction**, staleness eviction, dedup, context-budget eviction; **thinking-budget
+  dial** (mechanical archetypes think less); model routing (cheap-model-first, advisor+executor).
+- **ATO** (`--tune` ε-greedy / `--tune-bayes` Thompson) tunes the knobs against a real success
+  signal (`--verify-cmd`); convergence levers (`--in-loop-verify`, `--no-progress-limit`,
+  `--budget-awareness`) are on by default. The **budget-fixture CI loop** (`lvz-context/tests/
+  budget.rs`) gates skeleton-size regressions against committed token ceilings.
 
-- Prompt caching via Anthropic native Messages API + `cache_control: ephemeral` on stable
-  prefixes — this is the single biggest cost lever and the reason `lvz-anthropic` does **not**
-  use any OpenAI-compat shim (the shim drops caching). **`lvz-anthropic` also places a rolling
-  4th breakpoint on the conversation tail** (the last block of the last message) so the *growing
-  transcript* — not just the static system+tools+skeleton prefix — bills as `cache_read` each
-  round-trip (closes the measured gap where Dirac's explicit Anthropic caching out-cached us on
-  small tasks; `bench/README.md` §8). The adapter counts existing breakpoints and never exceeds
-  the Anthropic limit of 4.
-- **Prior-turn thinking is dropped on resend, never re-billed** (`build_content_block` returns
-  `None` for `Thinking`): the Messages API doesn't need past thinking once a turn's tool loop has
-  closed, and dropping beats caching it (zero tokens < cache-read tokens).
-- **Staleness-aware eviction** (`mark_stale_reads`, runs each loop before dedup): once a file is
-  *successfully* edited, earlier read/outline results for that path are replaced with a short
-  `[stale: …]` pointer (the most recent read and failed-edit cases are left intact).
-- **Thinking budget as a cost dial** (`ThinkingLevel {Off,Low,Medium,High}` on `ChatRequest` +
-  `Knobs`): output (thinking) tokens are the dominant cost once input is cached, so the agent
-  defaults thinking **lower for mechanical archetypes** (rename/single-file-edit/refactor →
-  `Low`; feature/other → provider default) via `resolve_thinking`, the **ATO tuner can tune it**
-  (5th dial, `THINKING_GRID`), and `--thinking-budget <off|low|medium|high>` forces it. Each
-  provider maps the level to its cheapest equivalent so a mechanical task never *raises* cost
-  (Anthropic: `Off`/`Low` ⇒ no thinking block, `Medium`/`High` ⇒ `budget_tokens`; Google ⇒
-  `thinkingConfig`; xAI ⇒ ignored, grok reasons automatically).
-- **1-hour cache TTL on the immutable prefix for long-running gateways**
-  (`AnthropicProvider::with_extended_cache_ttl`, auto-enabled under `--serve`/`--serve-matrix`):
-  marks the system+tools+skeleton breakpoints `ttl: "1h"` (+ the `extended-cache-ttl-2025-04-11`
-  beta header) so they survive idle gaps between turns without re-creation; the volatile
-  conversation tail stays at the default 5-minute TTL. One-shot CLI runs keep 5-min (cheaper write).
-- Order context immutable → stable → volatile to maximise cache hits; never let volatile
-  content leak into the cached prefix (guarded by the `cached_prefix_is_byte_stable_across_turns`
-  test: the budget-awareness progress note lives only in the conversation tail).
-- File-skeleton extraction, symbol-dependency tracking, hash-anchored/AST-native edits, and
-  token-efficient diffs over full-file rewrites (`lvz-context`).
-- The optimisation metric is the **cost-weighted task total across all round-trips** (never
-  per-call input): the agent budget and the ATO tuner minimise `Usage::cost(&CostWeights)` —
-  input·1 + output·~5 + cache_write·1.25 + cache_read·0.1 (provider presets; `CostWeights::flat()`
-  for raw tokens) — so prompt caching (the #1 cost lever) and output cost actually register, and a
-  cache-churning run is no longer mistaken for a cheap one. The skeleton-depth knob `N` is tuned
-  against the budget-fixture CI loop (§6.5), not guessed.
+## Conventions
+
+- **Rust** Cargo workspace; edition 2021, MSRV 1.88 (pinned in the root `Cargo.toml`). Correctness
+  via sum types + exhaustive `match`.
+- Async **tokio**; HTTP **reqwest**; JSON **serde**/**serde_json**; gRPC **tonic**+**prost** (xAI
+  codegen from vendored `proto/`).
+- Scripts **zsh**; local container shells **Podman** (not Docker).
+- Keep dependencies minimal; no heavyweight agent frameworks, no SDKs. The stale Anthropic-native
+  crates (`anthropic*`, `clust`, `misanthropy`) are **not** to be used — hand-roll thin `reqwest`
+  adapters to retain caching + thinking.
+- **Providers in scope: Anthropic + xAI + Google Gemini, native.** OpenAI and others are out of
+  scope. A Discord gateway is **out of scope** (do not build it).
+- Secrets: read from env / AWS Secrets Manager at runtime; never commit keys.
+- License: **MIT** (`LICENSE`).
+
+## Gotchas
+
+- **Building `lvz-xai` requires `protoc`** (`brew install protobuf`) — `build.rs` compiles the
+  vendored `proto/xai/api/v1/chat.proto`. Pin + update procedure in `proto/VENDOR.md`.
+- `lvz-context` tree-sitter grammar/core ABI versions are pinned in its `Cargo.toml` — bump together.
+- The budget loop's committed per-fixture ceilings (`lvz-context/tests/budget.rs`) are the baseline;
+  update them deliberately when skeleton output legitimately changes.
+- Gemini 3 attaches a `thoughtSignature` to each functionCall that must be echoed on resend (else
+  400); `lvz-google` round-trips it through the opaque tool-call id, contained to the adapter.
 
 ## Commands
 
 ```sh
-cargo build                          # build all workspace crates
-cargo test                           # run all tests
-cargo test -p <crate>                # test a single crate, e.g. -p lvz-agent
-cargo test -p <crate> <name>         # run a single test by name
-cargo clippy --all-targets           # lints (keep zero-warning)
+cargo build                          # build all crates
+cargo test                           # all tests
+cargo test -p <crate> [name]         # one crate / one test
+cargo clippy --all-targets           # lints (zero-warning)
 cargo fmt                            # format
 
-# Run the CLI (the `lavoisier` binary lives in lvz-cli):
-XAI_API_KEY=… cargo run -p lvz-cli -- "your prompt"                 # one streaming turn (xAI, gRPC default)
-ANTHROPIC_API_KEY=… cargo run -p lvz-cli -- --provider anthropic "…"  # Anthropic native
-XAI_API_KEY=… cargo run -p lvz-cli -- --agent "edit task here"      # M4 tool-using agent loop
-XAI_API_KEY=… cargo run -p lvz-cli -- --serve 127.0.0.1:8080        # M8/M9 HTTP/WS gateway (+ session memory)
-MATRIX_HOMESERVER=… MATRIX_USER=… MATRIX_PASSWORD=… \
-  XAI_API_KEY=… cargo run -p lvz-cli -- --serve-matrix              # M9 Matrix gateway (one room per session)
+# Run the CLI (binary in lvz-cli):
+XAI_API_KEY=…       cargo run -p lvz-cli -- "prompt"                 # one streaming turn (xAI gRPC default)
+ANTHROPIC_API_KEY=… cargo run -p lvz-cli -- --provider anthropic "…"
+XAI_API_KEY=…       cargo run -p lvz-cli -- --agent "edit task"      # tool-using agent loop
+XAI_API_KEY=…       cargo run -p lvz-cli -- --serve 127.0.0.1:8080   # HTTP/WS gateway + session memory
 ```
 
-CLI flags: `--agent` (tool loop), `--serve <host:port>` (HTTP/WS gateway; sessions persisted
-in-memory), `--serve-matrix` (Matrix gateway), `--api-key <KEY>` (repeatable) / `--rate-limit
-<N per 60s>` (gateway auth/quota), `--provider xai|anthropic|claude-cli`, `--model`,
-`--max-tokens`, `--system`, `--budget` (total-task token ceiling),
-`--summary-model`/`--compact-after`/`--context-limit` (agent efficiency knobs), `--tune`
-(ε-greedy ATO learner) or `--tune-bayes` (Thompson-sampling variant) with `--verify-cmd <cmd>`
-(post-task success gate), `--tune-state <path>` (persist learned profiles; `--tune` only),
-`--tune-decay <F>` (observation-decay EWMA), `--radius-counterfactual` (opt-in, unsound radius
-counterfactual) with `--radius-risk <F>` (reasoning-effect clawback, default 0.5; 0 = old
-pure-saving estimate), `--telemetry` (per-task stderr summary), `--classify-with-model` (model archetype
-classification), `--repo-skeleton <TOKENS>` (cache-aware repo-skeleton prefix, §6.1),
-`--no-batch-edit` (opt out of the `batch_edit` fan-out tool — independent mechanical edits via the
-provider's discounted batch API; on by default, Anthropic/Google only),
-`--thinking-budget <off|low|medium|high>` (force the normalised thinking level — else mechanical
-archetypes default lower and ATO can tune it),
-`--cheap-model`/`--escalate-after` (cheap-model-first) and `--advisor-model` (advisor+executor
-split) for §8 cost reduction, plus the **convergence levers** `--in-loop-verify` (stop as soon as
-`--verify-cmd` passes after an edit turn), `--no-progress-limit <N>` (nudge after N edit-free turns,
-hard-stop at 2N) and `--budget-awareness` (tell the model its turn/token budget each turn) — built to
-close the benchmark-surfaced *termination* gap (the agent finds+edits but won't stop; see
-`bench/README.md` Findings #2). **The convergence levers are now ON by default in the CLI**
-(`--in-loop-verify` + `--no-progress-limit 8` + `--budget-awareness`); `--no-converge` restores the
-raw run-to-`--max-steps` behaviour (used by `bench/run.zsh --no-converge` for A/B baselines).
-Gateway HTTP
-routes: `GET /health`, `GET /metrics` (Prometheus), `POST /v1/turns` (SSE), `GET /v1/ws`
-(WebSocket). Env: `XAI_API_KEY`/`XAI_BASE_URL`/`XAI_GRPC_ENDPOINT`, **`XAI_TRANSPORT=grpc|http`
-(default `grpc`)**, `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`,
-`MATRIX_HOMESERVER`/`MATRIX_USER`/`MATRIX_PASSWORD`, `LVZ_PROVIDER`, `LVZ_MODEL`,
-`LVZ_API_KEYS` (comma-separated gateway keys) / `LVZ_RATE_LIMIT` / `LVZ_SERVE_ADDR`. A local SSE
-mock can be pointed at via `*_BASE_URL` to test the HTTP path without a live key.
-
-```sh
-# Deploy (M10 — AWS Fargate arm64, us-west-2; see infra/README.md for the full runbook):
-podman build --platform linux/arm64 -f Containerfile -t lavoisier:dev .   # arm64 image (Podman)
-./infra/scripts/build-and-push.zsh dev   # push to ECR   ./infra/scripts/deploy.zsh   # terraform apply
-```
-
-All M0–M10 milestones are complete. The optional tracks are built: `lvz-tune` (ATO; full §10
-roadmap landed, both counterfactuals shipped), `lvz-claude-cli`, and advisor mode. A Discord
-gateway is **out of scope** (dropped at user request — do not build it). Remaining: live
-verification of `lvz-claude-cli` (needs a subscription) and the Matrix gateway (needs a
-homeserver); the M10 AWS apply itself (artifacts ship local-verified — run `infra/README.md`
-against a real account); and the one remaining deferred item — full **module-qualified** symbol
-resolution (the cross-file graph is now scope-aware but not import-path resolved; see the
-skeleton-fidelity debt). (Cost-weighted objective, reasoning-effect radius modelling, and on-disk
-`BayesTuner` persistence have since shipped.)
-
-## Conventions
-
-- **Rust** Cargo workspace; pin edition + MSRV in the root `Cargo.toml`. Correctness via
-  sum types + exhaustive `match`.
-- Async: **tokio**; HTTP: **reqwest**; JSON: **serde** / **serde_json**; gRPC: **tonic** +
-  **prost** (xAI codegen from vendored `proto/`).
-- Scripts: **zsh**. Local service shells: **Podman** (not Docker).
-- Keep dependencies minimal and vendor-agnostic; avoid heavyweight agent frameworks. The
-  stale Anthropic-native Rust crates (`anthropic*`, `clust`, `misanthropy`) are **not** to be
-  depended on — hand-roll a thin `reqwest` adapter to retain caching + extended thinking.
-- Providers in scope: **Anthropic + xAI native**, plus **Google Gemini** (`lvz-google`, added
-  2026-06-12 at the owner's explicit request to enable same-model benchmarking vs. agents that run
-  on `gemini-3-flash-preview` — see `bench/README.md`). OpenAI and other providers remain out of
-  scope. (This relaxes the original "Anthropic + xAI native only" decision; `RECIPE.md` §1 records it.)
-  **Live-verified** against the real Gemini API (`gemini-3-flash-preview`, `--thinking high`): a
-  streaming turn plus the agent tool loop end-to-end (functionCall decode, tool-result round-trip,
-  implicit `cache_read`, clean `EndTurn`). Live testing surfaced + fixed one bug: Gemini 3 thinking
-  attaches a `thoughtSignature` to each functionCall that **must be echoed back on resend** (else a
-  400) — `lvz-google` round-trips it through the opaque tool-call id (`call_{n}#{sig}`), contained
-  to the adapter (no protocol change).
-- Secrets: read from env / AWS Secrets Manager at runtime; never commit keys.
-- License: prefer **Apache-2.0** (aligns with xai-proto) or MIT.
+Key flags: `--agent`, `--serve`/`--serve-matrix`, `--provider xai|anthropic|google|claude-cli`,
+`--model`, `--thinking`, `--budget`, `--repo-skeleton`, `--tune`/`--tune-bayes` + `--verify-cmd`,
+`--cheap-model`/`--advisor-model`, `--no-batch-edit`, `--telemetry`, gateway `--api-key`/
+`--rate-limit`. Full list and env vars in `README.md`. Deploy: `infra/README.md`.

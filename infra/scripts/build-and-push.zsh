@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 # Build the arm64 `lavoisier` image with Podman and push it to the stack's ECR repo.
-# (RECIPE §9 M10 / §10: arm64, Podman not Docker.)
+# (§9 M10 / §10: arm64, Podman not Docker.)
 #
 # Prereqs: the ECR repo exists (terraform apply -target=aws_ecr_repository.app), Podman + AWS
 # CLI configured for us-west-2.

@@ -1,4 +1,4 @@
-//! Budget-fixture CI loop (`RECIPE.md` §6.5).
+//! Budget-fixture CI loop (§6.5).
 //!
 //! Each fixture is `(repo snapshot + edit target)` with a **committed token ceiling** at a
 //! chosen skeleton radius. The ceilings are the baseline: a change that makes skeletons fatter

@@ -4,7 +4,7 @@
 //! a `candidates[0].content.parts[]` slice plus a cumulative `usageMetadata`. Byte chunks may split
 //! a line, so we buffer until a line is `\n`-complete (mirrors the Anthropic/xAI decoders).
 //!
-//! Mapping (`RECIPE.md` §5.2):
+//! Mapping (§5.2):
 //! - `part.thought == true` + `text`     → [`Event::Thinking`]
 //! - `part.text`                         → [`Event::TextDelta`]
 //! - `part.functionCall`                 → [`Event::ToolUseStart`] + whole-args [`Event::ToolUseDelta`] + [`Event::ToolUseEnd`]

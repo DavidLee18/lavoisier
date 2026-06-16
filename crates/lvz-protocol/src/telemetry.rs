@@ -1,4 +1,4 @@
-//! The [`TelemetrySink`] contract: a per-task observability hook (`RECIPE.md` §6.4).
+//! The [`TelemetrySink`] contract: a per-task observability hook (§6.4).
 //!
 //! The gateway exports Prometheus `/metrics`, but a one-shot `--agent` run has no server to
 //! scrape. This trait lets *any* host of the agent — the CLI, a gateway, a test — receive one
@@ -14,7 +14,7 @@ use crate::tune::{Archetype, Knobs, ModelTier};
 /// What a task cost and how it ended — emitted once per task to a [`TelemetrySink`].
 #[derive(Debug, Clone)]
 pub struct TaskTelemetry {
-    /// The classified task archetype (`RECIPE.md` §6.5).
+    /// The classified task archetype (§6.5).
     pub archetype: Archetype,
     /// The headline model id the task ran on.
     pub model: String,

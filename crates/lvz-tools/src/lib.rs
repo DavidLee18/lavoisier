@@ -1,4 +1,4 @@
-//! Tool registry and built-in tools for the Lavoisier agent (`RECIPE.md` §4).
+//! Tool registry and built-in tools for the Lavoisier agent (§4).
 //!
 //! The [`Tool`] trait itself lives in `lvz-protocol`; this crate provides the dispatch
 //! [`ToolRegistry`] and the built-ins the agent uses to act on a repo: filesystem reads,

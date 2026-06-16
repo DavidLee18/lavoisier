@@ -1,4 +1,4 @@
-//! Token-efficient diffs (`RECIPE.md` §6.1): emit minimal unified hunks, never full-file
+//! Token-efficient diffs (§6.1): emit minimal unified hunks, never full-file
 //! rewrites. Small context radii keep the token cost proportional to what actually changed.
 
 use similar::TextDiff;

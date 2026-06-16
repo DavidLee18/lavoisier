@@ -5,7 +5,7 @@
 //! payload and ignore the `event:` lines. Byte chunks may split a line, so we buffer until a
 //! line is `\n`-complete before decoding (mirrors the xAI decoder).
 //!
-//! Event mapping (`RECIPE.md` §5.2):
+//! Event mapping (§5.2):
 //! - `message_start.usage`            → input / cache-creation / cache-read tokens (accumulated)
 //! - `content_block_start` (tool_use) → [`Event::ToolUseStart`]
 //! - `content_block_delta.text_delta`        → [`Event::TextDelta`]

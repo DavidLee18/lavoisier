@@ -1,11 +1,11 @@
 //! Request shape sent to a [`Provider`](crate::Provider): the model id, an optional system
 //! prompt, the conversation as role-tagged content blocks, and the available tool
 //! definitions. Cache markers live here so the protocol — not any one adapter — decides
-//! where the stable prefix ends (`RECIPE.md` §6.2). Adapters that lack caching ignore them.
+//! where the stable prefix ends (§6.2). Adapters that lack caching ignore them.
 
 use serde::{Deserialize, Serialize};
 
-/// Normalised extended-thinking effort, mapped per-provider by each adapter (`RECIPE.md` §8).
+/// Normalised extended-thinking effort, mapped per-provider by each adapter (§8).
 ///
 /// This is a *cost* dial: more thinking ⇒ more (priced) output tokens. The agent defaults it
 /// **lower for mechanical archetypes** (renames, single-file edits) and lets the ATO tuner learn

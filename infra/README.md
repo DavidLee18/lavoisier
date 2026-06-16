@@ -1,7 +1,7 @@
 # Lavoisier on AWS Fargate (M10)
 
 Deploys the `lavoisier` HTTP/WebSocket gateway to **AWS Fargate, arm64, us-west-2** behind an
-ALB — RECIPE §9 M10's "validate the shared core on Fargate behind gateways". The image is built
+ALB — §9 M10's "validate the shared core on Fargate behind gateways". The image is built
 with **Podman** (not Docker); secrets come from **AWS Secrets Manager**; nothing sensitive is
 baked into the image or the task definition.
 

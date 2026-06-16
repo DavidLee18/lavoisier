@@ -1,4 +1,4 @@
-//! The [`Tuner`] contract for adaptive token optimisation (ATO, `RECIPE.md` §5.6, §6.6).
+//! The [`Tuner`] contract for adaptive token optimisation (ATO, §5.6, §6.6).
 //!
 //! The agent asks a tuner which [`Knobs`] to use for a given [`TaskContext`] and reports the
 //! realised [`Outcome`] back. The default [`NoopTuner`] returns the static §6.5 defaults and
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::message::ThinkingLevel;
 use crate::provider::Capabilities;
 
-/// What kind of coding task this is. Knob optima differ per archetype (`RECIPE.md` §6.5).
+/// What kind of coding task this is. Knob optima differ per archetype (§6.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Archetype {
@@ -42,7 +42,7 @@ pub struct RepoProfile {
 }
 
 /// The context a tuner conditions on. Caching state is a major confounder and is carried
-/// explicitly so profiles can condition on it (`RECIPE.md` §6.6).
+/// explicitly so profiles can condition on it (§6.6).
 #[derive(Debug, Clone)]
 pub struct TaskContext {
     pub archetype: Archetype,
@@ -51,11 +51,11 @@ pub struct TaskContext {
     pub model: ModelTier,
     /// The concrete model id (e.g. `"claude-sonnet-4-6"`). Keyed by the learner *alongside* the
     /// coarse [`model`](Self::model) tier so a model upgrade (which shifts the knob optimum,
-    /// `RECIPE.md` §6.6 non-stationarity) starts a fresh profile instead of polluting the old
+    /// §6.6 non-stationarity) starts a fresh profile instead of polluting the old
     /// one. Empty string when unknown.
     pub model_id: String,
     /// Stable identity of the repository the task runs against (the agent uses the repo root
-    /// path). Keyed by the learner so per-repo knob optima don't average together (`RECIPE.md`
+    /// path). Keyed by the learner so per-repo knob optima don't average together (the design notes
     /// §6.6). Empty string when there's no repo context — then all tasks share one repo profile,
     /// so single-repo use sees no key fragmentation.
     pub repo_id: String,
@@ -93,7 +93,7 @@ impl Default for Knobs {
 }
 
 /// The realised result of a completed task. `total_tokens` is the optimisation objective;
-/// `success` is the non-negotiable constraint (`RECIPE.md` §6.6).
+/// `success` is the non-negotiable constraint (§6.6).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Outcome {
     /// The **cost-weighted** task total across ALL round-trips (in fresh-input-token-equivalent
@@ -109,7 +109,7 @@ pub struct Outcome {
     /// The constraint: compile/tests pass, diff accepted, no correction turn needed.
     pub success: bool,
     /// Largest *untruncated* tool-result size (bytes) seen during the task, when known. Enables
-    /// the learner's safe **counterfactual** crediting (`docs/ATO.md` §3, §10): if nothing in the
+    /// the learner's safe **counterfactual** crediting (`ATO.md` §3, §10): if nothing in the
     /// task exceeded the [`truncate_bytes`](Knobs::truncate_bytes) used, then any cheaper truncate
     /// value still ≥ this size would have produced a byte-identical transcript — the same outcome
     /// at the same cost — so the learner can credit it without a live trial. `None` = not tracked.

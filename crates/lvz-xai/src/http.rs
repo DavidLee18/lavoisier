@@ -1,4 +1,4 @@
-//! The in-crate OpenAI-compatible fallback transport (`RECIPE.md` §1, §8).
+//! The in-crate OpenAI-compatible fallback transport (§1, §8).
 //!
 //! Streams `chat/completions` against `https://api.x.ai/v1` (`stream: true`), normalising
 //! SSE chunks into the [`Event`] stream and supporting OpenAI-style function/tool calling:

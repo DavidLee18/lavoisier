@@ -1,9 +1,9 @@
-//! `lvz-gw-http` — the HTTP/REST + WebSocket gateway (`RECIPE.md` §7.2).
+//! `lvz-gw-http` — the HTTP/REST + WebSocket gateway (§7.2).
 //!
 //! A concrete [`Gateway`] that fronts the shared agent over HTTP. It depends only on
 //! `lvz-protocol` (the [`Gateway`]/[`AgentHandle`] contracts + the normalised [`Event`]
 //! stream) — never on a provider or on `lvz-agent`'s internals — so the same agent core
-//! serves the CLI and this gateway unchanged (`RECIPE.md` §6 invariant).
+//! serves the CLI and this gateway unchanged (§6 invariant).
 //!
 //! Surface:
 //! - `GET  /health`   — liveness probe.
@@ -44,7 +44,7 @@ use serde::Deserialize;
 /// The shared agent, as every handler sees it.
 type SharedAgent = Arc<dyn AgentHandle>;
 
-/// Auth + quota policy for the protected routes (`RECIPE.md` §7.3). Defaults are wide open
+/// Auth + quota policy for the protected routes (§7.3). Defaults are wide open
 /// (no keys required, no rate limit) — suitable for local use; lock down for exposed deploys.
 #[derive(Clone, Default)]
 pub struct GatewayConfig {
@@ -128,7 +128,7 @@ impl HttpGateway {
     }
 }
 
-/// Shared handler state: the agent plus the cross-cutting telemetry recorder (`RECIPE.md`
+/// Shared handler state: the agent plus the cross-cutting telemetry recorder (the design notes
 /// §6.4, §7.3).
 struct AppState {
     agent: SharedAgent,
@@ -246,7 +246,7 @@ async fn guard_request(
     next.run(request).await
 }
 
-// --- telemetry (RECIPE §6.4): tokens, cache hits, latency, per-turn counts ---
+// --- telemetry (§6.4): tokens, cache hits, latency, per-turn counts ---
 
 /// Process-wide counters, exported in Prometheus text format at `GET /metrics`. The agent
 /// emits exactly one terminal [`Usage`] per turn (the task total across round-trips), so the

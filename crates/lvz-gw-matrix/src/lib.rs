@@ -1,4 +1,4 @@
-//! `lvz-gw-matrix` — a Matrix gateway (`RECIPE.md` §7.2): a chat-driven frontend for the
+//! `lvz-gw-matrix` — a Matrix gateway (§7.2): a chat-driven frontend for the
 //! shared agent on your homeserver (e.g. Continuwuity).
 //!
 //! Deliberately a **thin** client over the Matrix client-server REST API (`reqwest` + JSON),

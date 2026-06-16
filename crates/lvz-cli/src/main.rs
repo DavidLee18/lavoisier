@@ -1,4 +1,4 @@
-//! `lavoisier` — the CLI gateway (`RECIPE.md` §4, §9 M1–M4).
+//! `lavoisier` — the CLI gateway (§4, §9 M1–M4).
 //!
 //! Two modes over the same plumbing:
 //! - **ask** (default): one streaming turn, no tools — the M1–M3 path.
@@ -166,12 +166,12 @@ struct Cli {
     /// Enable adaptive token optimisation (ATO, experimental): an online tuner that learns
     /// per-archetype knob settings from realised outcomes (most useful in a long-running
     /// `--serve` process). Pair with `--verify-cmd` for a real quality-gated success signal,
-    /// and `--tune-state` to persist what it learns across restarts (§6.6, `docs/ATO.md`).
+    /// and `--tune-state` to persist what it learns across restarts (§6.6, `ATO.md`).
     #[arg(long)]
     tune: bool,
 
     /// Use the experimental **Bayesian** (Thompson-sampling) ATO tuner instead of the ε-greedy
-    /// hill-climb (`docs/ATO.md` §10). Each knob vector carries a Beta posterior over success and
+    /// hill-climb (`ATO.md` §10). Each knob vector carries a Beta posterior over success and
     /// a Gaussian over cost; selection *samples* and picks the cheapest feasible draw, so posterior
     /// uncertainty drives exploration with no explicit ε. Implies `--tune`; takes precedence over it.
     /// Persists with `--tune-state` just like `--tune`.
@@ -196,7 +196,7 @@ struct Cli {
     #[arg(long, value_name = "F")]
     tune_decay: Option<f64>,
 
-    /// Enable the experimental, **unsound** skeleton-radius counterfactual (`docs/ATO.md` §6):
+    /// Enable the experimental, **unsound** skeleton-radius counterfactual (`ATO.md` §6):
     /// after each task, estimate what smaller --tune skeleton radii would have cost and credit
     /// them with the realised success bit (optimistically — it can't prove less context wouldn't
     /// have failed). Off by default; only meaningful with `--tune`. The truncate counterfactual
@@ -204,7 +204,7 @@ struct Cli {
     #[arg(long)]
     radius_counterfactual: bool,
 
-    /// Radius-counterfactual **re-exploration risk** in `[0,1]` (`docs/ATO.md` §10; default 0.5).
+    /// Radius-counterfactual **re-exploration risk** in `[0,1]` (`ATO.md` §10; default 0.5).
     /// Models the model's altered reasoning on a thinner skeleton: a smaller radius is credited with
     /// less of its raw input saving (a fraction is assumed clawed back re-acquiring stripped
     /// context), and a radius that strips most of the context isn't credited with success at all.
@@ -214,17 +214,17 @@ struct Cli {
 
     /// Print a per-task telemetry line to stderr after an `--agent` run (tokens, cache-hit rate,
     /// round-trips, success, latency, chosen knobs) — the one-shot equivalent of the gateway's
-    /// `/metrics` (`RECIPE.md` §6.4).
+    /// `/metrics` (§6.4).
     #[arg(long)]
     telemetry: bool,
 
     /// Classify the task archetype with a model call instead of the free keyword heuristic
-    /// (`RECIPE.md` §6.3). Costs one extra tool-less round-trip (routed to --summary-model when
+    /// (§6.3). Costs one extra tool-less round-trip (routed to --summary-model when
     /// set); falls back to the heuristic on failure. Mainly useful paired with `--tune`.
     #[arg(long)]
     classify_with_model: bool,
 
-    /// Inject a cache-aware repo-skeleton prefix (`RECIPE.md` §6.1) bounded to this many estimated
+    /// Inject a cache-aware repo-skeleton prefix (§6.1) bounded to this many estimated
     /// tokens (--agent/--serve): a tree-sitter outline of every source file in the working dir,
     /// built once and placed in the cached prompt prefix so the model sees whole-repo structure
     /// without per-task reads. Most valuable on a caching provider (Anthropic) and a long-running
@@ -355,7 +355,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // shutdown. No prompt is consumed.
     if let Some(addr) = cli.serve.clone() {
         // Wrap the agent in process-local session memory so each `session` continues its own
-        // conversation across turns (RECIPE §7.3).
+        // conversation across turns (§7.3).
         let inner = Arc::new(build_agent(provider, batch_provider, model, &cli));
         let agent: Arc<dyn AgentHandle> =
             Arc::new(SessionAgent::new(inner, Arc::new(InMemoryStore::new())));
@@ -561,7 +561,7 @@ fn build_agent(
 
 /// Wraps any [`PersistableTuner`] (the ε-greedy [`LearningTuner`] or the Bayesian [`BayesTuner`])
 /// to snapshot its profiles to disk after every observation, so what ATO learns survives across
-/// process restarts (`docs/ATO.md` §10 profile persistence). Selected by `--tune-state <path>`.
+/// process restarts (`ATO.md` §10 profile persistence). Selected by `--tune-state <path>`.
 struct PersistentTuner {
     inner: Arc<dyn PersistableTuner>,
     path: PathBuf,

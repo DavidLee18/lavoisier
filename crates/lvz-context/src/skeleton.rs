@@ -1,4 +1,4 @@
-//! File-skeleton extraction (`RECIPE.md` §6.1, the largest token lever): keep signatures,
+//! File-skeleton extraction (§6.1, the largest token lever): keep signatures,
 //! type definitions, and surrounding doc comments; replace function/method **bodies** with a
 //! placeholder. Bodies named in `keep_bodies` are retained — the building block for the
 //! skeleton-radius knob `N` ("include full bodies for symbols within N hops of the target").

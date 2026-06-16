@@ -2,7 +2,7 @@
 //!
 //! Implements [`Provider`] over the **native** Messages API (`POST /v1/messages`,
 //! `stream: true`). The native path is required to keep prompt caching and extended thinking
-//! (`RECIPE.md` §1, §6.2, §8) — Anthropic's OpenAI-compat shim drops both, which is exactly
+//! (§1, §6.2, §8) — Anthropic's OpenAI-compat shim drops both, which is exactly
 //! why this crate hand-rolls a thin `reqwest` adapter rather than depending on a stale
 //! community crate.
 //!

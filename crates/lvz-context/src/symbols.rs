@@ -1,4 +1,4 @@
-//! Recursive symbol-dependency tracking (`RECIPE.md` §6.1) — the graph that makes the
+//! Recursive symbol-dependency tracking (§6.1) — the graph that makes the
 //! skeleton-radius knob `N` real: "include full bodies for symbols within `N` dependency
 //! hops of the edit target."
 //!

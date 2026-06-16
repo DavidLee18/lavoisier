@@ -1,6 +1,6 @@
 # Adaptive Token Optimisation (ATO)
 
-ATO is Lavoisier's **online, quality-gated knob-tuning loop** (`RECIPE.md` §6.6). It learns,
+ATO is Lavoisier's **online, quality-gated knob-tuning loop** (§6.6). It learns,
 per task context, which efficiency settings minimise the **total tokens a task costs** without
 letting task success drop. This document is the exact mechanism as implemented.
 
@@ -14,7 +14,7 @@ letting task success drop. This document is the exact mechanism as implemented.
 ## 1. Where it sits: two loops, one objective
 
 The optimisation metric is **total task tokens across all round-trips** — never per-call input
-(`RECIPE.md` §6). Two loops drive the knobs toward that minimum:
+(§6). Two loops drive the knobs toward that minimum:
 
 - **Offline (§6.5), the budget-fixture CI loop.** Committed per-archetype token ceilings in
   `crates/lvz-context/tests/budget.rs` set good *static* defaults and a regression floor. This
@@ -69,7 +69,7 @@ Knob optima differ by context, so each context is its own little learning proble
 
 `LearningTuner` keys profiles on `ContextKey { archetype, caching, model, model_id }`. **Caching
 is keyed explicitly** because it dominates token economics: the cheapest knobs with a warm cache
-are not the cheapest without one, so the two must not be averaged together (`RECIPE.md` §6.6).
+are not the cheapest without one, so the two must not be averaged together (§6.6).
 The concrete **`model_id` is keyed alongside the coarse tier** so a model upgrade — which shifts
 the knob optimum (non-stationarity, §6.6) — starts a fresh profile instead of polluting the old
 model's learned optimum. Same model, same key; new model, new key.
@@ -118,7 +118,7 @@ ATO minimises **total task tokens subject to a success constraint**:
 
 > minimise `Outcome.total_tokens`  **subject to**  task-success rate ≥ `success_target`.
 
-The constraint is not optional (`RECIPE.md` §6.6, ≈0.9 confidence). Unconstrained token
+The constraint is not optional (§6.6, ≈0.9 confidence). Unconstrained token
 minimisation degenerates to *context starvation*: too-small skeletons / too-aggressive
 truncation make the model fail or need correction turns, which cost **more** than the tokens
 saved. So a knob vector is only ever chosen if it is **trusted** (see below); the cheapest
@@ -230,7 +230,7 @@ in; the learner just records the synthetic observations the agent emits.
 
 ## 8. The success signal — the keystone
 
-ATO is only as safe as the `success` bit it learns from. RECIPE §6.6 is blunt: **"Without a
+ATO is only as safe as the `success` bit it learns from. §6.6 is blunt: **"Without a
 quality signal, do not enable ATO."** For a coding agent the *right* signal is cheap and strong
 — compile/tests pass, the diff is accepted, no correction turn was needed.
 
@@ -266,7 +266,7 @@ pair the two for a production-grade signal.
   so a given history replays identically. ε-greedy needs no cryptographic RNG, and no `rand`
   dependency is pulled in.
 - **Overhead.** Pure bookkeeping — a couple of hash-map operations per task. Negligible tokens,
-  negligible compute (`RECIPE.md` §6.6).
+  negligible compute (§6.6).
 
 ---
 

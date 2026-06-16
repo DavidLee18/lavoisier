@@ -1,4 +1,4 @@
-//! Token-efficient context tools built on `lvz-context` (`RECIPE.md` §6.1): read a file's
+//! Token-efficient context tools built on `lvz-context` (§6.1): read a file's
 //! structure cheaply (skeleton), read it with edit anchors, and edit it by anchor without
 //! resending the whole file. These let the agent spend far fewer tokens than naive
 //! read_file/write_file round-trips.
@@ -91,7 +91,7 @@ fn outline_source(path: &str, source: &str, focus: Option<&str>, radius: u8) -> 
     }
 }
 
-/// `outline_files` — skeletons of several files in one round-trip (`RECIPE.md` §6.1 batching).
+/// `outline_files` — skeletons of several files in one round-trip (§6.1 batching).
 pub struct OutlineFilesTool;
 
 #[derive(Deserialize)]

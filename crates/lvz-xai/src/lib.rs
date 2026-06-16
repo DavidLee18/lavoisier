@@ -1,12 +1,12 @@
 //! xAI provider for Lavoisier.
 //!
-//! `RECIPE.md` (§1, §8) gives xAI two transports: a native **gRPC** path (codegen from the
+//! the design notes (§1, §8) gives xAI two transports: a native **gRPC** path (codegen from the
 //! vendored `xai-proto`, M7) and an in-crate **OpenAI-compatible** fallback against
 //! `https://api.x.ai/v1`. Both implement the [`Provider`] contract and converge on the
 //! normalised [`Event`] stream; each is the *only* place its wire format is known.
 //!
 //! [`XaiProvider`] is a thin dispatcher over the two. [`XaiProvider::from_env`] honours the
-//! `XAI_TRANSPORT` switch (`grpc` | `http`); gRPC is the default (RECIPE §8 "primary
+//! `XAI_TRANSPORT` switch (`grpc` | `http`); gRPC is the default (§8 "primary
 //! transport", live-verified against `api.x.ai`), with `http` available as a fallback.
 
 mod grpc;

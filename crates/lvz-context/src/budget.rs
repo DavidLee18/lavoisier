@@ -1,4 +1,4 @@
-//! The budget-fixture loop (`RECIPE.md` §6.5): token-efficiency CI for the skeleton-radius
+//! The budget-fixture loop (§6.5): token-efficiency CI for the skeleton-radius
 //! knob `N`.
 //!
 //! A [`Fixture`] is `(repo snapshot + edit target)`; [`Fixture::measure`] builds the context
@@ -18,7 +18,7 @@ use crate::symbols::SymbolGraph;
 use crate::tokens::estimate_tokens;
 use crate::{skeleton, Lang};
 
-/// Coarse task shape; knob optima differ per archetype (`RECIPE.md` §6.5). Mirrors
+/// Coarse task shape; knob optima differ per archetype (§6.5). Mirrors
 /// `lvz_protocol::Archetype` but kept local so `lvz-context` stays protocol-independent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Archetype {

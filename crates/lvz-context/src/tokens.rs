@@ -1,4 +1,4 @@
-//! A cheap, deterministic token estimator for the budget-fixture loop (`RECIPE.md` §6.4–§6.5).
+//! A cheap, deterministic token estimator for the budget-fixture loop (§6.4–§6.5).
 //!
 //! This is **not** a provider tokenizer — it is a stable proxy used to compare context sizes
 //! across skeleton radii and to gate regressions. Because the budget loop only needs relative,

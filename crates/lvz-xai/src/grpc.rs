@@ -1,4 +1,4 @@
-//! The native xAI **gRPC** transport (`RECIPE.md` §8): the primary path, generated from the
+//! The native xAI **gRPC** transport (§8): the primary path, generated from the
 //! vendored `xai-proto` chat service.
 //!
 //! It opens a TLS [`Channel`](tonic::transport::Channel) to `api.x.ai`, calls the server-
