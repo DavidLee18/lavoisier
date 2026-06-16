@@ -15,20 +15,21 @@ captured diff to a clean checkout and runs real acceptance checks (`tsc`-delta /
 
 | model | Lavoisier cost · **verified** | Dirac cost · **verified** | $/verified pass |
 |---|---|---|---|
-| `grok-4-1-fast-reasoning` | **$0.67** · 2/8 | $1.89 · **5/8** | $0.33 vs $0.38 |
-| `gemini-3-flash-preview` | **$0.92** · 2/8 | $3.40 · **7/8** | $0.46 vs $0.49 |
-| `claude-sonnet-4-6` | $5.73 · 5/8 | $5.79 · **7/8** | $1.15 vs **$0.83** |
+| `grok-4-1-fast-reasoning` | **$1.19** · 4/8 | $1.89 · 5/8 | **$0.30** vs $0.38 |
+| `gemini-3-flash-preview` | **$1.30** · 3/8 | $3.40 · 7/8 | **$0.43** vs $0.49 |
+| `claude-sonnet-4-6` | $7.18 · 5/8 | $5.79 · 7/8 | $1.44 vs **$0.83** |
 
-- **Lavoisier's raw per-task cost is lower or at parity** — driven by caching (huge on grok, where
-  Dirac's xAI transport re-bills context as fresh input; parity on Anthropic, where both cache).
-- **But Dirac completes more tasks under real acceptance checks** (5–7/8 vs 2–5/8). Lavoisier's misses
-  are mostly *empty patches* (no edit, especially the vscode/TS tasks) and *incomplete edits*.
-- **So on cost-per-completed-task it's ≈ parity on grok and gemini, and Dirac is cheaper on sonnet.**
-  Honest GA position: **Lavoisier is cost-competitive (cheaper per attempt) but has a real
-  task-completion gap to close before a blanket "more efficient" claim holds.** Its strongest honest
-  case is grok — cheapest both raw and per verified pass.
-- **§4–§8 below are the earlier development narrative** with looser grading; the old "~8.6× on grok"
-  was a false-cheap-stop artifact, corrected here.
+- **On cost-per-completed-task — the fair metric — Lavoisier is cheaper than Dirac on grok and gemini,
+  and dearer on sonnet.** Caching drives the raw-cost edge on grok (Dirac's xAI transport re-bills
+  context as fresh input); on Anthropic both cache, so it's close-to-reversed.
+- **Dirac still completes more tasks** (5–7/8 vs 3–5/8). The `str_replace` edit path (the reliable
+  exact-string editor) closed the *empty/failed-edit* failures — weak-model completion rose (grok 2→4,
+  gemini 2→3, both now cheaper per verified pass than Dirac) — but the residual gap is **disengagement**
+  (stops without editing) and **incomplete scope**, not the edit mechanism. On Sonnet, which never
+  needed the edit help, accuracy-first raised cost without raising completion, so **Dirac wins Sonnet**.
+- **Honest GA position:** Lavoisier is **cost-competitive-to-better per completed task on the cheaper
+  models (strongest case: grok)**, but does **not** yet beat Dirac across the board — a real
+  task-completion gap remains. §4–§8 below are the earlier development narrative (looser grading).
 
 > The live `--verify-cmd` (`ruff`/`tsc` on the whole tree) is a poor proxy — it fails on pre-existing
 > repo issues — so all pass/fail above comes from `verify.zsh` (scoped, delta-based, real tests), not it.
@@ -347,7 +348,8 @@ The release-readiness measurement: **Lavoisier and Dirac run back-to-back over t
 on three models** — `grok-4-1-fast-reasoning` (xAI), `gemini-3-flash-preview` (Google),
 `claude-sonnet-4-6` (Anthropic) — on **pinned repos** (`bench/PINS.txt`; django `f1440a7`,
 transformers `8014139`, vscode `588cbae5`, frozen so both agents see identical inputs) and the
-**hardened binary** (commits through `8104407`). Convergence levers on; `max_steps=60`, `max_tokens=16384`.
+**hardened binary** (through `afd8362`, incl. the `str_replace` edit path). Convergence levers on;
+`max_steps=60`, `max_tokens=16384`.
 
 **Correctness is graded by [`bench/verify.zsh`](verify.zsh)** — a deterministic, no-API verifier that
 applies each agent's captured diff to a clean pinned checkout and runs a per-task **acceptance check**:
@@ -356,36 +358,45 @@ isolates the change — a **`tsc` error-count delta** for the vscode/TS tasks (n
 on the changed files** for the transformers tasks, and the **real django `forms_tests` suite** for `08`.
 Anyone can re-run it to reproduce every verdict below; this replaces the noisy lint proxy the agents ran live.
 
-### Per-model totals (cost is live; pass/fail is `verify.zsh`)
+### Per-model totals (cost is live; pass/fail is `verify.zsh`) — with the `str_replace` edit path
 
-| model | Lavoisier cost · **verified** | Dirac cost · **verified** | cost ratio | $/verified pass |
-|---|---|---|---|---|
-| `grok-4-1-fast-reasoning` | **$0.665** · **2/8** | $1.893 · **5/8** | 2.84× cheaper | $0.33 vs $0.38 |
-| `gemini-3-flash-preview` | **$0.925** · **2/8** | $3.403 · **7/8** | 3.68× cheaper | $0.46 vs $0.49 |
-| `claude-sonnet-4-6` | $5.729 · **5/8** | $5.792 · **7/8** | parity | $1.15 vs **$0.83** |
+| model | Lavoisier cost · **verified** | Dirac cost · **verified** | **$/verified pass** |
+|---|---|---|---|
+| `grok-4-1-fast-reasoning` | **$1.19** · **4/8** | $1.89 · 5/8 | **$0.30** vs $0.38 |
+| `gemini-3-flash-preview` | **$1.30** · **3/8** | $3.40 · 7/8 | **$0.43** vs $0.49 |
+| `claude-sonnet-4-6` | $7.18 · 5/8 | $5.79 · 7/8 | $1.44 vs **$0.83** |
+
+> **Edit-path update (the `str_replace` tool).** The numbers above are with `str_replace` (the
+> unambiguous exact-string edit tool). Against the pre-tool baseline — grok 2/8 ($0.67), gemini 2/8
+> ($0.93), sonnet 5/8 ($5.73) — it lifted **weak-model completion** (grok +2, gemini +1, by turning the
+> empty/failed-edit tasks into real edits) and made Lavoisier **cheaper per verified pass than Dirac on
+> grok and gemini**. On **sonnet** (already strong, didn't need the edit help) completion was unchanged
+> and cost *rose* — "accuracy-first" made the capable model do more work — so Dirac stays ahead there on
+> both cost and completion. Per-task pass/fail is stochastic (a single run is a noisy sample); read the
+> suite, not the cell.
 
 ### What the numbers actually say — read cost and correctness together
 
-- **Lavoisier's raw per-task cost is lower** (or at parity), set by **caching**: on grok, Dirac's
-  OpenAI-compat xAI transport re-bills the growing context as fresh input while Lavoisier serves it from
-  cache (per-task `cache_read` in the millions) → 2.8×; on Anthropic both cache natively → parity.
-- **But under real acceptance checks, Dirac completes more tasks — by a wide margin** (5/8 vs 2/8 on
-  grok, 7/8 vs 2/8 on gemini, 7/8 vs 5/8 on sonnet). Lavoisier's failures are mostly **empty patches**
-  (it produced no edit, especially on the vscode/TS tasks) and **incomplete edits** (e.g. task 05: it
-  added `is_stale` to `DynamicCache` but never touched the 8 model files; task 08 on grok: an incomplete
-  rename that fails `forms_tests`).
-- **So the raw cost advantage largely evaporates once you pay only for completed work.** On
-  **cost-per-verified-pass** it is roughly **parity on grok and gemini, and Dirac is ~1.4× cheaper on
-  sonnet.** The honest GA position: **Lavoisier is cost-competitive — cheaper per attempt — but has a
-  real task-completion gap to close before any "more efficient" claim holds across the board.** Its
-  strongest honest case is grok (cheapest raw cost, and cheapest per verified pass).
+- **Caching sets Lavoisier's raw-cost edge:** on grok, Dirac's OpenAI-compat xAI transport re-bills the
+  growing context as fresh input while Lavoisier serves it from cache (per-task `cache_read` in the
+  millions); on Anthropic both cache natively, so the raw-cost gap there is small or reversed.
+- **Dirac still completes more tasks** under real acceptance checks (5/8 vs 4/8 on grok, 7/8 vs 3/8 on
+  gemini, 7/8 vs 5/8 on sonnet). After the `str_replace` edit path, Lavoisier's misses are no longer
+  empty patches but **disengagement** (it stops after ~2 round-trips without editing — sonnet/gemini
+  task 01) and **incomplete scope** (a signature refactor that misses call sites → type errors; a
+  multi-target task that does some of N).
+- **On cost-per-verified-pass — the fair metric — Lavoisier is now cheaper than Dirac on grok ($0.30 vs
+  $0.38) and gemini ($0.43 vs $0.49), and dearer on sonnet ($1.44 vs $0.83).** Honest GA position:
+  **Lavoisier is cost-competitive-to-better per completed task on the cheaper models, but Dirac completes
+  more tasks overall and wins outright on Sonnet.** Strongest honest case: **grok** — cheaper per attempt
+  *and* per verified pass, with completion now within one task of Dirac.
 - **Why the live lint proxy was useless here:** it required `ruff`/`tsc` clean on the *whole* tree, which
   has pre-existing issues, so it failed almost everything (it scored Dirac 1/8 on grok where the real
   verifier confirms 5/8). The acceptance checks — delta-based and scoped to the change — are the
   trustworthy signal. The one task with a real upstream test (django `08`) is graded by `forms_tests`
   directly; both agents pass it on some models and fail (incomplete rename) on others.
 
-### Two bugs this re-measurement caught (and fixed) before GA
+### Three issues this re-measurement caught (and fixed) before GA
 
 1. **False passes.** The first grok run scored "2/8" with **zero real edits** — every "pass" was a lint
    succeeding on an unchanged tree via a non-`EndTurn` exit. Fixed two ways: tools now report whether
@@ -396,11 +407,13 @@ Anyone can re-run it to reproduce every verdict below; this replaces the noisy l
    timeout** (`STREAM_IDLE_TIMEOUT`, 120 s) that fails a stalled stream fast instead of hanging. All
    later runs completed cleanly.
 
-A model-capability note surfaced too: weaker models (grok-fast) initially made **no** edits because they
-fed line-*text* to the hash-anchored edit tools, which can't target byte-identical lines (a recurring
-method signature). A prompt steer — "for a project-wide rename of a recurring identifier use one `sed`
-shell call; never retry an ambiguous anchor" — lifted grok from **0 → 5/8** tasks with real edits. The
-deeper fix (an unambiguous line-range/occurrence edit path) is roadmapped, not yet shipped.
+3. **Empty/failed edits → the `str_replace` edit path.** Weaker models initially made **no** edits
+   because they fed line-*text* to the hash-anchored edit tools, which can't target byte-identical lines.
+   The fix is **`str_replace`** — an unambiguous exact-string editor (accuracy-first: a non-unique match
+   errors rather than guess; `replace_all` + a `paths` list do a project-wide rename in one call). It
+   lifted weak-model verified completion (grok 2→4, gemini 2→3, both now cheaper per verified pass than
+   Dirac); the table above is with it. Residual misses are now disengagement + incomplete scope, not the
+   edit mechanism.
 
 ### Reproduce
 
@@ -491,10 +504,10 @@ ANTHROPIC_API_KEY=… ./bench/run.zsh --model claude-sonnet-4-6 --provider anthr
 - **vscode tasks are heavy.** Tasks 1–4 need a full `npm ci` + whole-project `tsc`; tasks 5–8 only
   need `ruff`. Use `--tasks` to subset.
 
-_Last updated: 2026-06-16. **Authoritative result is the GA head-to-head (§9):** all three models on the
-hardened binary, pinned repos, graded *real-change + verify* — Lavoisier $0.67 / $0.92 / $5.73 vs Dirac
-$1.89 / $3.40 / $5.79 on grok-4-1-fast / gemini-3-flash / sonnet-4-6 (≈2.84× / 3.68× / parity cheaper),
-with Dirac completing more tasks on gemini & sonnet. §4–§8 are the earlier development narrative (looser
-grading; the old "~8.6× on grok" was inflated by false-cheap stops, corrected to ~2.84× in §9). §5 holds:
-both agents pass real django `forms_tests`. Prices and Dirac figures are point-in-time; re-derive from
-§3 sources._
+_Last updated: 2026-06-16. **Authoritative result is the GA head-to-head (§9):** all three models, pinned
+repos, with the `str_replace` edit path; cost is live, correctness is `bench/verify.zsh` (real acceptance
+checks). Verified completion / $-per-verified-pass: grok Lav 4/8 @ $0.30 vs Dirac 5/8 @ $0.38 · gemini
+Lav 3/8 @ $0.43 vs Dirac 7/8 @ $0.49 · sonnet Lav 5/8 @ $1.44 vs Dirac 7/8 @ $0.83. Net: Lavoisier is
+cheaper per completed task on grok & gemini; Dirac completes more overall and wins Sonnet. §4–§8 are the
+earlier development narrative (looser grading; the old "~8.6× on grok" was a false-cheap-stop artifact).
+Prices/Dirac figures are point-in-time; re-derive from §3 sources._
