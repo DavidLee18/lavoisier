@@ -1,16 +1,27 @@
 [package]
-name = "lvz-cli"
-version = "0.0.0"
-description = "The lavoisier CLI — the first gateway. M1: a single non-streaming xAI turn."
+name = "lavoisier"
+version = "0.1.0"
+description = "Lavoisier — a token-efficient CLI coding agent (Anthropic + xAI + Google Gemini), with prompt caching, a tree-sitter context engine, and an adaptive-token-optimisation tuner."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
+homepage = "https://github.com/DavidLee18/lavoisier"
+keywords = ["llm", "agent", "coding-agent", "cli", "anthropic"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "lavoisier"
 path = "src/main.rs"
+
+# cargo-binstall: fetch a prebuilt binary from the GitHub release instead of compiling (so end
+# users need no Rust toolchain or `protoc`). The release.yml workflow uploads matching tarballs.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/lavoisier-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
 
 [dependencies]
 lvz-protocol.workspace = true

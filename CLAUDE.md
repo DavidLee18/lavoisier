@@ -67,7 +67,7 @@ register. Mechanisms, all live:
 - **Rust** Cargo workspace; edition 2021, MSRV 1.88 (pinned in the root `Cargo.toml`). Correctness
   via sum types + exhaustive `match`.
 - Async **tokio**; HTTP **reqwest**; JSON **serde**/**serde_json**; gRPC **tonic**+**prost** (xAI
-  codegen from vendored `proto/`).
+  codegen from vendored `crates/lvz-xai/proto/`).
 - Scripts **zsh**; local container shells **Podman** (not Docker).
 - Keep dependencies minimal; no heavyweight agent frameworks, no SDKs. The stale Anthropic-native
   crates (`anthropic*`, `clust`, `misanthropy`) are **not** to be used — hand-roll thin `reqwest`
@@ -80,7 +80,7 @@ register. Mechanisms, all live:
 ## Gotchas
 
 - **Building `lvz-xai` requires `protoc`** (`brew install protobuf`) — `build.rs` compiles the
-  vendored `proto/xai/api/v1/chat.proto`. Pin + update procedure in `proto/VENDOR.md`.
+  vendored `crates/lvz-xai/proto/xai/api/v1/chat.proto`. Pin + update procedure in that dir's `VENDOR.md`.
 - `lvz-context` tree-sitter grammar/core ABI versions are pinned in its `Cargo.toml` — bump together.
 - The budget loop's committed per-fixture ceilings (`lvz-context/tests/budget.rs`) are the baseline;
   update them deliberately when skeleton output legitimately changes.
@@ -96,11 +96,11 @@ cargo test -p <crate> [name]         # one crate / one test
 cargo clippy --all-targets           # lints (zero-warning)
 cargo fmt                            # format
 
-# Run the CLI (binary in lvz-cli):
-XAI_API_KEY=…       cargo run -p lvz-cli -- "prompt"                 # one streaming turn (xAI gRPC default)
-ANTHROPIC_API_KEY=… cargo run -p lvz-cli -- --provider anthropic "…"
-XAI_API_KEY=…       cargo run -p lvz-cli -- --agent "edit task"      # tool-using agent loop
-XAI_API_KEY=…       cargo run -p lvz-cli -- --serve 127.0.0.1:8080   # HTTP/WS gateway + session memory
+# Run the CLI (crate `lavoisier` in crates/lvz-cli):
+XAI_API_KEY=…       cargo run -p lavoisier -- "prompt"                 # one streaming turn (xAI gRPC default)
+ANTHROPIC_API_KEY=… cargo run -p lavoisier -- --provider anthropic "…"
+XAI_API_KEY=…       cargo run -p lavoisier -- --agent "edit task"      # tool-using agent loop
+XAI_API_KEY=…       cargo run -p lavoisier -- --serve 127.0.0.1:8080   # HTTP/WS gateway + session memory
 ```
 
 Key flags: `--agent`, `--serve`/`--serve-matrix`, `--provider xai|anthropic|google|claude-cli`,

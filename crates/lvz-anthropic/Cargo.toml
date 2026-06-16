@@ -1,6 +1,6 @@
 [package]
 name = "lvz-anthropic"
-version = "0.0.0"
+version = "0.1.0"
 description = "Anthropic provider for Lavoisier: native Messages API over SSE with prompt caching and extended thinking."
 edition.workspace = true
 rust-version.workspace = true

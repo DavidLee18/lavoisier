@@ -1,6 +1,6 @@
 [package]
 name = "lvz-claude-cli"
-version = "0.0.0"
+version = "0.1.0"
 description = "Optional Provider that shells out to Claude Code `claude -p` (subscription OAuth, NOT the API): stream-json -> Event. No prompt caching; capped by the Agent SDK credit (RECIPE.md §8). Personal/low-volume only, off by default."
 edition.workspace = true
 rust-version.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "lvz-agent"
-version = "0.0.0"
+version = "0.1.0"
 description = "The Lavoisier reasoning loop: plan→act→observe, provider- and gateway-agnostic."
 edition.workspace = true
 rust-version.workspace = true

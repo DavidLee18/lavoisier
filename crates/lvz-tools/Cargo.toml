@@ -1,6 +1,6 @@
 [package]
 name = "lvz-tools"
-version = "0.0.0"
+version = "0.1.0"
 description = "Tool registry and built-in tools (filesystem, shell) for the Lavoisier agent."
 edition.workspace = true
 rust-version.workspace = true

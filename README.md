@@ -54,14 +54,14 @@ Requires a recent Rust toolchain (**edition 2021, MSRV 1.88**) and **`protoc`**
 cargo build
 
 # One streaming turn (no tools). xAI uses gRPC by default (XAI_TRANSPORT=grpc):
-XAI_API_KEY=…       cargo run -p lvz-cli -- "explain a monad in one sentence"
-ANTHROPIC_API_KEY=… cargo run -p lvz-cli -- --provider anthropic "…"
+XAI_API_KEY=…       cargo run -p lavoisier -- "explain a monad in one sentence"
+ANTHROPIC_API_KEY=… cargo run -p lavoisier -- --provider anthropic "…"
 
 # The multi-step agent with filesystem + shell + context tools:
-XAI_API_KEY=… cargo run -p lvz-cli -- --agent "add a doc comment to the add() fn in src/lib.rs"
+XAI_API_KEY=… cargo run -p lavoisier -- --agent "add a doc comment to the add() fn in src/lib.rs"
 
 # Serve the shared agent as an HTTP/WebSocket gateway (+ in-memory session continuity):
-XAI_API_KEY=… cargo run -p lvz-cli -- --serve 127.0.0.1:8080
+XAI_API_KEY=… cargo run -p lavoisier -- --serve 127.0.0.1:8080
 ```
 
 ### Flags

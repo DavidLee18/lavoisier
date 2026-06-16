@@ -18,8 +18,7 @@ WORKDIR /build
 # The whole workspace is needed (build.rs + path deps); .containerignore drops target/, etc.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-COPY proto ./proto
-RUN cargo build --release -p lvz-cli
+RUN cargo build --release -p lavoisier
 
 # --- runtime ---------------------------------------------------------------
 # distroless/cc: glibc + libgcc (for `ring`) + CA certs, no shell. TLS is rustls/webpki, so

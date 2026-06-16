@@ -1,12 +1,12 @@
 //! Codegen for the xAI gRPC client (§8): compile the vendored
 //! `xai-org/xai-proto` chat service (and its transitive imports) with `tonic-prost-build`.
 //!
-//! Requires `protoc` on the build machine (e.g. `brew install protobuf`). The vendored
-//! protos live at the repo-root `proto/` directory — see `proto/VENDOR.md` for the pinned
-//! upstream commit and the update procedure.
+//! Requires `protoc` on the build machine (e.g. `brew install protobuf`). The vendored protos
+//! live in this crate's own `proto/` directory (so they ship in the published crate) — see
+//! `proto/VENDOR.md` for the pinned upstream commit and the update procedure.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../proto");
+    let proto_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("proto");
     let mut includes = vec![proto_root.clone()];
 
     // The protos import the well-known `google/protobuf/timestamp.proto`. Homebrew's protoc

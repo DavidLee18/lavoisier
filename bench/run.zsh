@@ -69,7 +69,7 @@ price=${PRICING[$MODEL]:-}
 # --- build the binary once (release, for speed) unless one was supplied ---
 if [[ -z $BIN ]]; then
   print -u2 "building lavoisier (release)…"
-  ( cd $REPO_ROOT && cargo build --release -p lvz-cli ) >&2 || { print -u2 "build failed"; exit 1; }
+  ( cd $REPO_ROOT && cargo build --release -p lavoisier ) >&2 || { print -u2 "build failed"; exit 1; }
   BIN=$REPO_ROOT/target/release/lavoisier
 fi
 BIN=${BIN:A}   # absolute — the runner cd's into each repo before invoking it
