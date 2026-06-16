@@ -44,7 +44,7 @@ jobs:
         run: cargo build --release --locked -p lavoisier --target ${{ matrix.target }}
 
       - name: Package
-        run: tar czf lavoisier-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release lavoisier
+        run: tar czf lavoisier-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release lav
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2

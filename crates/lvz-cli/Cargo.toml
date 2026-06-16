@@ -12,8 +12,9 @@ homepage = "https://github.com/DavidLee18/lavoisier"
 keywords = ["llm", "agent", "coding-agent", "cli", "anthropic"]
 categories = ["command-line-utilities", "development-tools"]
 
+# The package is `lavoisier`; the installed command is the short `lav` (ripgrep→rg style).
 [[bin]]
-name = "lavoisier"
+name = "lav"
 path = "src/main.rs"
 
 # cargo-binstall: fetch a prebuilt binary from the GitHub release instead of compiling (so end

@@ -11,6 +11,8 @@ gateway.
 
 ## Install
 
+The crate is `lavoisier`; the installed command is `lav`.
+
 ```sh
 # Prebuilt binary (no Rust toolchain or protoc needed):
 cargo binstall lavoisier
@@ -22,9 +24,9 @@ cargo install lavoisier
 ## Use
 
 ```sh
-XAI_API_KEY=…       lavoisier "explain a monad in one sentence"     # one streaming turn (xAI gRPC)
-ANTHROPIC_API_KEY=… lavoisier --provider anthropic --agent "…"      # the tool-using agent loop
-XAI_API_KEY=…       lavoisier --serve 127.0.0.1:8080                # HTTP/WebSocket gateway
+XAI_API_KEY=…       lav "explain a monad in one sentence"     # one streaming turn (xAI gRPC)
+ANTHROPIC_API_KEY=… lav --provider anthropic --agent "…"      # the tool-using agent loop
+XAI_API_KEY=…       lav --serve 127.0.0.1:8080                # HTTP/WebSocket gateway
 ```
 
 **Two modes:** efficiency-first by default; opt into accuracy-mode with a real test gate

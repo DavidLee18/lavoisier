@@ -45,7 +45,16 @@ A Cargo workspace, trait-segmented so the agent core never depends on a wire pro
 The keystone is `lvz-protocol`; dependencies point inward only. See [`ARCHITECTURE.md`](ARCHITECTURE.md)
 for the crate map, the invariants, and the key design decisions.
 
-## Quickstart
+## Install
+
+The crate is `lavoisier`; the installed command is **`lav`**.
+
+```sh
+cargo binstall lavoisier   # prebuilt binary, no toolchain/protoc needed
+cargo install lavoisier    # from source (needs protoc: brew install protobuf)
+```
+
+## Quickstart (from source)
 
 Requires a recent Rust toolchain (**edition 2021, MSRV 1.88**) and **`protoc`**
 (`brew install protobuf`) — `lvz-xai`'s build compiles the vendored xAI protos.

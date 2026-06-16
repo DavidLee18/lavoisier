@@ -70,7 +70,7 @@ price=${PRICING[$MODEL]:-}
 if [[ -z $BIN ]]; then
   print -u2 "building lavoisier (release)…"
   ( cd $REPO_ROOT && cargo build --release -p lavoisier ) >&2 || { print -u2 "build failed"; exit 1; }
-  BIN=$REPO_ROOT/target/release/lavoisier
+  BIN=$REPO_ROOT/target/release/lav
 fi
 BIN=${BIN:A}   # absolute — the runner cd's into each repo before invoking it
 [[ -x $BIN ]] || { print -u2 "binary not found/executable: $BIN"; exit 1; }

@@ -2,7 +2,7 @@
 
 Guidance for Claude Code working in this repository.
 
-**Lavoisier** (binary `lavoisier`, alias `lav`) is a modular, token-efficient CLI coding agent in
+**Lavoisier** (crate `lavoisier`, installed command `lav`) is a modular, token-efficient CLI coding agent in
 Rust with a provider-agnostic core (Anthropic + xAI native, plus Google Gemini). The same agent
 brain drives the CLI today and a multi-gateway "Hermes" service (HTTP/WebSocket, Matrix) tomorrow.
 

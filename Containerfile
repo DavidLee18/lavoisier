@@ -25,7 +25,7 @@ RUN cargo build --release -p lavoisier
 # no OpenSSL is needed. Runs as the nonroot uid; port 8080 is unprivileged.
 FROM --platform=linux/arm64 gcr.io/distroless/cc-debian12:nonroot AS runtime
 
-COPY --from=builder /build/target/release/lavoisier /usr/local/bin/lavoisier
+COPY --from=builder /build/target/release/lav /usr/local/bin/lav
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/lavoisier"]
+ENTRYPOINT ["/usr/local/bin/lav"]
 CMD ["--serve", "0.0.0.0:8080"]
