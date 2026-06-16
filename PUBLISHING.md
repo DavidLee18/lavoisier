@@ -53,7 +53,7 @@ Bump the version (all crates share `0.1.0`; keep them in lockstep) before re-pub
 
 `cargo binstall lavoisier` downloads a prebuilt binary from the GitHub release matching the crate
 version. Tag the version to trigger `.github/workflows/release.yml`, which builds and uploads
-`lavoisier-<target>.tar.gz` for macOS (arm64/x64) and Linux (x64/arm64):
+`lavoisier-<target>.tar.gz` for macOS (arm64/Apple Silicon) and Linux (x64/arm64):
 
 ```sh
 git tag v0.1.0
