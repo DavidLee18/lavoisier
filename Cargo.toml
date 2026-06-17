@@ -36,18 +36,19 @@ prost-types = "0.14"
 tonic-prost-build = "0.14"
 
 # Internal crates
-lvz-protocol = { path = "crates/lvz-protocol", version = "0.1.0" }
-lvz-anthropic = { path = "crates/lvz-anthropic", version = "0.1.0" }
-lvz-google = { path = "crates/lvz-google", version = "0.1.0" }
-lvz-claude-cli = { path = "crates/lvz-claude-cli", version = "0.1.0" }
-lvz-xai = { path = "crates/lvz-xai", version = "0.1.0" }
-lvz-tools = { path = "crates/lvz-tools", version = "0.1.0" }
-lvz-agent = { path = "crates/lvz-agent", version = "0.1.0" }
-lvz-context = { path = "crates/lvz-context", version = "0.1.0" }
-lvz-memory = { path = "crates/lvz-memory", version = "0.1.0" }
-lvz-tune = { path = "crates/lvz-tune", version = "0.1.0" }
-lvz-gw-http = { path = "crates/lvz-gw-http", version = "0.1.0" }
-lvz-gw-matrix = { path = "crates/lvz-gw-matrix", version = "0.1.0" }
+lvz-protocol = { path = "crates/lvz-protocol", version = "0.2.0" }
+lvz-anthropic = { path = "crates/lvz-anthropic", version = "0.2.0" }
+lvz-google = { path = "crates/lvz-google", version = "0.2.0" }
+lvz-claude-cli = { path = "crates/lvz-claude-cli", version = "0.2.0" }
+lvz-xai = { path = "crates/lvz-xai", version = "0.2.0" }
+lvz-tools = { path = "crates/lvz-tools", version = "0.2.0" }
+lvz-agent = { path = "crates/lvz-agent", version = "0.2.0" }
+lvz-context = { path = "crates/lvz-context", version = "0.2.0" }
+lvz-memory = { path = "crates/lvz-memory", version = "0.2.0" }
+lvz-tune = { path = "crates/lvz-tune", version = "0.2.0" }
+lvz-gw-http = { path = "crates/lvz-gw-http", version = "0.2.0" }
+lvz-gw-matrix = { path = "crates/lvz-gw-matrix", version = "0.2.0" }
+lvz-gw-cron = { path = "crates/lvz-gw-cron", version = "0.2.0" }
 
 [profile.release]
 lto = "thin"

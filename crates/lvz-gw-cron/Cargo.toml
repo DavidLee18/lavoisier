@@ -1,7 +1,7 @@
 [package]
-name = "lvz-anthropic"
+name = "lvz-gw-cron"
 version = "0.2.0"
-description = "Anthropic provider for Lavoisier: native Messages API over SSE with prompt caching and extended thinking."
+description = "Cron-scheduled gateway for the Lavoisier agent — fires agent turns on a UTC cron schedule."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,12 +11,8 @@ authors.workspace = true
 [dependencies]
 lvz-protocol.workspace = true
 async-trait.workspace = true
-bytes.workspace = true
 futures.workspace = true
-reqwest.workspace = true
-serde.workspace = true
+serde = { workspace = true }
 serde_json.workspace = true
-tokio.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }

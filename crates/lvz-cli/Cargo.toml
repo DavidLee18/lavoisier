@@ -1,6 +1,6 @@
 [package]
 name = "lavoisier"
-version = "0.1.0"
+version = "0.2.0"
 description = "Lavoisier — a token-efficient CLI coding agent (Anthropic + xAI + Google Gemini), with prompt caching, a tree-sitter context engine, and an adaptive-token-optimisation tuner."
 edition.workspace = true
 rust-version.workspace = true
@@ -36,9 +36,16 @@ lvz-memory.workspace = true
 lvz-tune.workspace = true
 lvz-gw-http.workspace = true
 lvz-gw-matrix.workspace = true
+lvz-gw-cron.workspace = true
 tokio.workspace = true
 clap.workspace = true
 futures.workspace = true
+
+# Opt-in Matrix end-to-end encryption (Olm/Megolm). Off by default to keep the standard build
+# light and 1.88-buildable; enabling it pulls in matrix-sdk-crypto and requires Rust >= 1.93.
+# Install with it via `cargo install lavoisier --features e2ee`.
+[features]
+e2ee = ["lvz-gw-matrix/e2ee"]
 
 [dev-dependencies]
 serde_json.workspace = true

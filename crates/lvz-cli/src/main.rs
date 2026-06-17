@@ -20,6 +20,7 @@ use lvz_agent::{Agent, AgentConfig, FixedTuner};
 use lvz_anthropic::AnthropicProvider;
 use lvz_claude_cli::ClaudeCliProvider;
 use lvz_google::GoogleProvider;
+use lvz_gw_cron::{CronGateway, CronJob};
 use lvz_gw_http::{GatewayConfig, HttpGateway};
 use lvz_gw_matrix::MatrixGateway;
 use lvz_memory::{InMemoryStore, SessionAgent};
@@ -62,6 +63,18 @@ struct Cli {
     /// Optional system prompt (overrides the agent's default in --agent mode).
     #[arg(long)]
     system: Option<String>,
+
+    /// Path to a persistent persona file (persona, standing instructions, priorities) layered
+    /// **above** the operational system prompt — the agent keeps it in mind on every turn, and
+    /// it sits in the cached prefix so it costs almost nothing to carry. Defaults to `./PERSONA.md`
+    /// if present; `--no-persona` disables auto-loading. Use this to give a long-running gateway
+    /// (HTTP/Matrix/cron) a stable identity and rules.
+    #[arg(long, value_name = "PATH")]
+    persona: Option<PathBuf>,
+
+    /// Do not auto-load `./PERSONA.md`. (An explicit `--persona <PATH>` still loads.)
+    #[arg(long)]
+    no_persona: bool,
 
     /// Sampling temperature (provider default if unset). Ignored in --agent mode.
     #[arg(long)]
@@ -174,6 +187,18 @@ struct Cli {
     /// `MATRIX_HOMESERVER`, `MATRIX_USER`, `MATRIX_PASSWORD` from the environment.
     #[arg(long)]
     serve_matrix: bool,
+
+    /// Schedule a recurring agent turn (in-process cron, UTC). The first **five** whitespace
+    /// tokens are a standard cron schedule (`min hour dom month dow`); the rest is the prompt.
+    /// Repeatable; each gets its own session (`cron-<n>`). Runs alongside `--serve`/`--serve-matrix`
+    /// or standalone. Example: `--cron "*/30 9-17 * * 1-5 summarise new CI failures"`.
+    #[arg(long = "cron", value_name = "SPEC")]
+    cron: Vec<String>,
+
+    /// Schedule recurring turns from a JSON file: an array of
+    /// `{"schedule","session"?,"prompt"}` objects (UTC cron). Merged with any `--cron` flags.
+    #[arg(long = "cron-file", value_name = "PATH")]
+    cron_file: Option<PathBuf>,
 
     /// Enable adaptive token optimisation (ATO, experimental): an online tuner that learns
     /// per-archetype knob settings from realised outcomes (most useful in a long-running
@@ -355,51 +380,60 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // Long-running gateways (HTTP/Matrix) get the 1-hour cache TTL on the immutable prefix.
-    let serving = cli.serve.is_some() || cli.serve_matrix;
+    // Cron jobs (in-process scheduler) can run standalone or alongside HTTP/Matrix.
+    let cron_jobs = build_cron_jobs(&cli)?;
+
+    // Long-running gateways (HTTP/Matrix/cron) get the 1-hour cache TTL on the immutable prefix.
+    let serving = cli.serve.is_some() || cli.serve_matrix || !cron_jobs.is_empty();
     let (provider, batch_provider) = cli.provider.build(cli.thinking.as_deref(), serving)?;
     let model = cli
         .model
         .clone()
         .unwrap_or_else(|| cli.provider.default_model().to_string());
 
-    // Gateway mode: run the HTTP/WebSocket server over the shared agent and never return until
-    // shutdown. No prompt is consumed.
-    if let Some(addr) = cli.serve.clone() {
-        // Wrap the agent in process-local session memory so each `session` continues its own
-        // conversation across turns (§7.3).
+    // Gateway mode: build the shared agent once — wrapped in process-local session memory so each
+    // `session` continues across turns (§7.3) — then run every active gateway (HTTP, Matrix, cron)
+    // concurrently until shutdown. No prompt is consumed.
+    if serving {
         let inner = Arc::new(build_agent(provider, batch_provider, model, &cli));
         let agent: Arc<dyn AgentHandle> =
             Arc::new(SessionAgent::new(inner, Arc::new(InMemoryStore::new())));
 
-        let mut gw_config = GatewayConfig::default();
-        if !cli.api_key.is_empty() {
-            gw_config = gw_config.with_api_keys(cli.api_key.clone());
-        }
-        if let Some(n) = cli.rate_limit {
-            gw_config = gw_config.with_rate_limit(n, std::time::Duration::from_secs(60));
-        }
-        let gateway = Arc::new(HttpGateway::bind(&addr)?.with_config(gw_config));
+        let mut gateways: Vec<Arc<dyn Gateway>> = Vec::new();
 
-        let auth = if cli.api_key.is_empty() {
-            "open"
-        } else {
-            "API-key required"
-        };
-        eprintln!(
-            "lavoisier: HTTP gateway listening on http://{addr} ({auth}; POST /v1/turns, GET /v1/ws)"
-        );
-        gateway.serve(agent).await?;
-        return Ok(());
-    }
+        if let Some(addr) = cli.serve.clone() {
+            let mut gw_config = GatewayConfig::default();
+            if !cli.api_key.is_empty() {
+                gw_config = gw_config.with_api_keys(cli.api_key.clone());
+            }
+            if let Some(n) = cli.rate_limit {
+                gw_config = gw_config.with_rate_limit(n, std::time::Duration::from_secs(60));
+            }
+            let auth = if cli.api_key.is_empty() {
+                "open"
+            } else {
+                "API-key required"
+            };
+            eprintln!(
+                "lavoisier: HTTP gateway listening on http://{addr} ({auth}; POST /v1/turns, GET /v1/ws)"
+            );
+            gateways.push(Arc::new(HttpGateway::bind(&addr)?.with_config(gw_config)));
+        }
 
-    // Matrix gateway mode: drive the shared agent from a homeserver, one room per session.
-    if cli.serve_matrix {
-        let inner = Arc::new(build_agent(provider, batch_provider, model, &cli));
-        let agent: Arc<dyn AgentHandle> =
-            Arc::new(SessionAgent::new(inner, Arc::new(InMemoryStore::new())));
-        let gateway = Arc::new(MatrixGateway::from_env()?);
-        gateway.serve(agent).await?;
+        if cli.serve_matrix {
+            gateways.push(Arc::new(MatrixGateway::from_env()?));
+        }
+
+        if !cron_jobs.is_empty() {
+            eprintln!("lavoisier: cron gateway with {} job(s)", cron_jobs.len());
+            gateways.push(Arc::new(CronGateway::new(cron_jobs)));
+        }
+
+        // Run them together; the process lives until a serve loop exits or errors.
+        let runs = gateways.into_iter().map(|gw| gw.serve(agent.clone()));
+        for res in futures::future::join_all(runs).await {
+            res?;
+        }
         return Ok(());
     }
 
@@ -444,6 +478,56 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Collect cron jobs from `--cron-file` (parsed first) then any `--cron` quick specs. CLI
+/// specs are indexed after the file jobs so their default `cron-<n>` sessions don't collide.
+fn build_cron_jobs(cli: &Cli) -> Result<Vec<CronJob>, Box<dyn std::error::Error>> {
+    let mut jobs = Vec::new();
+    if let Some(path) = &cli.cron_file {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        jobs.extend(CronJob::parse_file(&text)?);
+    }
+    let base = jobs.len();
+    for (i, spec) in cli.cron.iter().enumerate() {
+        jobs.push(CronJob::parse_cli(spec, base + i)?);
+    }
+    Ok(jobs)
+}
+
+/// Load the persistent persona prompt: an explicit `--persona <PATH>`, else `./PERSONA.md` if
+/// present (unless `--no-persona`). A missing explicit path is a hard error; a missing default is
+/// silent.
+fn load_persona(cli: &Cli) -> Option<String> {
+    let path = match (&cli.persona, cli.no_persona) {
+        (Some(p), _) => p.clone(),
+        (None, true) => return None,
+        (None, false) => {
+            let default = PathBuf::from("PERSONA.md");
+            if !default.is_file() {
+                return None;
+            }
+            default
+        }
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(s) if !s.trim().is_empty() => {
+            eprintln!("lavoisier: loaded persona from {}", path.display());
+            Some(s.trim().to_string())
+        }
+        Ok(_) => None,
+        Err(e) => {
+            // Only surface an error for an explicitly requested file.
+            if cli.persona.is_some() {
+                eprintln!(
+                    "lavoisier: WARNING could not read --persona {}: {e}",
+                    path.display()
+                );
+            }
+            None
+        }
+    }
+}
+
 /// Build the tool-using [`Agent`] from the CLI config. Shared by `--agent` (one-shot) and
 /// `--serve` (gateway) so both drive an identically-configured agent core.
 fn build_agent(
@@ -481,6 +565,14 @@ fn build_agent(
     }
     if let Some(system) = &cli.system {
         config.system = system.clone();
+    }
+    // Layer the persistent persona (persona/priorities) ABOVE the operational base prompt, so the
+    // agent keeps standing instructions in mind while retaining the tool/efficiency steering.
+    if let Some(persona) = load_persona(cli) {
+        config.system = format!(
+            "{persona}\n\n--- (operating instructions follow) ---\n\n{}",
+            config.system
+        );
     }
     if let Some(summary_model) = &cli.summary_model {
         config = config.with_summary_model(summary_model.clone());

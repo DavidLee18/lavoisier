@@ -1,7 +1,7 @@
 [package]
 name = "lvz-gw-matrix"
-version = "0.1.0"
-description = "Matrix gateway for Lavoisier (RECIPE.md §7.2): a thin reqwest client-server API client (login + /sync long-poll + m.room.message send) that drives the shared agent, one room per session. No E2EE — targets unencrypted rooms."
+version = "0.2.0"
+description = "Matrix gateway for Lavoisier: a thin reqwest client-server API client (login + /sync long-poll + m.room.message send) that drives the shared agent, one room per session. End-to-end encryption (Olm/Megolm) is opt-in behind the `e2ee` feature."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,6 +16,17 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+# Opt-in end-to-end encryption (Olm/Megolm) for encrypted rooms. Off by default — the default
+# gateway stays a thin REST client with the minimal-dependency footprint. Enabling `e2ee` pulls in
+# the crypto-only `matrix-sdk-crypto` (+ ruma/vodozemac) and requires Rust >= 1.93 (that crate's MSRV;
+# the rest of the workspace still builds on the pinned 1.88 when the feature is off).
+matrix-sdk-crypto = { version = "0.18", optional = true }
+ruma = { version = "0.16", optional = true, features = ["client-api", "events"] }
+http = { version = "1", optional = true }
+
+[features]
+e2ee = ["dep:matrix-sdk-crypto", "dep:ruma", "dep:http"]
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -52,6 +52,9 @@ The crate is `lavoisier`; the installed command is **`lav`**.
 ```sh
 cargo binstall lavoisier   # prebuilt binary, no toolchain/protoc needed
 cargo install lavoisier    # from source (needs protoc: brew install protobuf)
+
+# Opt-in Matrix end-to-end encryption (Olm/Megolm); needs Rust >= 1.93:
+cargo install lavoisier --features e2ee
 ```
 
 ## Quickstart (from source)
@@ -71,12 +74,32 @@ XAI_API_KEY=… cargo run -p lavoisier -- --agent "add a doc comment to the add(
 
 # Serve the shared agent as an HTTP/WebSocket gateway (+ in-memory session continuity):
 XAI_API_KEY=… cargo run -p lavoisier -- --serve 127.0.0.1:8080
+
+# Run scheduled agent turns (in-process cron, UTC) — standalone or alongside --serve/--serve-matrix:
+XAI_API_KEY=… cargo run -p lavoisier -- --cron "*/30 9-17 * * 1-5 summarise new CI failures"
 ```
+
+Gateways compose: `--serve`, `--serve-matrix`, and `--cron`/`--cron-file` all drive **one** shared
+agent and run concurrently in the same process, so a single low-resource host can answer HTTP/Matrix
+requests *and* fire scheduled jobs. Every gateway — cron included — drives the full tool-using agent
+loop, so scheduled jobs can read, edit, and run commands just like an interactive turn. Each cron job
+keeps a fixed session, so it accrues memory across fires (like the Matrix per-room sessions).
+
+**Persona / priorities.** Point `--persona <PATH>` at a file (or drop a `PERSONA.md` in the working
+dir) to give a long-running gateway a stable identity and standing instructions: it's layered above
+the operating system-prompt and rides in the cached prefix, so it costs almost nothing per turn.
+
+**Matrix encryption.** The Matrix gateway targets unencrypted rooms by default; build with
+`--features e2ee` (needs Rust ≥ 1.93) for Olm/Megolm end-to-end encryption via `matrix-sdk-crypto`.
 
 ### Flags
 
 `--agent` (tool loop) · `--serve <host:port>` (HTTP/WS gateway) · `--serve-matrix` (Matrix) ·
+`--cron "<min hour dom month dow> <prompt>"` (in-process scheduler, UTC; repeatable) ·
+`--cron-file <path>` (JSON jobs: `[{"schedule","session"?,"prompt"}]`) ·
 `--provider xai|anthropic|google|claude-cli` · `--model` · `--max-tokens` · `--system` ·
+`--persona <PATH>` (persistent persona/priorities layered above the system prompt; defaults to
+`./PERSONA.md` if present, `--no-persona` to disable) ·
 `--thinking <low|high|dynamic|N>` (Gemini thinking effort) · `--budget` (total-task token ceiling).
 
 Efficiency / cost levers: `--repo-skeleton <TOKENS>` (cache-aware repo-skeleton prefix) ·

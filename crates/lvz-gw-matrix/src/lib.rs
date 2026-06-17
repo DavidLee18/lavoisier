@@ -7,8 +7,10 @@
 //! and for each inbound `m.room.message` (`m.text`) from another user runs an agent turn
 //! (session = room id, so [`lvz-memory`] keeps per-room continuity) and posts the answer back.
 //!
-//! Scope: **unencrypted rooms only** (no E2EE — that is what `matrix-sdk` exists for). Depends
-//! only on `lvz-protocol`; the agent core stays unaware of Matrix.
+//! Scope: unencrypted rooms by default. **End-to-end encryption is opt-in** behind the `e2ee`
+//! Cargo feature (Olm/Megolm via the crypto-only `matrix-sdk-crypto`, contained to [`e2ee`]);
+//! without it the gateway is a thin REST client. Depends only on `lvz-protocol`; the agent core
+//! stays unaware of Matrix.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +21,9 @@ use async_trait::async_trait;
 use futures::stream::StreamExt;
 use lvz_protocol::{AgentHandle, Event, Gateway, GatewayError, TurnRequest};
 use serde::Deserialize;
+
+#[cfg(feature = "e2ee")]
+mod e2ee;
 
 /// Long-poll window for `/sync` (ms). The server holds the request open until an event
 /// arrives or this elapses.
@@ -91,19 +96,22 @@ impl MatrixGateway {
         Ok(Session {
             access_token: login.access_token,
             user_id: login.user_id,
+            device_id: login.device_id,
         })
     }
 
-    /// One `/sync` round-trip. `since = None` establishes a baseline (backlog discarded).
+    /// One `/sync` round-trip, returned as raw JSON. `since = None` establishes a baseline
+    /// (backlog discarded). The raw value is parsed into [`SyncResponse`] for message extraction
+    /// and (under `e2ee`) fed to the crypto layer for to-device/device-list processing.
     async fn sync_once(
         &self,
-        session: &Session,
+        token: &str,
         since: Option<&str>,
-    ) -> Result<SyncResponse, GatewayError> {
+    ) -> Result<serde_json::Value, GatewayError> {
         let mut req = self
             .http
             .get(self.url("/_matrix/client/v3/sync"))
-            .bearer_auth(&session.access_token)
+            .bearer_auth(token)
             .query(&[("timeout", SYNC_TIMEOUT_MS.to_string())]);
         if let Some(since) = since {
             req = req.query(&[("since", since)]);
@@ -125,7 +133,7 @@ impl MatrixGateway {
     /// Post a plain-text message to a room.
     async fn send_message(
         &self,
-        session: &Session,
+        token: &str,
         room_id: &str,
         body: &str,
     ) -> Result<(), GatewayError> {
@@ -139,7 +147,7 @@ impl MatrixGateway {
         let resp = self
             .http
             .put(self.url(&path))
-            .bearer_auth(&session.access_token)
+            .bearer_auth(token)
             .json(&payload)
             .send()
             .await
@@ -152,19 +160,21 @@ impl MatrixGateway {
         Ok(())
     }
 
-    /// Run one inbound message through the agent and post the answer back to its room.
-    async fn handle_message(
+    /// Run one inbound message through the agent; return its trimmed answer (or `None` if the
+    /// agent errored or produced nothing). Sending the answer is the caller's job, so plaintext
+    /// and encrypted rooms share this path and differ only in how the reply goes out.
+    async fn run_agent(
         &self,
-        session: &Session,
         agent: &Arc<dyn AgentHandle>,
-        msg: IncomingMessage,
-    ) {
-        let turn = TurnRequest::new(msg.room.clone(), msg.body);
+        room: &str,
+        body: String,
+    ) -> Option<String> {
+        let turn = TurnRequest::new(room.to_string(), body);
         let mut stream = match agent.submit(turn).await {
             Ok(stream) => stream,
             Err(e) => {
-                eprintln!("matrix: agent error in {}: {e}", msg.room);
-                return;
+                eprintln!("matrix: agent error in {room}: {e}");
+                return None;
             }
         };
         let mut answer = String::new();
@@ -173,17 +183,13 @@ impl MatrixGateway {
                 Ok(Event::TextDelta(text)) => answer.push_str(&text),
                 Ok(_) => {}
                 Err(e) => {
-                    eprintln!("matrix: stream error in {}: {e}", msg.room);
+                    eprintln!("matrix: stream error in {room}: {e}");
                     break;
                 }
             }
         }
         let answer = answer.trim();
-        if !answer.is_empty() {
-            if let Err(e) = self.send_message(session, &msg.room, answer).await {
-                eprintln!("matrix: send error in {}: {e}", msg.room);
-            }
-        }
+        (!answer.is_empty()).then(|| answer.to_string())
     }
 }
 
@@ -194,19 +200,56 @@ impl Gateway for MatrixGateway {
     }
 
     async fn serve(self: Arc<Self>, agent: Arc<dyn AgentHandle>) -> Result<(), GatewayError> {
+        // `#[async_trait]` boxes this method's future and requires it `Send` for *every* lifetime
+        // of the borrows awaited within — a higher-ranked form the matrix-sdk-crypto futures don't
+        // satisfy. Delegating to a plain inherent async fn (whose `Send` is inferred concretely,
+        // and which owns its arguments) sidesteps it.
+        self.serve_loop(agent).await
+    }
+}
+
+impl MatrixGateway {
+    /// The gateway's serve loop, as a plain (non-`async_trait`) async fn — see [`Gateway::serve`].
+    async fn serve_loop(self: Arc<Self>, agent: Arc<dyn AgentHandle>) -> Result<(), GatewayError> {
         let session = self.login().await?;
         eprintln!(
             "lavoisier: matrix gateway online as {} on {}",
             session.user_id, self.homeserver
         );
+        // Own the fields used across awaits so a `&Session` is never held across one (keeps the
+        // async_trait future unconditionally `Send`).
+        let token = session.access_token.clone();
+        let self_user = session.user_id.clone();
+
+        // Opt-in E2EE: bind an OlmMachine to this session and publish keys. If init fails we log
+        // and continue in plaintext-only mode rather than abort the gateway.
+        #[cfg(feature = "e2ee")]
+        let crypto = match e2ee::Crypto::new(
+            self.homeserver.clone(),
+            token.clone(),
+            &session.user_id,
+            &session.device_id,
+        )
+        .await
+        {
+            Ok(c) => {
+                eprintln!("lavoisier: matrix E2EE enabled");
+                Some(c)
+            }
+            Err(e) => {
+                eprintln!("matrix[e2ee]: init failed, continuing without encryption: {e}");
+                None
+            }
+        };
 
         // Baseline sync: take a `since` token and discard any backlog so we only act on
         // messages that arrive from now on.
-        let mut since = self.sync_once(&session, None).await?.next_batch;
+        let baseline = self.sync_once(&token, None).await?;
+        let mut since = parse_next_batch(&baseline)?;
 
         loop {
-            let resp = match self.sync_once(&session, Some(&since)).await {
-                Ok(resp) => resp,
+            let value = match self.sync_once(&token, Some(&since)).await {
+                Ok(value) => value,
                 Err(e) => {
                     // Transient sync failure: back off briefly and retry rather than exit.
                     eprintln!("matrix: {e}; retrying");
@@ -214,19 +257,66 @@ impl Gateway for MatrixGateway {
                     continue;
                 }
             };
-            let next = resp.next_batch.clone();
-            for msg in extract_messages(resp, &session.user_id) {
-                self.handle_message(&session, &agent, msg).await;
+
+            // Feed encryption changes (to-device, device lists, key counts) before acting.
+            #[cfg(feature = "e2ee")]
+            if let Some(c) = &crypto {
+                if let Err(e) = c.receive_sync(&value).await {
+                    eprintln!("matrix[e2ee]: {e}");
+                }
             }
+
+            let next = parse_next_batch(&value)?;
+            let resp = match SyncResponse::deserialize(&value) {
+                Ok(resp) => resp,
+                Err(e) => {
+                    eprintln!("matrix: malformed sync: {e}");
+                    since = next;
+                    continue;
+                }
+            };
+
+            // Plaintext messages: run the agent and reply in the clear.
+            for msg in extract_messages(resp, &self_user) {
+                if let Some(answer) = self.run_agent(&agent, &msg.room, msg.body).await {
+                    if let Err(e) = self.send_message(&token, &msg.room, &answer).await {
+                        eprintln!("matrix: send error in {}: {e}", msg.room);
+                    }
+                }
+            }
+
+            // Encrypted messages: decrypt, run the agent, and reply encrypted.
+            #[cfg(feature = "e2ee")]
+            if let Some(c) = &crypto {
+                for (room, body) in c.decrypt_messages(&value, self_user.clone()).await {
+                    if let Some(answer) = self.run_agent(&agent, &room, body).await {
+                        if let Err(e) = c.encrypt_and_send(room.clone(), answer).await {
+                            eprintln!("matrix[e2ee]: send error in {room}: {e}");
+                        }
+                    }
+                }
+            }
+
             since = next;
         }
     }
+}
+
+/// Pull the `next_batch` token out of a raw sync response.
+fn parse_next_batch(sync: &serde_json::Value) -> Result<String, GatewayError> {
+    sync.get("next_batch")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| GatewayError::Protocol("sync response missing next_batch".into()))
 }
 
 /// A logged-in session.
 struct Session {
     access_token: String,
     user_id: String,
+    /// The device id the homeserver assigned this login (needed to bind the E2EE `OlmMachine`).
+    #[cfg_attr(not(feature = "e2ee"), allow(dead_code))]
+    device_id: String,
 }
 
 /// One inbound text message worth answering.
@@ -262,7 +352,7 @@ fn extract_messages(sync: SyncResponse, self_user: &str) -> Vec<IncomingMessage>
 }
 
 /// Percent-encode a path segment (room ids contain `!`, `:` and `@`).
-fn urlencode(segment: &str) -> String {
+pub(crate) fn urlencode(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
         match byte {
@@ -281,11 +371,14 @@ fn urlencode(segment: &str) -> String {
 struct LoginResponse {
     access_token: String,
     user_id: String,
+    #[serde(default)]
+    device_id: String,
 }
 
 #[derive(Deserialize)]
 struct SyncResponse {
-    next_batch: String,
+    // `next_batch` is read from the raw sync JSON via `parse_next_batch` (so the sync token still
+    // advances even if this typed view fails to deserialize); this struct is just for messages.
     #[serde(default)]
     rooms: Rooms,
 }
@@ -357,10 +450,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_sync_yields_no_messages_and_keeps_next_batch() {
-        let sync = sync_from(serde_json::json!({ "next_batch": "s5" }));
-        assert_eq!(sync.next_batch, "s5");
+    fn empty_sync_yields_no_messages_and_parses_next_batch() {
+        let value = serde_json::json!({ "next_batch": "s5" });
+        assert_eq!(parse_next_batch(&value).unwrap(), "s5");
+        let sync: SyncResponse = serde_json::from_value(value).unwrap();
         assert!(extract_messages(sync, "@bot:hs").is_empty());
+    }
+
+    #[test]
+    fn missing_next_batch_is_an_error() {
+        assert!(parse_next_batch(&serde_json::json!({})).is_err());
     }
 
     #[test]

@@ -15,9 +15,26 @@ Companion docs — read the relevant one before working in that area:
 ## Status
 
 Complete and live-verified against real `XAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY`:
-all 13 crates, provider streaming (SSE + xAI gRPC), the agent loop, the token engine, session
-memory, the HTTP/Matrix gateways, AWS packaging (`infra/`), and the ATO learner. `cargo test`,
+all 14 crates, provider streaming (SSE + xAI gRPC), the agent loop, the token engine, session
+memory, the HTTP/Matrix/cron gateways, AWS packaging (`infra/`), and the ATO learner. `cargo test`,
 `cargo clippy --all-targets`, and `cargo fmt --check` are kept green.
+
+The **cron gateway** (`lvz-gw-cron`, `--cron`/`--cron-file`) is an in-process scheduler shaped as a
+`Gateway`: it fires `TurnRequest`s on a hand-rolled UTC cron schedule (no `chrono`/`cron` dep) into
+the shared agent. It composes with `--serve`/`--serve-matrix` (all gateways run concurrently over one
+agent, via `futures::join_all` over each `Gateway::serve`). Every gateway drives the full tool-using
+loop, so cron jobs run tools. Each job keeps a fixed session, so it accrues memory across fires.
+
+**Persona prompt** (`--persona <PATH>`, default `./PERSONA.md`): a persistent persona/priorities file
+layered *above* `DEFAULT_SYSTEM` in `build_agent`, so it sits in the cached prefix. `--no-persona`
+disables auto-load.
+
+**Matrix E2EE** is opt-in behind `lvz-gw-matrix`'s `e2ee` feature (and the `lavoisier` crate's
+passthrough `e2ee` feature): Olm/Megolm via the crypto-only `matrix-sdk-crypto`, contained to
+`crates/lvz-gw-matrix/src/e2ee.rs` (drives an `OlmMachine` over the hand-rolled REST transport, bridging
+ruma request types with `try_into_http_request`). **Off by default** — the default build stays minimal-dep
+and MSRV-1.88; the feature requires Rust ≥ 1.93. Crypto round-trip is unit-tested where offline-testable;
+full live verification needs a homeserver (like the rest of the Matrix gateway).
 
 Remaining/deferred: full **module-qualified** symbol resolution (the cross-file graph is scope-aware
 but not import-path resolved — fine for the radius knob); an unambiguous line-range/occurrence edit
