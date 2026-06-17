@@ -1,6 +1,6 @@
 [package]
 name = "lvz-tune"
-version = "0.2.0"
+version = "0.1.0"
 description = "Adaptive token optimisation (ATO, RECIPE.md §6.6) for Lavoisier: an online, quality-gated Tuner — an epsilon-greedy hill-climb over Knobs keyed by archetype x caching x model tier, bounded by the §6.5 baseline floor. Pure bookkeeping; no extra deps."
 edition.workspace = true
 rust-version.workspace = true

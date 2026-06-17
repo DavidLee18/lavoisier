@@ -1,6 +1,6 @@
 [package]
 name = "lvz-protocol"
-version = "0.2.0"
+version = "0.1.0"
 description = "Normalised contracts for the Lavoisier agent core: Provider, Event, Capabilities, Tool, Gateway, Tuner. Zero provider/gateway deps."
 edition.workspace = true
 rust-version.workspace = true

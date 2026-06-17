@@ -1,6 +1,6 @@
 [package]
 name = "lvz-gw-http"
-version = "0.2.0"
+version = "0.1.0"
 description = "HTTP/REST + WebSocket gateway for Lavoisier: drives the shared agent (AgentHandle) and streams the normalised Event stream over SSE/WebSocket."
 edition.workspace = true
 rust-version.workspace = true

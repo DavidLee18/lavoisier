@@ -1317,7 +1317,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lvz-agent"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1330,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-anthropic"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1344,7 +1344,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-claude-cli"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-context"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "similar",
  "tree-sitter",
@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-google"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1395,7 +1395,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-http"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1425,7 +1425,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-memory"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-protocol"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-tools"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "lvz-context",
@@ -1462,7 +1462,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-tune"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "lvz-protocol",
  "serde",
@@ -1471,7 +1471,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-xai"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",

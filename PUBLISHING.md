@@ -47,7 +47,9 @@ limit — only the initial publish of each new name is. A higher limit can be re
 help@crates.io.)
 
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
-Bump the version (all crates share one version — currently `0.2.0`; keep them in lockstep) before re-publishing.
+Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
+version requirement still resolves); leave the rest at their published version. As of `0.2.0` the changed
+set is `lvz-gw-cron` (new), `lvz-gw-matrix`, and `lavoisier`; the other crates stay at `0.1.0`.
 
 ## 2. Cut a release → prebuilt binaries → `cargo binstall`
 
