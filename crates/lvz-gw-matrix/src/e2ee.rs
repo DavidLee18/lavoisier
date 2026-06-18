@@ -197,11 +197,15 @@ impl Crypto {
         // unlike a closure) so the borrow of `users` doesn't span every await — which would make
         // this future's `Send` lifetime-dependent and break the gateway's serve future.
 
-        // Track the room's members, establish missing Olm sessions, then share the room key.
+        // Track the room's members, then **flush the resulting /keys/query** so we actually hold
+        // their device lists before establishing sessions and sharing the key. `update_tracked_users`
+        // only marks them dirty; without running the outgoing requests it triggers, the first reply
+        // to a room is encrypted to zero devices and the recipient can't decrypt it.
         self.machine
             .update_tracked_users(users.iter().map(Deref::deref))
             .await
             .map_err(estr)?;
+        self.process_outgoing().await?;
         if let Some((id, req)) = self
             .machine
             .get_missing_sessions(users.iter().map(Deref::deref))
