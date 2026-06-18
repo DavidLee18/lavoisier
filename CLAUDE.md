@@ -41,6 +41,15 @@ crates still take explicit config. **Memory** gained real bounds: `InMemoryStore
 hex-encoded filenames); `[memory] store = "memory"|"file"` selects between them. Sample:
 `lavoisier.example.toml`.
 
+The **`lavoisier` crate is lib + bin**: `src/lib.rs` holds everything (CLI, config, gateways) behind
+`pub fn main_with(extra_tools: Vec<Arc<dyn Tool>>)` / `pub async fn run_with(..)`, and `src/main.rs`
+is a thin shim calling `main_with(Vec::new())`. This is the **custom-tool extension point**: a private
+downstream crate depends on the published `lavoisier`, implements `Tool` (re-exported as
+`lavoisier::{Tool, ToolOutput, ToolError}`), and calls `main_with(vec![...])` to get the whole CLI
+with its own tools registered alongside the built-ins (`build_agent` registers `extra_tools` after the
+builtins). Template + compile check: `examples/private-tools/` (a `publish=false` workspace member).
+Tools remain compiled-in Rust — there is no dynamic plugin loading.
+
 **Matrix E2EE** is opt-in behind `lvz-gw-matrix`'s `e2ee` feature (and the `lavoisier` crate's
 passthrough `e2ee` feature): Olm/Megolm via the crypto-only `matrix-sdk-crypto`, contained to
 `crates/lvz-gw-matrix/src/e2ee.rs` (drives an `OlmMachine` over the hand-rolled REST transport, bridging

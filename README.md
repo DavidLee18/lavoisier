@@ -155,6 +155,51 @@ Env: `XAI_API_KEY` / `XAI_TRANSPORT=grpc|http` (default `grpc`) / `XAI_GRPC_ENDP
 `MATRIX_PASSWORD` · `LVZ_PROVIDER` / `LVZ_MODEL` / `LVZ_API_KEYS` / `LVZ_RATE_LIMIT` /
 `LVZ_SERVE_ADDR`.
 
+## Custom (private) tools
+
+Tools are compiled-in Rust (no dynamic plugins), so your own tools are just Rust code — and they
+can stay **private**: depend on the published `lavoisier` crate as a library and inject your tools,
+without forking or touching the public repo.
+
+```rust
+// your-private-crate/src/main.rs   (private repo; never published)
+use std::sync::Arc;
+use async_trait::async_trait;
+use lavoisier::{Tool, ToolError, ToolOutput};   // tool types re-exported by lavoisier
+use serde_json::{json, Value};
+
+struct QueryDb;
+#[async_trait]
+impl Tool for QueryDb {
+    fn name(&self) -> &str { "query_db" }
+    fn description(&self) -> &str { "Run a read-only SQL query." }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"]})
+    }
+    async fn invoke(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let sql = args["sql"].as_str().ok_or_else(|| ToolError::InvalidArgs("sql".into()))?;
+        Ok(ToolOutput::ok(format!("ran: {sql}")))   // .changed(true) only if it mutates the workspace
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    lavoisier::main_with(vec![Arc::new(QueryDb)])    // your tools, plus all the built-ins
+}
+```
+
+```toml
+# your-private-crate/Cargo.toml
+[dependencies]
+lavoisier   = "0.4"
+async-trait = "0.1"
+serde_json  = "1"
+```
+
+Your binary then behaves exactly like `lav` — same flags, config, and gateways (HTTP/Matrix/cron,
+E2EE, persona) — with your tools additionally available to the agent. A ready-to-copy template is in
+[`examples/private-tools/`](examples/private-tools). (`main_with` builds the tokio runtime for you;
+use `run_with` if you manage your own.)
+
 ## Deployment
 
 Container + Terraform IaC for the HTTP gateway on **AWS Fargate (arm64, us-west-2)** ship in
