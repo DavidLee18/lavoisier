@@ -80,6 +80,8 @@ pub struct GatewaySection {
     pub serve_matrix: Option<bool>,
     pub api_keys: Option<Vec<String>>,
     pub rate_limit: Option<u32>,
+    /// Auto-accept Matrix room invites (default `true`).
+    pub matrix_auto_join: Option<bool>,
 }
 
 impl Config {

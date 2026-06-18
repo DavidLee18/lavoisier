@@ -197,6 +197,11 @@ struct Cli {
     #[arg(long)]
     serve_matrix: bool,
 
+    /// Don't auto-accept Matrix room invites (the gateway joins invited rooms by default). Can
+    /// also be set via `[gateway] matrix_auto_join = false`.
+    #[arg(long)]
+    matrix_no_auto_join: bool,
+
     /// Schedule a recurring agent turn (in-process cron, UTC). The first **five** whitespace
     /// tokens are a standard cron schedule (`min hour dom month dow`); the rest is the prompt.
     /// Repeatable; each gets its own session (`cron-<n>`). Runs alongside `--serve`/`--serve-matrix`
@@ -436,7 +441,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if cli.serve_matrix {
-            gateways.push(Arc::new(MatrixGateway::from_env()?));
+            // Auto-join invites by default; disabled by `--matrix-no-auto-join` or the config key.
+            let auto_join =
+                !cli.matrix_no_auto_join && config.gateway.matrix_auto_join.unwrap_or(true);
+            gateways.push(Arc::new(
+                MatrixGateway::from_env()?.with_auto_join(auto_join),
+            ));
         }
 
         if !cron_jobs.is_empty() {

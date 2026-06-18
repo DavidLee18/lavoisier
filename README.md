@@ -91,6 +91,8 @@ the operating system-prompt and rides in the cached prefix, so it costs almost n
 
 **Matrix encryption.** The Matrix gateway targets unencrypted rooms by default; build with
 `--features e2ee` (needs Rust ≥ 1.93) for Olm/Megolm end-to-end encryption via `matrix-sdk-crypto`.
+The gateway **auto-accepts room invites** so you can just invite the bot; disable with
+`--matrix-no-auto-join` or `[gateway] matrix_auto_join = false`.
 
 ### Configuration file
 
@@ -124,6 +126,7 @@ api_keys = ["secret"]
 
 `--config <PATH>` (TOML defaults; see above) ·
 `--agent` (tool loop) · `--serve <host:port>` (HTTP/WS gateway) · `--serve-matrix` (Matrix) ·
+`--matrix-no-auto-join` (don't auto-accept Matrix invites) ·
 `--cron "<min hour dom month dow> <prompt>"` (in-process scheduler, UTC; repeatable) ·
 `--cron-file <path>` (JSON jobs: `[{"schedule","session"?,"prompt"}]`) ·
 `--provider xai|anthropic|google|claude-cli` · `--model` · `--max-tokens` · `--system` ·

@@ -35,7 +35,8 @@
 # path  = "./.lavoisier/sessions"   # required when store = "file"
 
 [gateway]
-# serve        = "127.0.0.1:8080"
-# serve_matrix = true
-# api_keys     = ["key1", "key2"]
-# rate_limit   = 60             # requests per 60s window
+# serve            = "127.0.0.1:8080"
+# serve_matrix     = true
+# api_keys         = ["key1", "key2"]
+# rate_limit       = 60          # requests per 60s window
+# matrix_auto_join = true        # auto-accept Matrix room invites (default true)

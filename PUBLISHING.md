@@ -49,8 +49,9 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
-(`v0.3.0`): `lvz-memory` (0.2.0) and `lavoisier` (0.3.0). Earlier, `v0.2.0` bumped `lvz-gw-cron` (new),
-`lvz-gw-matrix`, and `lavoisier`. The remaining crates are still at `0.1.0`.
+(`v0.3.1`): `lvz-gw-matrix` (0.2.2, auto-join) and `lavoisier` (0.3.1, opt-out flag/config). Earlier:
+`v0.3.0` bumped `lvz-memory` (0.2.0) + `lavoisier`; `v0.2.1` was a `lvz-gw-matrix` E2EE fix; `v0.2.0`
+bumped `lvz-gw-cron` (new), `lvz-gw-matrix`, and `lavoisier`. The remaining crates are still at `0.1.0`.
 
 ## 2. Cut a release → prebuilt binaries → `cargo binstall`
 
@@ -59,8 +60,8 @@ version. Tag the version to trigger `.github/workflows/release.yml`, which build
 `lavoisier-<target>.tar.gz` for macOS (arm64/Apple Silicon) and Linux (x64/arm64):
 
 ```sh
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.3.1
+git push origin v0.3.1
 ```
 
 Once the release assets are up, verify:

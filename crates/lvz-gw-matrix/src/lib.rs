@@ -36,6 +36,8 @@ pub struct MatrixGateway {
     password: String,
     http: reqwest::Client,
     txn: AtomicU64,
+    /// Auto-accept room invites for the bot account (on by default).
+    auto_join: bool,
 }
 
 impl MatrixGateway {
@@ -52,7 +54,15 @@ impl MatrixGateway {
             password: password.into(),
             http: reqwest::Client::new(),
             txn: AtomicU64::new(0),
+            auto_join: true,
         }
+    }
+
+    /// Enable or disable auto-accepting room invites (default `true`). When off, an operator must
+    /// join the bot to rooms out-of-band before it will respond there.
+    pub fn with_auto_join(mut self, auto_join: bool) -> Self {
+        self.auto_join = auto_join;
+        self
     }
 
     /// Construct from the environment: `MATRIX_HOMESERVER`, `MATRIX_USER`, `MATRIX_PASSWORD`.
@@ -160,6 +170,51 @@ impl MatrixGateway {
         Ok(())
     }
 
+    /// Accept a room invite (join the room).
+    async fn join_room(&self, token: &str, room_id: &str) -> Result<(), GatewayError> {
+        let path = format!("/_matrix/client/v3/join/{}", urlencode(room_id));
+        let resp = self
+            .http
+            .post(self.url(&path))
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::Io(format!("matrix join {status}: {msg}")));
+        }
+        Ok(())
+    }
+
+    /// Auto-accept any pending invites in a sync response (no-op when disabled). `seen` dedupes
+    /// join attempts across syncs so a still-propagating invite isn't joined repeatedly; a failed
+    /// join is removed from `seen` so it retries on the next sync.
+    async fn auto_join_invites(
+        &self,
+        token: &str,
+        sync: &serde_json::Value,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        if !self.auto_join {
+            return;
+        }
+        for room in extract_invites(sync) {
+            if !seen.insert(room.clone()) {
+                continue;
+            }
+            match self.join_room(token, &room).await {
+                Ok(()) => eprintln!("matrix: auto-joined invited room {room}"),
+                Err(e) => {
+                    eprintln!("matrix: auto-join {room} failed: {e}");
+                    seen.remove(&room);
+                }
+            }
+        }
+    }
+
     /// Run one inbound message through the agent; return its trimmed answer (or `None` if the
     /// agent errored or produced nothing). Sending the answer is the caller's job, so plaintext
     /// and encrypted rooms share this path and differ only in how the reply goes out.
@@ -243,8 +298,12 @@ impl MatrixGateway {
         };
 
         // Baseline sync: take a `since` token and discard any backlog so we only act on
-        // messages that arrive from now on.
+        // messages that arrive from now on. Pending invites *are* accepted (a backlog message is
+        // noise, but a pending invite is a standing request to join).
+        let mut seen_invites = std::collections::HashSet::new();
         let baseline = self.sync_once(&token, None).await?;
+        self.auto_join_invites(&token, &baseline, &mut seen_invites)
+            .await;
         let mut since = parse_next_batch(&baseline)?;
 
         loop {
@@ -257,6 +316,10 @@ impl MatrixGateway {
                     continue;
                 }
             };
+
+            // Accept any new room invites before processing messages.
+            self.auto_join_invites(&token, &value, &mut seen_invites)
+                .await;
 
             // Feed encryption changes (to-device, device lists, key counts) before acting.
             #[cfg(feature = "e2ee")]
@@ -308,6 +371,15 @@ fn parse_next_batch(sync: &serde_json::Value) -> Result<String, GatewayError> {
         .and_then(|v| v.as_str())
         .map(String::from)
         .ok_or_else(|| GatewayError::Protocol("sync response missing next_batch".into()))
+}
+
+/// Room ids the bot has been invited to (the keys of `rooms.invite` in a sync response).
+fn extract_invites(sync: &serde_json::Value) -> Vec<String> {
+    sync.get("rooms")
+        .and_then(|r| r.get("invite"))
+        .and_then(|i| i.as_object())
+        .map(|rooms| rooms.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// A logged-in session.
@@ -460,6 +532,22 @@ mod tests {
     #[test]
     fn missing_next_batch_is_an_error() {
         assert!(parse_next_batch(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn extracts_invited_room_ids() {
+        let sync = serde_json::json!({
+            "next_batch": "s1",
+            "rooms": { "invite": {
+                "!a:hs": { "invite_state": { "events": [] } },
+                "!b:hs": { "invite_state": { "events": [] } }
+            } }
+        });
+        let mut invites = extract_invites(&sync);
+        invites.sort();
+        assert_eq!(invites, vec!["!a:hs".to_string(), "!b:hs".to_string()]);
+        // No invite section ⇒ nothing to join.
+        assert!(extract_invites(&serde_json::json!({ "next_batch": "s2" })).is_empty());
     }
 
     #[test]

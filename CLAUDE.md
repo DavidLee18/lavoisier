@@ -25,6 +25,10 @@ the shared agent. It composes with `--serve`/`--serve-matrix` (all gateways run 
 agent, via `futures::join_all` over each `Gateway::serve`). Every gateway drives the full tool-using
 loop, so cron jobs run tools. Each job keeps a fixed session, so it accrues memory across fires.
 
+The **Matrix gateway auto-accepts room invites** by default (`rooms.invite` → `/join`, deduped across
+syncs); disable with `--matrix-no-auto-join` or `[gateway] matrix_auto_join = false`. E2EE is
+live-verified end-to-end (cross-implementation, against both Synapse and Continuwuity).
+
 **Persona prompt** (`--persona <PATH>`, default `./PERSONA.md`): a persistent persona/priorities file
 layered *above* `DEFAULT_SYSTEM` in `build_agent`, so it sits in the cached prefix. `--no-persona`
 disables auto-load.
