@@ -1,7 +1,7 @@
 [package]
 name = "lvz-memory"
-version = "0.1.0"
-description = "Session memory for Lavoisier (RECIPE.md §7.3): a SessionStore trait + in-memory impl, and a session-aware AgentHandle that gives the gateways multi-turn conversation continuity."
+version = "0.2.0"
+description = "Session memory for Lavoisier: a SessionStore trait with bounded in-memory and durable file-backed implementations, and a session-aware AgentHandle that gives the gateways multi-turn conversation continuity."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,8 +13,8 @@ lvz-protocol.workspace = true
 lvz-agent.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 lvz-tools.workspace = true
-serde_json.workspace = true

@@ -23,7 +23,7 @@ use lvz_google::GoogleProvider;
 use lvz_gw_cron::{CronGateway, CronJob};
 use lvz_gw_http::{GatewayConfig, HttpGateway};
 use lvz_gw_matrix::MatrixGateway;
-use lvz_memory::{InMemoryStore, SessionAgent};
+use lvz_memory::SessionAgent;
 use lvz_protocol::{
     AgentHandle, BatchProvider, ChatRequest, CostWeights, Event, Gateway, Knobs, Message, Outcome,
     Provider, TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, Tuner,
@@ -31,6 +31,9 @@ use lvz_protocol::{
 use lvz_tools::{BatchEditTool, ToolRegistry};
 use lvz_tune::{BayesTuner, LearningTuner, PersistableTuner, TuneConfig};
 use lvz_xai::XaiProvider;
+
+mod config;
+use config::Config;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -48,17 +51,23 @@ struct Cli {
     #[arg(long)]
     agent: bool,
 
-    /// Which provider to use.
-    #[arg(long, value_enum, env = "LVZ_PROVIDER", default_value_t = ProviderKind::Xai)]
-    provider: ProviderKind,
+    /// Path to a TOML config file (defaults for most flags; CLI/env still win). Without it,
+    /// `./lavoisier.toml` is auto-loaded if present. See `[provider]`/`[agent]`/`[memory]`/
+    /// `[gateway]` sections.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Which provider to use (default `xai`; overridable via `[provider]` in the config file).
+    #[arg(long, value_enum, env = "LVZ_PROVIDER")]
+    provider: Option<ProviderKind>,
 
     /// Model id. Defaults to a provider-appropriate model when unset.
     #[arg(long, env = "LVZ_MODEL")]
     model: Option<String>,
 
-    /// Maximum tokens to generate per turn.
-    #[arg(long, default_value_t = 2048)]
-    max_tokens: u32,
+    /// Maximum tokens to generate per turn (default 2048; overridable via `[agent] max_tokens`).
+    #[arg(long)]
+    max_tokens: Option<u32>,
 
     /// Optional system prompt (overrides the agent's default in --agent mode).
     #[arg(long)]
@@ -378,26 +387,32 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // Load the TOML config (explicit --config, else ./lavoisier.toml) and fill any flag the user
+    // left unset — CLI/env always wins. Done before anything reads `cli`.
+    let config = Config::load(cli.config.as_deref())?;
+    config.apply_to(&mut cli);
+    let provider_kind = cli.provider.unwrap_or(ProviderKind::Xai);
 
     // Cron jobs (in-process scheduler) can run standalone or alongside HTTP/Matrix.
     let cron_jobs = build_cron_jobs(&cli)?;
 
     // Long-running gateways (HTTP/Matrix/cron) get the 1-hour cache TTL on the immutable prefix.
     let serving = cli.serve.is_some() || cli.serve_matrix || !cron_jobs.is_empty();
-    let (provider, batch_provider) = cli.provider.build(cli.thinking.as_deref(), serving)?;
+    let (provider, batch_provider) = provider_kind.build(cli.thinking.as_deref(), serving)?;
     let model = cli
         .model
         .clone()
-        .unwrap_or_else(|| cli.provider.default_model().to_string());
+        .unwrap_or_else(|| provider_kind.default_model().to_string());
 
     // Gateway mode: build the shared agent once — wrapped in process-local session memory so each
     // `session` continues across turns (§7.3) — then run every active gateway (HTTP, Matrix, cron)
     // concurrently until shutdown. No prompt is consumed.
     if serving {
+        let store = config.build_session_store()?;
         let inner = Arc::new(build_agent(provider, batch_provider, model, &cli));
-        let agent: Arc<dyn AgentHandle> =
-            Arc::new(SessionAgent::new(inner, Arc::new(InMemoryStore::new())));
+        let agent: Arc<dyn AgentHandle> = Arc::new(SessionAgent::new(inner, store));
 
         let mut gateways: Vec<Arc<dyn Gateway>> = Vec::new();
 
@@ -461,7 +476,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         let mut req = ChatRequest::new(model)
-            .max_tokens(cli.max_tokens)
+            .max_tokens(cli.max_tokens.unwrap_or(2048))
             .push(Message::user(prompt));
         if let Some(system) = cli.system {
             req = req.system(system);
@@ -539,8 +554,8 @@ fn build_agent(
     let editor_model = model.clone();
     let mut config = AgentConfig::default()
         .with_model(model)
-        .with_cost_weights(cli.provider.cost_weights());
-    config.max_tokens = cli.max_tokens;
+        .with_cost_weights(cli.provider.unwrap_or(ProviderKind::Xai).cost_weights());
+    config.max_tokens = cli.max_tokens.unwrap_or(2048);
     if let Some(max_steps) = cli.max_steps {
         config.max_steps = max_steps;
     }

@@ -92,8 +92,37 @@ the operating system-prompt and rides in the cached prefix, so it costs almost n
 **Matrix encryption.** The Matrix gateway targets unencrypted rooms by default; build with
 `--features e2ee` (needs Rust ≥ 1.93) for Olm/Megolm end-to-end encryption via `matrix-sdk-crypto`.
 
+### Configuration file
+
+For long-running deployments, a **TOML config** sets defaults for most flags so you don't pass a
+long command line. `--config <PATH>` (or an auto-loaded `./lavoisier.toml`) is split into
+`[provider]`, `[agent]`, `[memory]`, and `[gateway]` sections; **an explicit CLI flag or env var
+always wins over the file**, which wins over the built-in default. Unknown keys are rejected.
+See [`lavoisier.example.toml`](lavoisier.example.toml).
+
+**Memory** is configured here. The in-memory session store is unbounded by default; `[memory]` can
+cap it — `max_messages` (most-recent-N per session) and `max_sessions` (LRU eviction) — or switch to
+a **durable file store** (`store = "file"`, `path = "..."`) so sessions survive restarts.
+
+```toml
+# lavoisier.toml
+[provider]
+provider = "anthropic"
+[agent]
+compact_after = 60000          # compact history past ~this many tokens
+context_limit = 120000         # evict oldest tool output to fit
+[memory]
+store = "file"                 # durable; survives restarts
+path  = "./.lavoisier/sessions"
+max_messages = 200             # cap each session's transcript
+[gateway]
+serve = "0.0.0.0:8080"
+api_keys = ["secret"]
+```
+
 ### Flags
 
+`--config <PATH>` (TOML defaults; see above) ·
 `--agent` (tool loop) · `--serve <host:port>` (HTTP/WS gateway) · `--serve-matrix` (Matrix) ·
 `--cron "<min hour dom month dow> <prompt>"` (in-process scheduler, UTC; repeatable) ·
 `--cron-file <path>` (JSON jobs: `[{"schedule","session"?,"prompt"}]`) ·

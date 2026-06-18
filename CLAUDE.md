@@ -29,6 +29,14 @@ loop, so cron jobs run tools. Each job keeps a fixed session, so it accrues memo
 layered *above* `DEFAULT_SYSTEM` in `build_agent`, so it sits in the cached prefix. `--no-persona`
 disables auto-load.
 
+**TOML config** (`--config <PATH>`, else auto `./lavoisier.toml`): `crates/lvz-cli/src/config.rs`
+parses `[provider]`/`[agent]`/`[memory]`/`[gateway]` and fills any flag the user left unset
+(precedence: CLI/env > file > default; `deny_unknown_fields`). It's a CLI-layer concern — library
+crates still take explicit config. **Memory** gained real bounds: `InMemoryStore::with_limits`
+(`max_messages` per session, `max_sessions` LRU) plus a durable `FileStore` (JSON per session,
+hex-encoded filenames); `[memory] store = "memory"|"file"` selects between them. Sample:
+`lavoisier.example.toml`.
+
 **Matrix E2EE** is opt-in behind `lvz-gw-matrix`'s `e2ee` feature (and the `lavoisier` crate's
 passthrough `e2ee` feature): Olm/Megolm via the crypto-only `matrix-sdk-crypto`, contained to
 `crates/lvz-gw-matrix/src/e2ee.rs` (drives an `OlmMachine` over the hand-rolled REST transport, bridging

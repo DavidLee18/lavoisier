@@ -1,0 +1,41 @@
+# Example Lavoisier config. Copy to `lavoisier.toml` (auto-loaded from the working dir) or pass
+# with `--config <PATH>`. Every key is optional. An explicit CLI flag or env var always wins over
+# the file, which wins over the built-in default. Unknown keys are rejected (typos surface).
+
+[provider]
+# provider = "anthropic"        # xai | anthropic | google | claude-cli  (default: xai)
+# model    = "claude-..."       # default: the provider's default model
+
+[agent]
+# Context compaction / eviction
+# compact_after = 60000         # compact history once it exceeds ~this many tokens
+# context_limit = 120000        # soft per-request ceiling; evict oldest tool output to fit
+# summary_model = "..."         # route compaction summaries to a cheaper model
+# Routing / budget
+# cheap_model    = "..."        # cheap-model-first
+# escalate_after = 3            # escalate to the main model after N steps
+# advisor_model  = "..."        # advisor+executor split
+# budget         = 2000000      # total-task cost-weighted token ceiling
+# max_steps      = 12
+# max_tokens     = 4096
+# repo_skeleton  = 4000         # cache-aware repo-skeleton prefix budget (tokens)
+# thinking       = "high"       # Gemini thinking effort: low|high|dynamic|N
+# Persona + accuracy levers (off by default)
+# persona        = "PERSONA.md"
+# require_edit   = true
+# verify_and_fix = true
+# verify_cmd     = "cargo test --quiet"
+
+[memory]
+# Bounds for the in-memory session store (unbounded by default):
+# max_messages = 200            # keep each session's most recent N messages
+# max_sessions = 100            # keep at most N sessions (LRU eviction)
+# Durable, file-backed store (survives restarts) instead of process-only memory:
+# store = "file"                # "memory" (default) | "file"
+# path  = "./.lavoisier/sessions"   # required when store = "file"
+
+[gateway]
+# serve        = "127.0.0.1:8080"
+# serve_matrix = true
+# api_keys     = ["key1", "key2"]
+# rate_limit   = 60             # requests per 60s window
