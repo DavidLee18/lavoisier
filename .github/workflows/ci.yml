@@ -1,0 +1,69 @@
+name: ci
+
+# Gate `main` and PRs: format, lints (zero-warning), build, and the test suite — plus a parallel
+# job that compiles and tests the opt-in `e2ee` feature (otherwise never exercised by the default
+# build). Third-party actions are pinned to a full commit SHA per CLAUDE.md; the trailing comment
+# records the version.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: fmt / clippy / build / test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # protoc for lvz-xai's build.rs (apt's 3.12 is too old — rejects proto3 `optional`).
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master @ 2026-06-18
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  e2ee:
+    name: e2ee feature
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master @ 2026-06-18
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Clippy + test (e2ee)
+        run: |
+          cargo clippy -p lvz-gw-matrix --features e2ee --all-targets --locked -- -D warnings
+          cargo test -p lvz-gw-matrix --features e2ee --locked
