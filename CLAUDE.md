@@ -100,6 +100,12 @@ register. Mechanisms, all live:
 - **Providers in scope: Anthropic + xAI + Google Gemini, native.** OpenAI and others are out of
   scope. A Discord gateway is **out of scope** (do not build it).
 - Secrets: read from env / AWS Secrets Manager at runtime; never commit keys.
+- **GitHub Actions are pinned to a full commit SHA**, never a tag/branch (`uses: owner/action@<40-char-sha>
+  # vX.Y.Z`) — supply-chain hardening; the trailing comment records the human-readable version. When
+  adding or bumping an action, resolve the tag to its commit (`gh api repos/<owner>/<repo>/commits/<tag>
+  --jq .sha`), pin that, and update the comment. Prefer versions on the current Node runtime to avoid
+  deprecation warnings. `dtolnay/rust-toolchain` is pinned to a `master` SHA **with** an explicit
+  `toolchain:` input (the `@stable` ref-name signal is lost once pinned).
 - License: **MIT** (`LICENSE`).
 
 ## Gotchas
