@@ -24,20 +24,28 @@ jobs:
           - { os: ubuntu-22.04,    target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
     steps:
-      - uses: actions/checkout@v4
+      # Third-party actions are pinned to a full commit SHA (supply-chain hardening); the trailing
+      # comment records the human-readable version the SHA corresponds to.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       # Pinned modern protoc on every runner — Ubuntu's apt protoc (3.12) is too old: it rejects
       # the proto3 `optional` fields in the vendored xAI protos. setup-protoc bundles the
       # well-known types (timestamp.proto), which the protoc resolves built-in.
+      # NOTE: v3.0.0 is the latest release and still ships a Node 20 entrypoint, so it emits a
+      # deprecation warning (forced onto Node 24 by the runner). Bump when upstream cuts a Node 24
+      # release; the build is unaffected.
       - name: Install protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "29.3"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # rust-toolchain selects the toolchain from the ref name (`@stable`); pinned to a SHA, that
+      # signal is gone, so the channel is passed explicitly via the `toolchain` input.
       - name: Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master @ 2026-06-18
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Build
@@ -47,6 +55,6 @@ jobs:
         run: tar czf lavoisier-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release lav
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           files: lavoisier-${{ matrix.target }}.tar.gz
