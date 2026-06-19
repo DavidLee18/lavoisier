@@ -33,8 +33,9 @@ This is what lets one agent brain serve the CLI today and a multi-gateway "Herme
 | `lvz-memory` | Session continuity: a `SessionStore` + `SessionAgent` so each session keeps its own transcript. |
 | `lvz-tune` | The ATO learner: `LearningTuner` (ε-greedy) and `BayesTuner` (Thompson sampling), with on-disk persistence. See [`ATO.md`](ATO.md). |
 | `lvz-gw-http` | HTTP/WebSocket gateway (axum): `/v1/turns` (SSE), `/v1/ws`, `/health`, Prometheus `/metrics`, API-key auth + rate limits. |
-| `lvz-gw-matrix` | Matrix gateway (one room per session). End-to-end encryption (Olm/Megolm via `matrix-sdk-crypto`) is opt-in behind the `e2ee` feature; off by default. |
+| `lvz-gw-matrix` | Matrix gateway (one room per session). Access-token or password auth with a stable, persistable device identity; optional per-sender allowlist. End-to-end encryption (Olm/Megolm via `matrix-sdk-crypto`, durable SQLite crypto store via `matrix-sdk-sqlite`) is opt-in behind the `e2ee` feature; off by default. |
 | `lvz-gw-cron` | Cron gateway: an in-process UTC scheduler (hand-rolled, no date deps) that fires turns on a cron schedule; composes with the other gateways over one agent. |
+| `lvz-gw-slack` | Slack gateway (Socket Mode, one session per channel/thread): thin `tokio-tungstenite` WebSocket client, no inbound port; `message`/`app_mention` → turn → `chat.postMessage`; optional per-user allowlist. |
 | `lvz-cli` | The `lavoisier` binary — the first gateway. |
 
 ## Key decisions

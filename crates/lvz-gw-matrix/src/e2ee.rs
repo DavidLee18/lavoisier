@@ -4,8 +4,10 @@
 //! `matrix-sdk` — and drives it over the gateway's hand-rolled REST transport. The flow follows
 //! the `matrix-sdk-crypto` custom-client tutorial:
 //!
-//! 1. **Init** ([`Crypto::new`]) builds an in-memory [`OlmMachine`] for the bot's user/device and
-//!    runs the initial outgoing requests (device-key + one-time-key upload).
+//! 1. **Init** ([`Crypto::new`]) builds an [`OlmMachine`] for the bot's user/device and runs the
+//!    initial outgoing requests (device-key + one-time-key upload). The machine is backed by a
+//!    durable SQLite crypto store when a store path is given (so the crypto identity — device keys,
+//!    Olm/Megolm sessions, tracked devices — survives restarts), or in-memory otherwise.
 //! 2. On every `/sync` ([`Crypto::receive_sync`]) the to-device events, device-list changes and
 //!    one-time-key counts are pushed into the machine, then the requests it produces are sent.
 //! 3. Inbound `m.room.encrypted` timeline events are decrypted ([`Crypto::decrypt_messages`]).
@@ -16,14 +18,16 @@
 //! gateway are unaware of it.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::{self, Display};
 use std::ops::Deref;
+use std::path::Path;
 
 use matrix_sdk_crypto::{
     types::events::room::encrypted::EncryptedEvent, types::requests::AnyOutgoingRequest,
     DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement,
 };
+use matrix_sdk_sqlite::SqliteCryptoStore;
 use ruma::{
     api::{
         auth_scheme::{AccessToken, SendAccessToken},
@@ -67,16 +71,35 @@ pub struct Crypto {
 }
 
 impl Crypto {
-    /// Build the [`OlmMachine`] for `user_id`/`device_id` and publish the bot's keys.
+    /// Build the [`OlmMachine`] for `user_id`/`device_id` and publish the bot's keys. When
+    /// `store_path` is given the machine is backed by a durable SQLite crypto store opened there
+    /// (created if absent, reused if present), optionally encrypted at rest with `passphrase`;
+    /// otherwise it is in-memory.
     pub async fn new(
         homeserver: String,
         token: String,
         user_id: &str,
         device_id: &str,
+        store_path: Option<&Path>,
+        passphrase: Option<&str>,
     ) -> Result<Self, E2eeError> {
         let user = UserId::parse(user_id).map_err(estr)?;
         let device: OwnedDeviceId = device_id.into();
-        let machine = OlmMachine::new(&user, &device).await;
+        let machine = match store_path {
+            Some(path) => {
+                let store = SqliteCryptoStore::open(path, passphrase)
+                    .await
+                    .map_err(estr)?;
+                eprintln!(
+                    "matrix[e2ee]: using persistent crypto store at {}",
+                    path.display()
+                );
+                OlmMachine::with_store(&user, &device, store, None)
+                    .await
+                    .map_err(estr)?
+            }
+            None => OlmMachine::new(&user, &device).await,
+        };
         let versions = SupportedVersions {
             versions: BTreeSet::from([MatrixVersion::V1_1]),
             features: BTreeSet::new(),
@@ -133,9 +156,16 @@ impl Crypto {
         self.process_outgoing().await
     }
 
-    /// Decrypt every inbound `m.room.encrypted` text message in a sync response, skipping our own.
-    /// Returns `(room_id, plaintext_body)` pairs for messages worth answering.
-    pub async fn decrypt_messages(&self, sync: &Value, self_user: String) -> Vec<(String, String)> {
+    /// Decrypt every inbound `m.room.encrypted` text message in a sync response, skipping our own
+    /// and any sender not in `allowed` (when an allowlist is configured — the `m.room.encrypted`
+    /// event's `sender` is cleartext, so the allowlist is enforced *before* decryption, identically
+    /// to the plaintext path). Returns `(room_id, plaintext_body)` pairs worth answering.
+    pub async fn decrypt_messages(
+        &self,
+        sync: &Value,
+        self_user: String,
+        allowed: Option<HashSet<String>>,
+    ) -> Vec<(String, String)> {
         let mut out = Vec::new();
         let settings = DecryptionSettings {
             sender_device_trust_requirement: TrustRequirement::Untrusted,
@@ -159,7 +189,11 @@ impl Crypto {
                 if ev.get("type").and_then(|t| t.as_str()) != Some("m.room.encrypted") {
                     continue;
                 }
-                if ev.get("sender").and_then(|s| s.as_str()) == Some(self_user.as_str()) {
+                let sender = ev.get("sender").and_then(|s| s.as_str());
+                if sender == Some(self_user.as_str()) {
+                    continue;
+                }
+                if !crate::sender_allowed(allowed.as_ref(), sender.unwrap_or_default()) {
                     continue;
                 }
                 let raw: Raw<EncryptedEvent> = match serde_json::from_value(ev.clone()) {

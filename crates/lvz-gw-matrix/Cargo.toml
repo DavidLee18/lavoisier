@@ -1,6 +1,6 @@
 [package]
 name = "lvz-gw-matrix"
-version = "0.2.2"
+version = "0.3.0"
 description = "Matrix gateway for Lavoisier: a thin reqwest client-server API client (login + /sync long-poll + m.room.message send) that drives the shared agent, one room per session. End-to-end encryption (Olm/Megolm) is opt-in behind the `e2ee` feature."
 edition.workspace = true
 rust-version.workspace = true
@@ -22,11 +22,15 @@ tokio.workspace = true
 # the crypto-only `matrix-sdk-crypto` (+ ruma/vodozemac) and requires Rust >= 1.93 (that crate's MSRV;
 # the rest of the workspace still builds on the pinned 1.88 when the feature is off).
 matrix-sdk-crypto = { version = "0.18", optional = true }
+# Durable crypto store so the bot's E2EE identity (device keys, Olm/Megolm sessions, tracked
+# devices) survives restarts. `bundled` compiles SQLite from source (no runtime libsqlite3),
+# keeping the binary self-contained for minimal/distroless deployments.
+matrix-sdk-sqlite = { version = "0.18", optional = true, default-features = false, features = ["crypto-store", "bundled"] }
 ruma = { version = "0.16", optional = true, features = ["client-api", "events"] }
 http = { version = "1", optional = true }
 
 [features]
-e2ee = ["dep:matrix-sdk-crypto", "dep:ruma", "dep:http"]
+e2ee = ["dep:matrix-sdk-crypto", "dep:matrix-sdk-sqlite", "dep:ruma", "dep:http"]
 
 [dev-dependencies]
 serde_json.workspace = true

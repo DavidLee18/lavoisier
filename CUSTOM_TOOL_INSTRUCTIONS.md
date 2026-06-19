@@ -3,7 +3,7 @@
 How to give the agent your own tools **without forking Lavoisier or putting your code in this
 repo**. Your tools live in a separate, private crate that depends on the published `lavoisier`
 crate and injects them at startup. Your binary then behaves exactly like `lav` — same flags,
-config, and gateways (HTTP/Matrix/cron, E2EE, persona) — with your tools additionally available to
+config, and gateways (HTTP/Matrix/Slack/cron, E2EE, persona) — with your tools additionally available to
 the agent.
 
 > Tools are **compiled-in Rust** — there is no dynamic/plugin loading. "Private" means the Rust

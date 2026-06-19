@@ -28,6 +28,10 @@ clap = { version = "4", features = ["derive", "env"] }
 # HTTP/WebSocket gateway (lvz-gw-http). axum brings its own hyper 1 server + WS support.
 axum = { version = "0.8", features = ["ws"] }
 
+# WebSocket *client* for the Slack gateway's Socket Mode (lvz-gw-slack). rustls + webpki-roots to
+# match the workspace TLS stack; `connect` enables `connect_async` (no native-tls, no OpenSSL).
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+
 # gRPC stack (lvz-xai primary transport; codegen from vendored proto/). Client-only:
 # default tonic features pull in the server/router (axum, h2) which we don't need.
 tonic = { version = "0.14", default-features = false, features = ["codegen", "channel", "tls-ring", "tls-webpki-roots"] }
@@ -48,8 +52,9 @@ lvz-context = { path = "crates/lvz-context", version = "0.1.0" }
 lvz-memory = { path = "crates/lvz-memory", version = "0.2.0" }
 lvz-tune = { path = "crates/lvz-tune", version = "0.1.0" }
 lvz-gw-http = { path = "crates/lvz-gw-http", version = "0.1.0" }
-lvz-gw-matrix = { path = "crates/lvz-gw-matrix", version = "0.2.2" }
+lvz-gw-matrix = { path = "crates/lvz-gw-matrix", version = "0.3.0" }
 lvz-gw-cron = { path = "crates/lvz-gw-cron", version = "0.2.0" }
+lvz-gw-slack = { path = "crates/lvz-gw-slack", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"

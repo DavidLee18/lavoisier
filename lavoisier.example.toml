@@ -37,6 +37,17 @@
 [gateway]
 # serve            = "127.0.0.1:8080"
 # serve_matrix     = true
+# serve_slack      = true        # Slack Socket Mode (needs SLACK_APP_TOKEN + SLACK_BOT_TOKEN)
 # api_keys         = ["key1", "key2"]
 # rate_limit       = 60          # requests per 60s window
-# matrix_auto_join = true        # auto-accept Matrix room invites (default true)
+# Matrix gateway:
+# matrix_auto_join    = true     # auto-accept Matrix room invites (default true)
+# matrix_state_dir    = "./.lavoisier/matrix"  # persist session (token + device id) + E2EE crypto
+#                                              # store here so identity is stable across restarts
+#                                              # (env MATRIX_STATE_DIR wins). Auth via env:
+#                                              # MATRIX_ACCESS_TOKEN or MATRIX_USER+MATRIX_PASSWORD.
+# matrix_allowed_users = ["@alice:hs", "@bob:hs"]   # only answer these senders (env
+#                                                   # MATRIX_ALLOWED_USERS wins; empty = everyone)
+# Slack gateway:
+# slack_allowed_users  = ["U_ALICE", "U_BOB"]       # only answer these Slack users (env
+#                                                   # SLACK_ALLOWED_USERS wins; empty = everyone)

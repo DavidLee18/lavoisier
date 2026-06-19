@@ -376,14 +376,12 @@ mod tests {
     }
 
     fn tmp() -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "lvz-batch-edit-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // A process-wide atomic counter guarantees a unique dir per call. (A timestamp alone
+        // collides: the clock's resolution is coarse enough that two test threads can land on the
+        // same nanos, share a dir, and one test's `remove_dir_all` then nukes the other's files.)
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("lvz-batch-edit-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }

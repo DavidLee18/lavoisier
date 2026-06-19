@@ -23,6 +23,7 @@ use lvz_google::GoogleProvider;
 use lvz_gw_cron::{CronGateway, CronJob};
 use lvz_gw_http::{GatewayConfig, HttpGateway};
 use lvz_gw_matrix::MatrixGateway;
+use lvz_gw_slack::SlackGateway;
 use lvz_memory::SessionAgent;
 use lvz_protocol::{
     AgentHandle, BatchProvider, ChatRequest, CostWeights, Event, Gateway, Knobs, Message, Outcome,
@@ -77,7 +78,7 @@ struct Cli {
     /// **above** the operational system prompt — the agent keeps it in mind on every turn, and
     /// it sits in the cached prefix so it costs almost nothing to carry. Defaults to `./PERSONA.md`
     /// if present; `--no-persona` disables auto-loading. Use this to give a long-running gateway
-    /// (HTTP/Matrix/cron) a stable identity and rules.
+    /// (HTTP/Matrix/Slack/cron) a stable identity and rules.
     #[arg(long, value_name = "PATH")]
     persona: Option<PathBuf>,
 
@@ -193,7 +194,9 @@ struct Cli {
     rate_limit: Option<u32>,
 
     /// Serve as a Matrix gateway (one room per session) instead of a one-shot turn. Reads
-    /// `MATRIX_HOMESERVER`, `MATRIX_USER`, `MATRIX_PASSWORD` from the environment.
+    /// `MATRIX_HOMESERVER` plus either `MATRIX_ACCESS_TOKEN` or (`MATRIX_USER` + `MATRIX_PASSWORD`).
+    /// Optional: `MATRIX_DEVICE_ID`, `MATRIX_STATE_DIR` (stable identity + E2EE crypto store across
+    /// restarts), `MATRIX_CRYPTO_STORE_KEY`, `MATRIX_ALLOWED_USERS`.
     #[arg(long)]
     serve_matrix: bool,
 
@@ -201,6 +204,12 @@ struct Cli {
     /// also be set via `[gateway] matrix_auto_join = false`.
     #[arg(long)]
     matrix_no_auto_join: bool,
+
+    /// Serve as a Slack gateway (Socket Mode; one session per channel/thread) instead of a one-shot
+    /// turn. Reads `SLACK_APP_TOKEN` (`xapp-…`) and `SLACK_BOT_TOKEN` (`xoxb-…`); optional
+    /// `SLACK_ALLOWED_USERS` (comma-separated user ids). Runs alongside `--serve`/`--serve-matrix`.
+    #[arg(long)]
+    serve_slack: bool,
 
     /// Schedule a recurring agent turn (in-process cron, UTC). The first **five** whitespace
     /// tokens are a standard cron schedule (`min hour dom month dow`); the rest is the prompt.
@@ -386,7 +395,7 @@ pub use lvz_protocol::{Tool, ToolError, ToolOutput};
 
 /// Run the full Lavoisier CLI, registering `extra_tools` into the agent alongside the built-ins.
 /// This is the entry point for a private downstream binary that wants the entire CLI — flags,
-/// config, gateways (HTTP/Matrix/cron), E2EE, persona — but with its own tools. The stock `lav`
+/// config, gateways (HTTP/Matrix/Slack/cron), E2EE, persona — but with its own tools. The stock `lav`
 /// binary calls this with an empty vec. Async; pair with your own runtime, or use [`main_with`].
 pub async fn run_with(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::Error>> {
     run(extra_tools).await
@@ -430,8 +439,10 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
     // Cron jobs (in-process scheduler) can run standalone or alongside HTTP/Matrix.
     let cron_jobs = build_cron_jobs(&cli)?;
 
-    // Long-running gateways (HTTP/Matrix/cron) get the 1-hour cache TTL on the immutable prefix.
-    let serving = cli.serve.is_some() || cli.serve_matrix || !cron_jobs.is_empty();
+    // Long-running gateways (HTTP/Matrix/Slack/cron) get the 1-hour cache TTL on the immutable
+    // prefix.
+    let serving =
+        cli.serve.is_some() || cli.serve_matrix || cli.serve_slack || !cron_jobs.is_empty();
     let (provider, batch_provider) = provider_kind.build(cli.thinking.as_deref(), serving)?;
     let model = cli
         .model
@@ -477,9 +488,34 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             // Auto-join invites by default; disabled by `--matrix-no-auto-join` or the config key.
             let auto_join =
                 !cli.matrix_no_auto_join && config.gateway.matrix_auto_join.unwrap_or(true);
-            gateways.push(Arc::new(
-                MatrixGateway::from_env()?.with_auto_join(auto_join),
-            ));
+            // `from_env` already applied any MATRIX_* env vars (incl. state dir / allowlist);
+            // fall back to the config file only where the corresponding env var is absent so the
+            // documented precedence (env > file) holds.
+            let mut matrix = MatrixGateway::from_env()?.with_auto_join(auto_join);
+            if std::env::var_os("MATRIX_STATE_DIR").is_none() {
+                if let Some(dir) = &config.gateway.matrix_state_dir {
+                    matrix = matrix.with_state_dir(dir.clone());
+                }
+            }
+            if std::env::var_os("MATRIX_ALLOWED_USERS").is_none() {
+                if let Some(users) = &config.gateway.matrix_allowed_users {
+                    matrix = matrix.with_allowed_users(users.clone());
+                }
+            }
+            gateways.push(Arc::new(matrix));
+        }
+
+        if cli.serve_slack {
+            // `from_env` already applied SLACK_ALLOWED_USERS; fall back to the config file only
+            // when that env var is absent (env > file).
+            let mut slack = SlackGateway::from_env()?;
+            if std::env::var_os("SLACK_ALLOWED_USERS").is_none() {
+                if let Some(users) = &config.gateway.slack_allowed_users {
+                    slack = slack.with_allowed_users(users.clone());
+                }
+            }
+            eprintln!("lavoisier: Slack gateway (Socket Mode)");
+            gateways.push(Arc::new(slack));
         }
 
         if !cron_jobs.is_empty() {

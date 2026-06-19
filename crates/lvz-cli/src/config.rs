@@ -78,10 +78,20 @@ pub struct MemorySection {
 pub struct GatewaySection {
     pub serve: Option<String>,
     pub serve_matrix: Option<bool>,
+    pub serve_slack: Option<bool>,
     pub api_keys: Option<Vec<String>>,
     pub rate_limit: Option<u32>,
     /// Auto-accept Matrix room invites (default `true`).
     pub matrix_auto_join: Option<bool>,
+    /// Only answer these Matrix senders (`@user:server`); empty/unset ⇒ answer everyone. The
+    /// `MATRIX_ALLOWED_USERS` env var (comma-separated) takes precedence.
+    pub matrix_allowed_users: Option<Vec<String>>,
+    /// Directory persisting the Matrix session (token + device id) and the E2EE crypto store, for
+    /// a stable identity across restarts. `MATRIX_STATE_DIR` takes precedence.
+    pub matrix_state_dir: Option<PathBuf>,
+    /// Only answer these Slack user ids; empty/unset ⇒ answer everyone. The `SLACK_ALLOWED_USERS`
+    /// env var (comma-separated) takes precedence.
+    pub slack_allowed_users: Option<Vec<String>>,
 }
 
 impl Config {
@@ -139,6 +149,7 @@ impl Config {
         // [gateway]
         merge(&mut cli.serve, &self.gateway.serve);
         cli.serve_matrix |= self.gateway.serve_matrix.unwrap_or(false);
+        cli.serve_slack |= self.gateway.serve_slack.unwrap_or(false);
         merge_copy(&mut cli.rate_limit, self.gateway.rate_limit);
         if cli.api_key.is_empty() {
             if let Some(keys) = &self.gateway.api_keys {
@@ -232,6 +243,35 @@ mod tests {
         );
 
         assert!(toml::from_str::<Config>("[agent]\nnonsense = 1\n").is_err());
+    }
+
+    #[test]
+    fn parses_gateway_matrix_and_slack_knobs() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [gateway]
+            serve_matrix = true
+            serve_slack = true
+            matrix_state_dir = "/var/lib/lav/matrix"
+            matrix_allowed_users = ["@a:hs", "@b:hs"]
+            slack_allowed_users = ["U_A"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.gateway.serve_matrix, Some(true));
+        assert_eq!(cfg.gateway.serve_slack, Some(true));
+        assert_eq!(
+            cfg.gateway.matrix_state_dir.as_deref(),
+            Some(Path::new("/var/lib/lav/matrix"))
+        );
+        assert_eq!(
+            cfg.gateway.matrix_allowed_users.as_deref(),
+            Some(&["@a:hs".to_string(), "@b:hs".to_string()][..])
+        );
+        assert_eq!(
+            cfg.gateway.slack_allowed_users.as_deref(),
+            Some(&["U_A".to_string()][..])
+        );
     }
 
     #[test]

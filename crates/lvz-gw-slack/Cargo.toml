@@ -1,0 +1,24 @@
+[package]
+name = "lvz-gw-slack"
+version = "0.1.0"
+description = "Slack gateway for Lavoisier: a thin Socket Mode client (apps.connections.open + WebSocket events + chat.postMessage) that drives the shared agent, one session per channel/thread."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+lvz-protocol.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true }
+# Socket Mode is a WebSocket transport (no inbound port). Thin ws client over the same rustls +
+# webpki-roots TLS stack the rest of the workspace uses; `connect` enables `connect_async`.
+tokio-tungstenite = { workspace = true }
+
+[dev-dependencies]
+serde_json.workspace = true

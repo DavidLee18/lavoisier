@@ -20,7 +20,7 @@ Each crate must already be on crates.io before the crates that depend on it. Dry
 
 ```sh
 for c in lvz-protocol lvz-context lvz-anthropic lvz-google lvz-xai lvz-claude-cli \
-         lvz-tune lvz-gw-http lvz-gw-matrix lvz-gw-cron lvz-tools lvz-agent lvz-memory lavoisier; do
+         lvz-tune lvz-gw-http lvz-gw-matrix lvz-gw-cron lvz-gw-slack lvz-tools lvz-agent lvz-memory lavoisier; do
   cargo publish -p "$c" --dry-run || break
 done
 ```
@@ -34,7 +34,7 @@ Then publish for real, **in this order**. Two limits to know:
 
 ```sh
 for c in lvz-protocol lvz-context lvz-anthropic lvz-google lvz-xai lvz-claude-cli \
-         lvz-tune lvz-gw-http lvz-gw-matrix lvz-gw-cron lvz-tools lvz-agent lvz-memory lavoisier; do
+         lvz-tune lvz-gw-http lvz-gw-matrix lvz-gw-cron lvz-gw-slack lvz-tools lvz-agent lvz-memory lavoisier; do
   until out=$(cargo publish -p "$c" 2>&1); do
     echo "$out" | grep -qiE '429|Too Many Requests' || { echo "$out" | tail; echo "HARD FAIL: $c"; exit 1; }
     echo "rate-limited on $c — sleeping 11m…"; sleep 660
@@ -49,8 +49,12 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
-(`v0.4.0`): `lavoisier` only (0.4.0 — now lib+bin with the `main_with` custom-tool entry point).
-Earlier: `v0.3.1` bumped `lvz-gw-matrix` (0.2.2, auto-join) + `lavoisier`; `v0.3.0` bumped `lvz-memory`
+(`v0.5.0`): `lvz-gw-slack` (0.1.0 — **new crate**, claim the name), `lvz-gw-matrix` (0.3.0 —
+token/whoami auth + stable device id, persistent SQLite crypto store, sender allowlist), and
+`lavoisier` (0.5.0 — `--serve-slack` + the new Matrix/config knobs). `lvz-tools` changed test-only
+code (no functional change), so it stays at 0.1.0.
+Earlier: `v0.4.0` bumped `lavoisier` only (0.4.0 — lib+bin `main_with` custom-tool entry point);
+`v0.3.1` bumped `lvz-gw-matrix` (0.2.2, auto-join) + `lavoisier`; `v0.3.0` bumped `lvz-memory`
 (0.2.0) + `lavoisier`; `v0.2.1` was a `lvz-gw-matrix` E2EE fix; `v0.2.0` bumped `lvz-gw-cron` (new),
 `lvz-gw-matrix`, and `lavoisier`. The remaining crates are still at `0.1.0`. (`examples/private-tools`
 is `publish = false` — never published.)

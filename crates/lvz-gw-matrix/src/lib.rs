@@ -11,8 +11,22 @@
 //! Cargo feature (Olm/Megolm via the crypto-only `matrix-sdk-crypto`, contained to [`e2ee`]);
 //! without it the gateway is a thin REST client. Depends only on `lvz-protocol`; the agent core
 //! stays unaware of Matrix.
+//!
+//! ## Authentication & identity
+//!
+//! Three ways to authenticate, in precedence order (highest first):
+//! 1. **Access token** (`MATRIX_ACCESS_TOKEN`) — skip `/login` entirely; the user/device id are
+//!    resolved via `GET /account/whoami`. Best for a long-lived bot provisioned once.
+//! 2. **Persisted session** — if a state directory is configured ([`MatrixGateway::with_state_dir`])
+//!    and holds a saved `{access_token, device_id}` from a previous run, it's reused (validated with
+//!    `whoami`), keeping the **device id stable across restarts** — a prerequisite for persistent
+//!    E2EE (see [`e2ee`]).
+//! 3. **Password login** (`MATRIX_PASSWORD`) — the fallback; the issued session is persisted to the
+//!    state dir (if any) so the next start takes path 2. A configured device id (`MATRIX_DEVICE_ID`)
+//!    or a previously-persisted one is reused on re-login so the device stays stable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +34,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::stream::StreamExt;
 use lvz_protocol::{AgentHandle, Event, Gateway, GatewayError, TurnRequest};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "e2ee")]
 mod e2ee;
@@ -33,29 +47,56 @@ const SYNC_TIMEOUT_MS: u64 = 30_000;
 pub struct MatrixGateway {
     homeserver: String,
     user: String,
-    password: String,
+    /// Password for the `m.login.password` fallback. `None` when authenticating by access token.
+    password: Option<String>,
+    /// Pre-provisioned access token; when set, login is skipped and identity is resolved via
+    /// `whoami` (precedence path 1).
+    access_token: Option<String>,
+    /// Device id to pin on the password-login path (and to reuse on re-login) so the crypto
+    /// identity stays stable across restarts.
+    device_id: Option<String>,
+    /// Directory holding the persisted session (`session.json`) and, under `e2ee`, the SQLite
+    /// crypto store (`crypto/`). The single on-disk home of the bot's Matrix identity.
+    state_dir: Option<PathBuf>,
+    /// Passphrase encrypting the E2EE crypto store at rest (`MATRIX_CRYPTO_STORE_KEY`).
+    crypto_passphrase: Option<String>,
     http: reqwest::Client,
     txn: AtomicU64,
     /// Auto-accept room invites for the bot account (on by default).
     auto_join: bool,
+    /// If set, only answer messages whose sender is in this allowlist (applied to plaintext and
+    /// encrypted rooms alike). `None` ⇒ answer everyone (the default).
+    allowed_users: Option<HashSet<String>>,
 }
 
 impl MatrixGateway {
+    /// Internal base constructor with all optional knobs unset.
+    fn base(homeserver: impl Into<String>, user: impl Into<String>) -> Self {
+        Self {
+            homeserver: homeserver.into().trim_end_matches('/').to_string(),
+            user: user.into(),
+            password: None,
+            access_token: None,
+            device_id: None,
+            state_dir: None,
+            crypto_passphrase: None,
+            http: reqwest::Client::new(),
+            txn: AtomicU64::new(0),
+            auto_join: true,
+            allowed_users: None,
+        }
+    }
+
     /// Construct against a homeserver base URL (e.g. `https://matrix.example.org`) and the
-    /// bot's login (`user` may be a localpart or a full `@user:server` id).
+    /// bot's login (`user` may be a localpart or a full `@user:server` id) with a password.
     pub fn new(
         homeserver: impl Into<String>,
         user: impl Into<String>,
         password: impl Into<String>,
     ) -> Self {
-        Self {
-            homeserver: homeserver.into().trim_end_matches('/').to_string(),
-            user: user.into(),
-            password: password.into(),
-            http: reqwest::Client::new(),
-            txn: AtomicU64::new(0),
-            auto_join: true,
-        }
+        let mut gw = Self::base(homeserver, user);
+        gw.password = Some(password.into());
+        gw
     }
 
     /// Enable or disable auto-accepting room invites (default `true`). When off, an operator must
@@ -65,28 +106,167 @@ impl MatrixGateway {
         self
     }
 
-    /// Construct from the environment: `MATRIX_HOMESERVER`, `MATRIX_USER`, `MATRIX_PASSWORD`.
+    /// Authenticate with a pre-provisioned access token instead of a password (precedence path 1).
+    pub fn with_access_token(mut self, token: impl Into<String>) -> Self {
+        self.access_token = Some(token.into());
+        self
+    }
+
+    /// Pin the Matrix device id (password-login path), keeping the crypto identity stable across
+    /// restarts.
+    pub fn with_device_id(mut self, device_id: impl Into<String>) -> Self {
+        self.device_id = Some(device_id.into());
+        self
+    }
+
+    /// Set the state directory: where the session (token + device id) is persisted and where the
+    /// E2EE crypto store lives. Enables stable-identity restarts.
+    pub fn with_state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.state_dir = Some(dir.into());
+        self
+    }
+
+    /// Set the passphrase used to encrypt the E2EE crypto store at rest.
+    pub fn with_crypto_passphrase(mut self, passphrase: impl Into<String>) -> Self {
+        self.crypto_passphrase = Some(passphrase.into());
+        self
+    }
+
+    /// Restrict which senders the bot answers. An empty list clears the restriction (answer
+    /// everyone); any non-empty list means only those `@user:server` ids drive the agent.
+    pub fn with_allowed_users(mut self, users: impl IntoIterator<Item = String>) -> Self {
+        let set: HashSet<String> = users.into_iter().collect();
+        self.allowed_users = (!set.is_empty()).then_some(set);
+        self
+    }
+
+    /// Construct from the environment. Required: `MATRIX_HOMESERVER`, plus **either**
+    /// `MATRIX_ACCESS_TOKEN` or (`MATRIX_USER` + `MATRIX_PASSWORD`). Optional:
+    /// `MATRIX_DEVICE_ID`, `MATRIX_STATE_DIR`, `MATRIX_CRYPTO_STORE_KEY`.
     pub fn from_env() -> Result<Self, GatewayError> {
-        let var =
+        let require =
             |k: &str| std::env::var(k).map_err(|_| GatewayError::Bind(format!("{k} is not set")));
-        Ok(Self::new(
-            var("MATRIX_HOMESERVER")?,
-            var("MATRIX_USER")?,
-            var("MATRIX_PASSWORD")?,
-        ))
+        let opt = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+
+        let homeserver = require("MATRIX_HOMESERVER")?;
+        let access_token = opt("MATRIX_ACCESS_TOKEN");
+        let password = opt("MATRIX_PASSWORD");
+        let user = opt("MATRIX_USER").unwrap_or_default();
+
+        if access_token.is_none() && password.is_none() {
+            return Err(GatewayError::Bind(
+                "set MATRIX_ACCESS_TOKEN, or MATRIX_USER + MATRIX_PASSWORD".into(),
+            ));
+        }
+        if access_token.is_none() && user.is_empty() {
+            return Err(GatewayError::Bind(
+                "MATRIX_USER is required for password login".into(),
+            ));
+        }
+
+        let mut gw = Self::base(homeserver, user);
+        gw.access_token = access_token;
+        gw.password = password;
+        gw.device_id = opt("MATRIX_DEVICE_ID");
+        gw.state_dir = opt("MATRIX_STATE_DIR").map(PathBuf::from);
+        gw.crypto_passphrase = opt("MATRIX_CRYPTO_STORE_KEY");
+        if let Some(users) = opt("MATRIX_ALLOWED_USERS") {
+            gw = gw.with_allowed_users(users.split(',').map(|s| s.trim().to_string()));
+        }
+        Ok(gw)
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.homeserver, path)
     }
 
-    /// Password-login; returns the access token + resolved user id.
-    async fn login(&self) -> Result<Session, GatewayError> {
-        let body = serde_json::json!({
+    /// Resolve the session to serve under, following the documented precedence: explicit access
+    /// token → persisted session → password login. The chosen session is persisted to the state
+    /// dir (if configured) so a later restart reuses the same device.
+    async fn resolve_session(&self) -> Result<Session, GatewayError> {
+        // 1. Explicit access token: resolve the identity via whoami (no login).
+        if let Some(token) = &self.access_token {
+            let who = self.whoami(token).await?;
+            let device_id = who
+                .device_id
+                .or_else(|| self.device_id.clone())
+                .unwrap_or_default();
+            let session = Session {
+                access_token: token.clone(),
+                user_id: who.user_id,
+                device_id,
+            };
+            self.save_session(&session);
+            return Ok(session);
+        }
+
+        // 2. Persisted session from a previous run (validated against whoami). On success the
+        //    device id is stable across restarts; on failure we fall through to password login,
+        //    reusing the persisted device id so even a re-login keeps the same device.
+        let persisted = self.load_session();
+        if let Some(saved) = &persisted {
+            match self.whoami(&saved.access_token).await {
+                Ok(who) => {
+                    let device_id = who
+                        .device_id
+                        .filter(|d| !d.is_empty())
+                        .unwrap_or_else(|| saved.device_id.clone());
+                    eprintln!("matrix: reusing persisted session (device {device_id})");
+                    return Ok(Session {
+                        access_token: saved.access_token.clone(),
+                        user_id: who.user_id,
+                        device_id,
+                    });
+                }
+                Err(e) => eprintln!(
+                    "matrix: persisted token rejected ({e}); falling back to password login"
+                ),
+            }
+        }
+
+        // 3. Password login. Reuse a configured or previously-persisted device id so the device
+        //    stays stable, then persist the issued session.
+        let reuse_device = self
+            .device_id
+            .clone()
+            .or_else(|| persisted.as_ref().map(|s| s.device_id.clone()));
+        let session = self.login(reuse_device.as_deref()).await?;
+        self.save_session(&session);
+        Ok(session)
+    }
+
+    /// Resolve `user_id`/`device_id` for an access token via `GET /account/whoami`.
+    async fn whoami(&self, token: &str) -> Result<WhoAmI, GatewayError> {
+        let resp = self
+            .http
+            .get(self.url("/_matrix/client/v3/account/whoami"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::Bind(format!("matrix whoami {status}: {msg}")));
+        }
+        resp.json()
+            .await
+            .map_err(|e| GatewayError::Protocol(e.to_string()))
+    }
+
+    /// Password-login (optionally pinning `device_id`); returns the access token + resolved ids.
+    async fn login(&self, device_id: Option<&str>) -> Result<Session, GatewayError> {
+        let password = self.password.as_deref().ok_or_else(|| {
+            GatewayError::Bind("no MATRIX_PASSWORD set and no usable access token".into())
+        })?;
+        let mut body = serde_json::json!({
             "type": "m.login.password",
             "identifier": { "type": "m.id.user", "user": self.user },
-            "password": self.password,
+            "password": password,
         });
+        if let Some(d) = device_id {
+            body["device_id"] = serde_json::Value::String(d.to_string());
+        }
         let resp = self
             .http
             .post(self.url("/_matrix/client/v3/login"))
@@ -108,6 +288,51 @@ impl MatrixGateway {
             user_id: login.user_id,
             device_id: login.device_id,
         })
+    }
+
+    /// Path to the persisted-session file under the state dir, if a state dir is configured.
+    fn session_path(&self) -> Option<PathBuf> {
+        self.state_dir.as_ref().map(|d| d.join("session.json"))
+    }
+
+    /// Load a previously-persisted session, if any. A session for a different homeserver is
+    /// ignored (so changing `MATRIX_HOMESERVER` doesn't reuse a stale token).
+    fn load_session(&self) -> Option<PersistedSession> {
+        let path = self.session_path()?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        let saved: PersistedSession = serde_json::from_str(&text).ok()?;
+        (saved.homeserver == self.homeserver).then_some(saved)
+    }
+
+    /// Persist the session (token + device id) to the state dir, if configured. Best-effort: a
+    /// write failure is logged, not fatal (the gateway still runs, just without restart stability).
+    fn save_session(&self, session: &Session) {
+        let Some(path) = self.session_path() else {
+            return;
+        };
+        if let Some(dir) = &self.state_dir {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                eprintln!("matrix: could not create state dir {}: {e}", dir.display());
+                return;
+            }
+        }
+        let saved = PersistedSession {
+            homeserver: self.homeserver.clone(),
+            user_id: session.user_id.clone(),
+            access_token: session.access_token.clone(),
+            device_id: session.device_id.clone(),
+        };
+        match serde_json::to_string_pretty(&saved) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    eprintln!(
+                        "matrix: could not persist session to {}: {e}",
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => eprintln!("matrix: could not serialise session: {e}"),
+        }
     }
 
     /// One `/sync` round-trip, returned as raw JSON. `since = None` establishes a baseline
@@ -266,24 +491,34 @@ impl Gateway for MatrixGateway {
 impl MatrixGateway {
     /// The gateway's serve loop, as a plain (non-`async_trait`) async fn — see [`Gateway::serve`].
     async fn serve_loop(self: Arc<Self>, agent: Arc<dyn AgentHandle>) -> Result<(), GatewayError> {
-        let session = self.login().await?;
+        let session = self.resolve_session().await?;
         eprintln!(
-            "lavoisier: matrix gateway online as {} on {}",
-            session.user_id, self.homeserver
+            "lavoisier: matrix gateway online as {} (device {}) on {}",
+            session.user_id, session.device_id, self.homeserver
         );
+        if let Some(allowed) = &self.allowed_users {
+            eprintln!(
+                "matrix: answering only {} allowlisted sender(s)",
+                allowed.len()
+            );
+        }
         // Own the fields used across awaits so a `&Session` is never held across one (keeps the
         // async_trait future unconditionally `Send`).
         let token = session.access_token.clone();
         let self_user = session.user_id.clone();
 
         // Opt-in E2EE: bind an OlmMachine to this session and publish keys. If init fails we log
-        // and continue in plaintext-only mode rather than abort the gateway.
+        // and continue in plaintext-only mode rather than abort the gateway. A configured state
+        // dir backs the OlmMachine with a durable SQLite crypto store (`<state_dir>/crypto`) so the
+        // crypto identity survives restarts; without one the machine is in-memory (single-session).
         #[cfg(feature = "e2ee")]
         let crypto = match e2ee::Crypto::new(
             self.homeserver.clone(),
             token.clone(),
             &session.user_id,
             &session.device_id,
+            self.state_dir.as_ref().map(|d| d.join("crypto")).as_deref(),
+            self.crypto_passphrase.as_deref(),
         )
         .await
         {
@@ -340,7 +575,7 @@ impl MatrixGateway {
             };
 
             // Plaintext messages: run the agent and reply in the clear.
-            for msg in extract_messages(resp, &self_user) {
+            for msg in extract_messages(resp, &self_user, self.allowed_users.as_ref()) {
                 if let Some(answer) = self.run_agent(&agent, &msg.room, msg.body).await {
                     if let Err(e) = self.send_message(&token, &msg.room, &answer).await {
                         eprintln!("matrix: send error in {}: {e}", msg.room);
@@ -351,7 +586,10 @@ impl MatrixGateway {
             // Encrypted messages: decrypt, run the agent, and reply encrypted.
             #[cfg(feature = "e2ee")]
             if let Some(c) = &crypto {
-                for (room, body) in c.decrypt_messages(&value, self_user.clone()).await {
+                for (room, body) in c
+                    .decrypt_messages(&value, self_user.clone(), self.allowed_users.clone())
+                    .await
+                {
                     if let Some(answer) = self.run_agent(&agent, &room, body).await {
                         if let Err(e) = c.encrypt_and_send(room.clone(), answer).await {
                             eprintln!("matrix[e2ee]: send error in {room}: {e}");
@@ -400,12 +638,20 @@ struct IncomingMessage {
 }
 
 /// Pull the answerable `m.room.message`/`m.text` events out of a sync response, skipping the
-/// bot's own messages (so it never replies to itself).
-fn extract_messages(sync: SyncResponse, self_user: &str) -> Vec<IncomingMessage> {
+/// bot's own messages (so it never replies to itself) and any sender not in `allowed` (when an
+/// allowlist is configured).
+fn extract_messages(
+    sync: SyncResponse,
+    self_user: &str,
+    allowed: Option<&HashSet<String>>,
+) -> Vec<IncomingMessage> {
     let mut out = Vec::new();
     for (room_id, room) in sync.rooms.join {
         for event in room.timeline.events {
             if event.kind != "m.room.message" || event.sender == self_user {
+                continue;
+            }
+            if !sender_allowed(allowed, &event.sender) {
                 continue;
             }
             if event.content.msgtype.as_deref() != Some("m.text") {
@@ -421,6 +667,12 @@ fn extract_messages(sync: SyncResponse, self_user: &str) -> Vec<IncomingMessage>
         }
     }
     out
+}
+
+/// Whether `sender` may drive the agent: true if no allowlist is configured, else membership.
+/// Shared by the plaintext and E2EE paths so encryption can't bypass the allowlist.
+pub(crate) fn sender_allowed(allowed: Option<&HashSet<String>>, sender: &str) -> bool {
+    allowed.is_none_or(|set| set.contains(sender))
 }
 
 /// Percent-encode a path segment (room ids contain `!`, `:` and `@`).
@@ -444,6 +696,25 @@ struct LoginResponse {
     access_token: String,
     user_id: String,
     #[serde(default)]
+    device_id: String,
+}
+
+/// `GET /account/whoami` response. `device_id` is optional (added to the spec later; some
+/// homeservers omit it for non-token logins).
+#[derive(Deserialize)]
+struct WhoAmI {
+    user_id: String,
+    #[serde(default)]
+    device_id: Option<String>,
+}
+
+/// The on-disk session artifact (`<state_dir>/session.json`): the token + device id (and the
+/// homeserver it belongs to) reused across restarts to keep a stable device/crypto identity.
+#[derive(Serialize, Deserialize)]
+struct PersistedSession {
+    homeserver: String,
+    user_id: String,
+    access_token: String,
     device_id: String,
 }
 
@@ -514,7 +785,7 @@ mod tests {
             ] } } } }
         }));
 
-        let msgs = extract_messages(sync, "@bot:hs");
+        let msgs = extract_messages(sync, "@bot:hs", None);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].room, "!room:hs");
         assert_eq!(msgs[0].sender, "@alice:hs");
@@ -522,11 +793,42 @@ mod tests {
     }
 
     #[test]
+    fn allowlist_filters_senders() {
+        let json = serde_json::json!({
+            "next_batch": "s3",
+            "rooms": { "join": { "!room:hs": { "timeline": { "events": [
+                { "type": "m.room.message", "sender": "@alice:hs",
+                  "content": { "msgtype": "m.text", "body": "from alice" } },
+                { "type": "m.room.message", "sender": "@mallory:hs",
+                  "content": { "msgtype": "m.text", "body": "from mallory" } }
+            ] } } } }
+        });
+        // No allowlist ⇒ both senders answered.
+        assert_eq!(
+            extract_messages(sync_from(json.clone()), "@bot:hs", None).len(),
+            2
+        );
+        // Allowlist ⇒ only the listed sender.
+        let allowed: HashSet<String> = ["@alice:hs".to_string()].into_iter().collect();
+        let msgs = extract_messages(sync_from(json), "@bot:hs", Some(&allowed));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender, "@alice:hs");
+    }
+
+    #[test]
+    fn sender_allowed_semantics() {
+        let allowed: HashSet<String> = ["@a:hs".to_string()].into_iter().collect();
+        assert!(sender_allowed(None, "@anyone:hs")); // unset ⇒ everyone
+        assert!(sender_allowed(Some(&allowed), "@a:hs"));
+        assert!(!sender_allowed(Some(&allowed), "@b:hs"));
+    }
+
+    #[test]
     fn empty_sync_yields_no_messages_and_parses_next_batch() {
         let value = serde_json::json!({ "next_batch": "s5" });
         assert_eq!(parse_next_batch(&value).unwrap(), "s5");
         let sync: SyncResponse = serde_json::from_value(value).unwrap();
-        assert!(extract_messages(sync, "@bot:hs").is_empty());
+        assert!(extract_messages(sync, "@bot:hs", None).is_empty());
     }
 
     #[test]

@@ -15,9 +15,9 @@ Companion docs — read the relevant one before working in that area:
 ## Status
 
 Complete and live-verified against real `XAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY`:
-all 14 crates, provider streaming (SSE + xAI gRPC), the agent loop, the token engine, session
-memory, the HTTP/Matrix/cron gateways, AWS packaging (`infra/`), and the ATO learner. `cargo test`,
-`cargo clippy --all-targets`, and `cargo fmt --check` are kept green.
+all 15 crates, provider streaming (SSE + xAI gRPC), the agent loop, the token engine, session
+memory, the HTTP/Matrix/Slack/cron gateways, AWS packaging (`infra/`), and the ATO learner. `cargo
+test`, `cargo clippy --all-targets`, and `cargo fmt --check` are kept green.
 
 The **cron gateway** (`lvz-gw-cron`, `--cron`/`--cron-file`) is an in-process scheduler shaped as a
 `Gateway`: it fires `TurnRequest`s on a hand-rolled UTC cron schedule (no `chrono`/`cron` dep) into
@@ -28,6 +28,23 @@ loop, so cron jobs run tools. Each job keeps a fixed session, so it accrues memo
 The **Matrix gateway auto-accepts room invites** by default (`rooms.invite` → `/join`, deduped across
 syncs); disable with `--matrix-no-auto-join` or `[gateway] matrix_auto_join = false`. E2EE is
 live-verified end-to-end (cross-implementation, against both Synapse and Continuwuity).
+
+**Matrix auth/identity** (`crates/lvz-gw-matrix/src/lib.rs`): authenticates by **access token**
+(`MATRIX_ACCESS_TOKEN`, identity via `/account/whoami`, no login) **or** password (`MATRIX_USER` +
+`MATRIX_PASSWORD`), precedence: explicit token > persisted session > password. `MATRIX_STATE_DIR`
+(or `[gateway] matrix_state_dir`) persists `session.json` (token + device id) so the **device id is
+stable across restarts** (and under `e2ee` the `<dir>/crypto` SQLite store persists the whole crypto
+identity — no re-verification after restart). Password login reuses a configured/persisted
+`MATRIX_DEVICE_ID`. A **per-sender allowlist** (`MATRIX_ALLOWED_USERS` / `[gateway]
+matrix_allowed_users`) gates both plaintext and encrypted paths (enforced pre-decrypt on the
+cleartext `sender`); empty ⇒ answer everyone.
+
+The **Slack gateway** (`lvz-gw-slack`, `--serve-slack`) is a thin **Socket Mode** client (no inbound
+port): `apps.connections.open` → `tokio-tungstenite` WebSocket → `message`/`app_mention` events →
+turn → `chat.postMessage`. Auth: `SLACK_APP_TOKEN` (`xapp-`) + `SLACK_BOT_TOKEN` (`xoxb-`). Session
+per channel (or thread `thread_ts`); replies thread when triggered in a thread. Same allowlist
+mechanism (`SLACK_ALLOWED_USERS` / `[gateway] slack_allowed_users`). Events are acked immediately and
+the turn runs spawned off the read loop (keeps acks/pings flowing). Reconnects on `disconnect`/error.
 
 **Persona prompt** (`--persona <PATH>`, default `./PERSONA.md`): a persistent persona/priorities file
 layered *above* `DEFAULT_SYSTEM` in `build_agent`, so it sits in the cached prefix. `--no-persona`
@@ -53,9 +70,12 @@ Tools remain compiled-in Rust — there is no dynamic plugin loading.
 **Matrix E2EE** is opt-in behind `lvz-gw-matrix`'s `e2ee` feature (and the `lavoisier` crate's
 passthrough `e2ee` feature): Olm/Megolm via the crypto-only `matrix-sdk-crypto`, contained to
 `crates/lvz-gw-matrix/src/e2ee.rs` (drives an `OlmMachine` over the hand-rolled REST transport, bridging
-ruma request types with `try_into_http_request`). **Off by default** — the default build stays minimal-dep
-and MSRV-1.88; the feature requires Rust ≥ 1.93. Crypto round-trip is unit-tested where offline-testable;
-full live verification needs a homeserver (like the rest of the Matrix gateway).
+ruma request types with `try_into_http_request`). The `OlmMachine` is backed by a durable
+`matrix-sdk-sqlite` `SqliteCryptoStore` when `MATRIX_STATE_DIR` is set (`OlmMachine::with_store`,
+`bundled` SQLite so no runtime libsqlite3; optional at-rest passphrase via `MATRIX_CRYPTO_STORE_KEY`),
+else in-memory. **Off by default** — the default build stays minimal-dep and MSRV-1.88; the feature
+requires Rust ≥ 1.93. Crypto round-trip is unit-tested where offline-testable; full live verification
+needs a homeserver (like the rest of the Matrix gateway).
 
 Remaining/deferred: full **module-qualified** symbol resolution (the cross-file graph is scope-aware
 but not import-path resolved — fine for the radius knob); an unambiguous line-range/occurrence edit
