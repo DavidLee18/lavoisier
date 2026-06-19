@@ -29,16 +29,29 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       # Pinned modern protoc on every runner — Ubuntu's apt protoc (3.12) is too old: it rejects
-      # the proto3 `optional` fields in the vendored xAI protos. setup-protoc bundles the
-      # well-known types (timestamp.proto), which the protoc resolves built-in.
-      # NOTE: v3.0.0 is the latest release and still ships a Node 20 entrypoint, so it emits a
-      # deprecation warning (forced onto Node 24 by the runner). Bump when upstream cuts a Node 24
-      # release; the build is unaffected.
+      # the proto3 `optional` fields in the vendored xAI protos. We download the official release
+      # directly (SHA-256 pinned) rather than via a JS action, so there is no Node-runtime
+      # dependency (the arduino/setup-protoc action only ships a Node 20 entrypoint, which the runner
+      # forces onto Node 24 with a deprecation warning) and no GITHUB_TOKEN is needed. protoc
+      # resolves the well-known types (timestamp.proto) from its sibling `include/` directory.
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          version: "29.3"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        env:
+          PROTOC_VERSION: "29.3"
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)   asset=linux-x86_64;   sha=3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a ;;
+            Linux-ARM64) asset=linux-aarch_64; sha=6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32 ;;
+            macOS-ARM64) asset=osx-aarch_64;   sha=2b8a3403cd097f95f3ba656e14b76c732b6b26d7f183330b11e36ef2bc028765 ;;
+            *) echo "unsupported runner ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+          esac
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${asset}.zip"
+          curl -fsSL -o protoc.zip "$url"
+          echo "${sha}  protoc.zip" | shasum -a 256 -c -
+          unzip -q protoc.zip -d "$HOME/.protoc"
+          echo "$HOME/.protoc/bin" >> "$GITHUB_PATH"
+          "$HOME/.protoc/bin/protoc" --version
 
       # rust-toolchain selects the toolchain from the ref name (`@stable`); pinned to a SHA, that
       # signal is gone, so the channel is passed explicitly via the `toolchain` input.

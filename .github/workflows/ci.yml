@@ -20,12 +20,26 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      # protoc for lvz-xai's build.rs (apt's 3.12 is too old — rejects proto3 `optional`).
+      # Direct, SHA-256-pinned protoc download (no JS action → no Node-runtime dependency, no token;
+      # apt's 3.12 is too old — rejects proto3 `optional` in the vendored xAI protos). See release.yml.
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          version: "29.3"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        env:
+          PROTOC_VERSION: "29.3"
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)   asset=linux-x86_64;   sha=3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a ;;
+            Linux-ARM64) asset=linux-aarch_64; sha=6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32 ;;
+            macOS-ARM64) asset=osx-aarch_64;   sha=2b8a3403cd097f95f3ba656e14b76c732b6b26d7f183330b11e36ef2bc028765 ;;
+            *) echo "unsupported runner ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+          esac
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${asset}.zip"
+          curl -fsSL -o protoc.zip "$url"
+          echo "${sha}  protoc.zip" | shasum -a 256 -c -
+          unzip -q protoc.zip -d "$HOME/.protoc"
+          echo "$HOME/.protoc/bin" >> "$GITHUB_PATH"
+          "$HOME/.protoc/bin/protoc" --version
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master @ 2026-06-18
@@ -51,11 +65,26 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      # Direct, SHA-256-pinned protoc download (no JS action → no Node-runtime dependency, no token;
+      # apt's 3.12 is too old — rejects proto3 `optional` in the vendored xAI protos). See release.yml.
       - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          version: "29.3"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        env:
+          PROTOC_VERSION: "29.3"
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)   asset=linux-x86_64;   sha=3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a ;;
+            Linux-ARM64) asset=linux-aarch_64; sha=6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32 ;;
+            macOS-ARM64) asset=osx-aarch_64;   sha=2b8a3403cd097f95f3ba656e14b76c732b6b26d7f183330b11e36ef2bc028765 ;;
+            *) echo "unsupported runner ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+          esac
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${asset}.zip"
+          curl -fsSL -o protoc.zip "$url"
+          echo "${sha}  protoc.zip" | shasum -a 256 -c -
+          unzip -q protoc.zip -d "$HOME/.protoc"
+          echo "$HOME/.protoc/bin" >> "$GITHUB_PATH"
+          "$HOME/.protoc/bin/protoc" --version
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master @ 2026-06-18
