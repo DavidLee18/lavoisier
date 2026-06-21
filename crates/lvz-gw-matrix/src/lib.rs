@@ -313,8 +313,15 @@ impl MatrixGateway {
         Ok(session)
     }
 
-    /// Resolve `user_id`/`device_id` for an access token via `GET /account/whoami`.
+    /// Resolve `user_id`/`device_id` for an access token via `GET /account/whoami`, retrying
+    /// transient failures (the homeserver may be briefly unavailable while a fresh task boots).
     async fn whoami(&self, token: &str) -> Result<WhoAmI, GatewayError> {
+        self.with_retry("whoami", || self.whoami_once(token)).await
+    }
+
+    /// One `GET /account/whoami` attempt. A 5xx/429/transport failure is classified `Io`
+    /// (transient ⇒ retried); a 4xx (e.g. an invalid/expired token) is `Bind` (fatal ⇒ surfaced).
+    async fn whoami_once(&self, token: &str) -> Result<WhoAmI, GatewayError> {
         let resp = self
             .http
             .get(self.url("/_matrix/client/v3/account/whoami"))
@@ -322,10 +329,13 @@ impl MatrixGateway {
             .send()
             .await
             .map_err(|e| GatewayError::Io(e.to_string()))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let status = resp.status();
+        if !status.is_success() {
             let msg = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::Bind(format!("matrix whoami {status}: {msg}")));
+            return Err(classify_status(
+                status,
+                format!("matrix whoami {status}: {msg}"),
+            ));
         }
         resp.json()
             .await
@@ -333,7 +343,15 @@ impl MatrixGateway {
     }
 
     /// Password-login (optionally pinning `device_id`); returns the access token + resolved ids.
+    /// Like [`whoami`](Self::whoami), transient failures are retried with backoff.
     async fn login(&self, device_id: Option<&str>) -> Result<Session, GatewayError> {
+        self.with_retry("login", || self.login_once(device_id))
+            .await
+    }
+
+    /// One `POST /login` attempt; transient failures `Io`, auth/config failures `Bind` (see
+    /// [`whoami_once`](Self::whoami_once)).
+    async fn login_once(&self, device_id: Option<&str>) -> Result<Session, GatewayError> {
         let password = self.password.as_deref().ok_or_else(|| {
             GatewayError::Bind("no MATRIX_PASSWORD set and no usable access token".into())
         })?;
@@ -352,10 +370,13 @@ impl MatrixGateway {
             .send()
             .await
             .map_err(|e| GatewayError::Io(e.to_string()))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let status = resp.status();
+        if !status.is_success() {
             let msg = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::Bind(format!("matrix login {status}: {msg}")));
+            return Err(classify_status(
+                status,
+                format!("matrix login {status}: {msg}"),
+            ));
         }
         let login: LoginResponse = resp
             .json()
@@ -366,6 +387,34 @@ impl MatrixGateway {
             user_id: login.user_id,
             device_id: login.device_id,
         })
+    }
+
+    /// Run a startup operation, retrying *transient* failures (`GatewayError::Io` — transport
+    /// errors, 5xx, 429) with exponential backoff so a homeserver that is briefly unavailable
+    /// (e.g. restarting while a fresh task boots) doesn't kill the gateway before it ever connects.
+    /// Mirrors the in-loop `/sync` retry, but with a growing delay. Fatal errors (`Bind`/`Protocol`
+    /// — e.g. a bad token) propagate immediately so misconfiguration surfaces fast.
+    async fn with_retry<T, F, Fut>(&self, what: &str, mut op: F) -> Result<T, GatewayError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, GatewayError>>,
+    {
+        let mut delay = Duration::from_secs(1);
+        let max = Duration::from_secs(30);
+        loop {
+            match op().await {
+                Ok(v) => return Ok(v),
+                Err(e @ GatewayError::Io(_)) => {
+                    eprintln!(
+                        "matrix: {what} failed ({e}); retrying in {}s",
+                        delay.as_secs()
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(max);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Path to the persisted-session file under the state dir, if a state dir is configured.
@@ -648,7 +697,9 @@ impl MatrixGateway {
         // messages that arrive from now on. Pending invites *are* accepted (a backlog message is
         // noise, but a pending invite is a standing request to join).
         let mut seen_invites = std::collections::HashSet::new();
-        let baseline = self.sync_once(&token, None).await?;
+        let baseline = self
+            .with_retry("baseline sync", || self.sync_once(&token, None))
+            .await?;
         self.auto_join_invites(&token, &baseline, &mut seen_invites)
             .await;
         let mut since = parse_next_batch(&baseline)?;
@@ -846,6 +897,17 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Classify a non-success HTTP status from the startup auth calls into a [`GatewayError`]:
+/// server errors (5xx) and `429 Too Many Requests` are *transient* (`Io` ⇒ retried with backoff);
+/// everything else (4xx — bad/expired token, wrong password) is fatal (`Bind` ⇒ surfaced).
+fn classify_status(status: reqwest::StatusCode, msg: String) -> GatewayError {
+    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        GatewayError::Io(msg)
+    } else {
+        GatewayError::Bind(msg)
     }
 }
 
@@ -1060,6 +1122,36 @@ mod tests {
         // Both constrained ⇒ intersection (only read_file is in both).
         let t = gw.tools_for("!ops:hs", "@admin:hs").unwrap();
         assert_eq!(t, vec!["read_file".to_string()]);
+    }
+
+    #[test]
+    fn classify_status_transient_vs_fatal() {
+        use reqwest::StatusCode;
+        // 5xx + 429 are transient ⇒ Io ⇒ retried with backoff.
+        for s in [
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            assert!(
+                matches!(classify_status(s, "x".into()), GatewayError::Io(_)),
+                "{s} should be transient"
+            );
+        }
+        // 4xx auth/config failures are fatal ⇒ Bind ⇒ surfaced immediately.
+        for s in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert!(
+                matches!(classify_status(s, "x".into()), GatewayError::Bind(_)),
+                "{s} should be fatal"
+            );
+        }
     }
 
     #[test]

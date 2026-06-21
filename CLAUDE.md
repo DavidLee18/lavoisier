@@ -50,7 +50,11 @@ advertised `tool_defs` *and* refuses a non-allowed `invoke`); the *policy* (`too
 stays in the Matrix gateway. A **home room** (`MATRIX_HOME_ROOM` / `[gateway] matrix_home_room`) gets a
 plaintext "shutting down" notice on SIGTERM/Ctrl-C — the serve loop races `/sync` against a shutdown
 signal and returns `Ok`, and the CLI joins gateways with `select_all` (not `join_all`) so the first to
-finish ⇒ a clean whole-process exit.
+finish ⇒ a clean whole-process exit. **Startup resilience**: the bind path (`whoami`/`login` and the
+baseline `/sync`) retries *transient* failures (5xx/429/transport, classified to `GatewayError::Io`)
+with exponential backoff (`with_retry`, 1s→30s cap), mirroring the in-loop `/sync` retry, so a
+homeserver that's briefly down while a fresh task boots doesn't kill the gateway; genuine auth/config
+errors (4xx ⇒ `GatewayError::Bind`) still surface immediately.
 
 The **Slack gateway** (`lvz-gw-slack`, `--serve-slack`) is a thin **Socket Mode** client (no inbound
 port): `apps.connections.open` → `tokio-tungstenite` WebSocket → `message`/`app_mention` events →

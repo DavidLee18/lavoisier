@@ -49,6 +49,11 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
+(`v0.6.1`): `lvz-gw-matrix` (0.3.2 — Matrix gateway **startup retry with exponential backoff** on
+transient bind failures so a homeserver restart doesn't kill a fresh task) and `lavoisier` (0.6.1 —
+republish to ship the fix in the binary). Both semver-compatible patches; publish order
+`lvz-gw-matrix` → `lavoisier`. The other thirteen crates stay put.
+Earlier changed set
 (`v0.6.0`): the Matrix room/member **tool permissions** feature. `lvz-protocol` (0.1.1 — additive
 `TurnRequest.allowed_tools` field; a constructor default keeps it semver-compatible, so dependents'
 `^0.1` requirements still resolve and the unchanged crates need **no** republish), `lvz-agent` (0.1.1

@@ -52,7 +52,7 @@ lvz-context = { path = "crates/lvz-context", version = "0.1.0" }
 lvz-memory = { path = "crates/lvz-memory", version = "0.2.1" }
 lvz-tune = { path = "crates/lvz-tune", version = "0.1.0" }
 lvz-gw-http = { path = "crates/lvz-gw-http", version = "0.1.0" }
-lvz-gw-matrix = { path = "crates/lvz-gw-matrix", version = "0.3.1" }
+lvz-gw-matrix = { path = "crates/lvz-gw-matrix", version = "0.3.2" }
 lvz-gw-cron = { path = "crates/lvz-gw-cron", version = "0.2.0" }
 lvz-gw-slack = { path = "crates/lvz-gw-slack", version = "0.1.0" }
 
