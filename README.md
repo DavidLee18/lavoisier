@@ -114,6 +114,42 @@ plaintext and encrypted rooms:
 - **Home room** — `MATRIX_HOME_ROOM` (or `[gateway] matrix_home_room`) names one room that receives a
   "shutting down" notice when the gateway is stopped (SIGTERM / Ctrl-C); the process then exits cleanly.
 
+A worked example — a deny-by-default perimeter where the bot answers only Alice and Bob, only in the
+`!ops` and `!general` rooms, runs the shell only in `!ops`, treats `!general` as read-only, and limits
+Bob to reads. The simple gates are env vars; the per-room/-member tool maps are config-file only:
+
+```sh
+# Perimeter: who + where. (env wins over the config file)
+export MATRIX_ACCESS_TOKEN=…                        # bot identity (or MATRIX_USER + MATRIX_PASSWORD)
+export MATRIX_ALLOWED_USERS="@alice:hs,@bob:hs"      # answer only these senders
+export MATRIX_ALLOWED_ROOMS="!ops:hs,!general:hs"    # …and only in these rooms (AND'd with the above)
+export MATRIX_HOME_ROOM="!ops:hs"                    # gets the "shutting down" notice on SIGTERM
+ANTHROPIC_API_KEY=… lav --serve-matrix --config lavoisier.toml
+```
+
+```toml
+# lavoisier.toml — per-room / per-member tool permissions (no env equivalent).
+# Absent from a map ⇒ unconstrained; when a room AND a member both apply, the effective
+# set is their INTERSECTION (a tool must be permitted by the room *and* the member).
+[gateway.matrix_room_tools]
+"!ops:hs"     = ["shell", "read_file", "write_file", "str_replace"]
+"!general:hs" = ["read_file", "read_files", "outline_file"]   # read-only room
+
+[gateway.matrix_user_tools]
+"@alice:hs" = ["shell", "read_file", "write_file", "str_replace"]
+"@bob:hs"   = ["read_file", "read_files"]                     # bob: reads only
+```
+
+Resulting effective tool sets (room ∩ member):
+- **Alice in `!ops`** → `shell, read_file, write_file, str_replace` (both sets agree — full power).
+- **Alice in `!general`** → `read_file` only (the read-only room masks her write tools).
+- **Bob in `!general`** → `read_file, read_files` (his reads, both permitted by the read-only room).
+- **Bob in `!ops`** → `read_file` only (his reads intersected with the room, which omits `read_files`).
+- **Anyone else, or any room outside the allowlist** → ignored entirely (no turn runs).
+
+A disallowed tool is never even advertised to the model, so it can't be called — the gate is enforced
+in the agent core, not just hidden in the prompt.
+
 **Matrix encryption.** The Matrix gateway targets unencrypted rooms by default; build with
 `--features e2ee` (needs Rust ≥ 1.93) for Olm/Megolm end-to-end encryption via `matrix-sdk-crypto`.
 With `MATRIX_STATE_DIR` set, the crypto store is persisted to SQLite (`<dir>/crypto`,
