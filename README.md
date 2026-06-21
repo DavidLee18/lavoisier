@@ -100,6 +100,20 @@ the operating system-prompt and rides in the cached prefix, so it costs almost n
 id) and keep a **stable device identity across restarts** — a prerequisite for durable E2EE. Restrict
 who can drive the bot with `MATRIX_ALLOWED_USERS` (or `[gateway] matrix_allowed_users`).
 
+**Matrix access control & tool permissions.** Three layers, all opt-in and applied uniformly to
+plaintext and encrypted rooms:
+- **Allowed rooms** — `MATRIX_ALLOWED_ROOMS` (or `[gateway] matrix_allowed_rooms`) limits the rooms
+  the bot acts in. Combined with the sender allowlist as a **conjunction**: a turn runs only if the
+  sender is allowed *and* the room is allowed — so an allowed user is answered only inside allowed rooms.
+- **Per-room / per-member tool permissions** — `[gateway.matrix_room_tools]` maps a room to the tools
+  permitted there, and `[gateway.matrix_user_tools]` maps a member to the tools permitted to them
+  (config-file only; richer than env can express cleanly). A room/user absent from a map is
+  unconstrained; when both apply, the effective set is their **intersection** (a tool must be allowed
+  by the room *and* the member). Enforced in the agent core per turn, so a disallowed tool is neither
+  advertised to the model nor runnable. Pair with allowed-rooms/-users for a deny-by-default perimeter.
+- **Home room** — `MATRIX_HOME_ROOM` (or `[gateway] matrix_home_room`) names one room that receives a
+  "shutting down" notice when the gateway is stopped (SIGTERM / Ctrl-C); the process then exits cleanly.
+
 **Matrix encryption.** The Matrix gateway targets unencrypted rooms by default; build with
 `--features e2ee` (needs Rust ≥ 1.93) for Olm/Megolm end-to-end encryption via `matrix-sdk-crypto`.
 With `MATRIX_STATE_DIR` set, the crypto store is persisted to SQLite (`<dir>/crypto`,
@@ -171,7 +185,8 @@ Env: `XAI_API_KEY` / `XAI_TRANSPORT=grpc|http` (default `grpc`) / `XAI_GRPC_ENDP
 `XAI_BASE_URL` · `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` · `GOOGLE_API_KEY` (or `GEMINI_API_KEY`)
 / `GOOGLE_THINKING` · Matrix: `MATRIX_HOMESERVER` / `MATRIX_ACCESS_TOKEN` /
 `MATRIX_USER` / `MATRIX_PASSWORD` / `MATRIX_DEVICE_ID` / `MATRIX_STATE_DIR` /
-`MATRIX_CRYPTO_STORE_KEY` / `MATRIX_ALLOWED_USERS` · Slack: `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN` /
+`MATRIX_CRYPTO_STORE_KEY` / `MATRIX_ALLOWED_USERS` / `MATRIX_ALLOWED_ROOMS` / `MATRIX_HOME_ROOM` ·
+Slack: `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN` /
 `SLACK_ALLOWED_USERS` · `LVZ_PROVIDER` / `LVZ_MODEL` / `LVZ_API_KEYS` / `LVZ_RATE_LIMIT` /
 `LVZ_SERVE_ADDR`.
 

@@ -67,6 +67,19 @@ pub struct MatrixGateway {
     /// If set, only answer messages whose sender is in this allowlist (applied to plaintext and
     /// encrypted rooms alike). `None` ⇒ answer everyone (the default).
     allowed_users: Option<HashSet<String>>,
+    /// If set, only act on messages in these rooms. Combined with [`Self::allowed_users`] as a
+    /// conjunction: a turn runs only if the sender is allowed **and** the room is allowed. `None`
+    /// ⇒ any room the bot is in (the default).
+    allowed_rooms: Option<HashSet<String>>,
+    /// Per-room tool permissions: `room_id` → the tools permitted there. A room absent from the
+    /// map is unconstrained. See [`Self::tools_for`].
+    room_tools: HashMap<String, HashSet<String>>,
+    /// Per-member tool permissions: `user_id` → the tools permitted to them. A user absent from
+    /// the map is unconstrained. Combined with [`Self::room_tools`] by intersection.
+    user_tools: HashMap<String, HashSet<String>>,
+    /// The "home" room: the single room that receives the shutdown notice when the gateway is
+    /// stopped (SIGTERM / Ctrl-C). `None` ⇒ no notice is sent.
+    home_room: Option<String>,
 }
 
 impl MatrixGateway {
@@ -84,6 +97,10 @@ impl MatrixGateway {
             txn: AtomicU64::new(0),
             auto_join: true,
             allowed_users: None,
+            allowed_rooms: None,
+            room_tools: HashMap::new(),
+            user_tools: HashMap::new(),
+            home_room: None,
         }
     }
 
@@ -140,9 +157,64 @@ impl MatrixGateway {
         self
     }
 
+    /// Restrict which rooms the bot acts in. An empty list clears the restriction (any room); a
+    /// non-empty list means only those room ids are served. Combined with the user allowlist as a
+    /// conjunction (sender allowed **and** room allowed).
+    pub fn with_allowed_rooms(mut self, rooms: impl IntoIterator<Item = String>) -> Self {
+        let set: HashSet<String> = rooms.into_iter().collect();
+        self.allowed_rooms = (!set.is_empty()).then_some(set);
+        self
+    }
+
+    /// Set per-room tool permissions: each `room_id` maps to the tools permitted in that room.
+    /// Rooms absent from the map are unconstrained. See [`Self::tools_for`].
+    pub fn with_room_tools(mut self, map: impl IntoIterator<Item = (String, Vec<String>)>) -> Self {
+        self.room_tools = map
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect();
+        self
+    }
+
+    /// Set per-member tool permissions: each `user_id` maps to the tools permitted to that member.
+    /// Users absent from the map are unconstrained. Intersected with the room policy.
+    pub fn with_user_tools(mut self, map: impl IntoIterator<Item = (String, Vec<String>)>) -> Self {
+        self.user_tools = map
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect();
+        self
+    }
+
+    /// Set the home room — the one room that receives a "shutting down" notice on graceful
+    /// shutdown (SIGTERM / Ctrl-C). The bot must already be joined to it.
+    pub fn with_home_room(mut self, room: impl Into<String>) -> Self {
+        let room = room.into();
+        self.home_room = (!room.is_empty()).then_some(room);
+        self
+    }
+
+    /// The effective per-turn tool allowlist for a `(room, sender)`, or `None` when neither a room
+    /// nor a member policy applies (⇒ the agent's full tool set). When both apply the result is
+    /// their **intersection** (a tool must be permitted by the room *and* the member); when only
+    /// one applies, that one is used. An empty result means "no tools".
+    fn tools_for(&self, room: &str, sender: &str) -> Option<Vec<String>> {
+        let room_set = self.room_tools.get(room);
+        let user_set = self.user_tools.get(sender);
+        match (room_set, user_set) {
+            (None, None) => None,
+            (Some(r), None) => Some(r.iter().cloned().collect()),
+            (None, Some(u)) => Some(u.iter().cloned().collect()),
+            (Some(r), Some(u)) => Some(r.intersection(u).cloned().collect()),
+        }
+    }
+
     /// Construct from the environment. Required: `MATRIX_HOMESERVER`, plus **either**
     /// `MATRIX_ACCESS_TOKEN` or (`MATRIX_USER` + `MATRIX_PASSWORD`). Optional:
-    /// `MATRIX_DEVICE_ID`, `MATRIX_STATE_DIR`, `MATRIX_CRYPTO_STORE_KEY`.
+    /// `MATRIX_DEVICE_ID`, `MATRIX_STATE_DIR`, `MATRIX_CRYPTO_STORE_KEY`,
+    /// `MATRIX_ALLOWED_USERS`, `MATRIX_ALLOWED_ROOMS` (comma-separated), `MATRIX_HOME_ROOM`.
+    /// Per-room/per-member tool permissions are richer than env can cleanly express and are set
+    /// only via the TOML config (`with_room_tools`/`with_user_tools`).
     pub fn from_env() -> Result<Self, GatewayError> {
         let require =
             |k: &str| std::env::var(k).map_err(|_| GatewayError::Bind(format!("{k} is not set")));
@@ -172,6 +244,12 @@ impl MatrixGateway {
         gw.crypto_passphrase = opt("MATRIX_CRYPTO_STORE_KEY");
         if let Some(users) = opt("MATRIX_ALLOWED_USERS") {
             gw = gw.with_allowed_users(users.split(',').map(|s| s.trim().to_string()));
+        }
+        if let Some(rooms) = opt("MATRIX_ALLOWED_ROOMS") {
+            gw = gw.with_allowed_rooms(rooms.split(',').map(|s| s.trim().to_string()));
+        }
+        if let Some(home) = opt("MATRIX_HOME_ROOM") {
+            gw = gw.with_home_room(home);
         }
         Ok(gw)
     }
@@ -395,6 +473,21 @@ impl MatrixGateway {
         Ok(())
     }
 
+    /// Post the shutdown notice to the home room (if one is configured). Best-effort and sent in
+    /// plaintext — an innocuous "shutting down" line, kept simple so it works in both encrypted and
+    /// unencrypted home rooms without tracking per-room encryption state.
+    async fn send_shutdown_notice(&self, token: &str) {
+        let Some(home) = &self.home_room else {
+            return;
+        };
+        if let Err(e) = self
+            .send_message(token, home, "⚠️ Lavoisier gateway shutting down.")
+            .await
+        {
+            eprintln!("matrix: failed to send shutdown notice to {home}: {e}");
+        }
+    }
+
     /// Accept a room invite (join the room).
     async fn join_room(&self, token: &str, room_id: &str) -> Result<(), GatewayError> {
         let path = format!("/_matrix/client/v3/join/{}", urlencode(room_id));
@@ -447,9 +540,15 @@ impl MatrixGateway {
         &self,
         agent: &Arc<dyn AgentHandle>,
         room: &str,
+        sender: &str,
         body: String,
     ) -> Option<String> {
-        let turn = TurnRequest::new(room.to_string(), body);
+        // Apply this room/member's tool permissions (if any) to the turn. The agent core enforces
+        // the allowlist; the policy decision lives here.
+        let mut turn = TurnRequest::new(room.to_string(), body);
+        if let Some(tools) = self.tools_for(room, sender) {
+            turn = turn.with_allowed_tools(tools);
+        }
         let mut stream = match agent.submit(turn).await {
             Ok(stream) => stream,
             Err(e) => {
@@ -502,6 +601,19 @@ impl MatrixGateway {
                 allowed.len()
             );
         }
+        if let Some(rooms) = &self.allowed_rooms {
+            eprintln!("matrix: acting only in {} allowlisted room(s)", rooms.len());
+        }
+        if !self.room_tools.is_empty() || !self.user_tools.is_empty() {
+            eprintln!(
+                "matrix: tool permissions set for {} room(s) and {} member(s)",
+                self.room_tools.len(),
+                self.user_tools.len()
+            );
+        }
+        if let Some(home) = &self.home_room {
+            eprintln!("matrix: home room {home} (receives the shutdown notice)");
+        }
         // Own the fields used across awaits so a `&Session` is never held across one (keeps the
         // async_trait future unconditionally `Send`).
         let token = session.access_token.clone();
@@ -541,15 +653,28 @@ impl MatrixGateway {
             .await;
         let mut since = parse_next_batch(&baseline)?;
 
+        // Race each `/sync` against a shutdown signal so the gateway can stop gracefully (and post
+        // the home-room notice) on SIGTERM / Ctrl-C rather than being hard-killed.
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
+
         loop {
-            let value = match self.sync_once(&token, Some(&since)).await {
-                Ok(value) => value,
-                Err(e) => {
-                    // Transient sync failure: back off briefly and retry rather than exit.
-                    eprintln!("matrix: {e}; retrying");
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    continue;
+            let value = tokio::select! {
+                biased;
+                _ = &mut shutdown => {
+                    eprintln!("matrix: shutdown signal received, stopping");
+                    self.send_shutdown_notice(&token).await;
+                    return Ok(());
                 }
+                res = self.sync_once(&token, Some(&since)) => match res {
+                    Ok(value) => value,
+                    Err(e) => {
+                        // Transient sync failure: back off briefly and retry rather than exit.
+                        eprintln!("matrix: {e}; retrying");
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        continue;
+                    }
+                },
             };
 
             // Accept any new room invites before processing messages.
@@ -575,8 +700,16 @@ impl MatrixGateway {
             };
 
             // Plaintext messages: run the agent and reply in the clear.
-            for msg in extract_messages(resp, &self_user, self.allowed_users.as_ref()) {
-                if let Some(answer) = self.run_agent(&agent, &msg.room, msg.body).await {
+            for msg in extract_messages(
+                resp,
+                &self_user,
+                self.allowed_users.as_ref(),
+                self.allowed_rooms.as_ref(),
+            ) {
+                if let Some(answer) = self
+                    .run_agent(&agent, &msg.room, &msg.sender, msg.body)
+                    .await
+                {
                     if let Err(e) = self.send_message(&token, &msg.room, &answer).await {
                         eprintln!("matrix: send error in {}: {e}", msg.room);
                     }
@@ -586,11 +719,16 @@ impl MatrixGateway {
             // Encrypted messages: decrypt, run the agent, and reply encrypted.
             #[cfg(feature = "e2ee")]
             if let Some(c) = &crypto {
-                for (room, body) in c
-                    .decrypt_messages(&value, self_user.clone(), self.allowed_users.clone())
+                for (room, sender, body) in c
+                    .decrypt_messages(
+                        &value,
+                        self_user.clone(),
+                        self.allowed_users.clone(),
+                        self.allowed_rooms.clone(),
+                    )
                     .await
                 {
-                    if let Some(answer) = self.run_agent(&agent, &room, body).await {
+                    if let Some(answer) = self.run_agent(&agent, &room, &sender, body).await {
                         if let Err(e) = c.encrypt_and_send(room.clone(), answer).await {
                             eprintln!("matrix[e2ee]: send error in {room}: {e}");
                         }
@@ -644,9 +782,13 @@ fn extract_messages(
     sync: SyncResponse,
     self_user: &str,
     allowed: Option<&HashSet<String>>,
+    allowed_rooms: Option<&HashSet<String>>,
 ) -> Vec<IncomingMessage> {
     let mut out = Vec::new();
     for (room_id, room) in sync.rooms.join {
+        if !room_allowed(allowed_rooms, &room_id) {
+            continue;
+        }
         for event in room.timeline.events {
             if event.kind != "m.room.message" || event.sender == self_user {
                 continue;
@@ -673,6 +815,38 @@ fn extract_messages(
 /// Shared by the plaintext and E2EE paths so encryption can't bypass the allowlist.
 pub(crate) fn sender_allowed(allowed: Option<&HashSet<String>>, sender: &str) -> bool {
     allowed.is_none_or(|set| set.contains(sender))
+}
+
+/// Whether `room` may be served: true if no room allowlist is configured, else membership.
+/// Shared by the plaintext and E2EE paths so encryption can't bypass the room restriction.
+pub(crate) fn room_allowed(allowed: Option<&HashSet<String>>, room: &str) -> bool {
+    allowed.is_none_or(|set| set.contains(room))
+}
+
+/// Resolve when the process is asked to terminate — SIGTERM (e.g. an ECS task stop) or Ctrl-C on
+/// Unix, Ctrl-C elsewhere — so the serve loop can shut down gracefully and post its home-room
+/// notice instead of being hard-killed.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            // If the SIGTERM handler can't be installed, still honour Ctrl-C.
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Percent-encode a path segment (room ids contain `!`, `:` and `@`).
@@ -785,7 +959,7 @@ mod tests {
             ] } } } }
         }));
 
-        let msgs = extract_messages(sync, "@bot:hs", None);
+        let msgs = extract_messages(sync, "@bot:hs", None, None);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].room, "!room:hs");
         assert_eq!(msgs[0].sender, "@alice:hs");
@@ -805,14 +979,87 @@ mod tests {
         });
         // No allowlist ⇒ both senders answered.
         assert_eq!(
-            extract_messages(sync_from(json.clone()), "@bot:hs", None).len(),
+            extract_messages(sync_from(json.clone()), "@bot:hs", None, None).len(),
             2
         );
         // Allowlist ⇒ only the listed sender.
         let allowed: HashSet<String> = ["@alice:hs".to_string()].into_iter().collect();
-        let msgs = extract_messages(sync_from(json), "@bot:hs", Some(&allowed));
+        let msgs = extract_messages(sync_from(json), "@bot:hs", Some(&allowed), None);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "@alice:hs");
+    }
+
+    #[test]
+    fn allowed_rooms_filter_and_combine_with_senders() {
+        let json = serde_json::json!({
+            "next_batch": "s4",
+            "rooms": { "join": {
+                "!ok:hs": { "timeline": { "events": [
+                    { "type": "m.room.message", "sender": "@alice:hs",
+                      "content": { "msgtype": "m.text", "body": "in ok room" } }
+                ] } },
+                "!nope:hs": { "timeline": { "events": [
+                    { "type": "m.room.message", "sender": "@alice:hs",
+                      "content": { "msgtype": "m.text", "body": "in blocked room" } }
+                ] } }
+            } }
+        });
+        // No room allowlist ⇒ both rooms answered.
+        assert_eq!(
+            extract_messages(sync_from(json.clone()), "@bot:hs", None, None).len(),
+            2
+        );
+        // Room allowlist ⇒ only the listed room.
+        let rooms: HashSet<String> = ["!ok:hs".to_string()].into_iter().collect();
+        let msgs = extract_messages(sync_from(json.clone()), "@bot:hs", None, Some(&rooms));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].room, "!ok:hs");
+        // Conjunction: an allowed sender in a disallowed room is still dropped.
+        let users: HashSet<String> = ["@alice:hs".to_string()].into_iter().collect();
+        let only_other: HashSet<String> = ["!nope:hs".to_string()].into_iter().collect();
+        // alice is allowed, but the only allowed room here is !nope:hs, so her !ok:hs message and
+        // the !nope:hs one both pass the *sender* check — but room-wise only !nope:hs survives.
+        let msgs = extract_messages(sync_from(json), "@bot:hs", Some(&users), Some(&only_other));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].room, "!nope:hs");
+    }
+
+    #[test]
+    fn room_allowed_semantics() {
+        let allowed: HashSet<String> = ["!a:hs".to_string()].into_iter().collect();
+        assert!(room_allowed(None, "!anything:hs")); // unset ⇒ every room
+        assert!(room_allowed(Some(&allowed), "!a:hs"));
+        assert!(!room_allowed(Some(&allowed), "!b:hs"));
+    }
+
+    #[test]
+    fn tool_policy_intersects_room_and_member() {
+        let gw = MatrixGateway::new("https://hs", "@bot:hs", "pw")
+            .with_room_tools([(
+                "!ops:hs".to_string(),
+                vec!["shell".to_string(), "read_file".to_string()],
+            )])
+            .with_user_tools([(
+                "@admin:hs".to_string(),
+                vec!["read_file".to_string(), "write_file".to_string()],
+            )]);
+
+        // Neither room nor member constrained ⇒ unrestricted (None).
+        assert!(gw.tools_for("!other:hs", "@guest:hs").is_none());
+
+        // Only the room is constrained ⇒ the room's set.
+        let mut t = gw.tools_for("!ops:hs", "@guest:hs").unwrap();
+        t.sort();
+        assert_eq!(t, vec!["read_file".to_string(), "shell".to_string()]);
+
+        // Only the member is constrained ⇒ the member's set.
+        let mut t = gw.tools_for("!other:hs", "@admin:hs").unwrap();
+        t.sort();
+        assert_eq!(t, vec!["read_file".to_string(), "write_file".to_string()]);
+
+        // Both constrained ⇒ intersection (only read_file is in both).
+        let t = gw.tools_for("!ops:hs", "@admin:hs").unwrap();
+        assert_eq!(t, vec!["read_file".to_string()]);
     }
 
     #[test]
@@ -828,7 +1075,7 @@ mod tests {
         let value = serde_json::json!({ "next_batch": "s5" });
         assert_eq!(parse_next_batch(&value).unwrap(), "s5");
         let sync: SyncResponse = serde_json::from_value(value).unwrap();
-        assert!(extract_messages(sync, "@bot:hs", None).is_empty());
+        assert!(extract_messages(sync, "@bot:hs", None, None).is_empty());
     }
 
     #[test]

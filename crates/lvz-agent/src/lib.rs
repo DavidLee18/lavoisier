@@ -463,6 +463,18 @@ impl Agent {
         &self,
         history: Vec<Message>,
     ) -> BoxStream<'static, Result<Event, AgentError>> {
+        self.run_seeded_with_tools(history, None)
+    }
+
+    /// Like [`run_seeded`](Self::run_seeded), but restricting this run to a per-turn tool
+    /// allowlist (`TurnRequest::allowed_tools`): only those tools are advertised to the model and
+    /// only those will `invoke`. `None` keeps the full tool set. A gateway uses this to enforce
+    /// room/member tool permissions without the agent core knowing the policy.
+    pub fn run_seeded_with_tools(
+        &self,
+        history: Vec<Message>,
+        allowed_tools: Option<Vec<String>>,
+    ) -> BoxStream<'static, Result<Event, AgentError>> {
         let (tx, rx) = mpsc::unbounded();
         let provider = self.provider.clone();
         let tools = self.tools.clone();
@@ -470,6 +482,7 @@ impl Agent {
         let tuner = self.tuner.clone();
         let telemetry = self.telemetry.clone();
         let skeleton_cell = self.repo_skeleton.clone();
+        let allowed_tools = allowed_tools.map(|v| v.into_iter().collect::<HashSet<String>>());
 
         tokio::spawn(async move {
             run_loop(
@@ -479,6 +492,7 @@ impl Agent {
                 tuner,
                 telemetry,
                 skeleton_cell,
+                allowed_tools,
                 history,
                 &tx,
             )
@@ -496,7 +510,7 @@ impl AgentHandle for Agent {
         &self,
         turn: TurnRequest,
     ) -> Result<BoxStream<'static, Result<Event, AgentError>>, AgentError> {
-        Ok(self.run(turn.input))
+        Ok(self.run_seeded_with_tools(vec![Message::user(turn.input)], turn.allowed_tools))
     }
 }
 
@@ -512,11 +526,21 @@ async fn run_loop(
     tuner: Arc<dyn Tuner>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
     skeleton_cell: Arc<OnceLock<Vec<(String, String)>>>,
+    allowed_tools: Option<HashSet<String>>,
     mut history: Vec<Message>,
     tx: &Sink,
 ) {
     let started = std::time::Instant::now();
-    let tool_defs = tools.defs();
+    // Per-turn tool allowlist (e.g. a gateway's room/member permissions): advertise only the
+    // permitted tools to the model. Enforcement is repeated at `invoke` below as defence in depth.
+    let tool_defs = match &allowed_tools {
+        Some(set) => tools
+            .defs()
+            .into_iter()
+            .filter(|d| set.contains(&d.name))
+            .collect(),
+        None => tools.defs(),
+    };
     let caps = provider.capabilities();
     // Classify against the latest user turn (the task); earlier seeded turns are context.
     let task_text = history.last().map(|m| m.text()).unwrap_or_default();
@@ -804,23 +828,39 @@ async fn run_loop(
                 );
             }
             let args = apply_knobs_to_args(&call.name, original_args, &knobs);
-            let block = match tools.invoke(&call.name, args).await {
-                Ok(out) => {
-                    // Record the pre-truncation size for counterfactual truncate-knob crediting.
-                    let len = out.content.len();
-                    max_result_bytes = Some(max_result_bytes.map_or(len, |m| m.max(len)));
-                    made_real_edit |= out.changed && is_edit_tool(&call.name);
-                    ContentBlock::ToolResult {
-                        tool_use_id: call.id.clone(),
-                        content: truncate(&out.content, knobs.truncate_bytes),
-                        is_error: out.is_error,
-                    }
-                }
-                Err(e) => ContentBlock::ToolResult {
+            // Defence in depth: even though a disallowed tool isn't advertised, refuse to run one
+            // if the model calls it anyway (hallucinated/provider-side name) under a turn allowlist.
+            let block = if allowed_tools
+                .as_ref()
+                .is_some_and(|set| !set.contains(&call.name))
+            {
+                ContentBlock::ToolResult {
                     tool_use_id: call.id.clone(),
-                    content: format!("tool error: {e}"),
+                    content: format!(
+                        "tool error: '{}' is not permitted in this context",
+                        call.name
+                    ),
                     is_error: true,
-                },
+                }
+            } else {
+                match tools.invoke(&call.name, args).await {
+                    Ok(out) => {
+                        // Record the pre-truncation size for counterfactual truncate-knob crediting.
+                        let len = out.content.len();
+                        max_result_bytes = Some(max_result_bytes.map_or(len, |m| m.max(len)));
+                        made_real_edit |= out.changed && is_edit_tool(&call.name);
+                        ContentBlock::ToolResult {
+                            tool_use_id: call.id.clone(),
+                            content: truncate(&out.content, knobs.truncate_bytes),
+                            is_error: out.is_error,
+                        }
+                    }
+                    Err(e) => ContentBlock::ToolResult {
+                        tool_use_id: call.id.clone(),
+                        content: format!("tool error: {e}"),
+                        is_error: true,
+                    },
+                }
             };
             results.push(block);
         }

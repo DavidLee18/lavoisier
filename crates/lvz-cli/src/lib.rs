@@ -502,6 +502,23 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
                     matrix = matrix.with_allowed_users(users.clone());
                 }
             }
+            if std::env::var_os("MATRIX_ALLOWED_ROOMS").is_none() {
+                if let Some(rooms) = &config.gateway.matrix_allowed_rooms {
+                    matrix = matrix.with_allowed_rooms(rooms.clone());
+                }
+            }
+            if std::env::var_os("MATRIX_HOME_ROOM").is_none() {
+                if let Some(home) = &config.gateway.matrix_home_room {
+                    matrix = matrix.with_home_room(home.clone());
+                }
+            }
+            // Per-room/per-member tool permissions are config-file-only (too structured for env).
+            if let Some(room_tools) = &config.gateway.matrix_room_tools {
+                matrix = matrix.with_room_tools(room_tools.clone());
+            }
+            if let Some(user_tools) = &config.gateway.matrix_user_tools {
+                matrix = matrix.with_user_tools(user_tools.clone());
+            }
             gateways.push(Arc::new(matrix));
         }
 
@@ -523,11 +540,16 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             gateways.push(Arc::new(CronGateway::new(cron_jobs)));
         }
 
-        // Run them together; the process lives until a serve loop exits or errors.
-        let runs = gateways.into_iter().map(|gw| gw.serve(agent.clone()));
-        for res in futures::future::join_all(runs).await {
-            res?;
-        }
+        // Run them together; the process lives until the first serve loop exits or errors. Using
+        // `select_all` (rather than `join_all`) means a graceful shutdown — the Matrix gateway
+        // returning `Ok` after catching SIGTERM / Ctrl-C and posting its home-room notice — ends the
+        // whole process promptly, and any gateway error surfaces immediately instead of being
+        // swallowed behind the other (endless) loops.
+        let runs = gateways
+            .into_iter()
+            .map(|gw| Box::pin(gw.serve(agent.clone())));
+        let (res, _idx, _rest) = futures::future::select_all(runs).await;
+        res?;
         return Ok(());
     }
 

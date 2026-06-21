@@ -39,6 +39,19 @@ identity — no re-verification after restart). Password login reuses a configur
 matrix_allowed_users`) gates both plaintext and encrypted paths (enforced pre-decrypt on the
 cleartext `sender`); empty ⇒ answer everyone.
 
+**Matrix access control / tool permissions** (same file): a **room allowlist** (`MATRIX_ALLOWED_ROOMS`
+/ `[gateway] matrix_allowed_rooms`) combines with the sender allowlist as a **conjunction** (a turn
+runs only if sender *and* room are allowed). **Per-room / per-member tool permissions**
+(`[gateway.matrix_room_tools]` / `[gateway.matrix_user_tools]`, config-file only) restrict which tools
+a turn may use; a room/user absent from a map is unconstrained, and when both apply the effective set
+is their **intersection**. The mechanism is a keystone change — a new
+`TurnRequest.allowed_tools: Option<Vec<String>>` enforced in the agent's `run_loop` (filters the
+advertised `tool_defs` *and* refuses a non-allowed `invoke`); the *policy* (`tools_for(room, sender)`)
+stays in the Matrix gateway. A **home room** (`MATRIX_HOME_ROOM` / `[gateway] matrix_home_room`) gets a
+plaintext "shutting down" notice on SIGTERM/Ctrl-C — the serve loop races `/sync` against a shutdown
+signal and returns `Ok`, and the CLI joins gateways with `select_all` (not `join_all`) so the first to
+finish ⇒ a clean whole-process exit.
+
 The **Slack gateway** (`lvz-gw-slack`, `--serve-slack`) is a thin **Socket Mode** client (no inbound
 port): `apps.connections.open` → `tokio-tungstenite` WebSocket → `message`/`app_mention` events →
 turn → `chat.postMessage`. Auth: `SLACK_APP_TOKEN` (`xapp-`) + `SLACK_BOT_TOKEN` (`xoxb-`). Session

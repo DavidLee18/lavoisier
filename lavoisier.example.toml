@@ -48,6 +48,22 @@
 #                                              # MATRIX_ACCESS_TOKEN or MATRIX_USER+MATRIX_PASSWORD.
 # matrix_allowed_users = ["@alice:hs", "@bob:hs"]   # only answer these senders (env
 #                                                   # MATRIX_ALLOWED_USERS wins; empty = everyone)
+# matrix_allowed_rooms = ["!ops:hs", "!general:hs"] # only act in these rooms (env
+#                                                   # MATRIX_ALLOWED_ROOMS wins; empty = any room).
+#                                                   # Combined with matrix_allowed_users as AND:
+#                                                   # an allowed user must also be in an allowed room.
+# matrix_home_room    = "!ops:hs"                   # receives the "shutting down" notice on
+#                                                   # SIGTERM/Ctrl-C (env MATRIX_HOME_ROOM wins)
+# Per-room / per-member tool permissions (config-file only). A room/user absent from a map is
+# unconstrained; when both a room and a member policy apply, the effective set is their INTERSECTION
+# (a tool must be permitted by the room AND the member). Pair with matrix_allowed_rooms/_users for a
+# deny-by-default perimeter.
+# [gateway.matrix_room_tools]
+# "!ops:hs"     = ["shell", "read_file", "write_file", "str_replace"]
+# "!general:hs" = ["read_file", "read_files", "outline_file"]   # read-only room
+# [gateway.matrix_user_tools]
+# "@alice:hs" = ["shell", "read_file", "write_file", "str_replace"]
+# "@bob:hs"   = ["read_file", "read_files"]                     # bob: reads only
 # Slack gateway:
 # slack_allowed_users  = ["U_ALICE", "U_BOB"]       # only answer these Slack users (env
 #                                                   # SLACK_ALLOWED_USERS wins; empty = everyone)

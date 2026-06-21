@@ -156,16 +156,18 @@ impl Crypto {
         self.process_outgoing().await
     }
 
-    /// Decrypt every inbound `m.room.encrypted` text message in a sync response, skipping our own
-    /// and any sender not in `allowed` (when an allowlist is configured — the `m.room.encrypted`
-    /// event's `sender` is cleartext, so the allowlist is enforced *before* decryption, identically
-    /// to the plaintext path). Returns `(room_id, plaintext_body)` pairs worth answering.
+    /// Decrypt every inbound `m.room.encrypted` text message in a sync response, skipping our own,
+    /// any sender not in `allowed`, and any room not in `allowed_rooms` (when those allowlists are
+    /// configured — the `m.room.encrypted` event's `sender` and the room id are cleartext, so both
+    /// are enforced *before* decryption, identically to the plaintext path). Returns
+    /// `(room_id, sender, plaintext_body)` triples worth answering.
     pub async fn decrypt_messages(
         &self,
         sync: &Value,
         self_user: String,
         allowed: Option<HashSet<String>>,
-    ) -> Vec<(String, String)> {
+        allowed_rooms: Option<HashSet<String>>,
+    ) -> Vec<(String, String, String)> {
         let mut out = Vec::new();
         let settings = DecryptionSettings {
             sender_device_trust_requirement: TrustRequirement::Untrusted,
@@ -178,6 +180,9 @@ impl Crypto {
             return out;
         };
         for (room_id, room) in join {
+            if !crate::room_allowed(allowed_rooms.as_ref(), room_id) {
+                continue;
+            }
             let Some(events) = room
                 .get("timeline")
                 .and_then(|t| t.get("events"))
@@ -196,6 +201,7 @@ impl Crypto {
                 if !crate::sender_allowed(allowed.as_ref(), sender.unwrap_or_default()) {
                     continue;
                 }
+                let sender = sender.unwrap_or_default().to_string();
                 let raw: Raw<EncryptedEvent> = match serde_json::from_value(ev.clone()) {
                     Ok(r) => r,
                     Err(_) => continue,
@@ -211,7 +217,7 @@ impl Crypto {
                 {
                     Ok(decrypted) => {
                         if let Some(body) = text_body(&decrypted.event) {
-                            out.push((room_id.clone(), body));
+                            out.push((room_id.clone(), sender.clone(), body));
                         }
                     }
                     Err(e) => eprintln!("matrix[e2ee]: decrypt failed in {room_id}: {e}"),

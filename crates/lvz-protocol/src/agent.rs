@@ -15,6 +15,12 @@ pub struct TurnRequest {
     pub session: String,
     /// The user's message for this turn.
     pub input: String,
+    /// Optional per-turn tool allowlist. `None` ⇒ the agent's full tool set (the default).
+    /// `Some(names)` restricts *this turn* to exactly those tools — both what's advertised to the
+    /// model and what `invoke` will run. The agent core enforces it generically; a gateway computes
+    /// the set from its own policy (e.g. the Matrix gateway's room/member tool permissions). An
+    /// empty set means "no tools this turn".
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 impl TurnRequest {
@@ -22,7 +28,14 @@ impl TurnRequest {
         Self {
             session: session.into(),
             input: input.into(),
+            allowed_tools: None,
         }
+    }
+
+    /// Restrict this turn to the given tool names (see [`TurnRequest::allowed_tools`]).
+    pub fn with_allowed_tools(mut self, tools: impl IntoIterator<Item = String>) -> Self {
+        self.allowed_tools = Some(tools.into_iter().collect());
+        self
     }
 }
 

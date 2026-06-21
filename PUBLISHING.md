@@ -49,10 +49,19 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
-(`v0.5.0`): `lvz-gw-slack` (0.1.0 — **new crate**, claim the name), `lvz-gw-matrix` (0.3.0 —
+(`v0.6.0`): the Matrix room/member **tool permissions** feature. `lvz-protocol` (0.1.1 — additive
+`TurnRequest.allowed_tools` field; a constructor default keeps it semver-compatible, so dependents'
+`^0.1` requirements still resolve and the unchanged crates need **no** republish), `lvz-agent` (0.1.1
+— `run_seeded_with_tools` + per-turn tool gating in `run_loop`), `lvz-memory` (0.2.1 — forwards
+`allowed_tools`), `lvz-gw-matrix` (0.3.1 — allowed-rooms, per-room/member tool policy, home-room
+shutdown notice), and `lavoisier` (0.6.0 — the new `[gateway]` Matrix knobs + `select_all` graceful
+shutdown). All bumps are **semver-compatible** (patch/leaf), so only these five republish — the other
+nine `lvz-*` crates stay put. Publish order: `lvz-protocol` → `lvz-agent` → `lvz-memory` →
+`lvz-gw-matrix` → `lavoisier`.
+Earlier (`v0.5.0`): `lvz-gw-slack` (0.1.0 — **new crate**, claim the name), `lvz-gw-matrix` (0.3.0 —
 token/whoami auth + stable device id, persistent SQLite crypto store, sender allowlist), and
 `lavoisier` (0.5.0 — `--serve-slack` + the new Matrix/config knobs). `lvz-tools` changed test-only
-code (no functional change), so it stays at 0.1.0.
+code (no functional change), so it stayed at 0.1.0.
 Earlier: `v0.4.0` bumped `lavoisier` only (0.4.0 — lib+bin `main_with` custom-tool entry point);
 `v0.3.1` bumped `lvz-gw-matrix` (0.2.2, auto-join) + `lavoisier`; `v0.3.0` bumped `lvz-memory`
 (0.2.0) + `lavoisier`; `v0.2.1` was a `lvz-gw-matrix` E2EE fix; `v0.2.0` bumped `lvz-gw-cron` (new),

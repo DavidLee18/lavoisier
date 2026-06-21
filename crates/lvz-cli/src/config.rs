@@ -9,6 +9,7 @@
 //! Memory in particular is configured here: the in-memory store is unbounded by default, but
 //! `[memory]` can cap it (`max_messages`, `max_sessions`) or switch to a durable file store.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -89,6 +90,19 @@ pub struct GatewaySection {
     /// Directory persisting the Matrix session (token + device id) and the E2EE crypto store, for
     /// a stable identity across restarts. `MATRIX_STATE_DIR` takes precedence.
     pub matrix_state_dir: Option<PathBuf>,
+    /// Only act in these Matrix rooms (room ids); empty/unset ⇒ any room the bot is in. Combined
+    /// with `matrix_allowed_users` as a conjunction. The `MATRIX_ALLOWED_ROOMS` env var
+    /// (comma-separated) takes precedence.
+    pub matrix_allowed_rooms: Option<Vec<String>>,
+    /// Per-room tool permissions: `room_id` → the tool names permitted in that room. A room absent
+    /// from the map is unconstrained. Intersected with `matrix_user_tools`.
+    pub matrix_room_tools: Option<HashMap<String, Vec<String>>>,
+    /// Per-member tool permissions: `user_id` → the tool names permitted to that member. A user
+    /// absent from the map is unconstrained. Intersected with `matrix_room_tools`.
+    pub matrix_user_tools: Option<HashMap<String, Vec<String>>>,
+    /// The Matrix "home" room that receives the shutdown notice on SIGTERM / Ctrl-C. The
+    /// `MATRIX_HOME_ROOM` env var takes precedence.
+    pub matrix_home_room: Option<String>,
     /// Only answer these Slack user ids; empty/unset ⇒ answer everyone. The `SLACK_ALLOWED_USERS`
     /// env var (comma-separated) takes precedence.
     pub slack_allowed_users: Option<Vec<String>>,
@@ -254,7 +268,15 @@ mod tests {
             serve_slack = true
             matrix_state_dir = "/var/lib/lav/matrix"
             matrix_allowed_users = ["@a:hs", "@b:hs"]
+            matrix_allowed_rooms = ["!ops:hs", "!general:hs"]
+            matrix_home_room = "!ops:hs"
             slack_allowed_users = ["U_A"]
+
+            [gateway.matrix_room_tools]
+            "!ops:hs" = ["shell", "read_file"]
+
+            [gateway.matrix_user_tools]
+            "@a:hs" = ["read_file"]
             "#,
         )
         .unwrap();
@@ -267,6 +289,19 @@ mod tests {
         assert_eq!(
             cfg.gateway.matrix_allowed_users.as_deref(),
             Some(&["@a:hs".to_string(), "@b:hs".to_string()][..])
+        );
+        assert_eq!(
+            cfg.gateway.matrix_allowed_rooms.as_deref(),
+            Some(&["!ops:hs".to_string(), "!general:hs".to_string()][..])
+        );
+        assert_eq!(cfg.gateway.matrix_home_room.as_deref(), Some("!ops:hs"));
+        assert_eq!(
+            cfg.gateway.matrix_room_tools.as_ref().unwrap()["!ops:hs"],
+            vec!["shell".to_string(), "read_file".to_string()]
+        );
+        assert_eq!(
+            cfg.gateway.matrix_user_tools.as_ref().unwrap()["@a:hs"],
+            vec!["read_file".to_string()]
         );
         assert_eq!(
             cfg.gateway.slack_allowed_users.as_deref(),

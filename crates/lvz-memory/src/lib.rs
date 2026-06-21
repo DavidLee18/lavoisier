@@ -217,7 +217,9 @@ impl AgentHandle for SessionAgent {
         // Seed the task with the session's prior transcript + the new user turn.
         let mut transcript = self.store.load(&turn.session).await;
         transcript.push(Message::user(turn.input));
-        let inner = self.agent.run_seeded(transcript.clone());
+        let inner = self
+            .agent
+            .run_seeded_with_tools(transcript.clone(), turn.allowed_tools);
 
         let tap = Tap {
             inner,
