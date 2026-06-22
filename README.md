@@ -150,6 +150,14 @@ Resulting effective tool sets (room ∩ member):
 A disallowed tool is never even advertised to the model, so it can't be called — the gate is enforced
 in the agent core, not just hidden in the prompt.
 
+**Matrix engagement & feedback.** The Matrix bot is addressable rather than a firehose. In a **1:1 DM**
+it answers everything; in a **group room** it engages only when you **@-mention it** or **reply to one
+of its messages** (this is on top of any sender/room allowlist). When it does engage it gives live
+feedback: it **reacts 👀** to your message, shows a **typing** indicator while it works, and posts a
+short **notice for each tool call** as it runs them (e.g. `🔧 `read_file` · src/lib.rs`), so you can see
+what it's doing before the answer arrives. (These behaviours are Matrix-only; the Slack gateway answers
+`message`/`app_mention` as before.)
+
 **Matrix encryption.** The Matrix gateway targets unencrypted rooms by default; build with
 `--features e2ee` (needs Rust ≥ 1.93) for Olm/Megolm end-to-end encryption via `matrix-sdk-crypto`.
 With `MATRIX_STATE_DIR` set, the crypto store is persisted to SQLite (`<dir>/crypto`,

@@ -56,6 +56,22 @@ with exponential backoff (`with_retry`, 1s→30s cap), mirroring the in-loop `/s
 homeserver that's briefly down while a fresh task boots doesn't kill the gateway; genuine auth/config
 errors (4xx ⇒ `GatewayError::Bind`) still surface immediately.
 
+**Matrix engagement & feedback** (Matrix gateway only — Slack unchanged): the bot is **addressable**,
+not a firehose. In a **1:1 DM** (room with exactly two joined members, detected via `/joined_members`
+and cached per room) it answers every message; in a **group room** it engages only when **@-mentioned**
+(authoritative `m.mentions`, MSC3952; plus a textual `@localpart`/MXID-token fallback) **or** when the
+message **replies to one of the bot's own recent messages** (tracked in a bounded `RecentIds` of sent
+event ids — `message_triggers` is the decision fn; this composes *on top of* the sender/room
+allowlists). On an engaged message the gateway gives **immediate feedback**: it reacts 👀 (`m.reaction`,
+sent in the clear even in encrypted rooms), shows a **typing** indicator (`PUT …/typing`, re-asserted
+on each tool call so it survives long turns), and posts a concise **per-tool-call notice** as the agent
+works (`🔧 \`name\` · hint`, the hint pulled from the streamed `Event::ToolUseStart/Delta/End` args via
+`tool_hint`). The shared `handle_message` runs this whole flow; `Reply::{Plain,Encrypted}` is the one
+seam that picks plaintext vs E2EE for the outbound messages, so the orchestration stays
+modality-agnostic. Mention/reply signals on encrypted messages are read post-decrypt (they live inside
+the ciphertext), reusing the same `mentions_bot`/`reply_target`/`message_text` helpers as the plaintext
+path so detection is identical.
+
 The **Slack gateway** (`lvz-gw-slack`, `--serve-slack`) is a thin **Socket Mode** client (no inbound
 port): `apps.connections.open` → `tokio-tungstenite` WebSocket → `message`/`app_mention` events →
 turn → `chat.postMessage`. Auth: `SLACK_APP_TOKEN` (`xapp-`) + `SLACK_BOT_TOKEN` (`xoxb-`). Session

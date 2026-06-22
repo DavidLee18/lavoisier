@@ -25,7 +25,7 @@
 //!    state dir (if any) so the next start takes path 2. A configured device id (`MATRIX_DEVICE_ID`)
 //!    or a previously-persisted one is reused on re-login so the device stays stable.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -492,13 +492,14 @@ impl MatrixGateway {
             .map_err(|e| GatewayError::Protocol(e.to_string()))
     }
 
-    /// Post a plain-text message to a room.
+    /// Post a plain-text message to a room; returns the homeserver-assigned event id (so the
+    /// caller can track its own messages for reply-detection).
     async fn send_message(
         &self,
         token: &str,
         room_id: &str,
         body: &str,
-    ) -> Result<(), GatewayError> {
+    ) -> Result<String, GatewayError> {
         let txn = self.txn.fetch_add(1, Ordering::Relaxed);
         let path = format!(
             "/_matrix/client/v3/rooms/{}/send/m.room.message/lvz{}",
@@ -519,7 +520,127 @@ impl MatrixGateway {
             let msg = resp.text().await.unwrap_or_default();
             return Err(GatewayError::Io(format!("matrix send {status}: {msg}")));
         }
+        let parsed: SendResponse = resp
+            .json()
+            .await
+            .map_err(|e| GatewayError::Protocol(e.to_string()))?;
+        Ok(parsed.event_id)
+    }
+
+    /// React to an event with a single emoji (an `m.reaction` annotation). Reactions are sent in
+    /// the clear — unencrypted by convention — in both plaintext and encrypted rooms.
+    async fn react(
+        &self,
+        token: &str,
+        room_id: &str,
+        event_id: &str,
+        emoji: &str,
+    ) -> Result<(), GatewayError> {
+        let txn = self.txn.fetch_add(1, Ordering::Relaxed);
+        let path = format!(
+            "/_matrix/client/v3/rooms/{}/send/m.reaction/lvz{}",
+            urlencode(room_id),
+            txn
+        );
+        let payload = serde_json::json!({
+            "m.relates_to": { "rel_type": "m.annotation", "event_id": event_id, "key": emoji }
+        });
+        let resp = self
+            .http
+            .put(self.url(&path))
+            .bearer_auth(token)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::Io(format!("matrix react {status}: {msg}")));
+        }
         Ok(())
+    }
+
+    /// Set (or clear) the bot's typing indicator in a room. `timeout` bounds how long the server
+    /// shows it without a refresh; we re-assert it as work progresses (each tool-call notice).
+    async fn set_typing(
+        &self,
+        token: &str,
+        room_id: &str,
+        user_id: &str,
+        typing: bool,
+    ) -> Result<(), GatewayError> {
+        let path = format!(
+            "/_matrix/client/v3/rooms/{}/typing/{}",
+            urlencode(room_id),
+            urlencode(user_id)
+        );
+        let payload = if typing {
+            serde_json::json!({ "typing": true, "timeout": 30_000 })
+        } else {
+            serde_json::json!({ "typing": false })
+        };
+        let resp = self
+            .http
+            .put(self.url(&path))
+            .bearer_auth(token)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::Io(format!("matrix typing {status}: {msg}")));
+        }
+        Ok(())
+    }
+
+    /// Whether `room` is a 1:1 DM (exactly two joined members: the bot and one other). The result
+    /// is cached in `cache` since membership rarely changes over a session; a transient lookup
+    /// failure is treated as "not a DM" (fall back to requiring a mention) and not cached.
+    async fn is_dm(&self, token: &str, room_id: &str, cache: &mut HashMap<String, bool>) -> bool {
+        if let Some(&dm) = cache.get(room_id) {
+            return dm;
+        }
+        match self.joined_member_count(token, room_id).await {
+            Ok(n) => {
+                let dm = n == 2;
+                cache.insert(room_id.to_string(), dm);
+                dm
+            }
+            Err(e) => {
+                eprintln!("matrix: joined_members({room_id}) failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// Count the joined members of a room (`GET …/joined_members`).
+    async fn joined_member_count(&self, token: &str, room_id: &str) -> Result<usize, GatewayError> {
+        let path = format!(
+            "/_matrix/client/v3/rooms/{}/joined_members",
+            urlencode(room_id)
+        );
+        let resp = self
+            .http
+            .get(self.url(&path))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::Io(format!(
+                "matrix joined_members {status}: {msg}"
+            )));
+        }
+        let parsed: JoinedMembersResponse = resp
+            .json()
+            .await
+            .map_err(|e| GatewayError::Protocol(e.to_string()))?;
+        Ok(parsed.joined.len())
     }
 
     /// Post the shutdown notice to the home room (if one is configured). Best-effort and sent in
@@ -582,33 +703,126 @@ impl MatrixGateway {
         }
     }
 
-    /// Run one inbound message through the agent; return its trimmed answer (or `None` if the
-    /// agent errored or produced nothing). Sending the answer is the caller's job, so plaintext
-    /// and encrypted rooms share this path and differ only in how the reply goes out.
-    async fn run_agent(
+    /// Decide whether to engage with a message and, if so, handle it. The bot engages in a 1:1 DM
+    /// unconditionally, or in a group room only when @-mentioned or replied to (see
+    /// [`message_triggers`]). The DM membership lookup is skipped when a mention/reply already
+    /// settles it, so the common case costs no extra round-trip.
+    #[allow(clippy::too_many_arguments)]
+    async fn engage(
         &self,
         agent: &Arc<dyn AgentHandle>,
+        token: &str,
+        self_user: &str,
+        reply: &Reply<'_>,
+        msg: IncomingMessage,
+        sent: &mut RecentIds,
+        dm_cache: &mut HashMap<String, bool>,
+    ) {
+        let pre_triggered = msg.mentions_bot
+            || msg
+                .in_reply_to
+                .as_deref()
+                .is_some_and(|id| sent.contains(id));
+        let is_dm = !pre_triggered && self.is_dm(token, &msg.room, dm_cache).await;
+        if !message_triggers(is_dm, msg.mentions_bot, msg.in_reply_to.as_deref(), sent) {
+            return;
+        }
+        self.handle_message(agent, token, self_user, reply, msg, sent)
+            .await;
+    }
+
+    /// Send a message body to a room in the right modality for this turn — plaintext or (under
+    /// the `e2ee` feature) encrypted — returning the event id. The single seam that lets the
+    /// shared per-message handler stay modality-agnostic.
+    async fn send_via(
+        &self,
+        reply: &Reply<'_>,
+        token: &str,
         room: &str,
-        sender: &str,
         body: String,
-    ) -> Option<String> {
+    ) -> Result<String, GatewayError> {
+        match reply {
+            Reply::Plain => self.send_message(token, room, &body).await,
+            #[cfg(feature = "e2ee")]
+            Reply::Encrypted(crypto) => crypto
+                .encrypt_and_send(room.to_string(), body)
+                .await
+                .map_err(|e| GatewayError::Io(e.to_string())),
+            #[cfg(not(feature = "e2ee"))]
+            Reply::_Unused(_) => unreachable!(),
+        }
+    }
+
+    /// Handle one engaged inbound message end to end: acknowledge with a reaction, show a typing
+    /// indicator, run the agent — posting a concise notice for each tool call as it happens — and
+    /// finally send the answer. Replies go out via `reply` (plaintext or encrypted); reactions and
+    /// typing always use the plaintext API. Every message the bot sends is recorded in `sent` so a
+    /// later reply to it re-engages the bot. The whole flow is best-effort: ack/typing failures are
+    /// logged, not fatal.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_message(
+        &self,
+        agent: &Arc<dyn AgentHandle>,
+        token: &str,
+        self_user: &str,
+        reply: &Reply<'_>,
+        msg: IncomingMessage,
+        sent: &mut RecentIds,
+    ) {
+        let room = msg.room;
+        // 1. Acknowledge that we saw the message.
+        if let Err(e) = self.react(token, &room, &msg.event_id, "👀").await {
+            eprintln!("matrix: react in {room}: {e}");
+        }
+        // 2. Show "typing…" while we prepare a response.
+        if let Err(e) = self.set_typing(token, &room, self_user, true).await {
+            eprintln!("matrix: typing in {room}: {e}");
+        }
+
         // Apply this room/member's tool permissions (if any) to the turn. The agent core enforces
         // the allowlist; the policy decision lives here.
-        let mut turn = TurnRequest::new(room.to_string(), body);
-        if let Some(tools) = self.tools_for(room, sender) {
+        let mut turn = TurnRequest::new(room.clone(), msg.body);
+        if let Some(tools) = self.tools_for(&room, &msg.sender) {
             turn = turn.with_allowed_tools(tools);
         }
         let mut stream = match agent.submit(turn).await {
             Ok(stream) => stream,
             Err(e) => {
                 eprintln!("matrix: agent error in {room}: {e}");
-                return None;
+                let _ = self.set_typing(token, &room, self_user, false).await;
+                return;
             }
         };
+
+        // 3. Stream the turn: accumulate the answer text, and post a notice for each tool call as
+        //    it completes (buffering the streamed argument JSON to extract a short target hint).
         let mut answer = String::new();
+        let mut tool_args: HashMap<String, (String, String)> = HashMap::new();
         while let Some(item) = stream.next().await {
             match item {
                 Ok(Event::TextDelta(text)) => answer.push_str(&text),
+                Ok(Event::ToolUseStart { id, name }) => {
+                    tool_args.insert(id, (name, String::new()));
+                }
+                Ok(Event::ToolUseDelta { id, json }) => {
+                    if let Some((_, args)) = tool_args.get_mut(&id) {
+                        args.push_str(&json);
+                    }
+                }
+                Ok(Event::ToolUseEnd { id }) => {
+                    if let Some((name, args)) = tool_args.remove(&id) {
+                        let notice = match tool_hint(&args) {
+                            Some(hint) => format!("🔧 `{name}` · {hint}"),
+                            None => format!("🔧 `{name}`"),
+                        };
+                        match self.send_via(reply, token, &room, notice).await {
+                            Ok(eid) => sent.insert(eid),
+                            Err(e) => eprintln!("matrix: tool notice in {room}: {e}"),
+                        }
+                        // Re-assert typing so the indicator survives a long multi-tool turn.
+                        let _ = self.set_typing(token, &room, self_user, true).await;
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("matrix: stream error in {room}: {e}");
@@ -616,9 +830,29 @@ impl MatrixGateway {
                 }
             }
         }
+
+        // 4. Stop typing and send the answer.
+        let _ = self.set_typing(token, &room, self_user, false).await;
         let answer = answer.trim();
-        (!answer.is_empty()).then(|| answer.to_string())
+        if !answer.is_empty() {
+            match self.send_via(reply, token, &room, answer.to_string()).await {
+                Ok(eid) => sent.insert(eid),
+                Err(e) => eprintln!("matrix: send error in {room}: {e}"),
+            }
+        }
     }
+}
+
+/// How a turn's outbound messages are delivered to the room — plaintext, or end-to-end encrypted
+/// (under the `e2ee` feature). Built per message by the serve loop so the shared
+/// [`MatrixGateway::handle_message`] stays modality-agnostic.
+enum Reply<'a> {
+    Plain,
+    #[cfg(feature = "e2ee")]
+    Encrypted(&'a e2ee::Crypto),
+    #[cfg(not(feature = "e2ee"))]
+    #[allow(dead_code)]
+    _Unused(std::marker::PhantomData<&'a ()>),
 }
 
 #[async_trait]
@@ -704,6 +938,12 @@ impl MatrixGateway {
             .await;
         let mut since = parse_next_batch(&baseline)?;
 
+        // Per-session engagement state: the bot's own recent event ids (so a reply to one
+        // re-engages it) and a per-room DM cache (so the "always answer in a 1:1" rule doesn't
+        // re-query membership every message).
+        let mut sent = RecentIds::new(256);
+        let mut dm_cache: HashMap<String, bool> = HashMap::new();
+
         // Race each `/sync` against a shutdown signal so the gateway can stop gracefully (and post
         // the home-room notice) on SIGTERM / Ctrl-C rather than being hard-killed.
         let shutdown = shutdown_signal();
@@ -750,27 +990,29 @@ impl MatrixGateway {
                 }
             };
 
-            // Plaintext messages: run the agent and reply in the clear.
+            // Plaintext messages: engage (if triggered) and reply in the clear.
             for msg in extract_messages(
                 resp,
                 &self_user,
                 self.allowed_users.as_ref(),
                 self.allowed_rooms.as_ref(),
             ) {
-                if let Some(answer) = self
-                    .run_agent(&agent, &msg.room, &msg.sender, msg.body)
-                    .await
-                {
-                    if let Err(e) = self.send_message(&token, &msg.room, &answer).await {
-                        eprintln!("matrix: send error in {}: {e}", msg.room);
-                    }
-                }
+                self.engage(
+                    &agent,
+                    &token,
+                    &self_user,
+                    &Reply::Plain,
+                    msg,
+                    &mut sent,
+                    &mut dm_cache,
+                )
+                .await;
             }
 
-            // Encrypted messages: decrypt, run the agent, and reply encrypted.
+            // Encrypted messages: decrypt, engage (if triggered), and reply encrypted.
             #[cfg(feature = "e2ee")]
             if let Some(c) = &crypto {
-                for (room, sender, body) in c
+                for msg in c
                     .decrypt_messages(
                         &value,
                         self_user.clone(),
@@ -779,11 +1021,16 @@ impl MatrixGateway {
                     )
                     .await
                 {
-                    if let Some(answer) = self.run_agent(&agent, &room, &sender, body).await {
-                        if let Err(e) = c.encrypt_and_send(room.clone(), answer).await {
-                            eprintln!("matrix[e2ee]: send error in {room}: {e}");
-                        }
-                    }
+                    self.engage(
+                        &agent,
+                        &token,
+                        &self_user,
+                        &Reply::Encrypted(c),
+                        msg,
+                        &mut sent,
+                        &mut dm_cache,
+                    )
+                    .await;
                 }
             }
 
@@ -824,11 +1071,18 @@ struct IncomingMessage {
     room: String,
     sender: String,
     body: String,
+    /// The event id, so the bot can react to it / track reply targets.
+    event_id: String,
+    /// Whether this message @-mentions the bot (a trigger in a group room).
+    mentions_bot: bool,
+    /// If this is a reply, the event id it replies to (a trigger when it's one of ours).
+    in_reply_to: Option<String>,
 }
 
 /// Pull the answerable `m.room.message`/`m.text` events out of a sync response, skipping the
 /// bot's own messages (so it never replies to itself) and any sender not in `allowed` (when an
-/// allowlist is configured).
+/// allowlist is configured). Each message also carries the signals — does it mention the bot, is
+/// it a reply, what's its event id — the serve loop needs to decide whether to engage.
 fn extract_messages(
     sync: SyncResponse,
     self_user: &str,
@@ -850,16 +1104,149 @@ fn extract_messages(
             if event.content.msgtype.as_deref() != Some("m.text") {
                 continue;
             }
-            if let Some(body) = event.content.body {
+            let mentions_bot = mentions_bot(&event.content, self_user);
+            let in_reply_to = reply_target(&event.content);
+            if let Some(body) = message_text(&event.content) {
                 out.push(IncomingMessage {
                     room: room_id.clone(),
                     sender: event.sender,
                     body,
+                    event_id: event.event_id,
+                    mentions_bot,
+                    in_reply_to,
                 });
             }
         }
     }
     out
+}
+
+/// Whether a message's content @-mentions the bot. The authoritative signal is `m.mentions`
+/// (MSC3952, sent by modern clients on an explicit @-mention); we also accept a textual fallback
+/// — the bot's full MXID or `@localpart` appearing as a token in the (plain or formatted) body —
+/// for clients/users that type the handle without producing a pill.
+pub(crate) fn mentions_bot(content: &EventContent, self_user: &str) -> bool {
+    if content
+        .mentions
+        .as_ref()
+        .is_some_and(|m| m.user_ids.iter().any(|u| u == self_user))
+    {
+        return true;
+    }
+    let localpart = self_user.strip_prefix('@').and_then(|s| s.split_once(':'));
+    let handle = localpart.map(|(l, _)| format!("@{l}"));
+    let texts = [content.body.as_deref(), content.formatted_body.as_deref()];
+    texts.into_iter().flatten().any(|text| {
+        text.split(|c: char| {
+            !(c.is_alphanumeric() || c == '@' || c == ':' || c == '_' || c == '.' || c == '-')
+        })
+        .any(|tok| tok == self_user || handle.as_deref().is_some_and(|h| tok == h))
+    })
+}
+
+/// The event id a message replies to, if any (`m.relates_to` → `m.in_reply_to`). Shared by the
+/// plaintext and (post-decryption) encrypted paths so reply-detection is identical.
+pub(crate) fn reply_target(content: &EventContent) -> Option<String> {
+    content
+        .relates_to
+        .as_ref()
+        .and_then(|r| r.in_reply_to.as_ref())
+        .map(|r| r.event_id.clone())
+        .filter(|id| !id.is_empty())
+}
+
+/// The text body of a message, but only when it's an `m.text` message (the bot answers text).
+pub(crate) fn message_text(content: &EventContent) -> Option<String> {
+    (content.msgtype.as_deref() == Some("m.text"))
+        .then(|| content.body.clone())
+        .flatten()
+}
+
+/// Decide whether the bot should engage with a message: always in a 1:1 DM; in a group room only
+/// when it's @-mentioned or replies to one of the bot's own recent messages.
+fn message_triggers(
+    is_dm: bool,
+    mentions_bot: bool,
+    in_reply_to: Option<&str>,
+    ours: &RecentIds,
+) -> bool {
+    is_dm || mentions_bot || in_reply_to.is_some_and(|id| ours.contains(id))
+}
+
+/// A short, human-readable hint at a tool call's target, pulled from its argument JSON — the first
+/// of a few salient keys (path/file/command/…), else the first string field — truncated. Used to
+/// annotate the per-tool-call room notice (`🔧 read_file · src/lib.rs`). Returns `None` when the
+/// args don't parse or carry nothing worth showing.
+fn tool_hint(args_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(args_json).ok()?;
+    let obj = v.as_object()?;
+    const SALIENT: &[&str] = &[
+        "path",
+        "file",
+        "files",
+        "command",
+        "cmd",
+        "pattern",
+        "query",
+        "name",
+        "old_string",
+    ];
+    let pick = SALIENT
+        .iter()
+        .find_map(|k| obj.get(*k).and_then(|x| x.as_str()))
+        .or_else(|| obj.values().find_map(|x| x.as_str()))?;
+    let pick = pick.trim();
+    if pick.is_empty() {
+        return None;
+    }
+    Some(truncate_hint(pick, 60))
+}
+
+/// Single-line truncation for a tool hint: collapse to the first line and cap the length.
+fn truncate_hint(s: &str, max: usize) -> String {
+    let line = s.lines().next().unwrap_or(s);
+    if line.chars().count() <= max {
+        line.to_string()
+    } else {
+        let kept: String = line.chars().take(max).collect();
+        format!("{kept}…")
+    }
+}
+
+/// A bounded set of the bot's recently-sent event ids, for recognising replies to its own
+/// messages. Insertion-ordered with a hard cap (oldest evicted) so it can't grow unbounded over a
+/// long-lived session.
+#[derive(Default)]
+struct RecentIds {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+impl RecentIds {
+    fn new(cap: usize) -> Self {
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn insert(&mut self, id: String) {
+        if id.is_empty() || !self.set.insert(id.clone()) {
+            return;
+        }
+        self.order.push_back(id);
+        if self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
+    }
 }
 
 /// Whether `sender` may drive the agent: true if no allowlist is configured, else membership.
@@ -935,6 +1322,19 @@ struct LoginResponse {
     device_id: String,
 }
 
+/// `PUT …/send/…` response — carries the `event_id` the homeserver assigned the event.
+#[derive(Deserialize)]
+struct SendResponse {
+    event_id: String,
+}
+
+/// `GET …/joined_members` response — used only for its member count (DM detection).
+#[derive(Deserialize)]
+struct JoinedMembersResponse {
+    #[serde(default)]
+    joined: HashMap<String, serde_json::Value>,
+}
+
 /// `GET /account/whoami` response. `device_id` is optional (added to the spec later; some
 /// homeservers omit it for non-token logins).
 #[derive(Deserialize)]
@@ -986,15 +1386,42 @@ struct SyncEvent {
     kind: String,
     sender: String,
     #[serde(default)]
+    event_id: String,
+    #[serde(default)]
     content: EventContent,
 }
 
 #[derive(Deserialize, Default)]
-struct EventContent {
+pub(crate) struct EventContent {
     #[serde(default)]
     msgtype: Option<String>,
     #[serde(default)]
     body: Option<String>,
+    #[serde(default)]
+    formatted_body: Option<String>,
+    /// Intentional mentions (MSC3952 / Matrix 1.7): the authoritative "who was @-mentioned" signal.
+    #[serde(default, rename = "m.mentions")]
+    mentions: Option<Mentions>,
+    #[serde(default, rename = "m.relates_to")]
+    relates_to: Option<RelatesTo>,
+}
+
+#[derive(Deserialize, Default)]
+struct Mentions {
+    #[serde(default)]
+    user_ids: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct RelatesTo {
+    #[serde(default, rename = "m.in_reply_to")]
+    in_reply_to: Option<InReplyTo>,
+}
+
+#[derive(Deserialize, Default)]
+struct InReplyTo {
+    #[serde(default)]
+    event_id: String,
 }
 
 #[cfg(test)]
@@ -1160,6 +1587,97 @@ mod tests {
         assert!(sender_allowed(None, "@anyone:hs")); // unset ⇒ everyone
         assert!(sender_allowed(Some(&allowed), "@a:hs"));
         assert!(!sender_allowed(Some(&allowed), "@b:hs"));
+    }
+
+    #[test]
+    fn extract_messages_surfaces_mention_reply_and_event_id() {
+        let sync = sync_from(serde_json::json!({
+            "next_batch": "s9",
+            "rooms": { "join": { "!room:hs": { "timeline": { "events": [
+                // Plain message — no mention, no reply.
+                { "type": "m.room.message", "event_id": "$plain", "sender": "@alice:hs",
+                  "content": { "msgtype": "m.text", "body": "just chatting" } },
+                // @-mention via m.mentions.
+                { "type": "m.room.message", "event_id": "$ment", "sender": "@alice:hs",
+                  "content": { "msgtype": "m.text", "body": "hey lav",
+                               "m.mentions": { "user_ids": ["@lav:hs"] } } },
+                // Reply to one of the bot's messages.
+                { "type": "m.room.message", "event_id": "$rep", "sender": "@bob:hs",
+                  "content": { "msgtype": "m.text", "body": "thanks",
+                               "m.relates_to": { "m.in_reply_to": { "event_id": "$mine" } } } }
+            ] } } } }
+        }));
+        let msgs = extract_messages(sync, "@lav:hs", None, None);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].event_id, "$plain");
+        assert!(!msgs[0].mentions_bot && msgs[0].in_reply_to.is_none());
+        assert!(msgs[1].mentions_bot);
+        assert_eq!(msgs[2].in_reply_to.as_deref(), Some("$mine"));
+    }
+
+    #[test]
+    fn mention_detection_via_text_fallback() {
+        let mk = |body: &str| EventContent {
+            msgtype: Some("m.text".into()),
+            body: Some(body.into()),
+            ..Default::default()
+        };
+        // Full MXID and @localpart as tokens both count.
+        assert!(mentions_bot(&mk("hey @lav:hs can you help"), "@lav:hs"));
+        assert!(mentions_bot(&mk("@lav please look"), "@lav:hs"));
+        // A substring of a larger token does not (no false positive).
+        assert!(!mentions_bot(&mk("email lavabit@example.com"), "@lav:hs"));
+        assert!(!mentions_bot(&mk("nothing to see"), "@lav:hs"));
+    }
+
+    #[test]
+    fn message_triggers_dm_vs_group() {
+        let mut ours = RecentIds::new(8);
+        ours.insert("$mine".into());
+        // DM: always engage, even with no mention/reply.
+        assert!(message_triggers(true, false, None, &ours));
+        // Group: engage only on mention or reply-to-ours.
+        assert!(!message_triggers(false, false, None, &ours));
+        assert!(message_triggers(false, true, None, &ours));
+        assert!(message_triggers(false, false, Some("$mine"), &ours));
+        // Reply to a message that isn't ours doesn't engage.
+        assert!(!message_triggers(false, false, Some("$other"), &ours));
+    }
+
+    #[test]
+    fn tool_hint_prefers_salient_keys_and_truncates() {
+        assert_eq!(
+            tool_hint(r#"{"path":"src/lib.rs"}"#).as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            tool_hint(r#"{"command":"cargo test"}"#).as_deref(),
+            Some("cargo test")
+        );
+        // Falls back to the first string value when no salient key is present.
+        assert_eq!(
+            tool_hint(r#"{"depth":3,"label":"x"}"#).as_deref(),
+            Some("x")
+        );
+        // Non-string-only / unparseable → None.
+        assert_eq!(tool_hint(r#"{"n":5}"#), None);
+        assert_eq!(tool_hint("not json"), None);
+        // Long values are truncated with an ellipsis.
+        let long = format!(r#"{{"query":"{}"}}"#, "a".repeat(100));
+        let hint = tool_hint(&long).unwrap();
+        assert!(hint.ends_with('…') && hint.chars().count() == 61);
+    }
+
+    #[test]
+    fn recent_ids_bounded_and_membership() {
+        let mut ids = RecentIds::new(2);
+        ids.insert("$a".into());
+        ids.insert("$b".into());
+        ids.insert("$c".into()); // evicts $a
+        assert!(!ids.contains("$a"));
+        assert!(ids.contains("$b") && ids.contains("$c"));
+        ids.insert("".into()); // empty ignored
+        assert!(!ids.contains(""));
     }
 
     #[test]

@@ -220,15 +220,17 @@ impl Crypto {
     /// Decrypt every inbound `m.room.encrypted` text message in a sync response, skipping our own,
     /// any sender not in `allowed`, and any room not in `allowed_rooms` (when those allowlists are
     /// configured — the `m.room.encrypted` event's `sender` and the room id are cleartext, so both
-    /// are enforced *before* decryption, identically to the plaintext path). Returns
-    /// `(room_id, sender, plaintext_body)` triples worth answering.
+    /// are enforced *before* decryption, identically to the plaintext path). The mention/reply
+    /// signals live inside the encrypted payload, so they're read from the *decrypted* content —
+    /// the cleartext `event_id` (needed to react) comes from the wrapper. Returns the same
+    /// [`IncomingMessage`](crate::IncomingMessage) shape as the plaintext path.
     pub async fn decrypt_messages(
         &self,
         sync: &Value,
         self_user: String,
         allowed: Option<HashSet<String>>,
         allowed_rooms: Option<HashSet<String>>,
-    ) -> Vec<(String, String, String)> {
+    ) -> Vec<crate::IncomingMessage> {
         let mut out = Vec::new();
         let settings = DecryptionSettings {
             sender_device_trust_requirement: TrustRequirement::Untrusted,
@@ -263,6 +265,11 @@ impl Crypto {
                     continue;
                 }
                 let sender = sender.unwrap_or_default().to_string();
+                let event_id = ev
+                    .get("event_id")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 let raw: Raw<EncryptedEvent> = match serde_json::from_value(ev.clone()) {
                     Ok(r) => r,
                     Err(_) => continue,
@@ -277,8 +284,14 @@ impl Crypto {
                     .await
                 {
                     Ok(decrypted) => {
-                        if let Some(body) = text_body(&decrypted.event) {
-                            out.push((room_id.clone(), sender.clone(), body));
+                        if let Some(msg) = to_incoming(
+                            &decrypted.event,
+                            room_id.clone(),
+                            sender.clone(),
+                            event_id.clone(),
+                            &self_user,
+                        ) {
+                            out.push(msg);
                         }
                     }
                     Err(e) => eprintln!("matrix[e2ee]: decrypt failed in {room_id}: {e}"),
@@ -288,10 +301,15 @@ impl Crypto {
         out
     }
 
-    /// Encrypt `body` as an `m.text` message and send it to `room_id` as `m.room.encrypted`.
-    /// Takes its arguments by value so the future borrows nothing lifetime-generic (keeps the
-    /// gateway's serve future `Send`).
-    pub async fn encrypt_and_send(&self, room_id: String, body: String) -> Result<(), E2eeError> {
+    /// Encrypt `body` as an `m.text` message and send it to `room_id` as `m.room.encrypted`;
+    /// returns the event id the homeserver assigned (so the gateway can track its own messages
+    /// for reply-detection). Takes its arguments by value so the future borrows nothing
+    /// lifetime-generic (keeps the gateway's serve future `Send`).
+    pub async fn encrypt_and_send(
+        &self,
+        room_id: String,
+        body: String,
+    ) -> Result<String, E2eeError> {
         let room = RoomId::parse(&room_id).map_err(estr)?;
         let users = self.joined_members(&room_id).await?;
         // Pass a fresh `&UserId` iterator per call (the `Deref::deref` fn item is lifetime-generic,
@@ -448,12 +466,13 @@ impl Crypto {
         R::IncomingResponse::try_from_http_response(http_resp).map_err(estr)
     }
 
-    /// `PUT` an already-encrypted payload as an `m.room.encrypted` timeline event.
+    /// `PUT` an already-encrypted payload as an `m.room.encrypted` timeline event; returns the
+    /// homeserver-assigned event id.
     async fn send_encrypted_event<T>(
         &self,
         room_id: &str,
         content: &Raw<T>,
-    ) -> Result<(), E2eeError> {
+    ) -> Result<String, E2eeError> {
         let txn = ruma::TransactionId::new();
         let url = format!(
             "{}/_matrix/client/v3/rooms/{}/send/m.room.encrypted/{}",
@@ -474,7 +493,11 @@ impl Crypto {
             let msg = resp.text().await.unwrap_or_default();
             return Err(E2eeError(format!("send m.room.encrypted {status}: {msg}")));
         }
-        Ok(())
+        let v: Value = resp.json().await.map_err(estr)?;
+        Ok(v.get("event_id")
+            .and_then(|e| e.as_str())
+            .unwrap_or_default()
+            .to_string())
     }
 
     /// Fetch the joined members of a room (recipients for room-key sharing).
@@ -513,17 +536,28 @@ fn raw_cast<T>(v: &impl serde::Serialize) -> Result<Raw<T>, E2eeError> {
     ))
 }
 
-/// Pull the `m.text` body out of a decrypted timeline event, if that's what it is.
-fn text_body<T>(event: &Raw<T>) -> Option<String> {
+/// Build an [`IncomingMessage`](crate::IncomingMessage) from a decrypted timeline event, when it's
+/// an `m.text` message. The mention/reply signals live in the (now-cleartext) content, so they're
+/// read here via the same shared helpers the plaintext path uses — keeping detection identical.
+/// Returns `None` for non-text events. The `event_id` is the cleartext wrapper's, passed in.
+fn to_incoming<T>(
+    event: &Raw<T>,
+    room: String,
+    sender: String,
+    event_id: String,
+    self_user: &str,
+) -> Option<crate::IncomingMessage> {
     let v: Value = serde_json::from_str(event.json().get()).ok()?;
-    let content = v.get("content")?;
-    if content.get("msgtype").and_then(|m| m.as_str()) != Some("m.text") {
-        return None;
-    }
-    content
-        .get("body")
-        .and_then(|b| b.as_str())
-        .map(String::from)
+    let content: crate::EventContent = serde_json::from_value(v.get("content")?.clone()).ok()?;
+    let body = crate::message_text(&content)?;
+    Some(crate::IncomingMessage {
+        room,
+        sender,
+        body,
+        event_id,
+        mentions_bot: crate::mentions_bot(&content, self_user),
+        in_reply_to: crate::reply_target(&content),
+    })
 }
 
 #[cfg(test)]
@@ -535,18 +569,30 @@ mod tests {
     }
 
     #[test]
-    fn text_body_extracts_plain_text() {
-        let ev = raw(r#"{"type":"m.room.message","content":{"msgtype":"m.text","body":"hello"}}"#);
-        assert_eq!(text_body(&ev), Some("hello".to_string()));
+    fn to_incoming_extracts_text_with_mention_and_reply() {
+        let ev = raw(r#"{"type":"m.room.message","content":{
+                "msgtype":"m.text","body":"@lav:hs help",
+                "m.mentions":{"user_ids":["@lav:hs"]},
+                "m.relates_to":{"m.in_reply_to":{"event_id":"$prev"}}}}"#);
+        let msg = to_incoming(
+            &ev,
+            "!r:hs".into(),
+            "@alice:hs".into(),
+            "$e1".into(),
+            "@lav:hs",
+        )
+        .unwrap();
+        assert_eq!(msg.body, "@lav:hs help");
+        assert_eq!(msg.event_id, "$e1");
+        assert!(msg.mentions_bot);
+        assert_eq!(msg.in_reply_to.as_deref(), Some("$prev"));
     }
 
     #[test]
-    fn text_body_ignores_non_text_and_missing_body() {
-        assert_eq!(
-            text_body(&raw(r#"{"content":{"msgtype":"m.image","body":"p.png"}}"#)),
-            None
+    fn to_incoming_skips_non_text() {
+        let img = raw(r#"{"content":{"msgtype":"m.image","body":"p.png"}}"#);
+        assert!(
+            to_incoming(&img, "!r:hs".into(), "@a:hs".into(), "$e".into(), "@lav:hs").is_none()
         );
-        assert_eq!(text_body(&raw(r#"{"content":{"msgtype":"m.text"}}"#)), None);
-        assert_eq!(text_body(&raw(r#"{"type":"m.room.member"}"#)), None);
     }
 }
