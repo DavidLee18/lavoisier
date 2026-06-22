@@ -1,6 +1,6 @@
 [package]
 name = "lavoisier"
-version = "0.6.2"
+version = "0.6.3"
 description = "Lavoisier — a token-efficient CLI coding agent (Anthropic + xAI + Google Gemini), with prompt caching, a tree-sitter context engine, and an adaptive-token-optimisation tuner."
 edition.workspace = true
 rust-version.workspace = true

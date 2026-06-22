@@ -49,10 +49,14 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
+(`v0.6.3`): `lvz-gw-matrix` (0.3.4 — **addressable engagement** (mention/reply gate, DM-exempt) plus
+live **reaction / typing / per-tool-call notices**) and `lavoisier` (0.6.3 — republish so the tagged
+binary picks up the change). Both semver-compatible patches; publish order `lvz-gw-matrix` →
+`lavoisier`. The other thirteen crates stay put.
+Earlier changed set
 (`v0.6.2`): `lvz-gw-matrix` (0.3.3 — **cross-signing identity bootstrapped once on startup** under the
 `e2ee` feature, gated on `cross_signing_status().is_complete()`) and `lavoisier` (0.6.2 — republish so
-the tagged binary picks up the change). Both semver-compatible patches; publish order `lvz-gw-matrix`
-→ `lavoisier`. The other thirteen crates stay put.
+the tagged binary picks up the change).
 Earlier changed set
 (`v0.6.1`): `lvz-gw-matrix` (0.3.2 — Matrix gateway **startup retry with exponential backoff** on
 transient bind failures so a homeserver restart doesn't kill a fresh task) and `lavoisier` (0.6.1 —
