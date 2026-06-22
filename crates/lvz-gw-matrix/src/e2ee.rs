@@ -31,7 +31,11 @@ use matrix_sdk_sqlite::SqliteCryptoStore;
 use ruma::{
     api::{
         auth_scheme::{AccessToken, SendAccessToken},
-        client::{keys::get_keys, sync::sync_events::DeviceLists, to_device::send_event_to_device},
+        client::{
+            keys::{get_keys, upload_signing_keys},
+            sync::sync_events::DeviceLists,
+            to_device::send_event_to_device,
+        },
         path_builder::VersionHistory,
         IncomingResponse as RumaIncomingResponse, MatrixVersion,
         OutgoingRequest as RumaOutgoingRequest, SupportedVersions,
@@ -113,7 +117,64 @@ impl Crypto {
         };
         // Initial device-key + one-time-key upload.
         crypto.process_outgoing().await?;
+        // Publish the bot's cross-signing identity once (best-effort; logged, never fatal).
+        crypto.bootstrap_cross_signing().await;
         Ok(crypto)
+    }
+
+    /// Publish the bot's **cross-signing identity** the first time it's set up, so other users'
+    /// clients see the bot's device as part of a signed identity rather than an unverified
+    /// standalone device. Done once: we bootstrap only when the private keys aren't already in the
+    /// store, because re-uploading an existing identity requires User-Interactive Auth (the
+    /// homeserver waives UIA only for the *first* cross-signing upload, per MSC3967), which a
+    /// token-authenticated bot can't complete. Best-effort — on any failure we log and carry on
+    /// (encryption still works; only cross-signing is skipped, e.g. on a server that demands UIA).
+    async fn bootstrap_cross_signing(&self) {
+        if let Err(e) = self.try_bootstrap_cross_signing().await {
+            eprintln!("matrix[e2ee]: cross-signing bootstrap skipped: {e}");
+        }
+    }
+
+    async fn try_bootstrap_cross_signing(&self) -> Result<(), E2eeError> {
+        if self.machine.cross_signing_status().await.is_complete() {
+            return Ok(()); // already have an identity (persistent store / earlier run)
+        }
+        let reqs = self
+            .machine
+            .bootstrap_cross_signing(false)
+            .await
+            .map_err(estr)?;
+        // 1. Device-key upload, if the machine asks for one (its response is fed back). Usually
+        //    `None` here since `process_outgoing` already uploaded the device keys.
+        if let Some(req) = reqs.upload_keys_req {
+            let id = req.request_id().to_owned();
+            if let AnyOutgoingRequest::KeysUpload(r) = req.request() {
+                let resp = self.send_ruma(r.clone()).await?;
+                self.machine
+                    .mark_request_as_sent(&id, &resp)
+                    .await
+                    .map_err(estr)?;
+            }
+        }
+        // 2. Upload the public cross-signing key triplet (no UIA on this first upload).
+        let triplet = reqs.upload_signing_keys_req;
+        let mut signing = upload_signing_keys::v3::Request::new();
+        signing.master_key = triplet.master_key.as_ref().map(raw_cast).transpose()?;
+        signing.self_signing_key = triplet
+            .self_signing_key
+            .as_ref()
+            .map(raw_cast)
+            .transpose()?;
+        signing.user_signing_key = triplet
+            .user_signing_key
+            .as_ref()
+            .map(raw_cast)
+            .transpose()?;
+        self.send_ruma(signing).await?;
+        // 3. Upload the signatures over those keys (already a ruma request).
+        self.send_ruma(reqs.upload_signatures_req).await?;
+        eprintln!("matrix[e2ee]: cross-signing identity published");
+        Ok(())
     }
 
     /// Feed a `/sync` response's encryption-relevant parts into the machine, then flush the
@@ -441,6 +502,15 @@ impl Crypto {
         }
         Ok(users)
     }
+}
+
+/// Re-encode a `matrix-sdk-crypto` value as a ruma [`Raw<T>`] by serialising and reparsing — both
+/// sides emit the same spec JSON, so this bridges the crate's `CrossSigningKey` into ruma's request
+/// type without depending on a direct `From` impl.
+fn raw_cast<T>(v: &impl serde::Serialize) -> Result<Raw<T>, E2eeError> {
+    Ok(Raw::from_json(
+        serde_json::value::to_raw_value(v).map_err(estr)?,
+    ))
 }
 
 /// Pull the `m.text` body out of a decrypted timeline event, if that's what it is.

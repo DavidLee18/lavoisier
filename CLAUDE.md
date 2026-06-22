@@ -90,7 +90,11 @@ passthrough `e2ee` feature): Olm/Megolm via the crypto-only `matrix-sdk-crypto`,
 ruma request types with `try_into_http_request`). The `OlmMachine` is backed by a durable
 `matrix-sdk-sqlite` `SqliteCryptoStore` when `MATRIX_STATE_DIR` is set (`OlmMachine::with_store`,
 `bundled` SQLite so no runtime libsqlite3; optional at-rest passphrase via `MATRIX_CRYPTO_STORE_KEY`),
-else in-memory. **Off by default** — the default build stays minimal-dep and MSRV-1.88; the feature
+else in-memory. On first init `Crypto::new` also **bootstraps the bot's cross-signing identity once**
+(`OlmMachine::bootstrap_cross_signing`, gated on `cross_signing_status().is_complete()` so it never
+re-uploads — a second upload would need UIA the token-auth bot can't do; relies on MSC3967 waiving UIA
+for the first upload) so peers see a signed identity, not an unverified standalone device; best-effort
+(logged, never fatal). **Off by default** — the default build stays minimal-dep and MSRV-1.88; the feature
 requires Rust ≥ 1.93. Crypto round-trip is unit-tested where offline-testable; full live verification
 needs a homeserver (like the rest of the Matrix gateway).
 
