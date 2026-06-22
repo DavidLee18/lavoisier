@@ -49,6 +49,12 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
+(`v0.6.5`): `lvz-gw-matrix` (0.3.6 — the unencrypted-send **transaction counter is seeded from a
+per-process timestamp** (`process_seed`, nanos since epoch) instead of restarting at 0 each boot, so
+txn ids never collide with a prior run's and get silently deduped by the homeserver) and `lavoisier`
+(0.6.5 — republish so the tagged binary picks up the change). Both semver-compatible patches; publish
+order `lvz-gw-matrix` → `lavoisier`. The other thirteen crates stay put.
+Earlier changed set
 (`v0.6.4`): `lvz-gw-matrix` (0.3.5 — the 👀 ack reaction is **swapped for a ✅/❌ outcome reaction** when
 the turn resolves: `react` returns the reaction event id, new `redact` + `finish_reaction` retract the
 ack and react success/failure) and `lavoisier` (0.6.4 — republish so the tagged binary picks up the
