@@ -66,7 +66,10 @@ allowlists). On an engaged message the gateway gives **immediate feedback**: it 
 sent in the clear even in encrypted rooms), shows a **typing** indicator (`PUT …/typing`, re-asserted
 on each tool call so it survives long turns), and posts a concise **per-tool-call notice** as the agent
 works (`🔧 \`name\` · hint`, the hint pulled from the streamed `Event::ToolUseStart/Delta/End` args via
-`tool_hint`). The shared `handle_message` runs this whole flow; `Reply::{Plain,Encrypted}` is the one
+`tool_hint`). When the turn resolves it **swaps the 👀 for a ✅/❌ outcome reaction** — `finish_reaction`
+redacts the transient ack (`PUT …/redact/…`) and reacts ✅ on success or ❌ when the agent errored, the
+event stream errored, or the answer failed to send (`react` now returns the reaction's event id so the
+ack can be retracted). The shared `handle_message` runs this whole flow; `Reply::{Plain,Encrypted}` is the one
 seam that picks plaintext vs E2EE for the outbound messages, so the orchestration stays
 modality-agnostic. Mention/reply signals on encrypted messages are read post-decrypt (they live inside
 the ciphertext), reusing the same `mentions_bot`/`reply_target`/`message_text` helpers as the plaintext

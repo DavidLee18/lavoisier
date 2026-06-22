@@ -527,15 +527,16 @@ impl MatrixGateway {
         Ok(parsed.event_id)
     }
 
-    /// React to an event with a single emoji (an `m.reaction` annotation). Reactions are sent in
-    /// the clear — unencrypted by convention — in both plaintext and encrypted rooms.
+    /// React to an event with a single emoji (an `m.reaction` annotation); returns the reaction's
+    /// own event id (so a transient ack reaction can later be redacted). Reactions are sent in the
+    /// clear — unencrypted by convention — in both plaintext and encrypted rooms.
     async fn react(
         &self,
         token: &str,
         room_id: &str,
         event_id: &str,
         emoji: &str,
-    ) -> Result<(), GatewayError> {
+    ) -> Result<String, GatewayError> {
         let txn = self.txn.fetch_add(1, Ordering::Relaxed);
         let path = format!(
             "/_matrix/client/v3/rooms/{}/send/m.reaction/lvz{}",
@@ -557,6 +558,37 @@ impl MatrixGateway {
             let status = resp.status();
             let msg = resp.text().await.unwrap_or_default();
             return Err(GatewayError::Io(format!("matrix react {status}: {msg}")));
+        }
+        let parsed: SendResponse = resp
+            .json()
+            .await
+            .map_err(|e| GatewayError::Protocol(e.to_string()))?;
+        Ok(parsed.event_id)
+    }
+
+    /// Redact (remove) an event the bot sent — used to retract the transient 👀 ack reaction once
+    /// the turn resolves to a success/failure indicator. Best-effort; reactions go out in the clear
+    /// so their redaction is a plaintext call too.
+    async fn redact(&self, token: &str, room_id: &str, event_id: &str) -> Result<(), GatewayError> {
+        let txn = self.txn.fetch_add(1, Ordering::Relaxed);
+        let path = format!(
+            "/_matrix/client/v3/rooms/{}/redact/{}/lvz{}",
+            urlencode(room_id),
+            urlencode(event_id),
+            txn
+        );
+        let resp = self
+            .http
+            .put(self.url(&path))
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::Io(format!("matrix redact {status}: {msg}")));
         }
         Ok(())
     }
@@ -753,12 +785,12 @@ impl MatrixGateway {
         }
     }
 
-    /// Handle one engaged inbound message end to end: acknowledge with a reaction, show a typing
-    /// indicator, run the agent — posting a concise notice for each tool call as it happens — and
-    /// finally send the answer. Replies go out via `reply` (plaintext or encrypted); reactions and
-    /// typing always use the plaintext API. Every message the bot sends is recorded in `sent` so a
-    /// later reply to it re-engages the bot. The whole flow is best-effort: ack/typing failures are
-    /// logged, not fatal.
+    /// Handle one engaged inbound message end to end: acknowledge with a transient 👀 reaction,
+    /// show a typing indicator, run the agent — posting a concise notice for each tool call as it
+    /// happens — send the answer, and finally swap the 👀 for a ✅/❌ outcome indicator. Replies go
+    /// out via `reply` (plaintext or encrypted); reactions and typing always use the plaintext API.
+    /// Every message the bot sends is recorded in `sent` so a later reply to it re-engages the bot.
+    /// The whole flow is best-effort: ack/typing/reaction failures are logged, not fatal.
     #[allow(clippy::too_many_arguments)]
     async fn handle_message(
         &self,
@@ -770,10 +802,16 @@ impl MatrixGateway {
         sent: &mut RecentIds,
     ) {
         let room = msg.room;
-        // 1. Acknowledge that we saw the message.
-        if let Err(e) = self.react(token, &room, &msg.event_id, "👀").await {
-            eprintln!("matrix: react in {room}: {e}");
-        }
+        // 1. Acknowledge that we saw the message with a transient 👀 reaction; we redact it and
+        //    replace it with a ✅/❌ outcome indicator once the turn resolves. Keep its event id so
+        //    we can retract it later.
+        let ack = match self.react(token, &room, &msg.event_id, "👀").await {
+            Ok(eid) => Some(eid),
+            Err(e) => {
+                eprintln!("matrix: react in {room}: {e}");
+                None
+            }
+        };
         // 2. Show "typing…" while we prepare a response.
         if let Err(e) = self.set_typing(token, &room, self_user, true).await {
             eprintln!("matrix: typing in {room}: {e}");
@@ -790,6 +828,8 @@ impl MatrixGateway {
             Err(e) => {
                 eprintln!("matrix: agent error in {room}: {e}");
                 let _ = self.set_typing(token, &room, self_user, false).await;
+                self.finish_reaction(token, &room, &msg.event_id, ack.as_deref(), false)
+                    .await;
                 return;
             }
         };
@@ -798,6 +838,7 @@ impl MatrixGateway {
         //    it completes (buffering the streamed argument JSON to extract a short target hint).
         let mut answer = String::new();
         let mut tool_args: HashMap<String, (String, String)> = HashMap::new();
+        let mut ok = true;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(Event::TextDelta(text)) => answer.push_str(&text),
@@ -826,6 +867,7 @@ impl MatrixGateway {
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("matrix: stream error in {room}: {e}");
+                    ok = false;
                     break;
                 }
             }
@@ -837,8 +879,36 @@ impl MatrixGateway {
         if !answer.is_empty() {
             match self.send_via(reply, token, &room, answer.to_string()).await {
                 Ok(eid) => sent.insert(eid),
-                Err(e) => eprintln!("matrix: send error in {room}: {e}"),
+                Err(e) => {
+                    eprintln!("matrix: send error in {room}: {e}");
+                    ok = false;
+                }
             }
+        }
+
+        // 5. Swap the 👀 ack for a ✅/❌ outcome indicator on the original message.
+        self.finish_reaction(token, &room, &msg.event_id, ack.as_deref(), ok)
+            .await;
+    }
+
+    /// Retract the transient 👀 ack (if it was sent) and react to the original message with a
+    /// success/failure indicator. Best-effort: each step is logged, never fatal.
+    async fn finish_reaction(
+        &self,
+        token: &str,
+        room: &str,
+        event_id: &str,
+        ack: Option<&str>,
+        ok: bool,
+    ) {
+        if let Some(ack) = ack {
+            if let Err(e) = self.redact(token, room, ack).await {
+                eprintln!("matrix: redact ack in {room}: {e}");
+            }
+        }
+        let emoji = if ok { "✅" } else { "❌" };
+        if let Err(e) = self.react(token, room, event_id, emoji).await {
+            eprintln!("matrix: outcome react in {room}: {e}");
         }
     }
 }

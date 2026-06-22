@@ -155,8 +155,9 @@ it answers everything; in a **group room** it engages only when you **@-mention 
 of its messages** (this is on top of any sender/room allowlist). When it does engage it gives live
 feedback: it **reacts 👀** to your message, shows a **typing** indicator while it works, and posts a
 short **notice for each tool call** as it runs them (e.g. `🔧 `read_file` · src/lib.rs`), so you can see
-what it's doing before the answer arrives. (These behaviours are Matrix-only; the Slack gateway answers
-`message`/`app_mention` as before.)
+what it's doing before the answer arrives. When the turn finishes it **replaces the 👀 with ✅** (success)
+or **❌** (the agent or the answer failed), so the reaction on your message tells you the outcome at a
+glance. (These behaviours are Matrix-only; the Slack gateway answers `message`/`app_mention` as before.)
 
 **Matrix encryption.** The Matrix gateway targets unencrypted rooms by default; build with
 `--features e2ee` (needs Rust ≥ 1.93) for Olm/Megolm end-to-end encryption via `matrix-sdk-crypto`.
