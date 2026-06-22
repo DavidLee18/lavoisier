@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::stream::StreamExt;
@@ -94,7 +94,13 @@ impl MatrixGateway {
             state_dir: None,
             crypto_passphrase: None,
             http: reqwest::Client::new(),
-            txn: AtomicU64::new(0),
+            // Seed the transaction counter from the process-start time (nanos since the epoch) so
+            // txn ids never reset to a value used by a prior run. Matrix dedupes sends by
+            // (device, txn id); a counter that restarted at 0 each boot could collide with an
+            // earlier event under the same device id and get silently dropped. The encrypted path
+            // sidesteps this with `ruma::TransactionId::new()`, but `ruma` is e2ee-only (and needs
+            // Rust ≥1.93), so the default build seeds the counter instead.
+            txn: AtomicU64::new(process_seed()),
             auto_join: true,
             allowed_users: None,
             allowed_rooms: None,
@@ -1366,6 +1372,16 @@ fn classify_status(status: reqwest::StatusCode, msg: String) -> GatewayError {
     } else {
         GatewayError::Bind(msg)
     }
+}
+
+/// Seed value for the per-process transaction counter: nanoseconds since the Unix epoch, so a
+/// fresh process starts well past any txn id a prior run could have emitted (the counter only ever
+/// increments). Falls back to 0 if the clock is somehow before the epoch.
+fn process_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 /// Percent-encode a path segment (room ids contain `!`, `:` and `@`).
