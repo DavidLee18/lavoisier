@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "lavoisier"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "clap",
  "futures",
@@ -1511,7 +1511,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-cron"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
