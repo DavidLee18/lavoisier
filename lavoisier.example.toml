@@ -40,6 +40,9 @@
 # serve_slack      = true        # Slack Socket Mode (needs SLACK_APP_TOKEN + SLACK_BOT_TOKEN)
 # api_keys         = ["key1", "key2"]
 # rate_limit       = 60          # requests per 60s window
+# Cron gateway (--cron / --cron-file): retry a failed fire (rejected submit or mid-turn stream error)
+# cron_retry_max   = 2           # global default max retries (0 = no retry); --cron-file job overrides
+# cron_retry_wait  = 60          # seconds between retries (fixed). env LVZ_CRON_RETRY_MAX/_WAIT win
 # Matrix gateway:
 # matrix_auto_join    = true     # auto-accept Matrix room invites (default true)
 # matrix_state_dir    = "./.lavoisier/matrix"  # persist session (token + device id) + E2EE crypto

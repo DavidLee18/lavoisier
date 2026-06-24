@@ -31,15 +31,26 @@ pub struct CronJob {
     pub session: String,
     /// The prompt submitted to the agent on each fire.
     pub prompt: String,
+    /// Max retries after a *failed* fire (submit error or mid-turn stream error), before giving up
+    /// and waiting for the next scheduled slot. `0` ⇒ no retry (single-shot, the prior behaviour).
+    pub retry_max: u32,
+    /// Seconds to wait between retries (fixed delay). Ignored when `retry_max == 0`.
+    pub retry_wait: u64,
 }
 
-/// JSON shape for a job in a `--cron-file` document: `{"schedule","session"?,"prompt"}`.
+/// JSON shape for a job in a `--cron-file` document:
+/// `{"schedule","session"?,"prompt","retry_max"?,"retry_wait"?}`. A per-job `retry_max`/`retry_wait`
+/// overrides the global default passed to [`CronJob::parse_file`].
 #[derive(Debug, Deserialize)]
 struct JobSpec {
     schedule: String,
     #[serde(default)]
     session: Option<String>,
     prompt: String,
+    #[serde(default)]
+    retry_max: Option<u32>,
+    #[serde(default)]
+    retry_wait: Option<u64>,
 }
 
 /// A failure building cron jobs from CLI/file input.
@@ -57,7 +68,7 @@ pub enum CronConfigError {
 }
 
 impl CronJob {
-    /// Build a job directly from parts.
+    /// Build a job directly from parts, with no retries (single-shot per fire).
     pub fn new(
         schedule: CronSchedule,
         session: impl Into<String>,
@@ -67,27 +78,50 @@ impl CronJob {
             schedule,
             session: session.into(),
             prompt: prompt.into(),
+            retry_max: 0,
+            retry_wait: 0,
         }
+    }
+
+    /// Set the retry policy (max retries after a failed fire + fixed wait, in seconds) for this job.
+    pub fn with_retries(mut self, retry_max: u32, retry_wait: u64) -> Self {
+        self.retry_max = retry_max;
+        self.retry_wait = retry_wait;
+        self
     }
 
     /// Parse a quick CLI spec: the first **five** whitespace-separated tokens are the cron
     /// schedule, the remainder is the prompt. `index` seeds the default session id
-    /// (`cron-<index>`) so multiple `--cron` flags don't share memory by accident.
+    /// (`cron-<index>`) so multiple `--cron` flags don't share memory by accident. `retry_max`/
+    /// `retry_wait` are the global retry defaults (a quick spec carries no inline retry policy).
     ///
     /// Example: `"*/30 * * * * summarise new issues and post a digest"`.
-    pub fn parse_cli(spec: &str, index: usize) -> Result<Self, CronConfigError> {
+    pub fn parse_cli(
+        spec: &str,
+        index: usize,
+        retry_max: u32,
+        retry_wait: u64,
+    ) -> Result<Self, CronConfigError> {
         let toks: Vec<&str> = spec.split_whitespace().collect();
         if toks.len() < 6 {
             return Err(CronConfigError::MissingPrompt(spec.to_string()));
         }
         let schedule = CronSchedule::parse(&toks[..5].join(" "))?;
         let prompt = toks[5..].join(" ");
-        Ok(Self::new(schedule, format!("cron-{index}"), prompt))
+        Ok(
+            Self::new(schedule, format!("cron-{index}"), prompt)
+                .with_retries(retry_max, retry_wait),
+        )
     }
 
-    /// Parse a `--cron-file` JSON document: an array of `{schedule, session?, prompt}`.
-    /// A missing `session` defaults to `cron-<index>`.
-    pub fn parse_file(json: &str) -> Result<Vec<Self>, CronConfigError> {
+    /// Parse a `--cron-file` JSON document: an array of
+    /// `{schedule, session?, prompt, retry_max?, retry_wait?}`. A missing `session` defaults to
+    /// `cron-<index>`; a missing `retry_max`/`retry_wait` falls back to the global default args.
+    pub fn parse_file(
+        json: &str,
+        retry_max: u32,
+        retry_wait: u64,
+    ) -> Result<Vec<Self>, CronConfigError> {
         let specs: Vec<JobSpec> =
             serde_json::from_str(json).map_err(|e| CronConfigError::Json(e.to_string()))?;
         specs
@@ -98,6 +132,10 @@ impl CronJob {
                     CronSchedule::parse(&s.schedule)?,
                     s.session.unwrap_or_else(|| format!("cron-{i}")),
                     s.prompt,
+                )
+                .with_retries(
+                    s.retry_max.unwrap_or(retry_max),
+                    s.retry_wait.unwrap_or(retry_wait),
                 ))
             })
             .collect()
@@ -157,8 +195,12 @@ impl Gateway for CronGateway {
     }
 }
 
-/// Loop a single job: wait for its next fire, run a turn, log the result, repeat. Returns when
-/// the schedule has no further fire (so an impossible schedule disables just that job).
+/// Loop a single job: wait for its next fire, run a turn (with retries on failure), log the
+/// result, repeat. Returns when the schedule has no further fire (so an impossible schedule
+/// disables just that job).
+///
+/// The next scheduled slot is always recomputed from "now" *after* any retries finish, so a
+/// retry's wait can never bleed into — or double-fire against — the following slot.
 async fn run_job(job: &CronJob, agent: Arc<dyn AgentHandle>) {
     loop {
         let now = now_unix();
@@ -167,12 +209,39 @@ async fn run_job(job: &CronJob, agent: Arc<dyn AgentHandle>) {
         };
         let wait = next.saturating_sub(now);
         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-        fire(job, &agent).await;
+
+        // Fire, then retry up to `retry_max` times on failure with a fixed `retry_wait`.
+        let mut attempt = 0u32;
+        loop {
+            if fire(job, &agent).await {
+                break;
+            }
+            if attempt >= job.retry_max {
+                if job.retry_max > 0 {
+                    eprintln!(
+                        "lavoisier[cron]: session={:?} gave up after {} retr{}",
+                        job.session,
+                        job.retry_max,
+                        if job.retry_max == 1 { "y" } else { "ies" }
+                    );
+                }
+                break;
+            }
+            attempt += 1;
+            eprintln!(
+                "lavoisier[cron]: session={:?} retry {attempt}/{} in {}s",
+                job.session, job.retry_max, job.retry_wait
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(job.retry_wait)).await;
+        }
     }
 }
 
-/// Run one turn for `job` and log the assistant's final text + token usage.
-async fn fire(job: &CronJob, agent: &Arc<dyn AgentHandle>) {
+/// Run one turn for `job` and log the assistant's final text + token usage. Returns `true` on a
+/// clean turn, `false` on a failure worth retrying (the submit was rejected, or the event stream
+/// errored mid-turn) — a completed turn is a success even if its answer is unsatisfying, since
+/// that's semantic and not knowable here.
+async fn fire(job: &CronJob, agent: &Arc<dyn AgentHandle>) -> bool {
     let turn = TurnRequest::new(job.session.clone(), job.prompt.clone());
     let mut stream = match agent.submit(turn).await {
         Ok(s) => s,
@@ -181,7 +250,7 @@ async fn fire(job: &CronJob, agent: &Arc<dyn AgentHandle>) {
                 "lavoisier[cron]: session={:?} submit failed: {e}",
                 job.session
             );
-            return;
+            return false;
         }
     };
 
@@ -190,6 +259,7 @@ async fn fire(job: &CronJob, agent: &Arc<dyn AgentHandle>) {
     // Track tool activity so the operator can see the job actually *did* work (ran tools), not
     // just produced text — cron turns drive the same tool-using agent loop as every other gateway.
     let mut tools: Vec<String> = Vec::new();
+    let mut ok = true;
     while let Some(item) = stream.next().await {
         match item {
             Ok(Event::TextDelta(t)) => answer.push_str(&t),
@@ -202,6 +272,7 @@ async fn fire(job: &CronJob, agent: &Arc<dyn AgentHandle>) {
                     "lavoisier[cron]: session={:?} stream error: {e}",
                     job.session
                 );
+                ok = false;
                 break;
             }
         }
@@ -225,6 +296,7 @@ async fn fire(job: &CronJob, agent: &Arc<dyn AgentHandle>) {
         job.session,
         answer.trim()
     );
+    ok
 }
 
 fn now_unix() -> u64 {
@@ -240,7 +312,8 @@ mod tests {
 
     #[test]
     fn parse_cli_splits_schedule_from_prompt() {
-        let j = CronJob::parse_cli("*/30 9-17 * * 1-5 check CI and report failures", 2).unwrap();
+        let j =
+            CronJob::parse_cli("*/30 9-17 * * 1-5 check CI and report failures", 2, 0, 0).unwrap();
         assert_eq!(j.session, "cron-2");
         assert_eq!(j.prompt, "check CI and report failures");
     }
@@ -248,14 +321,21 @@ mod tests {
     #[test]
     fn parse_cli_requires_a_prompt() {
         assert!(matches!(
-            CronJob::parse_cli("* * * * *", 0),
+            CronJob::parse_cli("* * * * *", 0, 0, 0),
             Err(CronConfigError::MissingPrompt(_))
         ));
     }
 
     #[test]
     fn parse_cli_rejects_bad_schedule() {
-        assert!(CronJob::parse_cli("99 * * * * do a thing", 0).is_err());
+        assert!(CronJob::parse_cli("99 * * * * do a thing", 0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn parse_cli_applies_global_retry_defaults() {
+        let j = CronJob::parse_cli("* * * * * ping", 0, 3, 30).unwrap();
+        assert_eq!(j.retry_max, 3);
+        assert_eq!(j.retry_wait, 30);
     }
 
     #[test]
@@ -264,7 +344,7 @@ mod tests {
             {"schedule": "0 9 * * *", "session": "digest", "prompt": "morning digest"},
             {"schedule": "*/15 * * * *", "prompt": "poll the queue"}
         ]"#;
-        let jobs = CronJob::parse_file(json).unwrap();
+        let jobs = CronJob::parse_file(json, 0, 0).unwrap();
         assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[0].session, "digest");
         assert_eq!(jobs[1].session, "cron-1"); // defaulted
@@ -272,9 +352,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_file_retry_per_job_overrides_global_default() {
+        let json = r#"[
+            {"schedule": "0 9 * * *", "prompt": "uses defaults"},
+            {"schedule": "0 9 * * *", "prompt": "overrides", "retry_max": 5, "retry_wait": 120}
+        ]"#;
+        let jobs = CronJob::parse_file(json, 2, 60).unwrap();
+        // Job 0 inherits the global defaults; job 1 overrides both.
+        assert_eq!((jobs[0].retry_max, jobs[0].retry_wait), (2, 60));
+        assert_eq!((jobs[1].retry_max, jobs[1].retry_wait), (5, 120));
+    }
+
+    #[test]
     fn parse_file_surfaces_bad_schedule() {
         let json = r#"[{"schedule": "bad", "prompt": "x"}]"#;
-        assert!(CronJob::parse_file(json).is_err());
+        assert!(CronJob::parse_file(json, 0, 0).is_err());
     }
 
     #[test]

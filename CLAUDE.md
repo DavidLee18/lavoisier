@@ -23,7 +23,13 @@ The **cron gateway** (`lvz-gw-cron`, `--cron`/`--cron-file`) is an in-process sc
 `Gateway`: it fires `TurnRequest`s on a hand-rolled UTC cron schedule (no `chrono`/`cron` dep) into
 the shared agent. It composes with `--serve`/`--serve-matrix` (all gateways run concurrently over one
 agent, via `futures::join_all` over each `Gateway::serve`). Every gateway drives the full tool-using
-loop, so cron jobs run tools. Each job keeps a fixed session, so it accrues memory across fires.
+loop, so cron jobs run tools. Each job keeps a fixed session, so it accrues memory across fires. A
+**failed fire is retryable** (a rejected `submit` or a mid-turn stream error — a *completed* turn is a
+success even if its answer is weak, since that's semantic): `fire` returns a success bool and `run_job`
+retries up to `retry_max` times with a fixed `retry_wait`, then waits for the next slot. Global defaults
+come from `--cron-retry-max`/`--cron-retry-wait` (env `LVZ_CRON_RETRY_*`, or `[gateway]
+cron_retry_max`/`cron_retry_wait`); a `--cron-file` job may override either per-job. The next scheduled
+slot is recomputed from "now" *after* retries finish, so a retry's wait never double-fires the next slot.
 
 The **Matrix gateway auto-accepts room invites** by default (`rooms.invite` → `/join`, deduped across
 syncs); disable with `--matrix-no-auto-join` or `[gateway] matrix_auto_join = false`. E2EE is

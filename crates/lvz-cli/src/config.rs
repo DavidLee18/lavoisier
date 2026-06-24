@@ -106,6 +106,13 @@ pub struct GatewaySection {
     /// Only answer these Slack user ids; empty/unset ⇒ answer everyone. The `SLACK_ALLOWED_USERS`
     /// env var (comma-separated) takes precedence.
     pub slack_allowed_users: Option<Vec<String>>,
+    /// Default max retries after a failed cron fire before waiting for the next slot (`0` ⇒ no
+    /// retry). A per-job `retry_max` in `--cron-file` overrides this. `--cron-retry-max` /
+    /// `LVZ_CRON_RETRY_MAX` take precedence.
+    pub cron_retry_max: Option<u32>,
+    /// Seconds to wait between cron retries. A per-job `retry_wait` in `--cron-file` overrides this.
+    /// `--cron-retry-wait` / `LVZ_CRON_RETRY_WAIT` take precedence.
+    pub cron_retry_wait: Option<u64>,
 }
 
 impl Config {
@@ -165,6 +172,8 @@ impl Config {
         cli.serve_matrix |= self.gateway.serve_matrix.unwrap_or(false);
         cli.serve_slack |= self.gateway.serve_slack.unwrap_or(false);
         merge_copy(&mut cli.rate_limit, self.gateway.rate_limit);
+        merge_copy(&mut cli.cron_retry_max, self.gateway.cron_retry_max);
+        merge_copy(&mut cli.cron_retry_wait, self.gateway.cron_retry_wait);
         if cli.api_key.is_empty() {
             if let Some(keys) = &self.gateway.api_keys {
                 cli.api_key = keys.clone();

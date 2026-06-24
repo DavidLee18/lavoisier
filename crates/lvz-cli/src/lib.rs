@@ -219,9 +219,25 @@ struct Cli {
     cron: Vec<String>,
 
     /// Schedule recurring turns from a JSON file: an array of
-    /// `{"schedule","session"?,"prompt"}` objects (UTC cron). Merged with any `--cron` flags.
+    /// `{"schedule","session"?,"prompt","retry_max"?,"retry_wait"?}` objects (UTC cron). Merged
+    /// with any `--cron` flags. Per-job `retry_max`/`retry_wait` override the global defaults below.
     #[arg(long = "cron-file", value_name = "PATH")]
     cron_file: Option<PathBuf>,
+
+    /// Default max retries after a *failed* cron fire (a rejected submit or a mid-turn stream
+    /// error) before giving up and waiting for the next scheduled slot. `0` (default) ⇒ no retry.
+    /// A per-job `retry_max` in `--cron-file` overrides this. Also `[gateway] cron_retry_max`.
+    #[arg(long = "cron-retry-max", value_name = "N", env = "LVZ_CRON_RETRY_MAX")]
+    cron_retry_max: Option<u32>,
+
+    /// Seconds to wait between cron retries (fixed delay). A per-job `retry_wait` in `--cron-file`
+    /// overrides this. Also settable via `[gateway] cron_retry_wait`.
+    #[arg(
+        long = "cron-retry-wait",
+        value_name = "SECS",
+        env = "LVZ_CRON_RETRY_WAIT"
+    )]
+    cron_retry_wait: Option<u64>,
 
     /// Enable adaptive token optimisation (ATO, experimental): an online tuner that learns
     /// per-archetype knob settings from realised outcomes (most useful in a long-running
@@ -597,15 +613,17 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
 /// Collect cron jobs from `--cron-file` (parsed first) then any `--cron` quick specs. CLI
 /// specs are indexed after the file jobs so their default `cron-<n>` sessions don't collide.
 fn build_cron_jobs(cli: &Cli) -> Result<Vec<CronJob>, Box<dyn std::error::Error>> {
+    let retry_max = cli.cron_retry_max.unwrap_or(0);
+    let retry_wait = cli.cron_retry_wait.unwrap_or(0);
     let mut jobs = Vec::new();
     if let Some(path) = &cli.cron_file {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("reading {}: {e}", path.display()))?;
-        jobs.extend(CronJob::parse_file(&text)?);
+        jobs.extend(CronJob::parse_file(&text, retry_max, retry_wait)?);
     }
     let base = jobs.len();
     for (i, spec) in cli.cron.iter().enumerate() {
-        jobs.push(CronJob::parse_cli(spec, base + i)?);
+        jobs.push(CronJob::parse_cli(spec, base + i, retry_max, retry_wait)?);
     }
     Ok(jobs)
 }

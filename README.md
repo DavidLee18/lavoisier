@@ -88,7 +88,10 @@ Gateways compose: `--serve`, `--serve-matrix`, `--serve-slack`, and `--cron`/`--
 answer HTTP/Matrix/Slack requests *and* fire scheduled jobs. Every gateway — cron included — drives
 the full tool-using agent loop, so scheduled jobs can read, edit, and run commands just like an
 interactive turn. Each cron job keeps a fixed session, so it accrues memory across fires (like the
-Matrix per-room / Slack per-channel sessions).
+Matrix per-room / Slack per-channel sessions). A failed fire (a rejected submit or a mid-turn stream
+error) can be **retried**: `--cron-retry-max N` + `--cron-retry-wait SECS` set global defaults, and a
+`--cron-file` job may override either per-job (`"retry_max"`/`"retry_wait"`); the next scheduled slot
+is recomputed only after retries finish, so a retry never double-fires the following slot.
 
 **Persona / priorities.** Point `--persona <PATH>` at a file (or drop a `PERSONA.md` in the working
 dir) to give a long-running gateway a stable identity and standing instructions: it's layered above
@@ -205,7 +208,8 @@ api_keys = ["secret"]
 `--agent` (tool loop) · `--serve <host:port>` (HTTP/WS gateway) · `--serve-matrix` (Matrix) ·
 `--serve-slack` (Slack Socket Mode) · `--matrix-no-auto-join` (don't auto-accept Matrix invites) ·
 `--cron "<min hour dom month dow> <prompt>"` (in-process scheduler, UTC; repeatable) ·
-`--cron-file <path>` (JSON jobs: `[{"schedule","session"?,"prompt"}]`) ·
+`--cron-file <path>` (JSON jobs: `[{"schedule","session"?,"prompt","retry_max"?,"retry_wait"?}]`) ·
+`--cron-retry-max <N>` / `--cron-retry-wait <SECS>` (retry a failed cron fire; per-job overridable) ·
 `--provider xai|anthropic|google|claude-cli` · `--model` · `--max-tokens` · `--system` ·
 `--persona <PATH>` (persistent persona/priorities layered above the system prompt; defaults to
 `./PERSONA.md` if present, `--no-persona` to disable) ·
