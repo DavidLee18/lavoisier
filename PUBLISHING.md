@@ -49,6 +49,13 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
+(`v0.6.6`): `lvz-gw-cron` (**0.3.0** — cron fires now **retry on failure** (a rejected submit or a
+mid-turn stream error) up to `retry_max` times with a fixed `retry_wait`; `parse_cli`/`parse_file`
+gained retry-default params, a **breaking** public-API change ⇒ a **minor** bump, not a patch) and
+`lavoisier` (0.6.6 — `--cron-retry-max`/`--cron-retry-wait` + `[gateway]` keys, and republish so the
+tagged binary picks up the new `lvz-gw-cron`). Publish order `lvz-gw-cron` → `lavoisier`; the workspace
+pin moved to `0.3.0` so `lavoisier` resolves the new minor. The other thirteen crates stay put.
+Earlier changed set
 (`v0.6.5`): `lvz-gw-matrix` (0.3.6 — the unencrypted-send **transaction counter is seeded from a
 per-process timestamp** (`process_seed`, nanos since epoch) instead of restarting at 0 each boot, so
 txn ids never collide with a prior run's and get silently deduped by the homeserver) and `lavoisier`
