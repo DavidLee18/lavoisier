@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="lavoisier-logo.png" alt="Lavoisier" width="200">
+</p>
+
 # Lavoisier
 
 A modular, **token-efficient** CLI coding agent in Rust with a provider-agnostic core
