@@ -124,6 +124,21 @@ countdown or a give-up notice. Reports are **addressable**: the bot registers `s
 (global `--schedule-retry-max`/`--schedule-retry-wait`, per-job overridable, next slot recomputed
 once the chain resolves); job state is in-memory, so history resets on restart.
 
+A room is a bad log, so the chat report is only ever a summary — the **full account goes to stderr**
+on every fire: untruncated output, duration, attempt, tools used, and (for prompt jobs) token usage.
+
+```
+lavoisier[schedule]: greet fired ok in 5ms (attempt 1) tools=[shell]
+--- output (53 bytes) ---
+exit=0
+--- stdout ---
+scheduled-hello
+
+lavoisier[schedule]: build FAILED in 8123ms (attempt 2/3) tools=[shell, read_file] usage=[in 4210 / out 388 / cache_read 2048]
+--- error ---
+stream error: provider error: 503 upstream unavailable
+```
+
 **Persona / priorities.** Point `--persona <PATH>` at a file (or drop a `PERSONA.md` in the working
 dir) to give a long-running gateway a stable identity and standing instructions: it's layered above
 the operating system-prompt and rides in the cached prefix, so it costs almost nothing per turn.

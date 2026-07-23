@@ -321,7 +321,7 @@ mod tests {
     async fn status_reports_detail_and_history() {
         let reg = registry();
         let job = reg.jobs()[0].clone();
-        reg.record(&job, Ok("Filesystem 42% used".into()));
+        reg.record(&job, &Ok("Filesystem 42% used".into()));
         let out = ScheduleStatusTool::new(reg)
             .invoke(json!({"id": "disk"}))
             .await

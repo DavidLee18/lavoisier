@@ -46,7 +46,11 @@ not commands — `schedule_list`/`schedule_status`/`schedule_run` are registered
 (like the shutdown notice — a scheduled fire has no inbound event to infer modality from) and their
 event ids go into `RecentIds`, so **replying to a report re-engages the bot** via the existing
 reply gate. `build_tool_registry` in `lvz-cli` is the composition root: the *same* registry goes to
-the agent and to the gateway's scheduler. Job state is in-memory (history resets on restart).
+the agent and to the gateway's scheduler. Job state is in-memory (history resets on restart). The
+room report is a *summary* (600-char cap); the **full account goes to stderr** per fire via
+`log_verbose` — untruncated output, duration, attempt, tools used, and token usage (kept even when a
+turn dies mid-stream, since it still cost tokens). That lives in `lvz-schedule`, not the gateway, so
+every frontend gets the same operator log.
 
 The **Matrix gateway auto-accepts room invites** by default (`rooms.invite` → `/join`, deduped across
 syncs); disable with `--matrix-no-auto-join` or `[gateway] matrix_auto_join = false`. E2EE is

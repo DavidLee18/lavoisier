@@ -53,6 +53,7 @@ async fn scheduled_tool_job_runs_a_real_shell_command() {
     assert!(report.ok, "expected success, got: {}", report.body);
     assert!(report.body.starts_with("✅ `greet`"));
     assert!(report.body.contains("scheduled-hello"));
+    assert_eq!(report.attempt, 1);
 
     let state = reg.state_of("greet").unwrap();
     assert_eq!((state.runs, state.failures), (1, 0));

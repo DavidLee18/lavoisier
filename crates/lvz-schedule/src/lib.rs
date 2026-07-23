@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
-use lvz_protocol::{AgentHandle, Event, TurnRequest};
+use lvz_protocol::{AgentHandle, Event, TurnRequest, Usage};
 use lvz_tools::ToolRegistry;
 use serde::Deserialize;
 use tokio::sync::Notify;
@@ -211,6 +211,19 @@ pub struct FireReport {
     pub room: Option<String>,
     pub ok: bool,
     pub body: String,
+    /// Which attempt in the current chain this was (1 = first try).
+    pub attempt: u32,
+}
+
+/// One action's raw result, before it is summarised for a room.
+///
+/// Carries the **untruncated** output and (for a prompt job) the turn's token usage, so the
+/// operator log can record what the chat summary necessarily drops.
+struct ActionOutcome {
+    result: Result<String, String>,
+    usage: Option<Usage>,
+    /// Tools the agent called, for a prompt job.
+    tools_used: Vec<String>,
 }
 
 /// The jobs, their live state, and the wait/fire loop. Shared as an `Arc` between the gateway
@@ -330,6 +343,10 @@ impl ScheduleRegistry {
 
     /// Run job `idx` once, record the outcome, schedule any retry, and return the report to
     /// deliver. `None` if `idx` is out of range.
+    ///
+    /// Also writes the **verbose** account of the fire to stderr — full untruncated output,
+    /// duration, and token usage. The room only ever sees a summary, so the operator log is the
+    /// one place the whole picture exists.
     pub async fn fire(
         &self,
         idx: usize,
@@ -337,16 +354,20 @@ impl ScheduleRegistry {
         agent: &Arc<dyn AgentHandle>,
     ) -> Option<FireReport> {
         let job = self.jobs.get(idx)?.clone();
-        let result = run_action(&job, tools, agent).await;
-        Some(self.record(&job, result))
+        let started = std::time::Instant::now();
+        let outcome = run_action(&job, tools, agent).await;
+        let elapsed = started.elapsed();
+        let report = self.record(&job, &outcome.result);
+        log_verbose(&job, &outcome, &report, elapsed);
+        Some(report)
     }
 
     /// Fold one attempt's result into the job's state and build its report.
-    fn record(&self, job: &ScheduleJob, result: Result<String, String>) -> FireReport {
+    fn record(&self, job: &ScheduleJob, result: &Result<String, String>) -> FireReport {
         let now = now_unix();
         let ok = result.is_ok();
         let detail = truncate(
-            match &result {
+            match result {
                 Ok(s) => s,
                 Err(e) => e,
             },
@@ -402,6 +423,7 @@ impl ScheduleRegistry {
             room: job.room.clone(),
             ok,
             body: report_body(job, ok, &detail, attempt, retry_in, gave_up),
+            attempt,
         }
     }
 }
@@ -417,27 +439,47 @@ async fn run_action(
     job: &ScheduleJob,
     tools: &ToolRegistry,
     agent: &Arc<dyn AgentHandle>,
-) -> Result<String, String> {
+) -> ActionOutcome {
     match &job.action {
-        Action::Tool { name, args } => match tools.invoke(name, args.clone()).await {
-            Err(e) => Err(format!("tool `{name}` failed: {e}")),
-            Ok(out) if out.is_error => Err(format!("tool `{name}` reported: {}", out.content)),
-            Ok(out) => Ok(out.content),
-        },
+        Action::Tool { name, args } => {
+            let result = match tools.invoke(name, args.clone()).await {
+                Err(e) => Err(format!("tool `{name}` failed: {e}")),
+                Ok(out) if out.is_error => Err(format!("tool `{name}` reported: {}", out.content)),
+                Ok(out) => Ok(out.content),
+            };
+            ActionOutcome {
+                result,
+                // A direct tool call never reaches a provider, so there is nothing to bill.
+                usage: None,
+                tools_used: vec![name.clone()],
+            }
+        }
         Action::Prompt { text } => {
             let turn = TurnRequest::new(job.session.clone(), text.clone());
-            let mut stream = agent
-                .submit(turn)
-                .await
-                .map_err(|e| format!("submit failed: {e}"))?;
+            let mut stream = match agent.submit(turn).await {
+                Ok(s) => s,
+                Err(e) => {
+                    return ActionOutcome {
+                        result: Err(format!("submit failed: {e}")),
+                        usage: None,
+                        tools_used: Vec::new(),
+                    }
+                }
+            };
             let mut answer = String::new();
             let mut used: Vec<String> = Vec::new();
+            let mut usage = None;
+            let mut failed = None;
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(Event::TextDelta(t)) => answer.push_str(&t),
                     Ok(Event::ToolUseStart { name, .. }) => used.push(name),
+                    Ok(Event::Usage(u)) => usage = Some(u),
                     Ok(_) => {}
-                    Err(e) => return Err(format!("stream error: {e}")),
+                    Err(e) => {
+                        failed = Some(format!("stream error: {e}"));
+                        break;
+                    }
                 }
             }
             let tools_note = if used.is_empty() {
@@ -445,7 +487,71 @@ async fn run_action(
             } else {
                 format!(" [tools: {}]", used.join(", "))
             };
-            Ok(format!("{}{tools_note}", answer.trim()))
+            ActionOutcome {
+                // Usage is kept even on a mid-turn failure — a turn that died still cost tokens,
+                // and the operator log is where that has to be visible.
+                result: match failed {
+                    Some(e) => Err(e),
+                    None => Ok(format!("{}{tools_note}", answer.trim())),
+                },
+                usage,
+                tools_used: used,
+            }
+        }
+    }
+}
+
+/// Write the full account of one fire to stderr.
+///
+/// The Matrix report is deliberately short — a room is a bad log — so this is the only place the
+/// untruncated output, the timing, and the token cost all land. Kept in this crate (rather than the
+/// gateway) so every frontend gets the same operator log for free.
+fn log_verbose(
+    job: &ScheduleJob,
+    outcome: &ActionOutcome,
+    report: &FireReport,
+    elapsed: std::time::Duration,
+) {
+    let ms = elapsed.as_millis();
+    let tools_note = if outcome.tools_used.is_empty() {
+        String::new()
+    } else {
+        format!(" tools=[{}]", outcome.tools_used.join(", "))
+    };
+    let usage_note = outcome
+        .usage
+        .as_ref()
+        .map(|u| {
+            format!(
+                " usage=[in {} / out {} / cache_read {}]",
+                u.input_tokens, u.output_tokens, u.cache_read_tokens
+            )
+        })
+        .unwrap_or_default();
+
+    match &outcome.result {
+        Ok(output) => {
+            eprintln!(
+                "lavoisier[schedule]: {} fired ok in {ms}ms (attempt {}){tools_note}{usage_note}",
+                job.id, report.attempt
+            );
+            let output = output.trim();
+            if output.is_empty() {
+                eprintln!("--- no output ---");
+            } else {
+                eprintln!("--- output ({} bytes) ---", output.len());
+                eprintln!("{output}");
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "lavoisier[schedule]: {} FAILED in {ms}ms (attempt {}/{}){tools_note}{usage_note}",
+                job.id,
+                report.attempt,
+                job.retry_max + 1
+            );
+            eprintln!("--- error ---");
+            eprintln!("{}", error.trim());
         }
     }
 }
@@ -642,7 +748,7 @@ mod tests {
     #[test]
     fn success_records_history_and_rearms() {
         let reg = ScheduleRegistry::new(vec![tool_job("a")]);
-        let report = reg.record(&reg.jobs[0].clone(), Ok("all good".into()));
+        let report = reg.record(&reg.jobs[0].clone(), &Ok("all good".into()));
         assert!(report.ok);
         assert!(report.body.starts_with("✅ `a`"));
         assert!(report.body.contains("all good"));
@@ -659,7 +765,7 @@ mod tests {
     #[test]
     fn failure_without_retries_gives_up_immediately() {
         let reg = ScheduleRegistry::new(vec![tool_job("a")]);
-        let report = reg.record(&reg.jobs[0].clone(), Err("boom".into()));
+        let report = reg.record(&reg.jobs[0].clone(), &Err("boom".into()));
         assert!(!report.ok);
         assert!(report.body.starts_with("❌ `a` failed (attempt 1)"));
         assert!(report.body.contains("boom"));
@@ -681,7 +787,7 @@ mod tests {
         let j = reg.jobs[0].clone();
 
         // Attempt 1 fails → retry 1/2 queued, cron slot suppressed so it can't race the retry.
-        let r1 = reg.record(&j, Err("boom".into()));
+        let r1 = reg.record(&j, &Err("boom".into()));
         assert!(r1.body.contains("↻ retry 1/2 in 30s"));
         let s = reg.state_of("a").unwrap();
         assert!(s.retry_at.is_some());
@@ -689,12 +795,12 @@ mod tests {
         assert_eq!(s.attempt, 1);
 
         // Attempt 2 fails → retry 2/2 queued.
-        let r2 = reg.record(&j, Err("boom".into()));
+        let r2 = reg.record(&j, &Err("boom".into()));
         assert!(r2.body.contains("↻ retry 2/2 in 30s"));
         assert_eq!(reg.state_of("a").unwrap().attempt, 2);
 
         // Attempt 3 exhausts the budget → give up and re-arm the cron slot from now.
-        let r3 = reg.record(&j, Err("boom".into()));
+        let r3 = reg.record(&j, &Err("boom".into()));
         assert!(r3.body.contains("⛔ gave up after 2 retries"));
         let s = reg.state_of("a").unwrap();
         assert!(s.retry_at.is_none());
@@ -710,8 +816,8 @@ mod tests {
         j.retry_wait = 5;
         let reg = ScheduleRegistry::new(vec![j]);
         let j = reg.jobs[0].clone();
-        reg.record(&j, Err("boom".into()));
-        let ok = reg.record(&j, Ok("recovered".into()));
+        reg.record(&j, &Err("boom".into()));
+        let ok = reg.record(&j, &Ok("recovered".into()));
         assert!(ok.ok);
         assert!(ok.body.contains("after 2 attempts"));
         let s = reg.state_of("a").unwrap();
@@ -725,7 +831,7 @@ mod tests {
         let reg = ScheduleRegistry::new(vec![tool_job("a")]);
         let j = reg.jobs[0].clone();
         for _ in 0..(HISTORY_CAP + 5) {
-            reg.record(&j, Ok("x".into()));
+            reg.record(&j, &Ok("x".into()));
         }
         assert_eq!(reg.state_of("a").unwrap().history.len(), HISTORY_CAP);
     }
@@ -735,14 +841,14 @@ mod tests {
         let mut j = tool_job("a");
         j.room = Some("!ops:hs".into());
         let reg = ScheduleRegistry::new(vec![j]);
-        let report = reg.record(&reg.jobs[0].clone(), Ok("x".into()));
+        let report = reg.record(&reg.jobs[0].clone(), &Ok("x".into()));
         assert_eq!(report.room.as_deref(), Some("!ops:hs"));
     }
 
     #[test]
     fn long_output_is_truncated() {
         let reg = ScheduleRegistry::new(vec![tool_job("a")]);
-        let report = reg.record(&reg.jobs[0].clone(), Ok("x".repeat(5_000)));
+        let report = reg.record(&reg.jobs[0].clone(), &Ok("x".repeat(5_000)));
         assert!(report.body.contains("[truncated]"));
         assert!(report.body.chars().count() < DETAIL_CAP + 100);
     }
