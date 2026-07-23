@@ -9,9 +9,8 @@
 //! Like the other `lvz-gw-*` crates it depends only on [`lvz_protocol`]; the agent core stays
 //! unaware that a scheduler is driving it. Each job keeps a fixed `session`, so [`lvz-memory`]
 //! gives a job continuity across fires (the same way the Matrix gateway keys a session per
-//! room). The cron engine itself is in [`cron`].
-
-mod cron;
+//! room). The cron engine itself lives in [`lvz_schedule`] and is re-exported here unchanged —
+//! the same parser backs both this gateway and the Matrix `schedule` feature.
 
 use std::sync::Arc;
 
@@ -20,7 +19,7 @@ use futures::stream::StreamExt;
 use lvz_protocol::{AgentHandle, Event, Gateway, GatewayError, TurnRequest};
 use serde::Deserialize;
 
-pub use cron::{CronError, CronSchedule};
+pub use lvz_schedule::{CronError, CronSchedule};
 
 /// One scheduled task: when to fire, which session to run it under, and the prompt to submit.
 #[derive(Debug, Clone)]

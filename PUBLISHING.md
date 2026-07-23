@@ -1,6 +1,6 @@
 # Publishing to crates.io + cargo-binstall
 
-`lavoisier` is a Cargo workspace, so the binary crate (`lavoisier`) and its 13 library crates
+`lavoisier` is a Cargo workspace, so the binary crate (`lavoisier`) and its 14 library crates
 (`lvz-*`) are published to crates.io **in dependency order**. End users then install a prebuilt
 binary with `cargo binstall lavoisier` (no Rust toolchain or `protoc` needed) or build from source
 with `cargo install lavoisier` (needs `protoc`).
@@ -20,7 +20,7 @@ Each crate must already be on crates.io before the crates that depend on it. Dry
 
 ```sh
 for c in lvz-protocol lvz-context lvz-anthropic lvz-google lvz-xai lvz-claude-cli \
-         lvz-tune lvz-gw-http lvz-gw-matrix lvz-gw-cron lvz-gw-slack lvz-tools lvz-agent lvz-memory lavoisier; do
+         lvz-tune lvz-tools lvz-schedule lvz-gw-http lvz-gw-matrix lvz-gw-cron lvz-gw-slack lvz-agent lvz-memory lavoisier; do
   cargo publish -p "$c" --dry-run || break
 done
 ```
@@ -34,7 +34,7 @@ Then publish for real, **in this order**. Two limits to know:
 
 ```sh
 for c in lvz-protocol lvz-context lvz-anthropic lvz-google lvz-xai lvz-claude-cli \
-         lvz-tune lvz-gw-http lvz-gw-matrix lvz-gw-cron lvz-gw-slack lvz-tools lvz-agent lvz-memory lavoisier; do
+         lvz-tune lvz-tools lvz-schedule lvz-gw-http lvz-gw-matrix lvz-gw-cron lvz-gw-slack lvz-agent lvz-memory lavoisier; do
   until out=$(cargo publish -p "$c" 2>&1); do
     echo "$out" | grep -qiE '429|Too Many Requests' || { echo "$out" | tail; echo "HARD FAIL: $c"; exit 1; }
     echo "rate-limited on $c — sleeping 11m…"; sleep 660
@@ -49,6 +49,17 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
+(`v0.7.0`): the **Matrix `schedule`** feature. `lvz-schedule` (**0.1.0 — new crate**, claim the name:
+the UTC cron engine moved out of `lvz-gw-cron`, plus the job/action model, the live job registry, and
+the `schedule_*` tools), `lvz-gw-cron` (0.3.1 — `mod cron` moved to `lvz-schedule` and re-exported;
+**public API identical**, so a patch), `lvz-gw-matrix` (**0.4.0** — new `with_schedule`/
+`with_schedule_room` builders and the in-loop scheduler; additive, but a feature ⇒ minor) and
+`lavoisier` (**0.7.0** — `--schedule-file`/`--schedule-room`/`--schedule-retry-*`, the `[gateway]`
+keys, and the `build_tool_registry` extraction so the agent and scheduler share one registry).
+Publish order `lvz-schedule` → `lvz-gw-matrix` → `lvz-gw-cron` → `lavoisier` (note `lvz-schedule`
+depends on `lvz-tools`, so it must follow it in the full-workspace order above). The other eleven
+crates stay put.
+Earlier changed set
 (`v0.6.6`): `lvz-gw-cron` (**0.3.0** — cron fires now **retry on failure** (a rejected submit or a
 mid-turn stream error) up to `retry_max` times with a fixed `retry_wait`; `parse_cli`/`parse_file`
 gained retry-default params, a **breaking** public-API change ⇒ a **minor** bump, not a patch) and

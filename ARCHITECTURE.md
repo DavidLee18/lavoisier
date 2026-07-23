@@ -34,7 +34,8 @@ This is what lets one agent brain serve the CLI today and a multi-gateway "Herme
 | `lvz-tune` | The ATO learner: `LearningTuner` (ε-greedy) and `BayesTuner` (Thompson sampling), with on-disk persistence. See [`ATO.md`](ATO.md). |
 | `lvz-gw-http` | HTTP/WebSocket gateway (axum): `/v1/turns` (SSE), `/v1/ws`, `/health`, Prometheus `/metrics`, API-key auth + rate limits. |
 | `lvz-gw-matrix` | Matrix gateway (one room per session). Access-token or password auth with a stable, persistable device identity; optional per-sender allowlist. End-to-end encryption (Olm/Megolm via `matrix-sdk-crypto`, durable SQLite crypto store via `matrix-sdk-sqlite`) is opt-in behind the `e2ee` feature; off by default. |
-| `lvz-gw-cron` | Cron gateway: an in-process UTC scheduler (hand-rolled, no date deps) that fires turns on a cron schedule; composes with the other gateways over one agent. |
+| `lvz-gw-cron` | Cron gateway: an in-process UTC scheduler that fires turns on a cron schedule; composes with the other gateways over one agent. The cron engine itself lives in `lvz-schedule` and is re-exported here. |
+| `lvz-schedule` | Scheduled **actions** (library, not a gateway): the hand-rolled UTC cron engine (no date deps), a job model whose action is either a *direct tool call* (unconditional, no model round-trip) or a prompt turn, a registry of live per-job state with bounded history, and the `schedule_*` tools. Frontend-agnostic — it returns a report and lets the caller deliver it; the Matrix gateway hosts it today. |
 | `lvz-gw-slack` | Slack gateway (Socket Mode, one session per channel/thread): thin `tokio-tungstenite` WebSocket client, no inbound port; `message`/`app_mention` → turn → `chat.postMessage`; optional per-user allowlist. |
 | `lvz-cli` | The `lavoisier` binary — the first gateway. |
 

@@ -29,6 +29,9 @@ use lvz_protocol::{
     AgentHandle, BatchProvider, ChatRequest, CostWeights, Event, Gateway, Knobs, Message, Outcome,
     Provider, TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, Tuner,
 };
+use lvz_schedule::{
+    ScheduleJob, ScheduleListTool, ScheduleRegistry, ScheduleRunTool, ScheduleStatusTool,
+};
 use lvz_tools::{BatchEditTool, ToolRegistry};
 use lvz_tune::{BayesTuner, LearningTuner, PersistableTuner, TuneConfig};
 use lvz_xai::XaiProvider;
@@ -238,6 +241,39 @@ struct Cli {
         env = "LVZ_CRON_RETRY_WAIT"
     )]
     cron_retry_wait: Option<u64>,
+
+    /// Run scheduled jobs **inside the Matrix gateway** from a JSON file: an array of
+    /// `{"id","schedule","room"?,"session"?,"tool"+"args"|"prompt","retry_max"?,"retry_wait"?}`
+    /// objects (UTC cron). A `tool` job invokes that tool directly — it runs unconditionally, with
+    /// no model round-trip; a `prompt` job fires an agent turn. Every fire is reported to the room,
+    /// and `schedule_list`/`schedule_status`/`schedule_run` let chat query and re-run jobs.
+    /// Requires `--serve-matrix`. Also `[gateway] schedule_file`.
+    #[arg(long = "schedule-file", value_name = "PATH")]
+    schedule_file: Option<PathBuf>,
+
+    /// Default Matrix room for schedule reports, for jobs that set no `room` of their own. Falls
+    /// back to the home room (`MATRIX_HOME_ROOM`). Also `[gateway] schedule_room`.
+    #[arg(long = "schedule-room", value_name = "ROOM", env = "LVZ_SCHEDULE_ROOM")]
+    schedule_room: Option<String>,
+
+    /// Default max retries after a *failed* scheduled fire before giving up and waiting for the
+    /// next slot. `0` (default) ⇒ no retry. A per-job `retry_max` overrides this. Also
+    /// `[gateway] schedule_retry_max`.
+    #[arg(
+        long = "schedule-retry-max",
+        value_name = "N",
+        env = "LVZ_SCHEDULE_RETRY_MAX"
+    )]
+    schedule_retry_max: Option<u32>,
+
+    /// Seconds to wait between scheduled-job retries (fixed delay). A per-job `retry_wait`
+    /// overrides this. Also settable via `[gateway] schedule_retry_wait`.
+    #[arg(
+        long = "schedule-retry-wait",
+        value_name = "SECS",
+        env = "LVZ_SCHEDULE_RETRY_WAIT"
+    )]
+    schedule_retry_wait: Option<u64>,
 
     /// Enable adaptive token optimisation (ATO, experimental): an online tuner that learns
     /// per-archetype knob settings from realised outcomes (most useful in a long-running
@@ -454,6 +490,10 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
 
     // Cron jobs (in-process scheduler) can run standalone or alongside HTTP/Matrix.
     let cron_jobs = build_cron_jobs(&cli)?;
+    // Matrix schedules, parsed up front (and *before* the `serving` check) so a misconfigured
+    // `--schedule-file` — bad JSON, or no `--serve-matrix` to host it — fails immediately instead
+    // of being silently ignored on the one-shot path.
+    let schedule_jobs = build_schedule(&cli)?;
 
     // Long-running gateways (HTTP/Matrix/Slack/cron) get the 1-hour cache TTL on the immutable
     // prefix.
@@ -470,13 +510,17 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
     // concurrently until shutdown. No prompt is consumed.
     if serving {
         let store = config.build_session_store()?;
-        let inner = Arc::new(build_agent(
-            provider,
-            batch_provider,
-            model,
+        // Schedules run inside the Matrix gateway, but the registry is built here: the agent needs
+        // the `schedule_*` tools, and the gateway needs the same registry to fire jobs against.
+        let schedule = schedule_jobs.map(|jobs| Arc::new(ScheduleRegistry::new(jobs)));
+        let tools = build_tool_registry(
             &cli,
+            batch_provider,
+            model.clone(),
             &extra_tools,
-        ));
+            schedule.as_ref(),
+        );
+        let inner = Arc::new(build_agent(provider, model, &cli, tools.clone()));
         let agent: Arc<dyn AgentHandle> = Arc::new(SessionAgent::new(inner, store));
 
         let mut gateways: Vec<Arc<dyn Gateway>> = Vec::new();
@@ -535,6 +579,15 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             if let Some(user_tools) = &config.gateway.matrix_user_tools {
                 matrix = matrix.with_user_tools(user_tools.clone());
             }
+            // Scheduled jobs live inside this gateway: it owns the timer, fires the action, and
+            // reports the outcome to a room.
+            if let Some(schedule) = &schedule {
+                eprintln!("lavoisier: matrix schedule with {} job(s)", schedule.len());
+                matrix = matrix.with_schedule(schedule.clone(), tools.clone());
+                if let Some(room) = &cli.schedule_room {
+                    matrix = matrix.with_schedule_room(room.clone());
+                }
+            }
             gateways.push(Arc::new(matrix));
         }
 
@@ -583,7 +636,8 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
     let mut renderer = Renderer::new();
 
     if cli.agent {
-        let mut agent = build_agent(provider, batch_provider, model, &cli, &extra_tools);
+        let tools = build_tool_registry(&cli, batch_provider, model.clone(), &extra_tools, None);
+        let mut agent = build_agent(provider, model, &cli, tools);
         if cli.telemetry {
             agent = agent.with_telemetry(Arc::new(StderrTelemetry));
         }
@@ -628,6 +682,32 @@ fn build_cron_jobs(cli: &Cli) -> Result<Vec<CronJob>, Box<dyn std::error::Error>
     Ok(jobs)
 }
 
+/// Load the Matrix schedule from `--schedule-file`, applying the global retry defaults. `None`
+/// when no file is configured (⇒ no schedule, and the `schedule_*` tools stay unregistered).
+///
+/// A schedule without `--serve-matrix` is a configuration mistake — the jobs would have nowhere to
+/// report — so it fails loudly rather than running them silently into stderr.
+fn build_schedule(cli: &Cli) -> Result<Option<Vec<ScheduleJob>>, Box<dyn std::error::Error>> {
+    let Some(path) = &cli.schedule_file else {
+        return Ok(None);
+    };
+    if !cli.serve_matrix {
+        return Err(
+            "--schedule-file requires --serve-matrix (schedules run inside the Matrix \
+                    gateway; use --cron/--cron-file for a standalone scheduler)"
+                .into(),
+        );
+    }
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let jobs = ScheduleJob::parse_file(
+        &text,
+        cli.schedule_retry_max.unwrap_or(0),
+        cli.schedule_retry_wait.unwrap_or(0),
+    )?;
+    Ok((!jobs.is_empty()).then_some(jobs))
+}
+
 /// Load the persistent persona prompt: an explicit `--persona <PATH>`, else `./PERSONA.md` if
 /// present (unless `--no-persona`). A missing explicit path is a hard error; a missing default is
 /// silent.
@@ -662,16 +742,55 @@ fn load_persona(cli: &Cli) -> Option<String> {
     }
 }
 
+/// Assemble the agent's tool set: built-ins, the optional `batch_edit` fan-out tool, the
+/// `schedule_*` tools when a schedule is configured, then any caller-provided tools.
+///
+/// Built at the composition root (rather than inside [`build_agent`]) so the *same* registry can
+/// also be handed to the Matrix gateway's scheduler — a scheduled `tool` job then dispatches
+/// through the identical tool instances the model uses, with no second construction to drift.
+/// [`ToolRegistry`] is a vector of `Arc`s, so the clone is cheap.
+fn build_tool_registry(
+    cli: &Cli,
+    batch_provider: Option<Arc<dyn BatchProvider>>,
+    editor_model: String,
+    extra_tools: &[Arc<dyn Tool>],
+    schedule: Option<&Arc<ScheduleRegistry>>,
+) -> ToolRegistry {
+    let mut registry = ToolRegistry::with_builtins();
+    // `batch_edit` fan-out tool: on by default (Lavoisier is cost-first), registered whenever the
+    // provider has a batch API. Lets the model run independent mechanical edits as one discounted
+    // async batch instead of looping over them. `--no-batch-edit` opts out; providers without a
+    // batch API (xAI/claude-cli) simply never get it.
+    if !cli.no_batch_edit {
+        if let Some(batch) = batch_provider {
+            registry.register(Arc::new(BatchEditTool::new(batch, editor_model)));
+        }
+    }
+    // Schedule introspection/control, so chat can ask "how's the backup job?" and "run it again"
+    // in natural language. Only registered when there are jobs — otherwise they are dead weight in
+    // the cached prefix of every request.
+    if let Some(schedule) = schedule {
+        registry.register(Arc::new(ScheduleListTool::new(schedule.clone())));
+        registry.register(Arc::new(ScheduleStatusTool::new(schedule.clone())));
+        registry.register(Arc::new(ScheduleRunTool::new(schedule.clone())));
+    }
+    // Caller-provided tools (e.g. a private downstream binary via `run_with`/`main_with`). Last, so
+    // a downstream tool can deliberately shadow a built-in (last registration wins).
+    for tool in extra_tools {
+        registry.register(tool.clone());
+    }
+    registry
+}
+
 /// Build the tool-using [`Agent`] from the CLI config. Shared by `--agent` (one-shot) and
-/// `--serve` (gateway) so both drive an identically-configured agent core.
+/// `--serve` (gateway) so both drive an identically-configured agent core. The tool set comes
+/// from [`build_tool_registry`].
 fn build_agent(
     provider: Arc<dyn Provider>,
-    batch_provider: Option<Arc<dyn BatchProvider>>,
     model: String,
     cli: &Cli,
-    extra_tools: &[Arc<dyn Tool>],
+    registry: ToolRegistry,
 ) -> Agent {
-    let editor_model = model.clone();
     let mut config = AgentConfig::default()
         .with_model(model)
         .with_cost_weights(cli.provider.unwrap_or(ProviderKind::Xai).cost_weights());
@@ -742,20 +861,6 @@ fn build_agent(
     // Profile the working directory so the tuner sees a real repo shape (§6.6).
     if let Ok(cwd) = std::env::current_dir() {
         config = config.with_repo_root(cwd);
-    }
-    let mut registry = ToolRegistry::with_builtins();
-    // `batch_edit` fan-out tool: on by default (Lavoisier is cost-first), registered whenever the
-    // provider has a batch API. Lets the model run independent mechanical edits as one discounted
-    // async batch instead of looping over them. `--no-batch-edit` opts out; providers without a
-    // batch API (xAI/claude-cli) simply never get it.
-    if !cli.no_batch_edit {
-        if let Some(batch) = batch_provider {
-            registry.register(Arc::new(BatchEditTool::new(batch, editor_model)));
-        }
-    }
-    // Caller-provided tools (e.g. a private downstream binary via `run_with`/`main_with`).
-    for tool in extra_tools {
-        registry.register(tool.clone());
     }
     let mut agent = Agent::new(provider, registry, config);
     if cli.tune_bayes {

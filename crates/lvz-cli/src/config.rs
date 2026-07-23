@@ -113,6 +113,14 @@ pub struct GatewaySection {
     /// Seconds to wait between cron retries. A per-job `retry_wait` in `--cron-file` overrides this.
     /// `--cron-retry-wait` / `LVZ_CRON_RETRY_WAIT` take precedence.
     pub cron_retry_wait: Option<u64>,
+    /// Path to the Matrix schedule file (see `--schedule-file`). Requires `serve_matrix`.
+    pub schedule_file: Option<PathBuf>,
+    /// Default room for schedule reports, for jobs that name none. Falls back to `matrix_home_room`.
+    pub schedule_room: Option<String>,
+    /// Default max retries after a failed scheduled fire. A per-job `retry_max` overrides this.
+    pub schedule_retry_max: Option<u32>,
+    /// Seconds between scheduled-job retries. A per-job `retry_wait` overrides this.
+    pub schedule_retry_wait: Option<u64>,
 }
 
 impl Config {
@@ -174,6 +182,13 @@ impl Config {
         merge_copy(&mut cli.rate_limit, self.gateway.rate_limit);
         merge_copy(&mut cli.cron_retry_max, self.gateway.cron_retry_max);
         merge_copy(&mut cli.cron_retry_wait, self.gateway.cron_retry_wait);
+        merge(&mut cli.schedule_file, &self.gateway.schedule_file);
+        merge(&mut cli.schedule_room, &self.gateway.schedule_room);
+        merge_copy(&mut cli.schedule_retry_max, self.gateway.schedule_retry_max);
+        merge_copy(
+            &mut cli.schedule_retry_wait,
+            self.gateway.schedule_retry_wait,
+        );
         if cli.api_key.is_empty() {
             if let Some(keys) = &self.gateway.api_keys {
                 cli.api_key = keys.clone();

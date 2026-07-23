@@ -15,7 +15,7 @@ Companion docs — read the relevant one before working in that area:
 ## Status
 
 Complete and live-verified against real `XAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY`:
-all 15 crates, provider streaming (SSE + xAI gRPC), the agent loop, the token engine, session
+all 16 crates, provider streaming (SSE + xAI gRPC), the agent loop, the token engine, session
 memory, the HTTP/Matrix/Slack/cron gateways, AWS packaging (`infra/`), and the ATO learner. `cargo
 test`, `cargo clippy --all-targets`, and `cargo fmt --check` are kept green.
 
@@ -30,6 +30,23 @@ retries up to `retry_max` times with a fixed `retry_wait`, then waits for the ne
 come from `--cron-retry-max`/`--cron-retry-wait` (env `LVZ_CRON_RETRY_*`, or `[gateway]
 cron_retry_max`/`cron_retry_wait`); a `--cron-file` job may override either per-job. The next scheduled
 slot is recomputed from "now" *after* retries finish, so a retry's wait never double-fires the next slot.
+
+**Matrix schedules** (`lvz-schedule`, `--schedule-file`) are the cron gateway's in-gateway sibling:
+jobs run *inside* the Matrix serve loop (a third `select!` branch alongside `/sync` and shutdown, so
+it shares the task with the non-`Send` `crypto`) and **report each outcome to a room**. A job's
+`Action` is either a **direct tool call** — dispatched straight through the shared `ToolRegistry`, so
+it runs *unconditionally* with no model round-trip and no tokens — or a **prompt turn** (the cron
+shape). `lvz-schedule` is a **leaf library** (no gateway→gateway edge); it owns the cron engine
+(moved here from `lvz-gw-cron`, which now re-exports `CronSchedule`/`CronError` unchanged), the job
+model, and the `ScheduleRegistry` holding live per-job state. Retry mirrors cron
+(`--schedule-retry-max`/`-wait`, per-job overridable, next slot recomputed once the chain resolves)
+but a pending retry is just another due time, not a blocking sleep. The chat surface is **tools**,
+not commands — `schedule_list`/`schedule_status`/`schedule_run` are registered into the agent so
+"how's the disk job?" and "run it again" work in natural language; reports are sent in the clear
+(like the shutdown notice — a scheduled fire has no inbound event to infer modality from) and their
+event ids go into `RecentIds`, so **replying to a report re-engages the bot** via the existing
+reply gate. `build_tool_registry` in `lvz-cli` is the composition root: the *same* registry goes to
+the agent and to the gateway's scheduler. Job state is in-memory (history resets on restart).
 
 The **Matrix gateway auto-accepts room invites** by default (`rooms.invite` → `/join`, deduped across
 syncs); disable with `--matrix-no-auto-join` or `[gateway] matrix_auto_join = false`. E2EE is

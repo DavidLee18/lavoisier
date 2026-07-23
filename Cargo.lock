@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "lavoisier"
-version = "0.6.6"
+version = "0.7.0"
 dependencies = [
  "clap",
  "futures",
@@ -1364,6 +1364,7 @@ dependencies = [
  "lvz-gw-slack",
  "lvz-memory",
  "lvz-protocol",
+ "lvz-schedule",
  "lvz-tools",
  "lvz-tune",
  "lvz-xai",
@@ -1511,11 +1512,12 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-cron"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "futures",
  "lvz-protocol",
+ "lvz-schedule",
  "serde",
  "serde_json",
  "thiserror",
@@ -1538,12 +1540,14 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-matrix"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "futures",
  "http",
  "lvz-protocol",
+ "lvz-schedule",
+ "lvz-tools",
  "matrix-sdk-crypto",
  "matrix-sdk-sqlite",
  "reqwest",
@@ -1586,6 +1590,20 @@ version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "lvz-schedule"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "lvz-protocol",
+ "lvz-tools",
  "serde",
  "serde_json",
  "thiserror",

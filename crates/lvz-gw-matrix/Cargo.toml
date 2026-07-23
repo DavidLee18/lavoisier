@@ -1,6 +1,6 @@
 [package]
 name = "lvz-gw-matrix"
-version = "0.3.6"
+version = "0.4.0"
 description = "Matrix gateway for Lavoisier: a thin reqwest client-server API client (login + /sync long-poll + m.room.message send) that drives the shared agent, one room per session. End-to-end encryption (Olm/Megolm) is opt-in behind the `e2ee` feature."
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,8 @@ authors.workspace = true
 
 [dependencies]
 lvz-protocol.workspace = true
+lvz-schedule.workspace = true
+lvz-tools.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 reqwest.workspace = true

@@ -97,6 +97,33 @@ error) can be **retried**: `--cron-retry-max N` + `--cron-retry-wait SECS` set g
 `--cron-file` job may override either per-job (`"retry_max"`/`"retry_wait"`); the next scheduled slot
 is recomputed only after retries finish, so a retry never double-fires the following slot.
 
+**Schedules (Matrix).** Where `--cron` fires a *prompt* into stderr, `--schedule-file` runs jobs
+**inside the Matrix gateway** and reports each outcome to a room. A job is either a **direct tool
+call** — which runs *unconditionally*, with no model round-trip and so no tokens — or a prompt turn:
+
+```jsonc
+[
+  // Deterministic: the tool always runs. Retries twice, 60s apart, on a non-zero exit.
+  {"id":"disk","schedule":"0 9 * * *","room":"!ops:example.org",
+   "tool":"shell","args":{"command":"df -h"},"retry_max":2,"retry_wait":60},
+  // Model-driven: fires an agent turn, which may chain tools.
+  {"id":"build","schedule":"*/15 * * * *","prompt":"check the build and summarise failures"}
+]
+```
+
+```sh
+ANTHROPIC_API_KEY=… cargo run -p lavoisier -- --serve-matrix \
+  --schedule-file jobs.json --schedule-room '!ops:example.org'
+```
+
+Every fire posts a result (`✅ \`disk\` · …`); failures are louder, carrying the error plus the retry
+countdown or a give-up notice. Reports are **addressable**: the bot registers `schedule_list`,
+`schedule_status`, and `schedule_run` as tools, so you can ask *"how's the disk job doing?"* or
+*"run it again"* in plain language — and because each report is one of the bot's own messages,
+**replying to one re-engages it** under the usual mention/reply gate. Retry semantics match cron
+(global `--schedule-retry-max`/`--schedule-retry-wait`, per-job overridable, next slot recomputed
+once the chain resolves); job state is in-memory, so history resets on restart.
+
 **Persona / priorities.** Point `--persona <PATH>` at a file (or drop a `PERSONA.md` in the working
 dir) to give a long-running gateway a stable identity and standing instructions: it's layered above
 the operating system-prompt and rides in the cached prefix, so it costs almost nothing per turn.
@@ -214,6 +241,10 @@ api_keys = ["secret"]
 `--cron "<min hour dom month dow> <prompt>"` (in-process scheduler, UTC; repeatable) ·
 `--cron-file <path>` (JSON jobs: `[{"schedule","session"?,"prompt","retry_max"?,"retry_wait"?}]`) ·
 `--cron-retry-max <N>` / `--cron-retry-wait <SECS>` (retry a failed cron fire; per-job overridable) ·
+`--schedule-file <path>` (Matrix schedules: JSON jobs
+`[{"id","schedule","room"?,"session"?,"tool"+"args"|"prompt","retry_max"?,"retry_wait"?}]`;
+requires `--serve-matrix`) · `--schedule-room <room>` (default report room) ·
+`--schedule-retry-max <N>` / `--schedule-retry-wait <SECS>` (per-job overridable) ·
 `--provider xai|anthropic|google|claude-cli` · `--model` · `--max-tokens` · `--system` ·
 `--persona <PATH>` (persistent persona/priorities layered above the system prompt; defaults to
 `./PERSONA.md` if present, `--no-persona` to disable) ·

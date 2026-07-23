@@ -34,6 +34,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use futures::stream::StreamExt;
 use lvz_protocol::{AgentHandle, Event, Gateway, GatewayError, TurnRequest};
+use lvz_schedule::ScheduleRegistry;
+use lvz_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "e2ee")]
@@ -80,6 +82,15 @@ pub struct MatrixGateway {
     /// The "home" room: the single room that receives the shutdown notice when the gateway is
     /// stopped (SIGTERM / Ctrl-C). `None` ⇒ no notice is sent.
     home_room: Option<String>,
+    /// Scheduled jobs run *inside* this gateway's loop, reporting their outcome to a room. `None`
+    /// ⇒ no schedule (the default). Shared with the `schedule_*` tools so chat can query it.
+    schedule: Option<Arc<ScheduleRegistry>>,
+    /// Tools a scheduled `Action::Tool` dispatches through — the *same* registry the agent uses,
+    /// so a scheduled call and a model-issued call hit identical tool instances.
+    schedule_tools: ToolRegistry,
+    /// Default room for schedule reports, used when a job names none. Falls back to
+    /// [`Self::home_room`].
+    schedule_room: Option<String>,
 }
 
 impl MatrixGateway {
@@ -107,6 +118,9 @@ impl MatrixGateway {
             room_tools: HashMap::new(),
             user_tools: HashMap::new(),
             home_room: None,
+            schedule: None,
+            schedule_tools: ToolRegistry::new(),
+            schedule_room: None,
         }
     }
 
@@ -198,6 +212,32 @@ impl MatrixGateway {
         let room = room.into();
         self.home_room = (!room.is_empty()).then_some(room);
         self
+    }
+
+    /// Run `schedule`'s jobs inside this gateway's loop, dispatching `Action::Tool` fires through
+    /// `tools`. Pass the *same* [`ToolRegistry`] the agent was built with so a scheduled tool call
+    /// and a model-issued one are indistinguishable.
+    pub fn with_schedule(mut self, schedule: Arc<ScheduleRegistry>, tools: ToolRegistry) -> Self {
+        self.schedule = Some(schedule);
+        self.schedule_tools = tools;
+        self
+    }
+
+    /// Default room for schedule reports, for jobs that don't name their own. Without this (and
+    /// without a home room) a job's report has nowhere to go and is logged to stderr instead.
+    pub fn with_schedule_room(mut self, room: impl Into<String>) -> Self {
+        let room = room.into();
+        self.schedule_room = (!room.is_empty()).then_some(room);
+        self
+    }
+
+    /// Where a report for `job_room` should be posted: the job's own room, else the configured
+    /// schedule room, else the home room.
+    fn report_room(&self, job_room: Option<&str>) -> Option<String> {
+        job_room
+            .map(str::to_string)
+            .or_else(|| self.schedule_room.clone())
+            .or_else(|| self.home_room.clone())
     }
 
     /// The effective per-turn tool allowlist for a `(room, sender)`, or `None` when neither a room
@@ -769,6 +809,47 @@ impl MatrixGateway {
             .await;
     }
 
+    /// Fire every due scheduled job and post its report.
+    ///
+    /// Reports go out **in the clear**, like the shutdown notice: unlike a reply, a scheduled fire
+    /// has no inbound event to infer the room's modality from, and a report room need not be
+    /// encrypted at all. Each report's event id is recorded in `sent` so **replying to a report
+    /// re-engages the bot** — that is what makes "why did this fail?" work in a group room, reusing
+    /// the existing reply-trigger gate rather than adding new machinery.
+    async fn run_scheduled(
+        &self,
+        agent: &Arc<dyn AgentHandle>,
+        token: &str,
+        due: &[usize],
+        sent: &mut RecentIds,
+    ) {
+        let Some(schedule) = &self.schedule else {
+            return;
+        };
+        for &idx in due {
+            let Some(report) = schedule.fire(idx, &self.schedule_tools, agent).await else {
+                continue;
+            };
+            match self.report_room(report.room.as_deref()) {
+                Some(room) => match self.send_message(token, &room, &report.body).await {
+                    Ok(eid) => sent.insert(eid),
+                    Err(e) => {
+                        eprintln!(
+                            "matrix[schedule]: report for {} in {room}: {e}",
+                            report.job_id
+                        )
+                    }
+                },
+                // Nowhere to report: still surface the outcome so a misconfigured room can't
+                // silently swallow a failing job.
+                None => eprintln!(
+                    "lavoisier[schedule]: {} (no report room configured): {}",
+                    report.job_id, report.body
+                ),
+            }
+        }
+    }
+
     /// Send a message body to a room in the right modality for this turn — plaintext or (under
     /// the `e2ee` feature) encrypted — returning the event id. The single seam that lets the
     /// shared per-message handler stay modality-agnostic.
@@ -973,6 +1054,25 @@ impl MatrixGateway {
         if let Some(home) = &self.home_room {
             eprintln!("matrix: home room {home} (receives the shutdown notice)");
         }
+        if let Some(schedule) = &self.schedule {
+            eprintln!("matrix: {} scheduled job(s)", schedule.len());
+            for job in schedule.jobs() {
+                match job.schedule.next_after_now() {
+                    Some(_) => eprintln!(
+                        "matrix[schedule]: {} [{}] {} → {}",
+                        job.id,
+                        job.expr,
+                        job.action.summary(),
+                        self.report_room(job.room.as_deref())
+                            .unwrap_or_else(|| "(stderr — no report room)".to_string())
+                    ),
+                    None => eprintln!(
+                        "matrix[schedule]: WARNING {} never fires (impossible schedule) — skipping",
+                        job.id
+                    ),
+                }
+            }
+        }
         // Own the fields used across awaits so a `&Session` is never held across one (keeps the
         // async_trait future unconditionally `Send`).
         let token = session.access_token.clone();
@@ -1026,12 +1126,19 @@ impl MatrixGateway {
         tokio::pin!(shutdown);
 
         loop {
+            // Three-way race: shutdown, a due scheduled job, or the next `/sync`. Running the
+            // scheduler as a branch of this loop (rather than a spawned task) keeps it on the same
+            // task as `crypto`, which is not `Send` in the higher-ranked form a spawn would need.
             let value = tokio::select! {
                 biased;
                 _ = &mut shutdown => {
                     eprintln!("matrix: shutdown signal received, stopping");
                     self.send_shutdown_notice(&token).await;
                     return Ok(());
+                }
+                due = wait_schedule(self.schedule.as_ref()) => {
+                    self.run_scheduled(&agent, &token, &due, &mut sent).await;
+                    continue;
                 }
                 res = self.sync_once(&token, Some(&since)) => match res {
                     Ok(value) => value,
@@ -1112,6 +1219,15 @@ impl MatrixGateway {
 
             since = next;
         }
+    }
+}
+
+/// Wait for the next due scheduled job. With no schedule configured this never resolves, so the
+/// serve loop's `select!` simply never picks the branch.
+async fn wait_schedule(schedule: Option<&Arc<ScheduleRegistry>>) -> Vec<usize> {
+    match schedule {
+        Some(s) => s.wait_due().await,
+        None => futures::future::pending().await,
     }
 }
 

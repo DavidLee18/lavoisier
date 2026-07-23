@@ -1,7 +1,7 @@
 [package]
-name = "lvz-gw-cron"
-version = "0.3.1"
-description = "Cron-scheduled gateway for the Lavoisier agent — fires agent turns on a UTC cron schedule."
+name = "lvz-schedule"
+version = "0.1.0"
+description = "Scheduled, unconditional actions for the Lavoisier agent — a UTC cron engine plus a job registry that fires direct tool calls or prompt turns and keeps queryable status."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -10,7 +10,7 @@ authors.workspace = true
 
 [dependencies]
 lvz-protocol.workspace = true
-lvz-schedule.workspace = true
+lvz-tools.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 serde = { workspace = true }
