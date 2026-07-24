@@ -51,6 +51,18 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
+(`v0.8.0`): **structured logging**. `--log-level`/`LVZ_LOG_LEVEL`/`[log] level` installs a `tracing`
+collector on stderr (RUST_LOG-style `EnvFilter` directives), and the 74 operator diagnostics moved from
+`eprintln!` to `tracing`. Each library crate gained a `tracing` dependency and its stderr output now
+flows through a filter, so all take a **minor** bump: `lvz-memory` (0.2.1→**0.3.0**), `lvz-schedule`
+(0.1.0→**0.2.0**), `lvz-gw-slack` (0.1.0→**0.2.0**), `lvz-gw-cron` (0.3.1→**0.4.0**), `lvz-gw-matrix`
+(0.4.0→**0.5.0**), and `lavoisier` (0.7.1→**0.8.0**, the new flag + `[log]` section). Under 0.x the
+minor slot is the incompatible one, and these bumps mean dependents' `^0.x` requirements no longer
+resolve — so the workspace pins move with them. Publish order `lvz-schedule` → `lvz-gw-matrix` →
+`lvz-gw-cron` → `lvz-gw-slack` → `lvz-memory` → `lavoisier` (`lvz-schedule` must precede the two
+gateways that depend on it). `lvz-tools` was untouched — its one `eprintln!` is `#[cfg(test)]`
+scaffolding, not a diagnostic — so it stays at 0.1.0, as do the other nine crates.
+Earlier changed set
 (`v0.7.0`): the **Matrix `schedule`** feature. `lvz-schedule` (**0.1.0 — new crate**, claim the name:
 the UTC cron engine moved out of `lvz-gw-cron`, plus the job/action model, the live job registry, and
 the `schedule_*` tools), `lvz-gw-cron` (0.3.1 — `mod cron` moved to `lvz-schedule` and re-exported;

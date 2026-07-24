@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "lavoisier"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "clap",
  "futures",
@@ -1514,7 +1514,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-cron"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1543,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-matrix"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1563,7 +1563,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-slack"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1578,7 +1578,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-memory"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1604,7 +1604,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-schedule"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures",

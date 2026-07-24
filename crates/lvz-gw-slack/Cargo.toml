@@ -1,6 +1,6 @@
 [package]
 name = "lvz-gw-slack"
-version = "0.1.0"
+version = "0.2.0"
 description = "Slack gateway for Lavoisier: a thin Socket Mode client (apps.connections.open + WebSocket events + chat.postMessage) that drives the shared agent, one session per channel/thread."
 edition.workspace = true
 rust-version.workspace = true
