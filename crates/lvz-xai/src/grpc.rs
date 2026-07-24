@@ -19,12 +19,14 @@ use lvz_protocol::{
 };
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
-/// Generated xAI proto types (`package xai_api`). See `build.rs` and `proto/VENDOR.md`.
-/// The full service surface is generated; we only consume the `Chat` streaming RPC, so the
-/// rest is dead code by design.
+/// Generated xAI proto types (`package xai_api`). The bindings are **committed**
+/// (`src/generated/xai_api.rs`) so downstream builds — docs.rs, `cargo install` — need no
+/// `protoc`; regenerate them with `LVZ_XAI_REGEN=1 cargo build -p lvz-xai`. See `build.rs` and
+/// `proto/VENDOR.md`. The full service surface is generated; we only consume the `Chat`
+/// streaming RPC, so the rest is dead code by design.
 #[allow(clippy::all, dead_code, rustdoc::all)]
 pub mod pb {
-    tonic::include_proto!("xai_api");
+    include!("generated/xai_api.rs");
 }
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "https://api.x.ai";

@@ -6,8 +6,19 @@
 
 Only the `proto/xai/` tree is vendored (plus this file and the license).
 `lvz-xai` compiles `xai/api/v1/chat.proto` and its transitive imports via
-`tonic-build` in its `build.rs`; the include root is this directory.
+`tonic-prost-build` in its `build.rs`; the include root is this directory.
+
+The generated bindings are **committed** at `../src/generated/xai_api.rs` and
+included directly by `src/grpc.rs`, so an ordinary build — including docs.rs and
+`cargo install` — needs **no `protoc`**. Codegen runs only when `LVZ_XAI_REGEN=1`
+is set (which does need `protoc`, e.g. `brew install protobuf`).
 
 To update: clone the source repo, copy `proto/xai` over this tree, and record
-the new pinned commit here. Then `cargo build -p lvz-xai` to regenerate and
-re-run the tests.
+the new pinned commit here. Then regenerate the committed bindings and re-run
+the tests:
+
+```sh
+LVZ_XAI_REGEN=1 cargo build -p lvz-xai   # rewrites src/generated/xai_api.rs (needs protoc)
+cargo test -p lvz-xai
+git add crates/lvz-xai/src/generated/xai_api.rs   # commit the refreshed bindings
+```

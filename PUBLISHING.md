@@ -2,16 +2,18 @@
 
 `lavoisier` is a Cargo workspace, so the binary crate (`lavoisier`) and its 14 library crates
 (`lvz-*`) are published to crates.io **in dependency order**. End users then install a prebuilt
-binary with `cargo binstall lavoisier` (no Rust toolchain or `protoc` needed) or build from source
-with `cargo install lavoisier` (needs `protoc`).
+binary with `cargo binstall lavoisier` (no Rust toolchain needed) or build from source with
+`cargo install lavoisier` (no `protoc` needed — `lvz-xai`'s gRPC bindings are committed; see below).
 
 ## Prerequisites (one-time)
 
 - A crates.io account + token: `cargo login`.
 - **Confirm the crate names are available** on crates.io: `lavoisier` and every `lvz-*` below. If one
   is taken, rename it (in its `Cargo.toml` and in `[workspace.dependencies]` in the root `Cargo.toml`).
-- `protoc` installed (`brew install protobuf`) — `cargo publish` verifies each crate by building it,
-  and `lvz-xai` compiles the vendored protos.
+- `protoc` is **not** required to publish — `lvz-xai`'s generated bindings are committed
+  (`crates/lvz-xai/src/generated/xai_api.rs`), so `cargo publish`'s verify build (and docs.rs, and
+  `cargo install`) compiles them without invoking `protoc`. You only need `protoc` to *regenerate*
+  those bindings after bumping the vendored proto (`LVZ_XAI_REGEN=1 cargo build -p lvz-xai`).
 - A clean, committed tree on `main`; everything green (`cargo test`, `clippy`, `fmt`).
 
 ## 1. Publish the crates (in this order)
@@ -131,9 +133,9 @@ lavoisier --help
 
 ## Notes
 
-- **docs.rs**: `lvz-xai` needs `protoc` at build time; docs.rs has no `protoc`, so its docs build may
-  fail. The other crates document fine. (Fix later if needed: vendor `protoc` via a `protobuf-src`
-  build-dependency, or pre-generate the proto bindings.)
+- **docs.rs**: builds fine for every crate — `lvz-xai`'s bindings are pre-generated and committed
+  (`src/generated/xai_api.rs`), so no `protoc` is needed at docs-build time. `lvz-gw-matrix` sets
+  `[package.metadata.docs.rs] features = ["e2ee"]` so its (default-off) crypto module documents too.
 - **Version bumps**: keep all crates at the same version. Bump together, re-run §1, then a new tag for §2.
 - **`e2ee` feature**: `lvz-gw-matrix` (and the `lavoisier` passthrough) gain an optional `e2ee` feature
   pulling `matrix-sdk-crypto`/`ruma`. It's **off by default**, so it doesn't affect the standard publish

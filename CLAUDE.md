@@ -210,8 +210,11 @@ register. Mechanisms, all live:
 
 ## Gotchas
 
-- **Building `lvz-xai` requires `protoc`** (`brew install protobuf`) — `build.rs` compiles the
-  vendored `crates/lvz-xai/proto/xai/api/v1/chat.proto`. Pin + update procedure in that dir's `VENDOR.md`.
+- **`lvz-xai`'s gRPC bindings are committed** (`crates/lvz-xai/src/generated/xai_api.rs`, included
+  by `src/grpc.rs`), so an ordinary build — including docs.rs and `cargo install` — needs **no
+  `protoc`**. `build.rs` regenerates them only under `LVZ_XAI_REGEN=1` (which needs
+  `protoc`/`brew install protobuf`), e.g. after bumping the vendored proto. Pin + update procedure
+  in `crates/lvz-xai/proto/VENDOR.md`.
 - `lvz-context` tree-sitter grammar/core ABI versions are pinned in its `Cargo.toml` — bump together.
 - The budget loop's committed per-fixture ceilings (`lvz-context/tests/budget.rs`) are the baseline;
   update them deliberately when skeleton output legitimately changes.
