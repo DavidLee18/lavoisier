@@ -45,7 +45,12 @@ pub enum CronError {
     FieldCount(usize),
     /// A field was malformed or out of range.
     #[error("invalid cron field {field:?}: {reason}")]
-    Field { field: String, reason: String },
+    Field {
+        /// The offending field's raw text.
+        field: String,
+        /// Why it was rejected.
+        reason: String,
+    },
 }
 
 /// Broken-down UTC wall-clock components used for matching.

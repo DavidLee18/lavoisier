@@ -7,10 +7,12 @@
 //! HTTP/Matrix gateways under `--serve` in a low-resource environment.
 //!
 //! Like the other `lvz-gw-*` crates it depends only on [`lvz_protocol`]; the agent core stays
-//! unaware that a scheduler is driving it. Each job keeps a fixed `session`, so [`lvz-memory`]
+//! unaware that a scheduler is driving it. Each job keeps a fixed `session`, so `lvz-memory`
 //! gives a job continuity across fires (the same way the Matrix gateway keys a session per
 //! room). The cron engine itself lives in [`lvz_schedule`] and is re-exported here unchanged —
 //! the same parser backs both this gateway and the Matrix `schedule` feature.
+
+#![warn(missing_docs)]
 
 use std::sync::Arc;
 

@@ -10,6 +10,7 @@
 //! definition, or content block whose protocol-level `cache` flag is set, placing a cache
 //! breakpoint at the end of the stable prefix. The agent (not this crate) decides where that
 //! boundary is by setting the flags.
+#![warn(missing_docs)]
 
 pub mod batch;
 mod sse;

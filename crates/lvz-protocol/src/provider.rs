@@ -57,7 +57,12 @@ pub enum ProviderError {
 
     /// The API returned a non-success status with a message.
     #[error("api error {status}: {message}")]
-    Api { status: u16, message: String },
+    Api {
+        /// The HTTP status code returned.
+        status: u16,
+        /// The error message from the API.
+        message: String,
+    },
 
     /// A response (or SSE/gRPC frame) could not be decoded into the expected shape.
     #[error("decode error: {0}")]

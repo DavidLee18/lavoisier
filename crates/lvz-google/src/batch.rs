@@ -17,9 +17,12 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_POLLS: u32 = 360;
 
 /// One entry in a batch: a caller-chosen `custom_id` (echoed back to correlate the result) and the
-/// request. All requests in a batch share the batch's `model` (passed to [`create_batch`]).
+/// request. All requests in a batch share the batch's `model` (passed to
+/// [`create_batch`](GoogleProvider::create_batch)).
 pub struct BatchRequest {
+    /// Caller-chosen id, echoed onto the matching [`BatchResult`] so results can be correlated.
     pub custom_id: String,
+    /// The generation request to run.
     pub request: ChatRequest,
 }
 
@@ -44,7 +47,9 @@ impl Batch {
 /// The per-request outcome read from a finished batch.
 #[derive(Debug, Clone)]
 pub struct BatchResult {
+    /// The `custom_id` of the originating [`BatchRequest`].
     pub custom_id: String,
+    /// Success (text + usage) or failure.
     pub outcome: BatchOutcome,
 }
 
@@ -52,7 +57,12 @@ pub struct BatchResult {
 #[derive(Debug, Clone)]
 pub enum BatchOutcome {
     /// Completed: the concatenated answer text and the turn's usage.
-    Succeeded { text: String, usage: Usage },
+    Succeeded {
+        /// The concatenated answer text.
+        text: String,
+        /// The turn's token usage.
+        usage: Usage,
+    },
     /// The request errored; carries the error message.
     Errored(String),
 }

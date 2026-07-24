@@ -12,6 +12,8 @@
 //! [`FileStore`]. Long-term / vector recall would be further `SessionStore` implementations
 //! behind the same trait.
 
+#![warn(missing_docs)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -191,6 +193,7 @@ pub struct SessionAgent {
 }
 
 impl SessionAgent {
+    /// Wrap an [`Agent`] and a [`SessionStore`] so each `submit` continues a named session.
     pub fn new(agent: Arc<Agent>, store: Arc<dyn SessionStore>) -> Self {
         Self { agent, store }
     }

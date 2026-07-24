@@ -18,9 +18,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingLevel {
+    /// No extended thinking.
     Off,
+    /// The provider's cheapest meaningful thinking setting.
     Low,
+    /// Moderate thinking budget.
     Medium,
+    /// Maximum thinking budget.
     High,
 }
 
@@ -45,7 +49,10 @@ pub enum ToolChoice {
 #[serde(rename_all = "snake_case")]
 pub enum OutputFormat {
     /// Constrain the response to JSON matching this JSON Schema.
-    JsonSchema { schema: serde_json::Value },
+    JsonSchema {
+        /// The JSON Schema the response must conform to.
+        schema: serde_json::Value,
+    },
 }
 
 /// A **provider-executed** (server-side) tool: the model invokes it and the *provider* runs it,
@@ -57,15 +64,19 @@ pub enum OutputFormat {
 pub enum ServerTool {
     /// Web search with optional caps and domain allow/block lists.
     WebSearch {
+        /// Cap on searches per turn; `None` ⇒ the provider default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_uses: Option<u32>,
+        /// If non-empty, restrict results to these domains.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         allowed_domains: Vec<String>,
+        /// Domains to exclude from results.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         blocked_domains: Vec<String>,
     },
     /// Fetch the contents of a specific URL.
     WebFetch {
+        /// Cap on fetches per turn; `None` ⇒ the provider default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_uses: Option<u32>,
     },
@@ -74,19 +85,25 @@ pub enum ServerTool {
     /// Search X (Twitter) posts (xAI Live Search). Optional handle allow/block lists and an
     /// ISO-8601 `YYYY-MM-DD` date window. xAI-specific — other providers ignore it.
     XSearch {
+        /// If non-empty, restrict to posts from these handles.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         allowed_handles: Vec<String>,
+        /// Handles to exclude.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         blocked_handles: Vec<String>,
+        /// Inclusive start of the ISO-8601 `YYYY-MM-DD` date window; `None` ⇒ unbounded.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_date: Option<String>,
+        /// Inclusive end of the date window; `None` ⇒ unbounded.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_date: Option<String>,
     },
     /// Retrieval-augmented search over xAI document collections by id, with an optional result
     /// cap. xAI-specific — other providers ignore it.
     CollectionsSearch {
+        /// The document collections to search.
         collection_ids: Vec<String>,
+        /// Cap on returned results; `None` ⇒ the provider default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
     },
@@ -111,7 +128,9 @@ pub enum BuiltinTool {
 /// A remote MCP (Model Context Protocol) server the provider connects to on the model's behalf.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServer {
+    /// Label identifying the server in tool calls.
     pub name: String,
+    /// The server's endpoint URL.
     pub url: String,
     /// Bearer token for the server (omit when the provider injects credentials out of band).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,7 +263,9 @@ impl ChatRequest {
 /// breakpoint after it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemPrompt {
+    /// The system prompt text.
     pub text: String,
+    /// Request a cache breakpoint after this prompt (honoured only by caching providers).
     #[serde(default)]
     pub cache: bool,
 }
@@ -253,14 +274,18 @@ pub struct SystemPrompt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
+    /// A message from the user.
     User,
+    /// A message from the model.
     Assistant,
 }
 
 /// One message: a role plus an ordered list of content blocks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    /// Who authored the message.
     pub role: Role,
+    /// The message's ordered content blocks.
     pub content: Vec<ContentBlock>,
 }
 
@@ -302,15 +327,29 @@ impl Message {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MediaSource {
     /// Inline base64-encoded bytes with their MIME type (e.g. `image/png`, `application/pdf`).
-    Base64 { media_type: String, data: String },
+    Base64 {
+        /// MIME type of the bytes (e.g. `image/png`).
+        media_type: String,
+        /// The base64-encoded bytes.
+        data: String,
+    },
     /// A URL the provider fetches itself.
-    Url { url: String },
+    Url {
+        /// The URL to fetch.
+        url: String,
+    },
     /// A previously-uploaded file referenced by id (provider Files API).
-    File { file_id: String },
+    File {
+        /// The provider's file id.
+        file_id: String,
+    },
     /// Inline **plain text** (raw, not base64) — used for text documents, the lightest way to get
     /// source-grounded [`ContentBlock::Document`] `citations` without a PDF. Anthropic maps it to a
     /// `text`-type document source; Gemini inlines it as a text part; image inputs ignore it.
-    PlainText { text: String },
+    PlainText {
+        /// The raw document text.
+        text: String,
+    },
 }
 
 /// A unit of message content. A message can mix text, thinking, images, documents, tool calls,
@@ -320,31 +359,47 @@ pub enum MediaSource {
 pub enum ContentBlock {
     /// Plain text. `cache` requests a breakpoint after this block (caching-capable providers).
     Text {
+        /// The text content.
         text: String,
+        /// Request a cache breakpoint after this block.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         cache: bool,
     },
     /// Extended-thinking text echoed back into history (Anthropic).
-    Thinking { text: String },
+    Thinking {
+        /// The thinking text.
+        text: String,
+    },
     /// An image input (vision). Providers without vision ignore it.
-    Image { source: MediaSource },
+    Image {
+        /// Where the image bytes come from.
+        source: MediaSource,
+    },
     /// A document input (e.g. PDF). Anthropic/Gemini support it; others ignore it. `citations`
     /// requests source-grounded citations in the answer (Anthropic; ignored elsewhere).
     Document {
+        /// Where the document bytes come from.
         source: MediaSource,
+        /// Request source-grounded citations in the answer.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         citations: bool,
     },
     /// An assistant tool call: opaque `id`, tool `name`, and parsed argument JSON.
     ToolUse {
+        /// Opaque call id, echoed back on the matching [`ToolResult`](ContentBlock::ToolResult).
         id: String,
+        /// The tool being called.
         name: String,
+        /// The parsed argument object.
         input: serde_json::Value,
     },
     /// The result of executing a tool call, keyed by the originating `tool_use_id`.
     ToolResult {
+        /// The `id` of the [`ToolUse`](ContentBlock::ToolUse) this answers.
         tool_use_id: String,
+        /// The tool's output, rendered for the model.
         content: String,
+        /// Whether the tool reported a (recoverable) error.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
@@ -381,9 +436,13 @@ impl ContentBlock {
 /// its arguments. `cache` marks the end of the (stable) tool-definition prefix.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDef {
+    /// The tool's name, as the model calls it.
     pub name: String,
+    /// Human-readable description sent to the model.
     pub description: String,
+    /// JSON Schema for the tool's argument object.
     pub schema: serde_json::Value,
+    /// Mark the end of the (stable) tool-definition prefix for caching.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cache: bool,
     /// Request strict schema validation of the tool's arguments (structured tool use). Providers

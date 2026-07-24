@@ -22,15 +22,21 @@ use crate::{skeleton, Lang};
 /// `lvz_protocol::Archetype` but kept local so `lvz-context` stays protocol-independent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Archetype {
+    /// A localised edit within one file — the narrowest radius.
     SingleFileEdit,
+    /// A structural change spanning callers of the edited symbol.
     Refactor,
+    /// Renaming a symbol across every reference.
     Rename,
+    /// Adding new behaviour — the widest context.
     Feature,
 }
 
 /// A repo snapshot plus the symbol at the centre of the intended edit.
 pub struct Fixture {
+    /// Stable identifier used to key the committed ceiling in `tests/budget.rs`.
     pub name: &'static str,
+    /// Task shape this fixture stands in for.
     pub archetype: Archetype,
     /// The files of the snapshot, as `(language, source)`.
     pub files: Vec<(Lang, String)>,
@@ -41,8 +47,11 @@ pub struct Fixture {
 /// The deterministic measurement of a fixture at one radius.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetReport {
+    /// The skeleton radius this measurement was taken at.
     pub radius: u8,
+    /// Estimated tokens of the constructed context.
     pub est_tokens: usize,
+    /// How many symbols kept full bodies at this radius.
     pub kept_symbols: usize,
 }
 

@@ -14,6 +14,7 @@
 //! **Thinking effort** is configurable (`thinkingConfig`): a keyword level (`low`/`high`/`dynamic`,
 //! Gemini 3) or a numeric token budget (Gemini 2.5) — set via [`GoogleProvider::with_thinking`] or
 //! `GOOGLE_THINKING` / the CLI `--thinking` flag. "High" matches the public Dirac refactor suite.
+#![warn(missing_docs)]
 
 pub mod batch;
 mod sse;
@@ -36,10 +37,15 @@ const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 /// A Gemini content-safety harm category (`safetySettings[].category`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HarmCategory {
+    /// Harassing, intimidating, or bullying content.
     Harassment,
+    /// Hateful content targeting identity or protected attributes.
     HateSpeech,
+    /// Sexually explicit content.
     SexuallyExplicit,
+    /// Content that promotes or enables real-world harm.
     DangerousContent,
+    /// Content undermining civic/electoral integrity.
     CivicIntegrity,
 }
 
@@ -61,7 +67,9 @@ impl HarmCategory {
 pub enum HarmBlockThreshold {
     /// Block low-probability-and-above harmful content (strictest).
     BlockLowAndAbove,
+    /// Block medium-probability-and-above harmful content.
     BlockMediumAndAbove,
+    /// Block only high-probability harmful content (most permissive block level).
     BlockOnlyHigh,
     /// Block nothing (the filter still scores but never blocks).
     BlockNone,
@@ -84,7 +92,9 @@ impl HarmBlockThreshold {
 /// One configurable Gemini safety filter: a category and its blocking threshold.
 #[derive(Debug, Clone, Copy)]
 pub struct SafetySetting {
+    /// The harm category this filter governs.
     pub category: HarmCategory,
+    /// The probability threshold at or above which content in that category is blocked.
     pub threshold: HarmBlockThreshold,
 }
 
@@ -185,9 +195,9 @@ impl GoogleProvider {
     }
 
     /// Create an explicit cached-content resource over a fixed prefix (system + contents) for
-    /// `model`, returning its `cachedContents/...` name. Pass that to [`with_cached_content`]
-    /// (Self::with_cached_content) so a large reused prefix (e.g. a repo skeleton) bills at the
-    /// cache-read rate. `ttl_seconds` sets the cache lifetime.
+    /// `model`, returning its `cachedContents/...` name. Pass that to
+    /// [`with_cached_content`](Self::with_cached_content) so a large reused prefix (e.g. a repo
+    /// skeleton) bills at the cache-read rate. `ttl_seconds` sets the cache lifetime.
     pub async fn create_cached_content(
         &self,
         model: &str,

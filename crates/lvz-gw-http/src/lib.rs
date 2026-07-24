@@ -12,6 +12,8 @@
 //! - `GET  /v1/ws`    — a **WebSocket**: send a turn JSON per message, receive the event
 //!   stream as JSON text frames; the socket stays open for further turns.
 
+#![warn(missing_docs)]
+
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;

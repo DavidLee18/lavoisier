@@ -27,7 +27,9 @@ pub trait Tool: Send + Sync {
 /// failure to the model (bad path, command exited non-zero) without aborting the turn.
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
+    /// The tool's output, rendered for the model.
     pub content: String,
+    /// Whether this result represents a recoverable, model-visible error.
     pub is_error: bool,
     /// Whether this invocation **actually mutated the workspace** (an edit tool that wrote a real
     /// change to a file). `false` for read-only tools and for edit tools that no-op'd — e.g. an
@@ -38,7 +40,7 @@ pub struct ToolOutput {
 }
 
 impl ToolOutput {
-    /// A successful result (no workspace mutation by default; edit tools call [`changed`]).
+    /// A successful result (no workspace mutation by default; edit tools call [`ToolOutput::changed`]).
     pub fn ok(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),

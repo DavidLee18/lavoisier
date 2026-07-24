@@ -9,6 +9,8 @@
 //! normalised [`Event`] stream is rendered to the terminal: answer text on stdout; thinking,
 //! tool activity, usage, and stop reason on stderr.
 
+#![warn(missing_docs)]
+
 use std::collections::HashMap;
 use std::io::{Read, Stdout, Write};
 use std::process::ExitCode;

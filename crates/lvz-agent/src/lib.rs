@@ -3,8 +3,8 @@
 //! The agent runs a **plan → act → observe** cycle: ask the provider for a turn, and if the
 //! model called tools, execute them, append the results to history, and ask again — until
 //! the model answers without calling a tool (or a safety/budget limit trips). It consumes
-//! only the [`Provider`] and [`Tool`] contracts plus a [`ToolRegistry`], so it is unaware of
-//! any wire protocol or gateway.
+//! only the [`Provider`] and [`Tool`](lvz_protocol::Tool) contracts plus a [`ToolRegistry`], so
+//! it is unaware of any wire protocol or gateway.
 //!
 //! Efficiency hardening (§6.3) lives here:
 //! - **Caching** is capability-gated (§6.2): the stable prefix (system prompt + tool
@@ -22,6 +22,8 @@
 //!
 //! Token usage is summed across every round-trip — including the compaction call — which is
 //! the metric that matters (§6.4) and is enforced against an optional budget.
+
+#![warn(missing_docs)]
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -183,14 +185,14 @@ pub struct AgentConfig {
     /// **No-edit completion guard** (convergence lever): refuse to let the model "finish" an *edit*
     /// task (any [`Archetype`] except `Other`) having changed **no** files — almost always
     /// disengagement (it answered or planned instead of acting). Instead of accepting the empty
-    /// result, inject a bounded nudge to make the edit and continue. Bounded by [`MAX_EDIT_NUDGES`]
+    /// result, inject a bounded nudge to make the edit and continue. Bounded by `MAX_EDIT_NUDGES`
     /// so a genuinely no-edit task (e.g. a question) still terminates. **Opt-in** (`--require-edit`):
     /// it trades efficiency (extra turns) for completion, so it is off unless asked for. Skipped for
     /// the `Other` archetype (likely Q&A).
     pub require_edit: bool,
     /// **Verify-and-fix completion gate** (accuracy lever): when the model tries to finish but the
     /// [`verify_command`](Self::verify_command) **fails**, don't accept it — feed the failure output
-    /// back and keep working until verify passes (bounded by [`MAX_FIX_ATTEMPTS`]). Catches
+    /// back and keep working until verify passes (bounded by `MAX_FIX_ATTEMPTS`). Catches
     /// *incomplete* changes (a refactor that broke call sites, a partial rename) that the model
     /// thought were done. **Opt-in** (`--verify-and-fix`, needs `--verify-cmd`): it trades efficiency
     /// (re-running verify + extra fix turns) for completeness, so it is off by default. Only as strong
@@ -422,6 +424,8 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Bind the loop to a provider, tool set, and config, using the default [`NoopTuner`] (the
+    /// static §6.5 baseline knobs). Add a learner with [`with_tuner`](Self::with_tuner).
     pub fn new(provider: Arc<dyn Provider>, tools: ToolRegistry, config: AgentConfig) -> Self {
         Self {
             provider,

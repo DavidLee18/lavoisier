@@ -24,6 +24,7 @@ pub struct TurnRequest {
 }
 
 impl TurnRequest {
+    /// A turn for `session` carrying `input`, with the full tool set (no allowlist).
     pub fn new(session: impl Into<String>, input: impl Into<String>) -> Self {
         Self {
             session: session.into(),

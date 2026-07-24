@@ -6,6 +6,8 @@
 //! capabilities (web search, memory, …) means registering more — nothing in the agent
 //! changes.
 
+#![warn(missing_docs)]
+
 mod batch;
 mod builtins;
 mod context;

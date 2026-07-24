@@ -7,7 +7,7 @@
 //! receives `message`/`app_mention` events over it, runs an agent turn, and posts the reply with
 //! `chat.postMessage`.
 //!
-//! Sessions are keyed per channel (or per thread, when a message is in a thread), so [`lvz-memory`]
+//! Sessions are keyed per channel (or per thread, when a message is in a thread), so `lvz-memory`
 //! gives each conversation continuity — the same way the Matrix gateway keys a session per room.
 //! Depends only on [`lvz_protocol`]; the agent core stays unaware of Slack.
 //!
@@ -16,6 +16,8 @@
 //! socket, and a **bot token** (`xoxb-…`, `SLACK_BOT_TOKEN`) for Web API calls. An optional
 //! `SLACK_ALLOWED_USERS` allowlist restricts who can drive the agent (shared semantics with the
 //! Matrix gateway).
+
+#![warn(missing_docs)]
 
 use std::collections::HashSet;
 use std::sync::Arc;

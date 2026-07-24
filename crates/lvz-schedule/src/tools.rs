@@ -77,6 +77,7 @@ pub struct ScheduleListTool {
 }
 
 impl ScheduleListTool {
+    /// Wrap a shared registry so the agent can list its jobs.
     pub fn new(registry: Arc<ScheduleRegistry>) -> Self {
         Self { registry }
     }
@@ -124,6 +125,7 @@ pub struct ScheduleStatusTool {
 }
 
 impl ScheduleStatusTool {
+    /// Wrap a shared registry so the agent can report one job's status.
     pub fn new(registry: Arc<ScheduleRegistry>) -> Self {
         Self { registry }
     }
@@ -212,6 +214,7 @@ pub struct ScheduleRunTool {
 }
 
 impl ScheduleRunTool {
+    /// Wrap a shared registry so the agent can fire a job out of band.
     pub fn new(registry: Arc<ScheduleRegistry>) -> Self {
         Self { registry }
     }

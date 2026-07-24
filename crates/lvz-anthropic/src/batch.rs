@@ -18,13 +18,16 @@ const MAX_POLLS: u32 = 360;
 
 /// One entry in a batch: a caller-chosen `custom_id` correlating the result, plus the request.
 pub struct BatchRequest {
+    /// Caller-chosen id, echoed onto the matching [`BatchResult`] so results can be correlated.
     pub custom_id: String,
+    /// The completion request to run.
     pub request: ChatRequest,
 }
 
 /// A submitted/queried batch.
 #[derive(Debug, Clone)]
 pub struct Batch {
+    /// The batch id (`msgbatch_...`) used to poll, cancel, and read results.
     pub id: String,
     /// `in_progress`, `canceling`, or `ended`.
     pub processing_status: String,
@@ -40,6 +43,7 @@ impl Batch {
 /// One page of the batch list (`GET /v1/messages/batches`).
 #[derive(Debug, Clone)]
 pub struct BatchList {
+    /// The batches on this page, most recent first.
     pub batches: Vec<Batch>,
     /// True if more pages follow; pass [`last_id`](Self::last_id) as `after_id` to fetch them.
     pub has_more: bool,
@@ -50,7 +54,9 @@ pub struct BatchList {
 /// The per-request outcome read from a finished batch.
 #[derive(Debug, Clone)]
 pub struct BatchResult {
+    /// The `custom_id` of the originating [`BatchRequest`].
     pub custom_id: String,
+    /// Success (text + usage), error, cancellation, or expiry.
     pub outcome: BatchOutcome,
 }
 
@@ -58,7 +64,12 @@ pub struct BatchResult {
 #[derive(Debug, Clone)]
 pub enum BatchOutcome {
     /// Completed: the concatenated answer text and the turn's usage.
-    Succeeded { text: String, usage: Usage },
+    Succeeded {
+        /// The concatenated answer text.
+        text: String,
+        /// The turn's token usage.
+        usage: Usage,
+    },
     /// The request errored (validation or server); carries the error type.
     Errored(String),
     /// Cancelled before completion.

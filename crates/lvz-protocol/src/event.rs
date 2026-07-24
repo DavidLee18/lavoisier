@@ -20,17 +20,40 @@ pub enum Event {
     /// Incremental extended-thinking text (Anthropic). Providers without thinking never emit this.
     Thinking(String),
     /// A tool call has begun; `id` correlates the following deltas and end.
-    ToolUseStart { id: String, name: String },
+    ToolUseStart {
+        /// Correlation id tying this call to its deltas and end.
+        id: String,
+        /// The tool being called.
+        name: String,
+    },
     /// Incremental tool-argument JSON for the call identified by `id`.
-    ToolUseDelta { id: String, json: String },
+    ToolUseDelta {
+        /// The call these argument bytes belong to.
+        id: String,
+        /// A fragment of the tool-argument JSON, to be concatenated in order.
+        json: String,
+    },
     /// The tool call identified by `id` is complete; its argument JSON is now whole.
-    ToolUseEnd { id: String },
+    ToolUseEnd {
+        /// The call that has finished streaming its arguments.
+        id: String,
+    },
     /// A **provider-executed** (server-side) tool was invoked by the model — e.g. web search or
     /// code execution. Informational: the agent does not execute these (the provider does).
-    ServerToolUse { id: String, name: String },
+    ServerToolUse {
+        /// Correlation id tying this call to its [`ServerToolResult`](Event::ServerToolResult).
+        id: String,
+        /// The server-side tool being run.
+        name: String,
+    },
     /// The result of a provider-executed tool, as a serialized JSON string (search hits, code
     /// stdout/stderr, fetched page, …), correlated by `id`.
-    ServerToolResult { id: String, content: String },
+    ServerToolResult {
+        /// The [`ServerToolUse`](Event::ServerToolUse) this result answers.
+        id: String,
+        /// The tool's result, serialized as a JSON string.
+        content: String,
+    },
     /// A citation the model attached to the preceding span of output (Anthropic document /
     /// web-search citations, emitted as the text is produced). Informational — the agent
     /// forwards it; gateways/CLIs surface it.
@@ -49,7 +72,9 @@ pub enum Event {
 /// Token accounting for a turn. Cache fields are zero on providers without prompt caching.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
+    /// Fresh (uncached) input tokens billed this turn.
     pub input_tokens: u64,
+    /// Generated output tokens billed this turn.
     pub output_tokens: u64,
     /// Tokens written to the cache this turn (Anthropic `cache_creation_input_tokens`).
     pub cache_creation_tokens: u64,
@@ -68,9 +93,13 @@ pub struct Usage {
 /// cross-provider baseline.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostWeights {
+    /// Weight of a fresh input token (the unit; normally `1.0`).
     pub input: f64,
+    /// Weight of an output token relative to input (typically ≈5×).
     pub output: f64,
+    /// Weight of a cache *write* relative to input (typically ≈1.25×).
     pub cache_creation: f64,
+    /// Weight of a cache *read* relative to input (typically ≈0.1×).
     pub cache_read: f64,
 }
 

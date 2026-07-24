@@ -1,7 +1,7 @@
 //! `lvz-tune` — adaptive token optimisation (ATO, §6.6).
 //!
 //! [`LearningTuner`] is the online half of the knob-tuning loop: it implements the
-//! [`Tuner`] contract so `lvz-agent` can swap it in for the default [`NoopTuner`] with no
+//! [`Tuner`] contract so `lvz-agent` can swap it in for the default `NoopTuner` with no
 //! other change. It treats each `(archetype, caching, model-tier)` context as its own
 //! contextual bandit and **ε-greedily hill-climbs** over [`Knobs`]: mostly it exploits the
 //! cheapest knob vector that meets a success constraint, occasionally it explores a one-step
@@ -27,6 +27,8 @@
 //! deferred: Bayesian optimisation. The success signal is only as good as what the agent reports —
 //! pair `--tune` with `--verify-cmd` for a real quality gate in production.
 
+#![warn(missing_docs)]
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -42,6 +44,7 @@ pub use bayes::BayesTuner;
 /// Bayesian [`BayesTuner`] uniformly. (Named `persist` to avoid colliding with each tuner's
 /// inherent `save`.)
 pub trait PersistableTuner: Tuner {
+    /// Snapshot the learned profiles to `path` (the uniform surface behind `--tune-state`).
     fn persist(&self, path: &Path) -> std::io::Result<()>;
 }
 
@@ -150,10 +153,12 @@ pub struct LearningTuner {
 }
 
 impl LearningTuner {
+    /// A cold tuner with default [`TuneConfig`] — knows nothing yet, so it returns the baseline.
     pub fn new() -> Self {
         Self::with_config(TuneConfig::default())
     }
 
+    /// A cold tuner with explicit hyper-parameters (exploration rate, success target, decay).
     pub fn with_config(cfg: TuneConfig) -> Self {
         Self {
             cfg,

@@ -13,11 +13,14 @@ use crate::{ChatRequest, ProviderError, Usage};
 /// One request in an auto-batch run: a caller-chosen `custom_id` (echoed back to correlate the
 /// result) plus the request itself.
 pub struct BatchTask {
+    /// Caller-chosen id echoed back on the matching [`BatchItem`] to correlate the result.
     pub custom_id: String,
+    /// The one-shot completion request to run.
     pub request: ChatRequest,
 }
 
 impl BatchTask {
+    /// A task pairing `custom_id` with the `request` to run under it.
     pub fn new(custom_id: impl Into<String>, request: ChatRequest) -> Self {
         Self {
             custom_id: custom_id.into(),
@@ -29,6 +32,7 @@ impl BatchTask {
 /// The outcome of one batched request, correlated by `custom_id`.
 #[derive(Debug, Clone)]
 pub struct BatchItem {
+    /// The `custom_id` of the [`BatchTask`] this result belongs to.
     pub custom_id: String,
     /// Concatenated answer text (empty when `error` is set).
     pub text: String,

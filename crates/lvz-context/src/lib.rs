@@ -15,6 +15,7 @@
 //!
 //! These are the primitives the agent uses to read less and write less; the skeleton-radius
 //! knob `N` (§6.5) drives [`skeleton::skeletonize`]'s `keep_bodies` set.
+#![warn(missing_docs)]
 
 pub mod anchor;
 pub mod budget;

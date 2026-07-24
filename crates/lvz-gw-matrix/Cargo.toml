@@ -36,3 +36,8 @@ e2ee = ["dep:matrix-sdk-crypto", "dep:matrix-sdk-sqlite", "dep:ruma", "dep:http"
 
 [dev-dependencies]
 serde_json.workspace = true
+
+# Build docs.rs with `e2ee` on so the crypto module (off by default) is documented too. The
+# feature needs Rust >= 1.93; docs.rs builds on recent nightly, so this resolves there.
+[package.metadata.docs.rs]
+features = ["e2ee"]

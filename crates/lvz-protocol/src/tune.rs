@@ -14,10 +14,15 @@ use crate::provider::Capabilities;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Archetype {
+    /// A localized edit within one file.
     SingleFileEdit,
+    /// A structural change spanning multiple files.
     Refactor,
+    /// A symbol rename across the codebase.
     Rename,
+    /// Net-new functionality.
     Feature,
+    /// Anything not fitting the above.
     Other,
 }
 
@@ -36,8 +41,11 @@ pub enum ModelTier {
 /// Repository shape that conditions knob selection.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoProfile {
+    /// Number of source files in the repo.
     pub file_count: u32,
+    /// Total size of the repo in bytes.
     pub total_bytes: u64,
+    /// The repo's dominant language.
     pub primary_language: String,
 }
 
@@ -45,9 +53,13 @@ pub struct RepoProfile {
 /// explicitly so profiles can condition on it (§6.6).
 #[derive(Debug, Clone)]
 pub struct TaskContext {
+    /// The classified task archetype.
     pub archetype: Archetype,
+    /// Shape of the repository the task runs against.
     pub repo: RepoProfile,
+    /// The provider's advertised capabilities (caching state is a major confounder).
     pub caps: Capabilities,
+    /// The coarse capability/cost tier of the model.
     pub model: ModelTier,
     /// The concrete model id (e.g. `"claude-sonnet-4-6"`). Keyed by the learner *alongside* the
     /// coarse [`model`](Self::model) tier so a model upgrade (which shifts the knob optimum,

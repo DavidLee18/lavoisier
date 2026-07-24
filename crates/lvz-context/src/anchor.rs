@@ -19,7 +19,9 @@ pub fn anchor_of(line: &str) -> String {
 /// A line paired with its anchor, as presented to the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnchoredLine {
+    /// The line's 8-hex content anchor.
     pub anchor: String,
+    /// The line's raw text.
     pub text: String,
 }
 
@@ -60,29 +62,35 @@ pub enum EditOp {
 /// A single anchored edit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edit {
+    /// Anchor of the line to act on.
     pub anchor: String,
+    /// What to do at the matched line.
     pub op: EditOp,
 }
 
 impl Edit {
+    /// Replace the anchored line with `text`.
     pub fn replace(anchor: impl Into<String>, text: impl Into<String>) -> Self {
         Edit {
             anchor: anchor.into(),
             op: EditOp::Replace(text.into()),
         }
     }
+    /// Insert `text` immediately after the anchored line.
     pub fn insert_after(anchor: impl Into<String>, text: impl Into<String>) -> Self {
         Edit {
             anchor: anchor.into(),
             op: EditOp::InsertAfter(text.into()),
         }
     }
+    /// Insert `text` immediately before the anchored line.
     pub fn insert_before(anchor: impl Into<String>, text: impl Into<String>) -> Self {
         Edit {
             anchor: anchor.into(),
             op: EditOp::InsertBefore(text.into()),
         }
     }
+    /// Delete the anchored line.
     pub fn delete(anchor: impl Into<String>) -> Self {
         Edit {
             anchor: anchor.into(),
@@ -97,7 +105,12 @@ pub enum AnchorError {
     /// No line matched the anchor — the file changed under the edit.
     NotFound(String),
     /// More than one line matched the anchor — the target is ambiguous.
-    Ambiguous { anchor: String, count: usize },
+    Ambiguous {
+        /// The over-matched anchor.
+        anchor: String,
+        /// How many lines it matched.
+        count: usize,
+    },
 }
 
 impl std::fmt::Display for AnchorError {

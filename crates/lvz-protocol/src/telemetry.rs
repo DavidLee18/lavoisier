@@ -56,5 +56,6 @@ impl TaskTelemetry {
 /// A sink that receives one [`TaskTelemetry`] per completed task. Implementations must be cheap
 /// and non-blocking (it is called on the agent's task path). `Send + Sync` for shared use.
 pub trait TelemetrySink: Send + Sync {
+    /// Record one completed task's telemetry. Must be cheap and non-blocking.
     fn record(&self, telemetry: &TaskTelemetry);
 }

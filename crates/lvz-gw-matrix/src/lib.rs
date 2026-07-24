@@ -5,10 +5,11 @@
 //! not the heavyweight `matrix-sdk` — mirroring the hand-rolled provider adapters and the
 //! project's minimal-dependency convention. It logs in with a password, long-polls `/sync`,
 //! and for each inbound `m.room.message` (`m.text`) from another user runs an agent turn
-//! (session = room id, so [`lvz-memory`] keeps per-room continuity) and posts the answer back.
+//! (session = room id, so `lvz-memory` keeps per-room continuity) and posts the answer back.
 //!
 //! Scope: unencrypted rooms by default. **End-to-end encryption is opt-in** behind the `e2ee`
-//! Cargo feature (Olm/Megolm via the crypto-only `matrix-sdk-crypto`, contained to [`e2ee`]);
+//! Cargo feature (Olm/Megolm via the crypto-only `matrix-sdk-crypto`, contained to the `e2ee`
+//! module);
 //! without it the gateway is a thin REST client. Depends only on `lvz-protocol`; the agent core
 //! stays unaware of Matrix.
 //!
@@ -20,10 +21,12 @@
 //! 2. **Persisted session** — if a state directory is configured ([`MatrixGateway::with_state_dir`])
 //!    and holds a saved `{access_token, device_id}` from a previous run, it's reused (validated with
 //!    `whoami`), keeping the **device id stable across restarts** — a prerequisite for persistent
-//!    E2EE (see [`e2ee`]).
+//!    E2EE (see the `e2ee` module).
 //! 3. **Password login** (`MATRIX_PASSWORD`) — the fallback; the issued session is persisted to the
 //!    state dir (if any) so the next start takes path 2. A configured device id (`MATRIX_DEVICE_ID`)
 //!    or a previously-persisted one is reused on re-login so the device stays stable.
+
+#![warn(missing_docs)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -187,7 +190,7 @@ impl MatrixGateway {
     }
 
     /// Set per-room tool permissions: each `room_id` maps to the tools permitted in that room.
-    /// Rooms absent from the map are unconstrained. See [`Self::tools_for`].
+    /// Rooms absent from the map are unconstrained. See `Self::tools_for`.
     pub fn with_room_tools(mut self, map: impl IntoIterator<Item = (String, Vec<String>)>) -> Self {
         self.room_tools = map
             .into_iter()

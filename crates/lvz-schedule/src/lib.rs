@@ -1,6 +1,6 @@
 //! Scheduled, **unconditional** actions for the Lavoisier agent.
 //!
-//! Where the cron gateway ([`lvz-gw-cron`]) fires a *prompt* and hopes the model picks the right
+//! Where the cron gateway (`lvz-gw-cron`) fires a *prompt* and hopes the model picks the right
 //! tool, a schedule job can name a **tool call directly** — it runs every time, deterministically,
 //! with no model round-trip (and so no tokens). A job may still fire a prompt turn when the point
 //! is for the agent to reason; both shapes live in [`Action`].
@@ -20,6 +20,8 @@
 //! `retry_wait`, and **the next scheduled slot is recomputed from "now" once the retry chain
 //! resolves**, so a retry's wait can never double-fire the following slot. Unlike cron, the wait is
 //! not a blocking sleep — a pending retry is just another due time, so the host loop stays free.
+
+#![warn(missing_docs)]
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -50,12 +52,17 @@ pub enum Action {
     /// Invoke a tool **directly** through the shared [`ToolRegistry`]. Deterministic and free —
     /// no model round-trip. This is the "unconditionally run this" case.
     Tool {
+        /// Registry name of the tool to invoke.
         name: String,
+        /// JSON arguments passed straight to the tool, verbatim on every fire.
         args: serde_json::Value,
     },
     /// Fire a prompt into the agent and let it decide which tools to call (the cron gateway's
     /// behaviour). Use when the job needs reasoning or a written summary.
-    Prompt { text: String },
+    Prompt {
+        /// The prompt fired into the agent, exactly as the model receives it.
+        text: String,
+    },
 }
 
 impl Action {
@@ -75,7 +82,9 @@ pub struct ScheduleJob {
     pub id: String,
     /// The cron expression as written, kept for display.
     pub expr: String,
+    /// The parsed form of `expr`, driving the wait/fire loop.
     pub schedule: CronSchedule,
+    /// What the job does when it fires — a direct tool call or a prompt turn.
     pub action: Action,
     /// Where to report this job's outcome. `None` ⇒ the caller's default room.
     pub room: Option<String>,
@@ -112,12 +121,24 @@ struct JobSpec {
 /// A failure building jobs from a schedule file.
 #[derive(Debug, thiserror::Error)]
 pub enum ScheduleConfigError {
+    /// The file was not the expected JSON array of job specs.
     #[error("invalid schedule JSON: {0}")]
     Json(String),
+    /// A job's cron expression failed to parse.
     #[error("job {id:?}: invalid cron expression: {source}")]
-    Cron { id: String, source: CronError },
+    Cron {
+        /// The offending job's id.
+        id: String,
+        /// The underlying parse failure.
+        source: CronError,
+    },
+    /// A job named neither, or both, of `tool`/`prompt` — the action is ambiguous.
     #[error("job {id:?}: specify exactly one of `tool` or `prompt`")]
-    Action { id: String },
+    Action {
+        /// The offending job's id.
+        id: String,
+    },
+    /// Two jobs shared an id; ids must be unique so chat can name one.
     #[error("duplicate job id {0:?}")]
     DuplicateId(String),
 }
@@ -177,6 +198,7 @@ impl ScheduleJob {
 pub struct Outcome {
     /// Unix seconds when the attempt finished.
     pub at: u64,
+    /// Whether the attempt succeeded.
     pub ok: bool,
     /// Output summary on success, error text on failure.
     pub detail: String,
@@ -194,11 +216,17 @@ pub struct JobState {
     pub retry_at: Option<u64>,
     /// Attempts used in the current chain (0 when idle).
     pub attempt: u32,
+    /// Unix seconds of the most recent fire, or `None` if never fired.
     pub last_fired: Option<u64>,
+    /// Outcome of the most recent fire, or `None` if never fired.
     pub last_ok: Option<bool>,
+    /// Total attempts ever recorded, retries included.
     pub runs: u64,
+    /// Total failed attempts ever recorded.
     pub failures: u64,
+    /// Failures since the last success — the streak, reset to 0 on any success.
     pub consecutive_failures: u32,
+    /// Recent outcomes, newest last, bounded by `HISTORY_CAP`.
     pub history: VecDeque<Outcome>,
 }
 
@@ -206,10 +234,13 @@ pub struct JobState {
 /// reports, and failures are louder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FireReport {
+    /// Which job fired.
     pub job_id: String,
     /// The job's own room, if it set one; otherwise the caller's default.
     pub room: Option<String>,
+    /// Whether this attempt succeeded.
     pub ok: bool,
+    /// The preformatted report text ready to post.
     pub body: String,
     /// Which attempt in the current chain this was (1 = first try).
     pub attempt: u32,
@@ -258,14 +289,17 @@ impl ScheduleRegistry {
         }
     }
 
+    /// The jobs, in registration order (the index the `schedule_*` tools address).
     pub fn jobs(&self) -> &[ScheduleJob] {
         &self.jobs
     }
 
+    /// True when no jobs are registered.
     pub fn is_empty(&self) -> bool {
         self.jobs.is_empty()
     }
 
+    /// How many jobs are registered.
     pub fn len(&self) -> usize {
         self.jobs.len()
     }

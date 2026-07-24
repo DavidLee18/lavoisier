@@ -12,6 +12,8 @@
 //!   tuner ────┘
 //! ```
 
+#![warn(missing_docs)]
+
 mod agent;
 mod batch;
 mod event;

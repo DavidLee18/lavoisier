@@ -9,9 +9,13 @@ use tree_sitter::Language as TsLanguage;
 /// A source language Lavoisier can parse for skeletons and symbols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
+    /// Rust.
     Rust,
+    /// Python.
     Python,
+    /// JavaScript.
     JavaScript,
+    /// TypeScript.
     TypeScript,
 }
 

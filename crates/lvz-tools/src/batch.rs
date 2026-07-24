@@ -63,7 +63,7 @@ impl BatchEditTool {
         }
     }
 
-    /// Override the per-edit token ceiling (default [`DEFAULT_MAX_TOKENS`]).
+    /// Override the per-edit token ceiling (default `DEFAULT_MAX_TOKENS`).
     pub fn with_max_tokens(mut self, n: u32) -> Self {
         self.max_tokens = n;
         self

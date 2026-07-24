@@ -9,6 +9,8 @@
 //! `XAI_TRANSPORT` switch (`grpc` | `http`); gRPC is the default (§8 "primary
 //! transport", live-verified against `api.x.ai`), with `http` available as a fallback.
 
+#![warn(missing_docs)]
+
 mod grpc;
 mod http;
 

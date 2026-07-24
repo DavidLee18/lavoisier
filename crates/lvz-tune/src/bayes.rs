@@ -70,10 +70,13 @@ pub struct BayesTuner {
 }
 
 impl BayesTuner {
+    /// A cold tuner with default [`TuneConfig`] — flat posteriors, so it returns the baseline.
     pub fn new() -> Self {
         Self::with_config(TuneConfig::default())
     }
 
+    /// A cold tuner with explicit hyper-parameters (only `success_target` and `min_trials` bite;
+    /// Thompson sampling drives exploration itself, so `epsilon` is unused here).
     pub fn with_config(cfg: TuneConfig) -> Self {
         Self {
             cfg,

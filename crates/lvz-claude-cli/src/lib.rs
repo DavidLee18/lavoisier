@@ -16,6 +16,8 @@
 //! Not live-verified here (needs a `claude` install + a subscription); the stream-json → Event
 //! mapping is unit-tested.
 
+#![warn(missing_docs)]
+
 use std::collections::VecDeque;
 use std::process::Stdio;
 
