@@ -28,6 +28,7 @@ use futures::{SinkExt, StreamExt};
 use lvz_protocol::{AgentHandle, Event, Gateway, GatewayError, TurnRequest};
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
+use tracing::{error, info, warn};
 
 const WEB_API: &str = "https://slack.com/api";
 
@@ -142,13 +143,14 @@ impl SlackGateway {
         }
         match self.web_post("chat.postMessage", &body).await {
             Ok(resp) if resp.get("ok").and_then(Value::as_bool) == Some(true) => {}
-            Ok(resp) => eprintln!(
-                "slack: chat.postMessage failed: {}",
-                resp.get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
+            Ok(resp) => error!(
+                error = resp
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                "chat.postMessage failed"
             ),
-            Err(e) => eprintln!("slack: chat.postMessage error: {e}"),
+            Err(e) => error!(error = %e, "chat.postMessage error"),
         }
     }
 
@@ -160,7 +162,7 @@ impl SlackGateway {
         let mut stream = match agent.submit(turn).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("slack: agent error in {}: {e}", msg.channel);
+                error!(channel = %msg.channel, error = %e, "agent error");
                 return;
             }
         };
@@ -170,7 +172,7 @@ impl SlackGateway {
                 Ok(Event::TextDelta(t)) => answer.push_str(&t),
                 Ok(_) => {}
                 Err(e) => {
-                    eprintln!("slack: stream error in {}: {e}", msg.channel);
+                    error!(channel = %msg.channel, error = %e, "stream error");
                     break;
                 }
             }
@@ -199,17 +201,14 @@ impl SlackGateway {
     /// on the periodic `disconnect` refresh or on error), dispatching each event to the agent.
     async fn serve_loop(self: Arc<Self>, agent: Arc<dyn AgentHandle>) -> Result<(), GatewayError> {
         let bot_user = self.bot_user_id().await?;
-        eprintln!("lavoisier: slack gateway online as {bot_user}");
+        info!(bot = %bot_user, "slack gateway online");
         if let Some(allowed) = &self.allowed_users {
-            eprintln!(
-                "slack: answering only {} allowlisted user(s)",
-                allowed.len()
-            );
+            info!(users = allowed.len(), "answering only allowlisted user(s)");
         }
         loop {
             if let Err(e) = self.clone().run_connection(&agent, &bot_user).await {
                 // Transient connection failure: back off briefly and reconnect rather than exit.
-                eprintln!("slack: {e}; reconnecting in 3s");
+                warn!(error = %e, "reconnecting in 3s");
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         }
@@ -227,7 +226,7 @@ impl SlackGateway {
             .await
             .map_err(|e| GatewayError::Io(format!("slack socket connect: {e}")))?;
         let (mut write, mut read) = ws.split();
-        eprintln!("slack: socket connected");
+        info!("socket connected");
 
         while let Some(frame) = read.next().await {
             let msg = frame.map_err(|e| GatewayError::Io(format!("slack socket read: {e}")))?;

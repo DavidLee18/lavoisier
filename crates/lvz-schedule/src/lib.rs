@@ -535,11 +535,15 @@ async fn run_action(
     }
 }
 
-/// Write the full account of one fire to stderr.
+/// Emit the full account of one fire as a single `tracing` event.
 ///
 /// The Matrix report is deliberately short — a room is a bad log — so this is the only place the
 /// untruncated output, the timing, and the token cost all land. Kept in this crate (rather than the
 /// gateway) so every frontend gets the same operator log for free.
+///
+/// One event per fire, at `info!` on success and `error!` on failure, so both are visible under the
+/// CLI's default filter. The untruncated body rides along as the `output`/`error` field rather than
+/// as extra lines.
 fn log_verbose(
     job: &ScheduleJob,
     outcome: &ActionOutcome,
@@ -565,27 +569,25 @@ fn log_verbose(
 
     match &outcome.result {
         Ok(output) => {
-            eprintln!(
-                "lavoisier[schedule]: {} fired ok in {ms}ms (attempt {}){tools_note}{usage_note}",
-                job.id, report.attempt
-            );
             let output = output.trim();
-            if output.is_empty() {
-                eprintln!("--- no output ---");
-            } else {
-                eprintln!("--- output ({} bytes) ---", output.len());
-                eprintln!("{output}");
-            }
+            tracing::info!(
+                job = %job.id,
+                attempt = report.attempt,
+                duration_ms = ms,
+                bytes = output.len(),
+                output = %output,
+                "job fired ok{tools_note}{usage_note}",
+            );
         }
         Err(error) => {
-            eprintln!(
-                "lavoisier[schedule]: {} FAILED in {ms}ms (attempt {}/{}){tools_note}{usage_note}",
-                job.id,
-                report.attempt,
-                job.retry_max + 1
+            tracing::error!(
+                job = %job.id,
+                attempt = report.attempt,
+                max_attempts = job.retry_max + 1,
+                duration_ms = ms,
+                error = %error.trim(),
+                "job FAILED{tools_note}{usage_note}",
             );
-            eprintln!("--- error ---");
-            eprintln!("{}", error.trim());
         }
     }
 }

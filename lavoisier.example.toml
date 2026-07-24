@@ -79,3 +79,24 @@
 # Slack gateway:
 # slack_allowed_users  = ["U_ALICE", "U_BOB"]       # only answer these Slack users (env
 #                                                   # SLACK_ALLOWED_USERS wins; empty = everyone)
+
+# ---------------------------------------------------------------------------------------------
+# [log] — structured logging to stderr (tracing).
+#
+# Operator diagnostics (gateways, scheduler, memory) are tracing events. The DEFAULT filter is our
+# own crates at `info` and everything else at `warn`, so that output prints as it always has while
+# dependency chatter stays hidden — `tracing` is a facade shared with tonic/hyper/h2/axum, so an
+# unscoped `info` would surface their events too.
+#
+# Set `level` to retune: quieter (`warn`), louder (`debug`), or targeted at one subsystem. The value
+# is a RUST_LOG-style filter. `--log-level` / `LVZ_LOG_LEVEL` take precedence over this file. A
+# malformed filter is reported and the default is used, so a typo can't silence a daemon.
+#
+# The CLI's own [tool]/[usage]/[done] rendering and the --telemetry line are NOT logging and are
+# never suppressed by this setting.
+# ---------------------------------------------------------------------------------------------
+# [log]
+# level = "info"                                    # everything at info and above
+# level = "debug"                                   # noisier, includes dependency chatter
+# level = "lvz_gw_matrix=debug,warn"                # Matrix gateway at debug, everything else warn
+# level = "lavoisier=info,lvz_schedule=debug,error" # per-crate targeting

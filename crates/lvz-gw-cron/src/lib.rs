@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use futures::stream::StreamExt;
 use lvz_protocol::{AgentHandle, Event, Gateway, GatewayError, TurnRequest};
 use serde::Deserialize;
+use tracing::{error, info, warn};
 
 pub use lvz_schedule::{CronError, CronSchedule};
 
@@ -178,13 +179,10 @@ impl Gateway for CronGateway {
         }
         for job in &self.jobs {
             match job.schedule.next_after_now() {
-                Some(_) => eprintln!(
-                    "lavoisier[cron]: scheduled session={:?} — {}",
-                    job.session, job.prompt
-                ),
-                None => eprintln!(
-                    "lavoisier[cron]: WARNING session={:?} never fires (impossible schedule) — skipping",
-                    job.session
+                Some(_) => info!(session = ?job.session, prompt = %job.prompt, "scheduled"),
+                None => warn!(
+                    session = ?job.session,
+                    "never fires (impossible schedule) — skipping"
                 ),
             }
         }
@@ -219,9 +217,10 @@ async fn run_job(job: &CronJob, agent: Arc<dyn AgentHandle>) {
             }
             if attempt >= job.retry_max {
                 if job.retry_max > 0 {
-                    eprintln!(
-                        "lavoisier[cron]: session={:?} gave up after {} retr{}",
-                        job.session,
+                    warn!(
+                        session = ?job.session,
+                        retries = job.retry_max,
+                        "gave up after {} retr{}",
                         job.retry_max,
                         if job.retry_max == 1 { "y" } else { "ies" }
                     );
@@ -229,9 +228,11 @@ async fn run_job(job: &CronJob, agent: Arc<dyn AgentHandle>) {
                 break;
             }
             attempt += 1;
-            eprintln!(
-                "lavoisier[cron]: session={:?} retry {attempt}/{} in {}s",
-                job.session, job.retry_max, job.retry_wait
+            warn!(
+                session = ?job.session,
+                "retry {attempt}/{} in {}s",
+                job.retry_max,
+                job.retry_wait
             );
             tokio::time::sleep(std::time::Duration::from_secs(job.retry_wait)).await;
         }
@@ -247,10 +248,7 @@ async fn fire(job: &CronJob, agent: &Arc<dyn AgentHandle>) -> bool {
     let mut stream = match agent.submit(turn).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
-                "lavoisier[cron]: session={:?} submit failed: {e}",
-                job.session
-            );
+            error!(session = ?job.session, error = %e, "submit failed");
             return false;
         }
     };
@@ -269,10 +267,7 @@ async fn fire(job: &CronJob, agent: &Arc<dyn AgentHandle>) -> bool {
             Ok(Event::Done(_)) => {}
             Ok(_) => {}
             Err(e) => {
-                eprintln!(
-                    "lavoisier[cron]: session={:?} stream error: {e}",
-                    job.session
-                );
+                error!(session = ?job.session, error = %e, "stream error");
                 ok = false;
                 break;
             }
@@ -292,9 +287,9 @@ async fn fire(job: &CronJob, agent: &Arc<dyn AgentHandle>) -> bool {
     } else {
         format!(" [tools: {}]", tools.join(", "))
     };
-    eprintln!(
-        "lavoisier[cron]: session={:?} fired{toks}{tools_note}: {}",
-        job.session,
+    info!(
+        session = ?job.session,
+        "fired{toks}{tools_note}: {}",
         answer.trim()
     );
     ok

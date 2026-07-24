@@ -40,6 +40,7 @@ use lvz_protocol::{AgentHandle, Event, Gateway, GatewayError, TurnRequest};
 use lvz_schedule::ScheduleRegistry;
 use lvz_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
+use tracing::{error, info, warn};
 
 #[cfg(feature = "e2ee")]
 mod e2ee;
@@ -338,16 +339,16 @@ impl MatrixGateway {
                         .device_id
                         .filter(|d| !d.is_empty())
                         .unwrap_or_else(|| saved.device_id.clone());
-                    eprintln!("matrix: reusing persisted session (device {device_id})");
+                    info!(%device_id, "reusing persisted session");
                     return Ok(Session {
                         access_token: saved.access_token.clone(),
                         user_id: who.user_id,
                         device_id,
                     });
                 }
-                Err(e) => eprintln!(
-                    "matrix: persisted token rejected ({e}); falling back to password login"
-                ),
+                Err(e) => {
+                    warn!(error = %e, "persisted token rejected; falling back to password login")
+                }
             }
         }
 
@@ -454,9 +455,11 @@ impl MatrixGateway {
             match op().await {
                 Ok(v) => return Ok(v),
                 Err(e @ GatewayError::Io(_)) => {
-                    eprintln!(
-                        "matrix: {what} failed ({e}); retrying in {}s",
-                        delay.as_secs()
+                    warn!(
+                        what,
+                        error = %e,
+                        retry_in_secs = delay.as_secs(),
+                        "request failed; retrying"
                     );
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(max);
@@ -488,7 +491,7 @@ impl MatrixGateway {
         };
         if let Some(dir) = &self.state_dir {
             if let Err(e) = std::fs::create_dir_all(dir) {
-                eprintln!("matrix: could not create state dir {}: {e}", dir.display());
+                error!(dir = %dir.display(), error = %e, "could not create state dir");
                 return;
             }
         }
@@ -501,13 +504,10 @@ impl MatrixGateway {
         match serde_json::to_string_pretty(&saved) {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&path, json) {
-                    eprintln!(
-                        "matrix: could not persist session to {}: {e}",
-                        path.display()
-                    );
+                    error!(path = %path.display(), error = %e, "could not persist session");
                 }
             }
-            Err(e) => eprintln!("matrix: could not serialise session: {e}"),
+            Err(e) => error!(error = %e, "could not serialise session"),
         }
     }
 
@@ -691,7 +691,7 @@ impl MatrixGateway {
                 dm
             }
             Err(e) => {
-                eprintln!("matrix: joined_members({room_id}) failed: {e}");
+                error!(%room_id, error = %e, "joined_members failed");
                 false
             }
         }
@@ -735,7 +735,7 @@ impl MatrixGateway {
             .send_message(token, home, "⚠️ Lavoisier gateway shutting down.")
             .await
         {
-            eprintln!("matrix: failed to send shutdown notice to {home}: {e}");
+            error!(room = %home, error = %e, "failed to send shutdown notice");
         }
     }
 
@@ -775,9 +775,9 @@ impl MatrixGateway {
                 continue;
             }
             match self.join_room(token, &room).await {
-                Ok(()) => eprintln!("matrix: auto-joined invited room {room}"),
+                Ok(()) => info!(%room, "auto-joined invited room"),
                 Err(e) => {
-                    eprintln!("matrix: auto-join {room} failed: {e}");
+                    error!(%room, error = %e, "auto-join failed");
                     seen.remove(&room);
                 }
             }
@@ -837,17 +837,20 @@ impl MatrixGateway {
                 Some(room) => match self.send_message(token, &room, &report.body).await {
                     Ok(eid) => sent.insert(eid),
                     Err(e) => {
-                        eprintln!(
-                            "matrix[schedule]: report for {} in {room}: {e}",
-                            report.job_id
+                        error!(
+                            job = %report.job_id,
+                            %room,
+                            error = %e,
+                            "schedule: sending job report failed"
                         )
                     }
                 },
                 // Nowhere to report: still surface the outcome so a misconfigured room can't
                 // silently swallow a failing job.
-                None => eprintln!(
-                    "lavoisier[schedule]: {} (no report room configured): {}",
-                    report.job_id, report.body
+                None => info!(
+                    job = %report.job_id,
+                    report = %report.body,
+                    "schedule: job report (no report room configured)"
                 ),
             }
         }
@@ -898,13 +901,13 @@ impl MatrixGateway {
         let ack = match self.react(token, &room, &msg.event_id, "👀").await {
             Ok(eid) => Some(eid),
             Err(e) => {
-                eprintln!("matrix: react in {room}: {e}");
+                error!(%room, error = %e, "react failed");
                 None
             }
         };
         // 2. Show "typing…" while we prepare a response.
         if let Err(e) = self.set_typing(token, &room, self_user, true).await {
-            eprintln!("matrix: typing in {room}: {e}");
+            error!(%room, error = %e, "typing indicator failed");
         }
 
         // Apply this room/member's tool permissions (if any) to the turn. The agent core enforces
@@ -916,7 +919,7 @@ impl MatrixGateway {
         let mut stream = match agent.submit(turn).await {
             Ok(stream) => stream,
             Err(e) => {
-                eprintln!("matrix: agent error in {room}: {e}");
+                error!(%room, error = %e, "agent error");
                 let _ = self.set_typing(token, &room, self_user, false).await;
                 self.finish_reaction(token, &room, &msg.event_id, ack.as_deref(), false)
                     .await;
@@ -948,7 +951,7 @@ impl MatrixGateway {
                         };
                         match self.send_via(reply, token, &room, notice).await {
                             Ok(eid) => sent.insert(eid),
-                            Err(e) => eprintln!("matrix: tool notice in {room}: {e}"),
+                            Err(e) => error!(%room, error = %e, "tool notice failed"),
                         }
                         // Re-assert typing so the indicator survives a long multi-tool turn.
                         let _ = self.set_typing(token, &room, self_user, true).await;
@@ -956,7 +959,7 @@ impl MatrixGateway {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    eprintln!("matrix: stream error in {room}: {e}");
+                    error!(%room, error = %e, "stream error");
                     ok = false;
                     break;
                 }
@@ -970,7 +973,7 @@ impl MatrixGateway {
             match self.send_via(reply, token, &room, answer.to_string()).await {
                 Ok(eid) => sent.insert(eid),
                 Err(e) => {
-                    eprintln!("matrix: send error in {room}: {e}");
+                    error!(%room, error = %e, "send error");
                     ok = false;
                 }
             }
@@ -993,12 +996,12 @@ impl MatrixGateway {
     ) {
         if let Some(ack) = ack {
             if let Err(e) = self.redact(token, room, ack).await {
-                eprintln!("matrix: redact ack in {room}: {e}");
+                error!(%room, error = %e, "redact ack failed");
             }
         }
         let emoji = if ok { "✅" } else { "❌" };
         if let Err(e) = self.react(token, room, event_id, emoji).await {
-            eprintln!("matrix: outcome react in {room}: {e}");
+            error!(%room, error = %e, "outcome react failed");
         }
     }
 }
@@ -1034,44 +1037,46 @@ impl MatrixGateway {
     /// The gateway's serve loop, as a plain (non-`async_trait`) async fn — see [`Gateway::serve`].
     async fn serve_loop(self: Arc<Self>, agent: Arc<dyn AgentHandle>) -> Result<(), GatewayError> {
         let session = self.resolve_session().await?;
-        eprintln!(
-            "lavoisier: matrix gateway online as {} (device {}) on {}",
-            session.user_id, session.device_id, self.homeserver
+        info!(
+            user_id = %session.user_id,
+            device_id = %session.device_id,
+            homeserver = %self.homeserver,
+            "matrix gateway online"
         );
         if let Some(allowed) = &self.allowed_users {
-            eprintln!(
-                "matrix: answering only {} allowlisted sender(s)",
-                allowed.len()
+            info!(
+                senders = allowed.len(),
+                "answering only allowlisted sender(s)"
             );
         }
         if let Some(rooms) = &self.allowed_rooms {
-            eprintln!("matrix: acting only in {} allowlisted room(s)", rooms.len());
+            info!(rooms = rooms.len(), "acting only in allowlisted room(s)");
         }
         if !self.room_tools.is_empty() || !self.user_tools.is_empty() {
-            eprintln!(
-                "matrix: tool permissions set for {} room(s) and {} member(s)",
-                self.room_tools.len(),
-                self.user_tools.len()
+            info!(
+                rooms = self.room_tools.len(),
+                members = self.user_tools.len(),
+                "tool permissions set"
             );
         }
         if let Some(home) = &self.home_room {
-            eprintln!("matrix: home room {home} (receives the shutdown notice)");
+            info!(room = %home, "home room (receives the shutdown notice)");
         }
         if let Some(schedule) = &self.schedule {
-            eprintln!("matrix: {} scheduled job(s)", schedule.len());
+            info!(jobs = schedule.len(), "scheduled job(s)");
             for job in schedule.jobs() {
                 match job.schedule.next_after_now() {
-                    Some(_) => eprintln!(
-                        "matrix[schedule]: {} [{}] {} → {}",
-                        job.id,
-                        job.expr,
-                        job.action.summary(),
-                        self.report_room(job.room.as_deref())
-                            .unwrap_or_else(|| "(stderr — no report room)".to_string())
+                    Some(_) => info!(
+                        job = %job.id,
+                        expr = %job.expr,
+                        action = %job.action.summary(),
+                        report_to = %self.report_room(job.room.as_deref())
+                            .unwrap_or_else(|| "(stderr — no report room)".to_string()),
+                        "schedule: job registered"
                     ),
-                    None => eprintln!(
-                        "matrix[schedule]: WARNING {} never fires (impossible schedule) — skipping",
-                        job.id
+                    None => warn!(
+                        job = %job.id,
+                        "schedule: job never fires (impossible schedule) — skipping"
                     ),
                 }
             }
@@ -1097,11 +1102,11 @@ impl MatrixGateway {
         .await
         {
             Ok(c) => {
-                eprintln!("lavoisier: matrix E2EE enabled");
+                info!("e2ee: matrix E2EE enabled");
                 Some(c)
             }
             Err(e) => {
-                eprintln!("matrix[e2ee]: init failed, continuing without encryption: {e}");
+                warn!(error = %e, "e2ee: init failed, continuing without encryption");
                 None
             }
         };
@@ -1135,7 +1140,7 @@ impl MatrixGateway {
             let value = tokio::select! {
                 biased;
                 _ = &mut shutdown => {
-                    eprintln!("matrix: shutdown signal received, stopping");
+                    info!("shutdown signal received, stopping");
                     self.send_shutdown_notice(&token).await;
                     return Ok(());
                 }
@@ -1147,7 +1152,7 @@ impl MatrixGateway {
                     Ok(value) => value,
                     Err(e) => {
                         // Transient sync failure: back off briefly and retry rather than exit.
-                        eprintln!("matrix: {e}; retrying");
+                        warn!(error = %e, "sync failed; retrying");
                         tokio::time::sleep(Duration::from_secs(3)).await;
                         continue;
                     }
@@ -1162,7 +1167,7 @@ impl MatrixGateway {
             #[cfg(feature = "e2ee")]
             if let Some(c) = &crypto {
                 if let Err(e) = c.receive_sync(&value).await {
-                    eprintln!("matrix[e2ee]: {e}");
+                    error!(error = %e, "e2ee: receive_sync failed");
                 }
             }
 
@@ -1170,7 +1175,7 @@ impl MatrixGateway {
             let resp = match SyncResponse::deserialize(&value) {
                 Ok(resp) => resp,
                 Err(e) => {
-                    eprintln!("matrix: malformed sync: {e}");
+                    error!(error = %e, "malformed sync");
                     since = next;
                     continue;
                 }

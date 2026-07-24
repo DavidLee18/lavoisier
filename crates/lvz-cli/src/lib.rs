@@ -12,7 +12,7 @@
 #![warn(missing_docs)]
 
 use std::collections::HashMap;
-use std::io::{Read, Stdout, Write};
+use std::io::{IsTerminal, Read, Stdout, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -59,7 +59,7 @@ struct Cli {
 
     /// Path to a TOML config file (defaults for most flags; CLI/env still win). Without it,
     /// `./lavoisier.toml` is auto-loaded if present. See `[provider]`/`[agent]`/`[memory]`/
-    /// `[gateway]` sections.
+    /// `[gateway]`/`[log]` sections.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
@@ -332,6 +332,16 @@ struct Cli {
     #[arg(long)]
     telemetry: bool,
 
+    /// Filter for the structured `tracing` logs written to **stderr**. Accepts `RUST_LOG`-style
+    /// directives, so it takes either a bare level (`info`, `debug`) or per-target rules
+    /// (`lvz_gw_matrix=debug,warn`). Unset ⇒ our own crates log at `info` and everything else at
+    /// `warn`, which keeps the operator output printing as it always has without dragging in
+    /// dependency chatter (tonic/hyper emit through the same facade). Use this to go quieter
+    /// (`--log-level warn`), louder (`debug`), or to target one subsystem. A malformed filter is
+    /// reported and the default is used. Also settable via `[log] level`.
+    #[arg(long = "log-level", value_name = "FILTER", env = "LVZ_LOG_LEVEL")]
+    log_level: Option<String>,
+
     /// Classify the task archetype with a model call instead of the free keyword heuristic
     /// (§6.3). Costs one extra tool-less round-trip (routed to --summary-model when
     /// set); falls back to the heuristic on failure. Mainly useful paired with `--tune`.
@@ -447,6 +457,82 @@ impl ProviderKind {
 /// depending only on `lavoisier` (no direct `lvz-protocol` dependency needed).
 pub use lvz_protocol::{Tool, ToolError, ToolOutput};
 
+/// The [`tracing`] facade, re-exported so a private downstream crate can instrument its own tools
+/// (`lavoisier::tracing::info!(…)`) without taking a direct `tracing` dependency or having to match
+/// this crate's version. A downstream tool's events surface under its own crate name, so reach them
+/// with a directive like `--log-level 'my_tools=debug'` (the default filter only raises *our*
+/// crates to `info`, leaving everything else at `warn`).
+pub use tracing;
+
+/// The filter used when the operator sets none.
+///
+/// Our own crates log at `info`, so the operator diagnostics that predate structured logging keep
+/// printing as before; everything else sits at `warn`. The scoping is the point: `tracing` is a
+/// facade shared with our dependencies (tonic, hyper, h2, axum, tower all emit through it), so a
+/// bare `info` default would drag their chatter into view. `EnvFilter` has no glob for `lvz_*`,
+/// hence the explicit roll-call — a crate missing from this list falls back to `warn`, silently
+/// hiding its `info` milestones, so add new crates here.
+const DEFAULT_LOG_FILTER: &str = "warn,\
+    lavoisier=info,\
+    lvz_agent=info,\
+    lvz_anthropic=info,\
+    lvz_claude_cli=info,\
+    lvz_context=info,\
+    lvz_google=info,\
+    lvz_gw_cron=info,\
+    lvz_gw_http=info,\
+    lvz_gw_matrix=info,\
+    lvz_gw_slack=info,\
+    lvz_memory=info,\
+    lvz_protocol=info,\
+    lvz_schedule=info,\
+    lvz_tools=info,\
+    lvz_tune=info,\
+    lvz_xai=info";
+
+/// Install the stderr logging collector.
+///
+/// Always installs: the operator diagnostics these events replace used to print unconditionally, so
+/// going quiet by default would be a silent regression for a long-running gateway. `--log-level`
+/// only *retunes* the filter; [`DEFAULT_LOG_FILTER`] applies when it is unset.
+///
+/// This is the only place in the workspace that installs a collector: library crates emit through
+/// the facade and never decide where events go, so embedding `lavoisier` as a library leaves the
+/// host application's own collector untouched. Returns whether a collector was actually installed
+/// (`false` if one was already set — e.g. by an embedding host).
+fn init_logging(filter: Option<&str>) -> bool {
+    let directives = filter.unwrap_or(DEFAULT_LOG_FILTER);
+    // A bad filter is reported, then we fall back to the default rather than losing all output —
+    // a typo in `--log-level` should not silence a running daemon.
+    let env_filter = match build_log_filter(directives) {
+        Some(f) => f,
+        None => match build_log_filter(DEFAULT_LOG_FILTER) {
+            Some(f) => f,
+            None => return false,
+        },
+    };
+    // ANSI only when stderr is a terminal, so redirected logs stay clean.
+    let ansi = std::io::stderr().is_terminal();
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(ansi)
+        .try_init()
+        .is_ok()
+}
+
+/// Parse a `RUST_LOG`-style filter, reporting a bad one on stderr. Split out from [`init_logging`]
+/// so the validation is testable without touching the process-global collector.
+fn build_log_filter(directives: &str) -> Option<tracing_subscriber::EnvFilter> {
+    match tracing_subscriber::EnvFilter::try_new(directives) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            eprintln!("lavoisier: invalid --log-level {directives:?}: {e}");
+            None
+        }
+    }
+}
+
 /// Run the full Lavoisier CLI, registering `extra_tools` into the agent alongside the built-ins.
 /// This is the entry point for a private downstream binary that wants the entire CLI — flags,
 /// config, gateways (HTTP/Matrix/Slack/cron), E2EE, persona — but with its own tools. The stock `lav`
@@ -488,7 +574,23 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
     // left unset — CLI/env always wins. Done before anything reads `cli`.
     let config = Config::load(cli.config.as_deref())?;
     config.apply_to(&mut cli);
+
+    // Install the logging collector as early as possible — right after precedence is resolved, so
+    // `[log] level` counts, and before any work worth logging happens.
+    init_logging(cli.log_level.as_deref());
+    // Deferred from `Config::load`: the file carries `[log] level`, so it is necessarily read
+    // before the collector exists and an event emitted there would be dropped.
+    if let Some(path) = &config.source {
+        tracing::info!(path = %path.display(), "loaded config");
+    }
+
     let provider_kind = cli.provider.unwrap_or(ProviderKind::Xai);
+    tracing::debug!(
+        provider = ?provider_kind,
+        model = cli.model.as_deref().unwrap_or("(default)"),
+        agent = cli.agent,
+        "lavoisier starting"
+    );
 
     // Cron jobs (in-process scheduler) can run standalone or alongside HTTP/Matrix.
     let cron_jobs = build_cron_jobs(&cli)?;
@@ -540,8 +642,10 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             } else {
                 "API-key required"
             };
-            eprintln!(
-                "lavoisier: HTTP gateway listening on http://{addr} ({auth}; POST /v1/turns, GET /v1/ws)"
+            tracing::info!(
+                %addr,
+                %auth,
+                "HTTP gateway listening on http://{addr} (POST /v1/turns, GET /v1/ws)"
             );
             gateways.push(Arc::new(HttpGateway::bind(&addr)?.with_config(gw_config)));
         }
@@ -584,7 +688,7 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             // Scheduled jobs live inside this gateway: it owns the timer, fires the action, and
             // reports the outcome to a room.
             if let Some(schedule) = &schedule {
-                eprintln!("lavoisier: matrix schedule with {} job(s)", schedule.len());
+                tracing::info!(jobs = schedule.len(), "matrix schedule armed");
                 matrix = matrix.with_schedule(schedule.clone(), tools.clone());
                 if let Some(room) = &cli.schedule_room {
                     matrix = matrix.with_schedule_room(room.clone());
@@ -602,12 +706,12 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
                     slack = slack.with_allowed_users(users.clone());
                 }
             }
-            eprintln!("lavoisier: Slack gateway (Socket Mode)");
+            tracing::info!("Slack gateway (Socket Mode)");
             gateways.push(Arc::new(slack));
         }
 
         if !cron_jobs.is_empty() {
-            eprintln!("lavoisier: cron gateway with {} job(s)", cron_jobs.len());
+            tracing::info!(jobs = cron_jobs.len(), "cron gateway armed");
             gateways.push(Arc::new(CronGateway::new(cron_jobs)));
         }
 
@@ -727,16 +831,17 @@ fn load_persona(cli: &Cli) -> Option<String> {
     };
     match std::fs::read_to_string(&path) {
         Ok(s) if !s.trim().is_empty() => {
-            eprintln!("lavoisier: loaded persona from {}", path.display());
+            tracing::info!(path = %path.display(), "loaded persona");
             Some(s.trim().to_string())
         }
         Ok(_) => None,
         Err(e) => {
             // Only surface an error for an explicitly requested file.
             if cli.persona.is_some() {
-                eprintln!(
-                    "lavoisier: WARNING could not read --persona {}: {e}",
-                    path.display()
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "could not read --persona"
                 );
             }
             None
@@ -876,7 +981,7 @@ fn build_agent(
         let tuner: Arc<dyn Tuner> = match &cli.tune_state {
             Some(path) => {
                 let inner = BayesTuner::load(path, tune_cfg).unwrap_or_else(|e| {
-                    eprintln!("tune-state: could not load {path}: {e}; starting cold");
+                    tracing::warn!(%path, error = %e, "tune-state: could not load; starting cold");
                     BayesTuner::with_config(tune_cfg)
                 });
                 PersistentTuner::new(Arc::new(inner), path).into_arc()
@@ -894,7 +999,7 @@ fn build_agent(
         let tuner: Arc<dyn Tuner> = match &cli.tune_state {
             Some(path) => {
                 let inner = LearningTuner::load(path, tune_cfg).unwrap_or_else(|e| {
-                    eprintln!("tune-state: could not load {path}: {e}; starting cold");
+                    tracing::warn!(%path, error = %e, "tune-state: could not load; starting cold");
                     LearningTuner::with_config(tune_cfg)
                 });
                 PersistentTuner::new(Arc::new(inner), path).into_arc()
@@ -941,7 +1046,7 @@ impl Tuner for PersistentTuner {
     fn observe(&self, ctx: &TaskContext, used: &Knobs, out: &Outcome) {
         self.inner.observe(ctx, used, out);
         if let Err(e) = self.inner.persist(&self.path) {
-            eprintln!("tune-state: could not save {}: {e}", self.path.display());
+            tracing::warn!(path = %self.path.display(), error = %e, "tune-state: could not save");
         }
     }
 }
@@ -1038,5 +1143,112 @@ impl Renderer {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_filter_is_valid_and_scopes_to_our_crates() {
+        // A typo here would silently downgrade every crate to `warn`, hiding the operator output
+        // that used to print unconditionally — so parse it and check the shape explicitly.
+        assert!(build_log_filter(DEFAULT_LOG_FILTER).is_some());
+        assert!(
+            DEFAULT_LOG_FILTER.starts_with("warn,"),
+            "dependencies must default to warn, not info"
+        );
+        // Every workspace library that logs must be listed, or its info events vanish.
+        for krate in [
+            "lavoisier",
+            "lvz_gw_matrix",
+            "lvz_gw_slack",
+            "lvz_gw_cron",
+            "lvz_gw_http",
+            "lvz_schedule",
+            "lvz_memory",
+            "lvz_tools",
+        ] {
+            assert!(
+                DEFAULT_LOG_FILTER.contains(&format!("{krate}=info")),
+                "{krate} missing from the default filter"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_filter_falls_back_to_the_default_rather_than_going_silent() {
+        // `init_logging` installs a process-global collector, so this can only be asserted through
+        // the fallback path it uses: the default must still parse when the operator's does not.
+        assert!(build_log_filter("lvz_gw_matrix=nonsense").is_none());
+        assert!(build_log_filter(DEFAULT_LOG_FILTER).is_some());
+    }
+
+    #[test]
+    fn accepts_bare_levels_and_per_target_directives() {
+        for ok in [
+            "info",
+            "debug",
+            "off",
+            "lvz_gw_matrix=debug",
+            "lvz_gw_matrix=debug,warn",
+            "lavoisier=trace,lvz_schedule=debug,error",
+        ] {
+            assert!(build_log_filter(ok).is_some(), "expected {ok:?} to parse");
+        }
+    }
+
+    #[test]
+    fn rejects_a_malformed_filter() {
+        // A bad directive must be reported, not silently swallowed into "logs nothing".
+        assert!(build_log_filter("=====").is_none());
+        assert!(build_log_filter("lvz_gw_matrix=nonsense").is_none());
+    }
+
+    /// A writer that appends into a shared buffer, so a scoped subscriber's output is inspectable.
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The default filter's correctness rests on `EnvFilter` matching a directive target as a
+    /// **prefix** of the event's target: `lvz_gw_matrix=info` has to cover events emitted from
+    /// `lvz_gw_matrix::e2ee` too, or half a crate's logs go missing. Verified against a scoped
+    /// subscriber so no process-global state is touched.
+    #[test]
+    fn a_crate_directive_covers_that_crate_s_submodules() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(build_log_filter("warn,lvz_gw_matrix=info").unwrap())
+            .with_writer(move || SharedBuf(sink.clone()))
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "lvz_gw_matrix", "crate root event");
+            tracing::info!(target: "lvz_gw_matrix::e2ee", "submodule event");
+            tracing::info!(target: "tonic::transport", "dependency info");
+            tracing::warn!(target: "tonic::transport", "dependency warn");
+        });
+
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("crate root event"), "root target must match");
+        assert!(
+            out.contains("submodule event"),
+            "a crate directive must cover its submodules (prefix match)"
+        );
+        assert!(
+            !out.contains("dependency info"),
+            "dependency info must stay below the warn floor"
+        );
+        assert!(out.contains("dependency warn"), "dependency warn must pass");
     }
 }

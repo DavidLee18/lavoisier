@@ -164,9 +164,10 @@ impl SessionStore for FileStore {
     async fn save(&self, session: &str, mut history: Vec<Message>) {
         trim_to(&mut history, self.max_messages);
         if let Err(e) = tokio::fs::create_dir_all(&self.dir).await {
-            eprintln!(
-                "lavoisier[memory]: cannot create session dir {}: {e}",
-                self.dir.display()
+            tracing::error!(
+                dir = %self.dir.display(),
+                error = %e,
+                "cannot create session dir",
             );
             return;
         }
@@ -174,13 +175,14 @@ impl SessionStore for FileStore {
         match serde_json::to_vec_pretty(&history) {
             Ok(bytes) => {
                 if let Err(e) = tokio::fs::write(&path, bytes).await {
-                    eprintln!(
-                        "lavoisier[memory]: cannot write session {}: {e}",
-                        path.display()
+                    tracing::error!(
+                        session = %path.display(),
+                        error = %e,
+                        "cannot write session",
                     );
                 }
             }
-            Err(e) => eprintln!("lavoisier[memory]: cannot serialize session: {e}"),
+            Err(e) => tracing::error!(session = %session, error = %e, "cannot serialize session"),
         }
     }
 }

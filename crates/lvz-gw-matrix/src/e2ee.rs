@@ -45,6 +45,7 @@ use ruma::{
     OneTimeKeyAlgorithm, OwnedDeviceId, OwnedUserId, RoomId, UInt, UserId,
 };
 use serde_json::Value;
+use tracing::{error, info, warn};
 
 /// An end-to-end-encryption error. We collapse the many `matrix-sdk-crypto`/`ruma` error types to
 /// a string at the boundary — the gateway only logs them, and this avoids leaking those types
@@ -94,10 +95,7 @@ impl Crypto {
                 let store = SqliteCryptoStore::open(path, passphrase)
                     .await
                     .map_err(estr)?;
-                eprintln!(
-                    "matrix[e2ee]: using persistent crypto store at {}",
-                    path.display()
-                );
+                info!(store = %path.display(), "e2ee: using persistent crypto store");
                 OlmMachine::with_store(&user, &device, store, None)
                     .await
                     .map_err(estr)?
@@ -131,7 +129,7 @@ impl Crypto {
     /// (encryption still works; only cross-signing is skipped, e.g. on a server that demands UIA).
     async fn bootstrap_cross_signing(&self) {
         if let Err(e) = self.try_bootstrap_cross_signing().await {
-            eprintln!("matrix[e2ee]: cross-signing bootstrap skipped: {e}");
+            warn!(error = %e, "e2ee: cross-signing bootstrap skipped");
         }
     }
 
@@ -173,7 +171,7 @@ impl Crypto {
         self.send_ruma(signing).await?;
         // 3. Upload the signatures over those keys (already a ruma request).
         self.send_ruma(reqs.upload_signatures_req).await?;
-        eprintln!("matrix[e2ee]: cross-signing identity published");
+        info!("e2ee: cross-signing identity published");
         Ok(())
     }
 
@@ -294,7 +292,7 @@ impl Crypto {
                             out.push(msg);
                         }
                     }
-                    Err(e) => eprintln!("matrix[e2ee]: decrypt failed in {room_id}: {e}"),
+                    Err(e) => error!(%room_id, error = %e, "e2ee: decrypt failed"),
                 }
             }
         }
@@ -415,7 +413,7 @@ impl Crypto {
                     // Only emitted for in-room interactive verification, which this bot neither
                     // initiates nor supports — so there is nothing to send. (Left unmarked; the
                     // machine simply re-lists it, but a non-verifying bot never produces one.)
-                    eprintln!("matrix[e2ee]: ignoring in-room verification message (unsupported)");
+                    warn!("e2ee: ignoring in-room verification message (unsupported)");
                 }
             }
         }

@@ -3,8 +3,8 @@
 //! A `lavoisier.toml` (or `--config <PATH>`) sets defaults for most flags, so a `--serve` /
 //! `--serve-matrix` / `--cron` process can be configured from a file instead of a long command
 //! line. **Precedence: an explicit CLI flag (or env var) always wins over the file, which wins
-//! over the built-in default.** The file is split into `[provider]`, `[agent]`, `[memory]`, and
-//! `[gateway]` sections; unknown keys are rejected so typos surface immediately.
+//! over the built-in default.** The file is split into `[provider]`, `[agent]`, `[memory]`,
+//! `[gateway]`, and `[log]` sections; unknown keys are rejected so typos surface immediately.
 //!
 //! Memory in particular is configured here: the in-memory store is unbounded by default, but
 //! `[memory]` can cap it (`max_messages`, `max_sessions`) or switch to a durable file store.
@@ -26,6 +26,23 @@ pub struct Config {
     pub agent: AgentSection,
     pub memory: MemorySection,
     pub gateway: GatewaySection,
+    pub log: LogSection,
+    /// Where this config was read from, or `None` if no file was found.
+    ///
+    /// Recorded rather than logged at load time on purpose: `[log] level` lives *in* this file, so
+    /// loading necessarily happens before the collector is installed and an event emitted here
+    /// would be dropped. The caller logs it once logging is up.
+    #[serde(skip)]
+    pub source: Option<PathBuf>,
+}
+
+/// `[log]` — structured logging to stderr. Absent ⇒ no collector is installed.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogSection {
+    /// `RUST_LOG`-style filter: a bare level (`info`) or per-target directives
+    /// (`lvz_gw_matrix=debug,warn`). `--log-level` / `LVZ_LOG_LEVEL` take precedence.
+    pub level: Option<String>,
 }
 
 /// `[provider]` — which model/provider to drive.
@@ -139,9 +156,9 @@ impl Config {
         };
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("reading config {}: {e}", path.display()))?;
-        let config: Config =
+        let mut config: Config =
             toml::from_str(&text).map_err(|e| format!("parsing config {}: {e}", path.display()))?;
-        eprintln!("lavoisier: loaded config from {}", path.display());
+        config.source = Some(path);
         Ok(config)
     }
 
@@ -194,6 +211,9 @@ impl Config {
                 cli.api_key = keys.clone();
             }
         }
+
+        // [log]
+        merge(&mut cli.log_level, &self.log.level);
     }
 
     /// Build the session store described by `[memory]` (`memory` store unless `store = "file"`).
@@ -281,6 +301,57 @@ mod tests {
         );
 
         assert!(toml::from_str::<Config>("[agent]\nnonsense = 1\n").is_err());
+    }
+
+    #[test]
+    fn load_records_its_source_instead_of_logging_it() {
+        // Regression guard: `[log] level` lives in this file, so loading happens *before* the
+        // collector is installed. An event emitted inside `load` would be silently dropped — the
+        // path must be recorded for the caller to log once logging is up.
+        let dir = std::env::temp_dir().join(format!("lvz-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lavoisier.toml");
+        std::fs::write(&path, "[log]\nlevel = \"warn\"\n").unwrap();
+
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.source.as_deref(), Some(path.as_path()));
+        assert_eq!(cfg.log.level.as_deref(), Some("warn"));
+
+        // No file discovered ⇒ nothing to report.
+        assert_eq!(Config::default().source, None);
+        // `source` is not a TOML key — it's derived, and must not be settable from the file.
+        assert!(toml::from_str::<Config>("source = \"x\"\n").is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parses_log_section_and_rejects_unknown_keys() {
+        let cfg: Config = toml::from_str("[log]\nlevel = \"lvz_gw_matrix=debug,warn\"\n").unwrap();
+        assert_eq!(cfg.log.level.as_deref(), Some("lvz_gw_matrix=debug,warn"));
+
+        // Absent `[log]` ⇒ no level ⇒ no collector installed (the no-op default).
+        let empty: Config = toml::from_str("").unwrap();
+        assert_eq!(empty.log.level, None);
+
+        assert!(toml::from_str::<Config>("[log]\nlevl = \"info\"\n").is_err());
+    }
+
+    #[test]
+    fn cli_log_level_wins_over_the_file() {
+        use clap::Parser;
+        let cfg: Config = toml::from_str("[log]\nlevel = \"warn\"\n").unwrap();
+
+        // Unset on the CLI ⇒ the file fills it in.
+        let mut cli = Cli::parse_from(["lav"]);
+        cli.log_level = None; // ignore any ambient LVZ_LOG_LEVEL in the test environment
+        cfg.apply_to(&mut cli);
+        assert_eq!(cli.log_level.as_deref(), Some("warn"));
+
+        // Explicit on the CLI ⇒ the file must not override it.
+        let mut cli = Cli::parse_from(["lav", "--log-level", "trace"]);
+        cfg.apply_to(&mut cli);
+        assert_eq!(cli.log_level.as_deref(), Some("trace"));
     }
 
     #[test]

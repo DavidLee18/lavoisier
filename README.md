@@ -280,6 +280,19 @@ bounded — best with a real test gate).
 
 Gateway: `--api-key <KEY>` (repeatable) · `--rate-limit <N per 60s>`.
 
+Logging: operator diagnostics are structured `tracing` events on **stderr**. `--log-level <FILTER>`
+(env `LVZ_LOG_LEVEL`, or `[log] level`) retunes them; the value is a `RUST_LOG`-style filter, so it
+takes a bare level (`info`, `debug`) or per-target directives
+(`--log-level 'lvz_gw_matrix=debug,warn'`). The **default is our own crates at `info` and everything
+else at `warn`** — which keeps the gateway/scheduler output printing as it always has, while the
+scoping stops `tracing` (a facade shared with tonic/hyper/h2/axum) from dragging dependency chatter
+into view. Go quieter with `--log-level warn`, louder with `debug`, or target one subsystem. A
+malformed filter is reported and the default is used, so a typo can't silence a running daemon.
+
+Note the CLI's own interface — the streamed `[tool]` / `[usage]` / `[done]` rendering and the
+`--telemetry` summary — is **not** routed through logging: it's product output, so it always prints
+and no log filter can suppress it.
+
 Env: `XAI_API_KEY` / `XAI_TRANSPORT=grpc|http` (default `grpc`) / `XAI_GRPC_ENDPOINT` /
 `XAI_BASE_URL` · `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` · `GOOGLE_API_KEY` (or `GEMINI_API_KEY`)
 / `GOOGLE_THINKING` · Matrix: `MATRIX_HOMESERVER` / `MATRIX_ACCESS_TOKEN` /
@@ -287,7 +300,7 @@ Env: `XAI_API_KEY` / `XAI_TRANSPORT=grpc|http` (default `grpc`) / `XAI_GRPC_ENDP
 `MATRIX_CRYPTO_STORE_KEY` / `MATRIX_ALLOWED_USERS` / `MATRIX_ALLOWED_ROOMS` / `MATRIX_HOME_ROOM` ·
 Slack: `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN` /
 `SLACK_ALLOWED_USERS` · `LVZ_PROVIDER` / `LVZ_MODEL` / `LVZ_API_KEYS` / `LVZ_RATE_LIMIT` /
-`LVZ_SERVE_ADDR`.
+`LVZ_SERVE_ADDR` / `LVZ_LOG_LEVEL`.
 
 ## Custom (private) tools
 

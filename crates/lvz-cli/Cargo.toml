@@ -44,6 +44,8 @@ clap.workspace = true
 futures.workspace = true
 serde.workspace = true
 toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 # Opt-in Matrix end-to-end encryption (Olm/Megolm). Off by default to keep the standard build
 # light and 1.88-buildable; enabling it pulls in matrix-sdk-crypto and requires Rust >= 1.93.

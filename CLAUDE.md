@@ -113,6 +113,30 @@ the turn runs spawned off the read loop (keeps acks/pings flowing). Reconnects o
 layered *above* `DEFAULT_SYSTEM` in `build_agent`, so it sits in the cached prefix. `--no-persona`
 disables auto-load.
 
+**Logging** (`--log-level <FILTER>`, env `LVZ_LOG_LEVEL`, or `[log] level`): operator diagnostics are
+structured **`tracing`** events on stderr. The `tracing` *facade* is free — already in every build
+because axum/tonic/tower/h2 emit through it — so instrumenting library crates costs no new
+dependency; only `tracing-subscriber` (at the CLI) is added weight. **The collector is installed in
+exactly one place**: `init_logging` in `lvz-cli`. Library crates emit through the facade and **never
+install a collector**, which is what keeps `lavoisier`-as-a-library from hijacking a host app's
+logging.
+
+The filter is a `RUST_LOG`-style `EnvFilter` directive set. **`DEFAULT_LOG_FILTER` scopes our own
+crates to `info` and everything else to `warn`** — the messages these events replaced used to print
+unconditionally, so a quiet default would be a silent regression for a long-running gateway; the
+scoping is what stops the shared facade from surfacing tonic/hyper chatter. `EnvFilter` has no glob
+for `lvz_*`, so the default is an explicit roll-call — **a new crate must be added to it**, or its
+`info` events silently vanish. A malformed filter is reported and falls back to the default rather
+than silencing the process. The facade is **re-exported as `lavoisier::tracing`** so a private
+downstream tools crate can instrument itself without its own `tracing` dependency (its events land
+under its own crate name, so reach them with e.g. `--log-level 'my_tools=debug'`).
+
+**What is *not* logging**: the CLI's streamed interface (`[tool]`, `[tool args]`, `[server tool]`,
+`[citation]`, `[usage]`, `[done]`), the `--telemetry` summary, the fatal `error:` lines, and the
+invalid-filter message stay plain `eprintln!`. They are product output, not diagnostics — never
+level-filtered, never suppressible by a log filter (and the invalid-filter message can't route
+through the logging it is reporting broken). Answer text stays on **stdout**.
+
 **TOML config** (`--config <PATH>`, else auto `./lavoisier.toml`): `crates/lvz-cli/src/config.rs`
 parses `[provider]`/`[agent]`/`[memory]`/`[gateway]` and fills any flag the user left unset
 (precedence: CLI/env > file > default; `deny_unknown_fields`). It's a CLI-layer concern — library
@@ -220,6 +244,17 @@ register. Mechanisms, all live:
   update them deliberately when skeleton output legitimately changes.
 - Gemini 3 attaches a `thoughtSignature` to each functionCall that must be echoed on resend (else
   400); `lvz-google` round-trips it through the opaque tool-call id, contained to the adapter.
+- **Inside a `tracing` macro, fully qualify `serde_json::Value`.** The macro expansion brings
+  `tracing::field::Value` (a *trait*) into scope, so a bare `Value::as_str` path resolves to it and
+  fails with `expected a type, found a trait` — even though the identical expression compiles fine
+  elsewhere in the same file. Write `.and_then(serde_json::Value::as_str)` (see
+  `lvz-gw-slack/src/lib.rs:149`). Only the `Value::method` *path* form breaks; passing a `Value`
+  as a field value is fine. Bites any crate that parses JSON and logs — i.e. the gateways.
+- **Add every new crate to `DEFAULT_LOG_FILTER`** (`lvz-cli/src/lib.rs`). `EnvFilter` has no glob,
+  so "our crates at `info`, dependencies at `warn`" is an explicit 16-crate roll-call. A crate
+  missing from it silently falls to the `warn` floor and its `info!` milestones vanish — no error,
+  just absent output. A unit test guards the list. Directives match the event target by **prefix**,
+  so `lvz_gw_matrix=info` also covers `lvz_gw_matrix::e2ee` (also unit-tested).
 
 ## Commands
 

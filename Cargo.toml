@@ -40,6 +40,13 @@ prost = "0.14"
 prost-types = "0.14"
 tonic-prost-build = "0.14"
 
+# Structured logging. The `tracing` *facade* is already in every build (axum/tonic/tower/h2 emit
+# through it), so instrumenting our own code costs nothing new. `tracing-subscriber` is the only
+# added weight and is needed solely to *install* a collector at the CLI entry point; `env-filter`
+# buys RUST_LOG-style per-target directives (`lvz_gw_matrix=debug,warn`).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std", "env-filter"] }
+
 # Internal crates
 lvz-protocol = { path = "crates/lvz-protocol", version = "0.1.1" }
 lvz-anthropic = { path = "crates/lvz-anthropic", version = "0.1.0" }
