@@ -26,7 +26,7 @@ use lvz_gw_cron::{CronGateway, CronJob};
 use lvz_gw_http::{GatewayConfig, HttpGateway};
 use lvz_gw_matrix::MatrixGateway;
 use lvz_gw_slack::SlackGateway;
-use lvz_legion::{Debater, Panel};
+use lvz_legion::{Debater, Language, Panel};
 use lvz_memory::SessionAgent;
 use lvz_protocol::{
     AgentHandle, BatchProvider, ChatRequest, CostWeights, Deliberator, Event, Gateway, Knobs,
@@ -193,6 +193,12 @@ struct Cli {
     /// Critique rounds the legion runs after the initial draft (default 1; 0 = draft then judge).
     #[arg(long = "legion-rounds", value_name = "N", env = "LVZ_LEGION_ROUNDS")]
     legion_rounds: Option<usize>,
+
+    /// Locale for the legion council's progress notices (POSIX form, e.g. `ko_KR.UTF-8`). Only
+    /// `KO_KR` selects Korean; anything else — including unset — keeps them English. Falls back to
+    /// the `LANG` env var.
+    #[arg(long = "lang", value_name = "LOCALE", env = "LANG")]
+    lang: Option<String>,
 
     /// Serve the agent as an HTTP/WebSocket gateway on this `host:port` (e.g. `127.0.0.1:8080`)
     /// instead of running a one-shot turn. Implies the agent tool loop. No prompt is required.
@@ -938,10 +944,19 @@ fn build_legion(
         None => debaters[0].clone(),
     };
     let rounds = cli.legion_rounds.unwrap_or(1);
-    let panel = Panel::new(debaters, judge, rounds).map_err(|e| e.to_string())?;
+    // Locale for the progress notices: --lang (or the LANG env var, via clap). Only KO_KR ⇒ Korean.
+    let lang = cli
+        .lang
+        .as_deref()
+        .map(Language::from_locale)
+        .unwrap_or_default();
+    let panel = Panel::new(debaters, judge, rounds)
+        .map_err(|e| e.to_string())?
+        .with_language(lang);
     tracing::info!(
         debaters = panel.debaters().len(),
         rounds = panel.rounds(),
+        ?lang,
         "legion configured"
     );
     Ok(Some(Arc::new(panel)))

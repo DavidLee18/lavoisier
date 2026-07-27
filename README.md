@@ -281,7 +281,10 @@ e.g. `--legion-debater anthropic:claude-opus-4-8 --legion-debater xai:grok-4`) m
 (`--legion-rounds <N>`, default 1), and a judge (`--legion-judge <PROVIDER:MODEL>`, default the first
 debater) synthesises one agreed plan that seeds the executor (deliberate-then-act). Cross-provider is
 first-class; each named provider needs its API key in the env. Configurable via `[legion]`. Supersedes
-`--advisor-model`; the debate itself is internal (see it with `--log-level 'lvz_legion=debug'`).
+`--advisor-model`; the debate itself is internal (see it with `--log-level 'lvz_legion=debug'`). The
+council streams short progress notices per phase (`🧠 council convened…` → `🗣 critique round…` →
+`⚖️ judge synthesising…`); these **localise** via `--lang <LOCALE>` (falls back to the `LANG` env var)
+— `KO_KR` renders them in Korean, anything else keeps English.
 
 ATO: `--tune` (ε-greedy) or `--tune-bayes` (Thompson sampling) · `--verify-cmd <cmd>` (real
 success gate, e.g. `cargo test`) · `--tune-state <path>` (persist learned profiles) · `--tune-decay`

@@ -1,6 +1,6 @@
 [package]
 name = "lvz-legion"
-version = "0.1.3"
+version = "0.1.4"
 description = "Legion for Lavoisier — a multi-model council that drafts, critiques, and judges a task before the agent acts. Implements the lvz-protocol Deliberator contract over a panel of provider+model debaters."
 edition.workspace = true
 rust-version.workspace = true

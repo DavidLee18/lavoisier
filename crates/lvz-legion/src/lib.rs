@@ -108,12 +108,64 @@ impl std::fmt::Debug for Debater {
     }
 }
 
+/// The natural language the council's user-visible **progress notices** are rendered in. Only the
+/// `🧠`/`🗣`/`⚖️` phase notices localize — the debate transcript and the executor's answer are
+/// unaffected. Defaults to [`Language::English`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Language {
+    /// English (the default).
+    #[default]
+    English,
+    /// Korean (`ko_KR`).
+    Korean,
+}
+
+impl Language {
+    /// Resolve a POSIX locale string — a `LANG` value like `ko_KR.UTF-8`, or a `--lang` flag — to a
+    /// [`Language`]. Only `KO_KR` (case-insensitive, any `.encoding` suffix ignored) selects Korean;
+    /// everything else, including an unrecognised or empty value, falls back to [`Language::English`].
+    pub fn from_locale(raw: &str) -> Self {
+        let norm = raw.split('.').next().unwrap_or(raw).to_ascii_uppercase();
+        if norm == "KO_KR" {
+            Language::Korean
+        } else {
+            Language::English
+        }
+    }
+
+    /// The "council convened" draft-phase notice for `n` debaters.
+    fn council_convened(self, n: usize) -> String {
+        match self {
+            Language::English => format!("🧠 council convened — {n} debaters drafting…"),
+            Language::Korean => format!("🧠 위원회 소집 — 토론자 {n}명이 초안 작성 중…"),
+        }
+    }
+
+    /// The critique-round notice for round `round` of `total`.
+    fn critique_round(self, round: usize, total: usize) -> String {
+        match self {
+            Language::English => format!("🗣 critique round {round}/{total}…"),
+            Language::Korean => format!("🗣 비평 라운드 {round}/{total}…"),
+        }
+    }
+
+    /// The judge-synthesis notice.
+    fn judge_synthesising(self) -> &'static str {
+        match self {
+            Language::English => "⚖️ judge synthesising the verdict…",
+            Language::Korean => "⚖️ 심판이 결론을 종합하는 중…",
+        }
+    }
+}
+
 /// A council of debaters plus a judge. Implements [`Deliberator`].
 #[derive(Clone, Debug)]
 pub struct Panel {
     debaters: Vec<Debater>,
     judge: Debater,
     rounds: usize,
+    /// Language for the user-visible progress notices (default [`Language::English`]).
+    lang: Language,
 }
 
 impl Panel {
@@ -131,7 +183,14 @@ impl Panel {
             debaters,
             judge,
             rounds,
+            lang: Language::English,
         })
+    }
+
+    /// Set the language for the council's progress notices (default [`Language::English`]).
+    pub fn with_language(mut self, lang: Language) -> Self {
+        self.lang = lang;
+        self
     }
 
     /// The debaters on this panel.
@@ -257,10 +316,7 @@ impl Deliberator for Panel {
 
         // Progress notices so a slow multi-model debate isn't dead air on the frontend (the agent
         // wires `ctx.progress` to the turn's `Event::Notice` stream).
-        ctx.notify(&format!(
-            "🧠 위원회 소집 — 토론자 {}명이 초안 작성 중…",
-            self.debaters.len()
-        ));
+        ctx.notify(&self.lang.council_convened(self.debaters.len()));
 
         let mut positions: Vec<Option<String>> = vec![None; self.debaters.len()];
         let mut usage = Usage::default();
@@ -290,7 +346,7 @@ impl Deliberator for Panel {
         // Phase 2 — critique rounds: each debater sees the board and revises, concurrently.
         let critique_system = critique_system.as_str();
         for round in 0..self.rounds {
-            ctx.notify(&format!("🗣 비평 라운드 {}/{}…", round + 1, self.rounds));
+            ctx.notify(&self.lang.critique_round(round + 1, self.rounds));
             let board = render_positions(&self.debaters, &positions);
             let crit_futs = self.debaters.iter().enumerate().map(|(i, d)| {
                 let user = format!(
@@ -310,7 +366,7 @@ impl Deliberator for Panel {
         }
 
         // Phase 3 — judge synthesis.
-        ctx.notify("⚖️ 심판이 결론을 종합하는 중…");
+        ctx.notify(self.lang.judge_synthesising());
         let board = render_positions(&self.debaters, &positions);
         let judge_user = format!("TASK:\n{task}\n\nFINAL PANEL POSITIONS:\n{board}");
         match ask(&self.judge, &judge_system, judge_user, JUDGE_MAX_TOKENS).await {
@@ -543,10 +599,49 @@ mod tests {
 
         panel.deliberate_with_context("task", &ctx).await.unwrap();
 
+        // Default language is English.
+        let notices = notices.lock().unwrap();
+        assert!(notices.iter().any(|m| m.contains("council convened")));
+        assert!(notices.iter().any(|m| m.contains("critique round 1/1")));
+        assert!(notices.iter().any(|m| m.contains("judge synthesising")));
+    }
+
+    #[tokio::test]
+    async fn progress_notices_localise_to_korean_when_set() {
+        let panel = Panel::new(
+            vec![debater("a", "A"), debater("b", "B")],
+            debater("judge", "PLAN"),
+            1,
+        )
+        .unwrap()
+        .with_language(Language::Korean);
+
+        let notices = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let n = Arc::clone(&notices);
+        let sink = move |m: &str| n.lock().unwrap().push(m.to_string());
+        let ctx = DeliberationContext {
+            system: "",
+            tools: &[],
+            progress: Some(&sink),
+        };
+
+        panel.deliberate_with_context("task", &ctx).await.unwrap();
+
         let notices = notices.lock().unwrap();
         assert!(notices.iter().any(|m| m.contains("위원회 소집")));
         assert!(notices.iter().any(|m| m.contains("비평 라운드 1/1")));
         assert!(notices.iter().any(|m| m.contains("결론을 종합")));
+    }
+
+    #[test]
+    fn language_from_locale_only_ko_kr_selects_korean() {
+        assert_eq!(Language::from_locale("ko_KR.UTF-8"), Language::Korean);
+        assert_eq!(Language::from_locale("KO_KR"), Language::Korean);
+        assert_eq!(Language::from_locale("ko_kr.utf-8"), Language::Korean);
+        assert_eq!(Language::from_locale("en_US.UTF-8"), Language::English);
+        assert_eq!(Language::from_locale("ko"), Language::English);
+        assert_eq!(Language::from_locale(""), Language::English);
+        assert_eq!(Language::default(), Language::English);
     }
 
     #[tokio::test]

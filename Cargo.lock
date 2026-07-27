@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "lavoisier"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "clap",
  "futures",
@@ -1580,7 +1580,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-legion"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "futures",

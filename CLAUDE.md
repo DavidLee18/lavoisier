@@ -97,8 +97,9 @@ streamed `Event::ToolUseStart/Delta/End` args via `tool_hint`). The typing indic
 calls) — the homeserver's typing timeout is 30 s, and a **silent legion deliberation emits no tool
 events for ~60 s+**, so without the timer the indicator would lapse into dead air mid-turn. The gateway
 also renders **`Event::Notice`** progress lines as short messages (and refreshes typing) — the agent
-streams these for the council's deliberation phases (Korean, `🧠 위원회 소집…` → `🗣 비평 라운드…` →
-`⚖️ 심판이 결론을 종합하는 중…`), so a slow multi-model debate shows visible progress instead of silence. When the turn resolves it **swaps the 👀 for a ✅/❌ outcome reaction** — `finish_reaction`
+streams these for the council's deliberation phases (`🧠 council convened…` → `🗣 critique round…` →
+`⚖️ judge synthesising…`, **localised** — Korean when `--lang`/`LANG` is `KO_KR`, else English; see the
+legion section), so a slow multi-model debate shows visible progress instead of silence. When the turn resolves it **swaps the 👀 for a ✅/❌ outcome reaction** — `finish_reaction`
 redacts the transient ack (`PUT …/redact/…`) and reacts ✅ on success or ❌ when the agent errored, the
 event stream errored, or the answer failed to send (`react` now returns the reaction's event id so the
 ack can be retracted). The shared `handle_message` runs this whole flow; `Reply::{Plain,Encrypted}` is the one
@@ -157,7 +158,11 @@ progress**: `DeliberationContext.progress` is an optional callback the `Panel` f
 (`council convened…` / `critique round…` / `judge synthesising…`), which the agent wires to the
 turn's **`Event::Notice`** stream so a slow debate (which produces no answer text until the executor
 runs) shows visible progress on every frontend (the CLI prints `[notice] …`; the Matrix gateway posts
-a short message and refreshes typing) instead of ~60 s of silence. It is **best-effort**: a failed deliberation is logged (`warn!`)
+a short message and refreshes typing) instead of ~60 s of silence. The notices are **localised** via a
+`lvz_legion::Language` (default `English`, `Korean` when the resolved locale is `KO_KR`) set on the
+`Panel` with `with_language`; the CLI resolves it from **`--lang`** (env `LANG`) through
+`Language::from_locale` — only `KO_KR` (case-insensitive, `.encoding` suffix ignored) selects Korean.
+Only these phase notices localise; the debate transcript and the executor's answer are unaffected. It is **best-effort**: a failed deliberation is logged (`warn!`)
 and the turn proceeds unseeded, never dying. The debate is **internal** — the round-by-round
 transcript goes to `tracing` (`lvz_legion=debug`), and only the judge's synthesis (and the reply the
 executor then produces) is user-visible. The panel needs **≥2 debaters** (one is just
