@@ -20,8 +20,8 @@ use std::sync::Arc;
 use futures::StreamExt;
 
 use lvz_protocol::{
-    ChatRequest, DeliberateError, Deliberation, Deliberator, Event, Message, Provider,
-    ThinkingLevel, Usage,
+    ChatRequest, DeliberateError, Deliberation, DeliberationContext, Deliberator, Event, Message,
+    Provider, ThinkingLevel, Usage,
 };
 
 /// Token ceiling for a single debater's draft/critique call. Positions are meant to be concise
@@ -187,28 +187,89 @@ fn render_positions(debaters: &[Debater], positions: &[Option<String>]) -> Strin
     out
 }
 
+/// Render the executor's [`DeliberationContext`] into a grounding block appended to every debater's
+/// (and the judge's) system prompt.
+///
+/// This is the fix for a council that argues in a vacuum: it tells the debaters **who they are**
+/// (the agent's persona/system prompt) and **what the executor can actually do** (the tools it may
+/// call this turn), so they plan to *use* those tools instead of concluding the task is impossible
+/// and seeding the executor with a refusal. Empty context yields a minimal block (no persona, "no
+/// tools"), which is what the tests and the bare `deliberate` entry point exercise.
+fn context_preamble(ctx: &DeliberationContext<'_>) -> String {
+    let mut out = String::new();
+    if !ctx.system.trim().is_empty() {
+        let _ = write!(
+            out,
+            "You are deliberating on behalf of a specific agent. Adopt its identity, persona, and \
+             constraints as your own — do NOT disclaim being it or being a different assistant:\n\
+             --- AGENT SYSTEM PROMPT ---\n{}\n--- END AGENT SYSTEM PROMPT ---\n\n",
+            ctx.system.trim()
+        );
+    }
+    if ctx.tools.is_empty() {
+        out.push_str(
+            "The executor that will carry out the agreed plan has NO tools available; plan only \
+             what can be done by replying.",
+        );
+    } else {
+        out.push_str(
+            "The executor that will carry out the agreed plan can call these tools. Plan to USE \
+             the relevant ones to accomplish the task — do NOT conclude the task is impossible or \
+             out of scope merely because you cannot act yourself; the executor acts:\n",
+        );
+        for t in ctx.tools {
+            let _ = writeln!(out, "- `{}`: {}", t.name, t.description.trim());
+        }
+    }
+    out
+}
+
 #[async_trait::async_trait]
 impl Deliberator for Panel {
+    /// Bare entry point: deliberate with no executor grounding. Delegates to
+    /// [`deliberate_with_context`](Self::deliberate_with_context) with [`DeliberationContext::EMPTY`]
+    /// so the debate logic lives in exactly one place.
     async fn deliberate(&self, task: &str) -> Result<Deliberation, DeliberateError> {
+        self.deliberate_with_context(task, &DeliberationContext::EMPTY)
+            .await
+    }
+
+    async fn deliberate_with_context(
+        &self,
+        task: &str,
+        ctx: &DeliberationContext<'_>,
+    ) -> Result<Deliberation, DeliberateError> {
         tracing::info!(
             debaters = self.debaters.len(),
             rounds = self.rounds,
             judge = %self.judge.name,
+            tools = ctx.tools.len(),
             "legion convened"
         );
+
+        // Grounding block appended to every phase's system prompt: the agent's persona + the tools
+        // the executor can actually call, so the council plans as the agent (and to use its tools),
+        // not as a generic tool-less assistant that refuses.
+        let preamble = context_preamble(ctx);
+        let draft_system = format!("{LEGION_DRAFT_SYSTEM}\n\n{preamble}");
+        let critique_system = format!("{LEGION_CRITIQUE_SYSTEM}\n\n{preamble}");
+        let judge_system = format!("{LEGION_JUDGE_SYSTEM}\n\n{preamble}");
+
+        // Progress notices so a slow multi-model debate isn't dead air on the frontend (the agent
+        // wires `ctx.progress` to the turn's `Event::Notice` stream).
+        ctx.notify(&format!(
+            "🧠 council convened — {} debaters drafting…",
+            self.debaters.len()
+        ));
 
         let mut positions: Vec<Option<String>> = vec![None; self.debaters.len()];
         let mut usage = Usage::default();
 
         // Phase 1 — draft round: every debater proposes independently, concurrently.
+        let draft_system = draft_system.as_str();
         let draft_futs = self.debaters.iter().enumerate().map(|(i, d)| {
             let user = task.to_string();
-            async move {
-                (
-                    i,
-                    ask(d, LEGION_DRAFT_SYSTEM, user, DEBATER_MAX_TOKENS).await,
-                )
-            }
+            async move { (i, ask(d, draft_system, user, DEBATER_MAX_TOKENS).await) }
         });
         for (i, res) in futures::future::join_all(draft_futs).await {
             match res {
@@ -227,7 +288,9 @@ impl Deliberator for Panel {
         }
 
         // Phase 2 — critique rounds: each debater sees the board and revises, concurrently.
+        let critique_system = critique_system.as_str();
         for round in 0..self.rounds {
+            ctx.notify(&format!("⚖️ critique round {}/{}…", round + 1, self.rounds));
             let board = render_positions(&self.debaters, &positions);
             let crit_futs = self.debaters.iter().enumerate().map(|(i, d)| {
                 let user = format!(
@@ -235,12 +298,7 @@ impl Deliberator for Panel {
                      Critique the others and give your revised position.",
                     name = d.name
                 );
-                async move {
-                    (
-                        i,
-                        ask(d, LEGION_CRITIQUE_SYSTEM, user, DEBATER_MAX_TOKENS).await,
-                    )
-                }
+                async move { (i, ask(d, critique_system, user, DEBATER_MAX_TOKENS).await) }
             });
             for (i, res) in futures::future::join_all(crit_futs).await {
                 if let Some((text, u)) = res {
@@ -252,16 +310,10 @@ impl Deliberator for Panel {
         }
 
         // Phase 3 — judge synthesis.
+        ctx.notify("⚖️ judge synthesising the verdict…");
         let board = render_positions(&self.debaters, &positions);
         let judge_user = format!("TASK:\n{task}\n\nFINAL PANEL POSITIONS:\n{board}");
-        match ask(
-            &self.judge,
-            LEGION_JUDGE_SYSTEM,
-            judge_user,
-            JUDGE_MAX_TOKENS,
-        )
-        .await
-        {
+        match ask(&self.judge, &judge_system, judge_user, JUDGE_MAX_TOKENS).await {
             Some((plan, u)) => {
                 usage.accumulate(&u);
                 tracing::info!(
@@ -389,6 +441,112 @@ mod tests {
         assert_eq!(out.plan, "PLAN");
         // Only debater b contributes: 1 draft + 1 critique + 1 judge = 3 × 10.
         assert_eq!(out.usage.output_tokens, 30);
+    }
+
+    /// A provider that records every system prompt it is asked to stream under, then replies with a
+    /// fixed text. Lets a test assert what grounding the debaters actually received.
+    struct Capturing {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for Capturing {
+        async fn stream(
+            &self,
+            req: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
+            let system = req.system.map(|s| s.text).unwrap_or_default();
+            self.seen.lock().unwrap().push(system);
+            let events = vec![
+                Ok(Event::TextDelta(self.reply.clone())),
+                Ok(Event::Usage(Usage::default())),
+                Ok(Event::Done(StopReason::EndTurn)),
+            ];
+            Ok(stream::iter(events).boxed())
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    fn capturing(name: &str, seen: &Arc<std::sync::Mutex<Vec<String>>>, reply: &str) -> Debater {
+        Debater::new(
+            name,
+            Arc::new(Capturing {
+                seen: Arc::clone(seen),
+                reply: reply.into(),
+            }),
+            format!("{name}-model"),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn context_grounds_debaters_with_persona_and_tools() {
+        use lvz_protocol::ToolDef;
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let panel = Panel::new(
+            vec![capturing("a", &seen, "A"), capturing("b", &seen, "B")],
+            capturing("judge", &seen, "PLAN"),
+            1,
+        )
+        .unwrap();
+
+        let tools = vec![ToolDef {
+            name: "start_broadcast".into(),
+            description: "Start a live broadcast".into(),
+            schema: serde_json::json!({}),
+            cache: false,
+            strict: false,
+        }];
+        let ctx = DeliberationContext {
+            system: "You are Lav, the parish broadcast bot.",
+            tools: &tools,
+            progress: None,
+        };
+
+        let out = panel
+            .deliberate_with_context("start the service", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.plan, "PLAN");
+
+        // Every model call (drafts + critiques + judge) must have carried the persona and the tool
+        // catalogue, so no debater argues in a vacuum.
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        for system in seen.iter() {
+            assert!(system.contains("You are Lav, the parish broadcast bot."));
+            assert!(system.contains("start_broadcast"));
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_notices_are_emitted_per_phase() {
+        let panel = Panel::new(
+            vec![debater("a", "A"), debater("b", "B")],
+            debater("judge", "PLAN"),
+            1,
+        )
+        .unwrap();
+
+        let notices = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let n = Arc::clone(&notices);
+        let sink = move |m: &str| n.lock().unwrap().push(m.to_string());
+        let ctx = DeliberationContext {
+            system: "",
+            tools: &[],
+            progress: Some(&sink),
+        };
+
+        panel.deliberate_with_context("task", &ctx).await.unwrap();
+
+        let notices = notices.lock().unwrap();
+        assert!(notices.iter().any(|m| m.contains("council convened")));
+        assert!(notices.iter().any(|m| m.contains("critique round 1/1")));
+        assert!(notices.iter().any(|m| m.contains("judge synthesising")));
     }
 
     #[tokio::test]

@@ -927,41 +927,69 @@ impl MatrixGateway {
             }
         };
 
-        // 3. Stream the turn: accumulate the answer text, and post a notice for each tool call as
-        //    it completes (buffering the streamed argument JSON to extract a short target hint).
+        // 3. Stream the turn: accumulate the answer text; post a notice for each tool call as it
+        //    completes (buffering the streamed argument JSON to extract a short target hint) and for
+        //    each `Event::Notice` progress line (e.g. a legion council's deliberation phases). A
+        //    background keep-alive re-asserts the typing indicator on a timer — the server's typing
+        //    timeout is 30s, and a silent legion deliberation emits no tool events for ~60s+, so
+        //    without this the "typing…" indicator lapses into dead air mid-turn.
         let mut answer = String::new();
         let mut tool_args: HashMap<String, (String, String)> = HashMap::new();
         let mut ok = true;
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(Event::TextDelta(text)) => answer.push_str(&text),
-                Ok(Event::ToolUseStart { id, name }) => {
-                    tool_args.insert(id, (name, String::new()));
-                }
-                Ok(Event::ToolUseDelta { id, json }) => {
-                    if let Some((_, args)) = tool_args.get_mut(&id) {
-                        args.push_str(&json);
-                    }
-                }
-                Ok(Event::ToolUseEnd { id }) => {
-                    if let Some((name, args)) = tool_args.remove(&id) {
-                        let notice = match tool_hint(&args) {
-                            Some(hint) => format!("🔧 `{name}` · {hint}"),
-                            None => format!("🔧 `{name}`"),
-                        };
-                        match self.send_via(reply, token, &room, notice).await {
-                            Ok(eid) => sent.insert(eid),
-                            Err(e) => error!(%room, error = %e, "tool notice failed"),
+        let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(20));
+        keepalive.tick().await; // consume the immediate first tick; the next fires at +20s
+        loop {
+            tokio::select! {
+                biased;
+                item = stream.next() => {
+                    let Some(item) = item else { break };
+                    match item {
+                        Ok(Event::TextDelta(text)) => answer.push_str(&text),
+                        Ok(Event::Notice(text)) => {
+                            match self.send_via(reply, token, &room, text).await {
+                                Ok(eid) => {
+                                    sent.insert(eid);
+                                }
+                                Err(e) => error!(%room, error = %e, "progress notice failed"),
+                            }
+                            // A notice is progress — keep the indicator alive.
+                            let _ = self.set_typing(token, &room, self_user, true).await;
                         }
-                        // Re-assert typing so the indicator survives a long multi-tool turn.
-                        let _ = self.set_typing(token, &room, self_user, true).await;
+                        Ok(Event::ToolUseStart { id, name }) => {
+                            tool_args.insert(id, (name, String::new()));
+                        }
+                        Ok(Event::ToolUseDelta { id, json }) => {
+                            if let Some((_, args)) = tool_args.get_mut(&id) {
+                                args.push_str(&json);
+                            }
+                        }
+                        Ok(Event::ToolUseEnd { id }) => {
+                            if let Some((name, args)) = tool_args.remove(&id) {
+                                let notice = match tool_hint(&args) {
+                                    Some(hint) => format!("🔧 `{name}` · {hint}"),
+                                    None => format!("🔧 `{name}`"),
+                                };
+                                match self.send_via(reply, token, &room, notice).await {
+                                    Ok(eid) => {
+                                        sent.insert(eid);
+                                    }
+                                    Err(e) => error!(%room, error = %e, "tool notice failed"),
+                                }
+                                // Re-assert typing so the indicator survives a long multi-tool turn.
+                                let _ = self.set_typing(token, &room, self_user, true).await;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!(%room, error = %e, "stream error");
+                            ok = false;
+                            break;
+                        }
                     }
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    error!(%room, error = %e, "stream error");
-                    ok = false;
-                    break;
+                _ = keepalive.tick() => {
+                    // No output for a while (e.g. mid-deliberation) — refresh "typing…".
+                    let _ = self.set_typing(token, &room, self_user, true).await;
                 }
             }
         }

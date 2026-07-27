@@ -65,6 +65,15 @@ pub enum Event {
     },
     /// Token accounting, including cache hits. May arrive mid-stream and/or at the end.
     Usage(Usage),
+    /// A human-readable **progress notice** about the turn itself — not part of the assistant's
+    /// answer. Providers never emit this; the **agent** injects it to surface work the user would
+    /// otherwise wait on in silence (e.g. a legion council's `council convened…` /
+    /// `judge synthesising…` phases before the executor produces any text). Frontends render it as a
+    /// transient status line (the CLI prints `[notice] …`; the Matrix gateway posts a short message
+    /// and refreshes its typing indicator); consumers that don't care ignore it. Distinct from
+    /// [`TextDelta`](Event::TextDelta) (answer text) and [`Thinking`](Event::Thinking) (model
+    /// chain-of-thought).
+    Notice(String),
     /// Terminal event: the turn finished for the given reason.
     Done(StopReason),
 }
@@ -239,6 +248,7 @@ mod tests {
                 cache_creation_tokens: 3,
                 cache_read_tokens: 4,
             }),
+            Event::Notice("council convened".into()),
             Event::Done(StopReason::EndTurn),
             Event::Done(StopReason::Other("time_limit".into())),
         ];

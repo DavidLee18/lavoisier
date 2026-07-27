@@ -38,9 +38,9 @@ use lvz_context::tokens::estimate_tokens;
 use lvz_context::Lang;
 use lvz_protocol::{
     AgentError, AgentHandle, Archetype, Capabilities, ChatRequest, ContentBlock, CostWeights,
-    Deliberator, Event, Knobs, Message, ModelTier, NoopTuner, Outcome, Provider, RepoProfile, Role,
-    StopReason, SystemPrompt, TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, ToolDef,
-    Tuner, TurnRequest, Usage,
+    DeliberationContext, Deliberator, Event, Knobs, Message, ModelTier, NoopTuner, Outcome,
+    Provider, RepoProfile, Role, StopReason, SystemPrompt, TaskContext, TaskTelemetry,
+    TelemetrySink, ThinkingLevel, ToolDef, Tuner, TurnRequest, Usage,
 };
 use lvz_tools::ToolRegistry;
 use serde_json::{json, Value};
@@ -645,7 +645,22 @@ async fn run_loop(
     // Both are best-effort — a failed pre-pass is logged and the loop proceeds unseeded — and both
     // count their tokens toward the task total (§6.4).
     if let Some(panel) = &legion {
-        match panel.deliberate(&task_text).await {
+        // Ground the council in the executor's identity and this turn's real capabilities, so the
+        // debate plans *as the agent* and to *use* its tools — otherwise a persona-less, tool-less
+        // council can synthesise a refusal that then seeds (and dooms) the executor.
+        //
+        // Also stream the council's phase notices to the frontend as `Event::Notice`, so a slow
+        // multi-model debate (which emits no answer text until the executor runs) isn't dead air.
+        let notice_tx = tx.clone();
+        let progress = move |m: &str| {
+            let _ = notice_tx.unbounded_send(Ok(Event::Notice(m.to_string())));
+        };
+        let dctx = DeliberationContext {
+            system: &config.system,
+            tools: &tool_defs,
+            progress: Some(&progress),
+        };
+        match panel.deliberate_with_context(&task_text, &dctx).await {
             Ok(d) => {
                 total.accumulate(&d.usage);
                 history.push(Message::assistant(format!(
@@ -2105,6 +2120,9 @@ impl TurnAccumulator {
             Event::ServerToolUse { .. } | Event::ServerToolResult { .. } => Some(event),
             // Citations are informational metadata on the assistant's text; forward them.
             Event::Citation { .. } => Some(event),
+            // Progress notices are injected by the agent (never by a provider); forward for
+            // visibility, they carry no turn state.
+            Event::Notice(_) => Some(event),
             Event::Usage(u) => {
                 self.usage = u; // providers emit one usage per turn; last wins
                 None

@@ -90,10 +90,15 @@ and cached per room) it answers every message; in a **group room** it engages on
 message **replies to one of the bot's own recent messages** (tracked in a bounded `RecentIds` of sent
 event ids — `message_triggers` is the decision fn; this composes *on top of* the sender/room
 allowlists). On an engaged message the gateway gives **immediate feedback**: it reacts 👀 (`m.reaction`,
-sent in the clear even in encrypted rooms), shows a **typing** indicator (`PUT …/typing`, re-asserted
-on each tool call so it survives long turns), and posts a concise **per-tool-call notice** as the agent
-works (`🔧 \`name\` · hint`, the hint pulled from the streamed `Event::ToolUseStart/Delta/End` args via
-`tool_hint`). When the turn resolves it **swaps the 👀 for a ✅/❌ outcome reaction** — `finish_reaction`
+sent in the clear even in encrypted rooms), shows a **typing** indicator (`PUT …/typing`), and posts a
+concise **per-tool-call notice** as the agent works (`🔧 \`name\` · hint`, the hint pulled from the
+streamed `Event::ToolUseStart/Delta/End` args via `tool_hint`). The typing indicator is kept alive by a
+**20 s keep-alive timer** in `handle_message`'s stream loop (a `tokio::select!` branch, not just on tool
+calls) — the homeserver's typing timeout is 30 s, and a **silent legion deliberation emits no tool
+events for ~60 s+**, so without the timer the indicator would lapse into dead air mid-turn. The gateway
+also renders **`Event::Notice`** progress lines as short messages (and refreshes typing) — the agent
+streams these for the council's deliberation phases (`🧠 council convened…` → `⚖️ critique round…` →
+`⚖️ judge synthesising…`), so a slow multi-model debate shows visible progress instead of silence. When the turn resolves it **swaps the 👀 for a ✅/❌ outcome reaction** — `finish_reaction`
 redacts the transient ack (`PUT …/redact/…`) and reacts ✅ on success or ❌ when the agent errored, the
 event stream errored, or the answer failed to send (`react` now returns the reaction's event id so the
 ack can be retracted). The shared `handle_message` runs this whole flow; `Reply::{Plain,Encrypted}` is the one
@@ -123,7 +128,21 @@ one agreed plan-of-action + reply points. That plan seeds the executor as its op
 council is a new **`Deliberator` contract** in `lvz-protocol` (mirroring `Tuner`) implemented by
 `lvz-legion`'s `Panel`; the agent holds it as `Arc<dyn Deliberator>` on the `Agent` struct (the tuner
 pattern — *not* in the Debug-derived `AgentConfig`) and runs it at the single advisor seam in
-`run_loop`, which it **supersedes**. It is **best-effort**: a failed deliberation is logged (`warn!`)
+`run_loop`, which it **supersedes**. **The council is grounded in the executor's context**, not left
+to argue in a vacuum: the agent calls `deliberate_with_context(task, &DeliberationContext { system,
+tools })`, handing the debaters the executor's **system prompt** (the `PERSONA.md` layer + operating
+instructions) and **this turn's advertised tools** (already filtered by any per-turn permission
+allowlist). Each phase's system prompt appends that grounding, so the debaters plan *as the agent*
+and *to use its tools* — without it a persona-less, tool-less council can synthesise a **refusal**
+("I'm not that bot / I can't do that") that then seeds and dooms the executor even though it holds
+the tools. `deliberate_with_context` is an **additive, backward-compatible** method on the trait: it
+defaults to delegating to the bare `deliberate(task)`, so pre-existing `Deliberator` impls are
+unaffected (`DeliberationContext::EMPTY` is the no-grounding fallback). The council also **streams
+progress**: `DeliberationContext.progress` is an optional callback the `Panel` fires per phase
+(`council convened…` / `critique round…` / `judge synthesising…`), which the agent wires to the
+turn's **`Event::Notice`** stream so a slow debate (which produces no answer text until the executor
+runs) shows visible progress on every frontend (the CLI prints `[notice] …`; the Matrix gateway posts
+a short message and refreshes typing) instead of ~60 s of silence. It is **best-effort**: a failed deliberation is logged (`warn!`)
 and the turn proceeds unseeded, never dying. The debate is **internal** — the round-by-round
 transcript goes to `tracing` (`lvz_legion=debug`), and only the judge's synthesis (and the reply the
 executor then produces) is user-visible. The panel needs **≥2 debaters** (one is just
@@ -152,7 +171,7 @@ downstream tools crate can instrument itself without its own `tracing` dependenc
 under its own crate name, so reach them with e.g. `--log-level 'my_tools=debug'`).
 
 **What is *not* logging**: the CLI's streamed interface (`[tool]`, `[tool args]`, `[server tool]`,
-`[citation]`, `[usage]`, `[done]`), the `--telemetry` summary, the fatal `error:` lines, and the
+`[citation]`, `[notice]`, `[usage]`, `[done]`), the `--telemetry` summary, the fatal `error:` lines, and the
 invalid-filter message stay plain `eprintln!`. They are product output, not diagnostics — never
 level-filtered, never suppressible by a log filter (and the invalid-filter message can't route
 through the logging it is reporting broken). Answer text stays on **stdout**.

@@ -16,6 +16,61 @@
 use async_trait::async_trait;
 
 use crate::event::Usage;
+use crate::message::ToolDef;
+
+/// The executor's context, handed to the council so it deliberates **as the agent** rather than as
+/// a generic, tool-less assistant.
+///
+/// Without this a council reasons in a vacuum: it doesn't know the agent's persona/identity, and it
+/// assumes it has no tools — so it can wrongly conclude a task is impossible and synthesise a
+/// *refusal*, which then seeds (and dooms) the executor even though the executor holds the tools.
+/// Supplying the executor's system prompt and this turn's advertised tools closes that gap. All
+/// fields are borrowed for the duration of the [`deliberate_with_context`](Deliberator::deliberate_with_context)
+/// call.
+#[derive(Clone, Copy)]
+pub struct DeliberationContext<'a> {
+    /// The executor's full system prompt (the persona layered above the operating instructions), so
+    /// the council shares the agent's identity, priorities, and constraints.
+    pub system: &'a str,
+    /// The tools advertised to the executor **this turn** (already filtered by any per-turn
+    /// permission allowlist), so the council plans with the real capabilities instead of assuming
+    /// it has none.
+    pub tools: &'a [ToolDef],
+    /// Optional **progress sink**: a callback the council may invoke with a short human-readable
+    /// phase notice (e.g. `"council convened — 2 debaters drafting…"`, `"judge synthesising…"`).
+    /// The agent wires this to the turn's [`Event::Notice`](crate::Event::Notice) stream so a slow
+    /// deliberation isn't dead air on the frontend. `None` ⇒ the council stays silent (the default).
+    pub progress: Option<&'a (dyn Fn(&str) + Send + Sync)>,
+}
+
+impl DeliberationContext<'_> {
+    /// A context with no system prompt, no tools, and no progress sink — the council reasons with no
+    /// extra grounding. This is what the default [`Deliberator::deliberate_with_context`] falls back
+    /// to.
+    pub const EMPTY: DeliberationContext<'static> = DeliberationContext {
+        system: "",
+        tools: &[],
+        progress: None,
+    };
+
+    /// Emit a progress `notice` through the [`progress`](Self::progress) sink, if one is set.
+    pub fn notify(&self, notice: &str) {
+        if let Some(sink) = self.progress {
+            sink(notice);
+        }
+    }
+}
+
+impl std::fmt::Debug for DeliberationContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The `progress` callback isn't `Debug`; show the data fields and whether a sink is present.
+        f.debug_struct("DeliberationContext")
+            .field("system", &self.system)
+            .field("tools", &self.tools)
+            .field("progress", &self.progress.is_some())
+            .finish()
+    }
+}
 
 /// The agreed outcome of a council deliberation: the synthesised plan-of-action plus the total
 /// token [`Usage`] the debate cost.
@@ -57,5 +112,29 @@ pub enum DeliberateError {
 #[async_trait]
 pub trait Deliberator: Send + Sync {
     /// Run the council's argument over `task` and return the agreed plan plus the tokens it cost.
+    ///
+    /// This is the bare form. The agent actually calls
+    /// [`deliberate_with_context`](Self::deliberate_with_context), which additionally hands the
+    /// council the executor's [`DeliberationContext`] (system prompt + this turn's tools). Keep
+    /// implementing this method — it stays the required entry point and the default target of the
+    /// context-aware one — but implementors that can use the context (like `lvz-legion`'s panel)
+    /// should override [`deliberate_with_context`](Self::deliberate_with_context) with the richer
+    /// logic and let this delegate to it with [`DeliberationContext::EMPTY`].
     async fn deliberate(&self, task: &str) -> Result<Deliberation, DeliberateError>;
+
+    /// Deliberate `task` with the executor's [`DeliberationContext`] (its system prompt and the
+    /// tools it may call this turn).
+    ///
+    /// The default implementation **ignores** the context and delegates to
+    /// [`deliberate`](Self::deliberate), so pre-existing implementors keep working unchanged. A
+    /// council that grounds its debate in the agent's persona and real capabilities (so it plans to
+    /// *use* the tools instead of concluding the task is impossible) overrides this. Added as a
+    /// backward-compatible extension.
+    async fn deliberate_with_context(
+        &self,
+        task: &str,
+        _ctx: &DeliberationContext<'_>,
+    ) -> Result<Deliberation, DeliberateError> {
+        self.deliberate(task).await
+    }
 }

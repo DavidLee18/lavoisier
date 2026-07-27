@@ -51,6 +51,30 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
+(`v0.9.1`): **legion grounding fix** — the council was arguing in a vacuum (no persona, no tools), so a
+gateway bot with a `PERSONA.md` and real tools would deliberate, synthesise a *refusal* ("I'm not that
+bot / I can't do that"), and seed that into the executor — which then obeyed it instead of calling the
+tools. Fix: the agent now hands the council a `DeliberationContext` (the executor's system prompt + this
+turn's advertised tools) via a new **additive, backward-compatible** trait method
+`Deliberator::deliberate_with_context` (defaults to delegating to the bare `deliberate`, so pre-existing
+impls are untouched). `lvz-protocol` (0.1.2→**0.1.3** — new `DeliberationContext` + provided method;
+additive ⇒ patch, dependents' `^0.1` still resolve, so the unchanged crates need **no** republish);
+`lvz-legion` (0.1.0→**0.1.2** — `Panel` overrides `deliberate_with_context`, appending persona + tool
+catalogue to every phase's system prompt, and fires `ctx.progress` per phase); `lvz-agent`
+(0.1.2→**0.1.4** — calls `deliberate_with_context` with `config.system` + `tool_defs`, and streams the
+council's phase notices as `Event::Notice`); and `lavoisier` (0.9.0→**0.9.1** — picks up the fix; the CLI
+prints `Event::Notice` as `[notice] …`).
+This release also bundles a **Matrix "thinking" fix**: the typing indicator lapsed after the server's
+30 s timeout during the ~60 s+ silent deliberation, so the gateway now keeps it alive on a 20 s timer and
+renders `Event::Notice` progress lines as short messages. That adds a new **additive** `Event::Notice(String)`
+variant — additive under 0.x (every in-workspace `Event` consumer already has a wildcard arm, and staying
+in `0.1.x` means all crates resolve to the single `lvz-protocol 0.1.4`, so the unchanged crates need **no**
+republish — same reasoning as v0.6.0's `TurnRequest.allowed_tools`). So `lvz-protocol` is **0.1.2→0.1.4**
+(grounding context **and** `Event::Notice`) and `lvz-gw-matrix` is **0.5.0→0.5.1** (keep-alive + notice
+rendering). Publish order `lvz-protocol` → `lvz-legion` → `lvz-agent` → `lvz-gw-matrix` → `lavoisier`
+(`lvz-legion`/`lvz-agent`/`lvz-gw-matrix` all only need the new `lvz-protocol`, so their relative order is
+free). The other eleven crates stay put.
+Earlier changed set
 (`v0.9.0`): the **legion council** — a panel of provider+model debaters that draft, critique each other,
 and have a judge synthesise one agreed plan that seeds the executor before the loop (deliberate-then-act;
 supersedes the single advisor). New crate `lvz-legion` (**0.1.0** — the `Panel`/`Debater` council + the

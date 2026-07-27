@@ -28,7 +28,7 @@ mod tune;
 
 pub use agent::{AgentError, AgentHandle, TurnRequest};
 pub use batch::{BatchItem, BatchProvider, BatchTask};
-pub use deliberate::{DeliberateError, Deliberation, Deliberator};
+pub use deliberate::{DeliberateError, Deliberation, DeliberationContext, Deliberator};
 pub use event::{CostWeights, Event, StopReason, Usage};
 pub use gateway::{Gateway, GatewayError};
 pub use message::{

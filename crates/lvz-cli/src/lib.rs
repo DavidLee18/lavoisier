@@ -1212,6 +1212,7 @@ impl Renderer {
             Event::Citation { cited_text, source } => {
                 eprintln!("[citation: {source}] {cited_text}")
             }
+            Event::Notice(text) => eprintln!("\n[notice] {text}"),
             Event::Usage(usage) => {
                 eprintln!(
                     "\n[usage] in={} out={} cache_read={} cache_creation={}",
