@@ -1,6 +1,6 @@
 # Publishing to crates.io + cargo-binstall
 
-`lavoisier` is a Cargo workspace, so the binary crate (`lavoisier`) and its 14 library crates
+`lavoisier` is a Cargo workspace, so the binary crate (`lavoisier`) and its 15 library crates
 (`lvz-*`) are published to crates.io **in dependency order**. End users then install a prebuilt
 binary with `cargo binstall lavoisier` (no Rust toolchain needed) or build from source with
 `cargo install lavoisier` (no `protoc` needed — `lvz-xai`'s gRPC bindings are committed; see below).
@@ -22,7 +22,7 @@ Each crate must already be on crates.io before the crates that depend on it. Dry
 
 ```sh
 for c in lvz-protocol lvz-context lvz-anthropic lvz-google lvz-xai lvz-claude-cli \
-         lvz-tune lvz-tools lvz-schedule lvz-gw-http lvz-gw-matrix lvz-gw-cron lvz-gw-slack lvz-agent lvz-memory lavoisier; do
+         lvz-tune lvz-legion lvz-tools lvz-schedule lvz-gw-http lvz-gw-matrix lvz-gw-cron lvz-gw-slack lvz-agent lvz-memory lavoisier; do
   cargo publish -p "$c" --dry-run || break
 done
 ```
@@ -36,7 +36,7 @@ Then publish for real, **in this order**. Two limits to know:
 
 ```sh
 for c in lvz-protocol lvz-context lvz-anthropic lvz-google lvz-xai lvz-claude-cli \
-         lvz-tune lvz-tools lvz-schedule lvz-gw-http lvz-gw-matrix lvz-gw-cron lvz-gw-slack lvz-agent lvz-memory lavoisier; do
+         lvz-tune lvz-legion lvz-tools lvz-schedule lvz-gw-http lvz-gw-matrix lvz-gw-cron lvz-gw-slack lvz-agent lvz-memory lavoisier; do
   until out=$(cargo publish -p "$c" 2>&1); do
     echo "$out" | grep -qiE '429|Too Many Requests' || { echo "$out" | tail; echo "HARD FAIL: $c"; exit 1; }
     echo "rate-limited on $c — sleeping 11m…"; sleep 660
@@ -51,6 +51,17 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
+(`v0.9.0`): the **legion council** — a panel of provider+model debaters that draft, critique each other,
+and have a judge synthesise one agreed plan that seeds the executor before the loop (deliberate-then-act;
+supersedes the single advisor). New crate `lvz-legion` (**0.1.0** — the `Panel`/`Debater` council + the
+draft→critique→judge engine; claim the name); `lvz-protocol` (0.1.1→**0.1.2** — additive `Deliberator`
+contract + `Deliberation`/`DeliberateError`; additive ⇒ patch, dependents' `^0.1` still resolve, so the
+unchanged crates need **no** republish); `lvz-agent` (0.1.1→**0.1.2** — additive `Agent::with_legion` + the
+pre-pass branch in `run_loop` + a new `tracing` dep; additive ⇒ patch); and `lavoisier` (0.8.0→**0.9.0** —
+`--legion-debater`/`--legion-judge`/`--legion-rounds` + the `[legion]` config section). Publish order
+`lvz-protocol` → `lvz-legion` → `lvz-agent` → `lavoisier` (`lvz-legion` and `lvz-agent` both only need the
+new `lvz-protocol`, so their relative order is free). The other thirteen crates stay put.
+Earlier changed set
 (`v0.8.0`): **structured logging**. `--log-level`/`LVZ_LOG_LEVEL`/`[log] level` installs a `tracing`
 collector on stderr (RUST_LOG-style `EnvFilter` directives), and the 74 operator diagnostics moved from
 `eprintln!` to `tracing`. Each library crate gained a `tracing` dependency and its stderr output now
