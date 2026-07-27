@@ -29,7 +29,7 @@
 #![warn(missing_docs)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -95,6 +95,10 @@ pub struct MatrixGateway {
     /// Default room for schedule reports, used when a job names none. Falls back to
     /// [`Self::home_room`].
     schedule_room: Option<String>,
+    /// Directory inbound media (images/files) is downloaded to. `Some` **enables** media ingest:
+    /// an engaged image/file message is fetched here and its local path handed to the agent so a
+    /// tool can act on it. `None` (the default) ⇒ media messages are ignored, as before.
+    media_dir: Option<PathBuf>,
 }
 
 impl MatrixGateway {
@@ -125,6 +129,7 @@ impl MatrixGateway {
             schedule: None,
             schedule_tools: ToolRegistry::new(),
             schedule_room: None,
+            media_dir: None,
         }
     }
 
@@ -170,6 +175,16 @@ impl MatrixGateway {
     /// Set the passphrase used to encrypt the E2EE crypto store at rest.
     pub fn with_crypto_passphrase(mut self, passphrase: impl Into<String>) -> Self {
         self.crypto_passphrase = Some(passphrase.into());
+        self
+    }
+
+    /// Set the directory inbound media (images/files) is downloaded to, **enabling** media ingest.
+    /// An engaged `m.image`/`m.file`/`m.audio`/`m.video` message is then fetched here and its local
+    /// path handed to the agent (as a line appended to the turn) so a tool can act on it. Unset ⇒
+    /// media messages are ignored (the default). Note: encrypted-room media (whose reference lives
+    /// under `file` with decryption keys, not a plaintext `url`) is not yet ingested.
+    pub fn with_media_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.media_dir = Some(dir.into());
         self
     }
 
@@ -262,7 +277,8 @@ impl MatrixGateway {
     /// Construct from the environment. Required: `MATRIX_HOMESERVER`, plus **either**
     /// `MATRIX_ACCESS_TOKEN` or (`MATRIX_USER` + `MATRIX_PASSWORD`). Optional:
     /// `MATRIX_DEVICE_ID`, `MATRIX_STATE_DIR`, `MATRIX_CRYPTO_STORE_KEY`,
-    /// `MATRIX_ALLOWED_USERS`, `MATRIX_ALLOWED_ROOMS` (comma-separated), `MATRIX_HOME_ROOM`.
+    /// `MATRIX_ALLOWED_USERS`, `MATRIX_ALLOWED_ROOMS` (comma-separated), `MATRIX_HOME_ROOM`,
+    /// `MATRIX_MEDIA_DIR` (enables downloading inbound images/files for tool use).
     /// Per-room/per-member tool permissions are richer than env can cleanly express and are set
     /// only via the TOML config (`with_room_tools`/`with_user_tools`).
     pub fn from_env() -> Result<Self, GatewayError> {
@@ -292,6 +308,7 @@ impl MatrixGateway {
         gw.device_id = opt("MATRIX_DEVICE_ID");
         gw.state_dir = opt("MATRIX_STATE_DIR").map(PathBuf::from);
         gw.crypto_passphrase = opt("MATRIX_CRYPTO_STORE_KEY");
+        gw.media_dir = opt("MATRIX_MEDIA_DIR").map(PathBuf::from);
         if let Some(users) = opt("MATRIX_ALLOWED_USERS") {
             gw = gw.with_allowed_users(users.split(',').map(|s| s.trim().to_string()));
         }
@@ -574,6 +591,61 @@ impl MatrixGateway {
             .await
             .map_err(|e| GatewayError::Protocol(e.to_string()))?;
         Ok(parsed.event_id)
+    }
+
+    /// Download a piece of Matrix media (`mxc://server/mediaId`) into `dir`, returning the saved
+    /// path. Uses the **authenticated** media endpoint (`/_matrix/client/v1/media/download`, Matrix
+    /// 1.11+) — the bot holds a token and unauthenticated media is being retired. The saved name is
+    /// the event id joined with the sender-supplied filename, both sanitised, so two downloads never
+    /// collide and nothing escapes `dir`.
+    async fn download_media(
+        &self,
+        token: &str,
+        mxc: &str,
+        dir: &Path,
+        event_id: &str,
+        filename: &str,
+    ) -> Result<PathBuf, GatewayError> {
+        let (server, media_id) = mxc
+            .strip_prefix("mxc://")
+            .and_then(|s| s.split_once('/'))
+            .filter(|(s, m)| !s.is_empty() && !m.is_empty())
+            .ok_or_else(|| GatewayError::Protocol(format!("not an mxc uri: {mxc}")))?;
+        let path = format!(
+            "/_matrix/client/v1/media/download/{}/{}",
+            urlencode(server),
+            urlencode(media_id)
+        );
+        let resp = self
+            .http
+            .get(self.url(&path))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::Io(format!(
+                "matrix media download {status}: {msg}"
+            )));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        let dest = dir.join(format!(
+            "{}_{}",
+            sanitize_component(event_id),
+            sanitize_component(filename)
+        ));
+        tokio::fs::write(&dest, &bytes)
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        Ok(dest)
     }
 
     /// React to an event with a single emoji (an `m.reaction` annotation); returns the reaction's
@@ -910,9 +982,48 @@ impl MatrixGateway {
             error!(%room, error = %e, "typing indicator failed");
         }
 
+        // If this message carried a file and media ingest is enabled, download it and tell the
+        // agent where it landed so a tool can act on the bytes (the "bytes-to-tool" path — the model
+        // never sees the image, it just receives a local path to hand to a tool).
+        let mut body = msg.body;
+        if let (Some(att), Some(dir)) = (&msg.attachment, self.media_dir.as_deref()) {
+            match self
+                .download_media(token, &att.mxc, dir, &msg.event_id, &att.filename)
+                .await
+            {
+                Ok(path) => {
+                    let mime = att
+                        .mimetype
+                        .as_deref()
+                        .unwrap_or("application/octet-stream");
+                    let note = format!(
+                        "\n\n[attachment] The user shared a file, now saved locally at:\n  {}\n\
+                         (original name: {}, type: {}). Use your available tools to act on this \
+                         file as the user asks.",
+                        path.display(),
+                        att.filename,
+                        mime,
+                    );
+                    if body.trim().is_empty() {
+                        body = format!("The user sent a file with no other message.{note}");
+                    } else {
+                        body.push_str(&note);
+                    }
+                    info!(%room, path = %path.display(), "media downloaded for turn");
+                }
+                Err(e) => {
+                    warn!(%room, error = %e, "media download failed");
+                    body.push_str(
+                        "\n\n[attachment] The user shared a file, but downloading it failed. \
+                         Tell them it couldn't be retrieved.",
+                    );
+                }
+            }
+        }
+
         // Apply this room/member's tool permissions (if any) to the turn. The agent core enforces
         // the allowlist; the policy decision lives here.
-        let mut turn = TurnRequest::new(room.clone(), msg.body);
+        let mut turn = TurnRequest::new(room.clone(), body);
         if let Some(tools) = self.tools_for(&room, &msg.sender) {
             turn = turn.with_allowed_tools(tools);
         }
@@ -1215,6 +1326,7 @@ impl MatrixGateway {
                 &self_user,
                 self.allowed_users.as_ref(),
                 self.allowed_rooms.as_ref(),
+                self.media_dir.is_some(),
             ) {
                 self.engage(
                     &agent,
@@ -1237,6 +1349,7 @@ impl MatrixGateway {
                         self_user.clone(),
                         self.allowed_users.clone(),
                         self.allowed_rooms.clone(),
+                        self.media_dir.is_some(),
                     )
                     .await
                 {
@@ -1305,6 +1418,20 @@ struct IncomingMessage {
     mentions_bot: bool,
     /// If this is a reply, the event id it replies to (a trigger when it's one of ours).
     in_reply_to: Option<String>,
+    /// A downloadable file this message carried (image/file/audio/video), captured only when media
+    /// ingest is enabled. `handle_message` fetches the bytes and hands the agent a local path.
+    attachment: Option<Attachment>,
+}
+
+/// A file referenced by an inbound message, to be downloaded for tool use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Attachment {
+    /// The `mxc://server/mediaId` content URI to download.
+    mxc: String,
+    /// A human filename for the saved file (`content.filename`, else `content.body`).
+    filename: String,
+    /// The declared MIME type, if the sender's client included one (`content.info.mimetype`).
+    mimetype: Option<String>,
 }
 
 /// Pull the answerable `m.room.message`/`m.text` events out of a sync response, skipping the
@@ -1316,6 +1443,7 @@ fn extract_messages(
     self_user: &str,
     allowed: Option<&HashSet<String>>,
     allowed_rooms: Option<&HashSet<String>>,
+    media: bool,
 ) -> Vec<IncomingMessage> {
     let mut out = Vec::new();
     for (room_id, room) in sync.rooms.join {
@@ -1329,21 +1457,20 @@ fn extract_messages(
             if !sender_allowed(allowed, &event.sender) {
                 continue;
             }
-            if event.content.msgtype.as_deref() != Some("m.text") {
+            let Some((body, attachment)) = message_content(&event.content, media) else {
                 continue;
-            }
+            };
             let mentions_bot = mentions_bot(&event.content, self_user);
             let in_reply_to = reply_target(&event.content);
-            if let Some(body) = message_text(&event.content) {
-                out.push(IncomingMessage {
-                    room: room_id.clone(),
-                    sender: event.sender,
-                    body,
-                    event_id: event.event_id,
-                    mentions_bot,
-                    in_reply_to,
-                });
-            }
+            out.push(IncomingMessage {
+                room: room_id.clone(),
+                sender: event.sender,
+                body,
+                event_id: event.event_id,
+                mentions_bot,
+                in_reply_to,
+                attachment,
+            });
         }
     }
     out
@@ -1383,11 +1510,63 @@ pub(crate) fn reply_target(content: &EventContent) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
-/// The text body of a message, but only when it's an `m.text` message (the bot answers text).
-pub(crate) fn message_text(content: &EventContent) -> Option<String> {
-    (content.msgtype.as_deref() == Some("m.text"))
-        .then(|| content.body.clone())
-        .flatten()
+/// Message types that carry a downloadable file the bot will ingest when media is enabled.
+const MEDIA_MSGTYPES: &[&str] = &["m.image", "m.file", "m.audio", "m.video"];
+
+/// Extract the answerable `(body, attachment)` from a message's content. An `m.text` message →
+/// `(body, None)`. A media message (image/file/audio/video) → `(caption, Some(attachment))`, but
+/// only when `media` ingest is enabled and the content carries a plaintext `url` — encrypted-room
+/// media puts the reference under `file` with decryption keys, which isn't ingested yet. Anything
+/// else (a non-text message with media off, or an unknown type) → `None`, so the bot ignores it.
+pub(crate) fn message_content(
+    content: &EventContent,
+    media: bool,
+) -> Option<(String, Option<Attachment>)> {
+    match content.msgtype.as_deref() {
+        Some("m.text") => content.body.clone().map(|b| (b, None)),
+        Some(t) if media && MEDIA_MSGTYPES.contains(&t) => {
+            let mxc = content.url.clone()?;
+            // Per the spec, when a separate `filename` is present `body` is a caption; otherwise
+            // `body` *is* the filename (and there's no caption).
+            let (filename, caption) = match (&content.filename, &content.body) {
+                (Some(name), body) => (name.clone(), body.clone().unwrap_or_default()),
+                (None, Some(name)) => (name.clone(), String::new()),
+                (None, None) => ("attachment".to_string(), String::new()),
+            };
+            let mimetype = content.info.as_ref().and_then(|i| i.mimetype.clone());
+            Some((
+                caption,
+                Some(Attachment {
+                    mxc,
+                    filename,
+                    mimetype,
+                }),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Sanitise one path component for a downloaded-media filename: keep alphanumerics and `.-_`,
+/// replace everything else with `_`, and cap the length so a hostile filename can't blow up the
+/// path. Never returns an empty string (so a fully-stripped name still yields a usable component).
+fn sanitize_component(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(96)
+        .collect();
+    if cleaned.is_empty() {
+        "file".to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// Decide whether the bot should engage with a message: always in a 1:1 DM; in a group room only
@@ -1642,6 +1821,21 @@ pub(crate) struct EventContent {
     mentions: Option<Mentions>,
     #[serde(default, rename = "m.relates_to")]
     relates_to: Option<RelatesTo>,
+    /// Content URI (`mxc://…`) of an unencrypted media message (`m.image`/`m.file`/…).
+    #[serde(default)]
+    url: Option<String>,
+    /// Original filename of a media message, when the client sends `body` as a caption instead.
+    #[serde(default)]
+    filename: Option<String>,
+    /// Media metadata block; we read `mimetype` from it.
+    #[serde(default)]
+    info: Option<MediaInfo>,
+}
+
+#[derive(Deserialize, Default)]
+struct MediaInfo {
+    #[serde(default)]
+    mimetype: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1686,11 +1880,64 @@ mod tests {
             ] } } } }
         }));
 
-        let msgs = extract_messages(sync, "@bot:hs", None, None);
+        // media off ⇒ the m.image is skipped, only the text survives.
+        let msgs = extract_messages(sync, "@bot:hs", None, None, false);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].room, "!room:hs");
         assert_eq!(msgs[0].sender, "@alice:hs");
         assert_eq!(msgs[0].body, "hello bot");
+        assert!(msgs[0].attachment.is_none());
+    }
+
+    #[test]
+    fn extracts_media_message_as_attachment_when_media_on() {
+        let sync = sync_from(serde_json::json!({
+            "next_batch": "s2",
+            "rooms": { "join": { "!room:hs": { "timeline": { "events": [
+                { "type": "m.room.message", "sender": "@alice:hs", "event_id": "$img",
+                  "content": { "msgtype": "m.image", "body": "prayer.png",
+                               "url": "mxc://hs/media123",
+                               "info": { "mimetype": "image/png" } } },
+                { "type": "m.room.message", "sender": "@alice:hs",
+                  "content": { "msgtype": "m.image", "body": "no-url.png" } }
+            ] } } } }
+        }));
+
+        // media on ⇒ the image with a url becomes an attachment; the one without a url is dropped.
+        let msgs = extract_messages(sync, "@bot:hs", None, None, true);
+        assert_eq!(msgs.len(), 1);
+        let att = msgs[0].attachment.as_ref().expect("attachment captured");
+        assert_eq!(att.mxc, "mxc://hs/media123");
+        assert_eq!(att.filename, "prayer.png");
+        assert_eq!(att.mimetype.as_deref(), Some("image/png"));
+        // no caption (filename came from body), so the turn body is empty until augmented.
+        assert_eq!(msgs[0].body, "");
+    }
+
+    #[test]
+    fn media_caption_is_kept_and_filename_taken_from_filename_field() {
+        let sync = sync_from(serde_json::json!({
+            "next_batch": "s2",
+            "rooms": { "join": { "!room:hs": { "timeline": { "events": [
+                { "type": "m.room.message", "sender": "@alice:hs", "event_id": "$img",
+                  "content": { "msgtype": "m.image", "body": "start the broadcast",
+                               "filename": "shot.jpg", "url": "mxc://hs/xyz" } }
+            ] } } } }
+        }));
+        let msgs = extract_messages(sync, "@bot:hs", None, None, true);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, "start the broadcast");
+        let att = msgs[0].attachment.as_ref().unwrap();
+        assert_eq!(att.filename, "shot.jpg");
+    }
+
+    #[test]
+    fn sanitize_component_strips_and_bounds() {
+        assert_eq!(sanitize_component("$abc/def:ghi"), "_abc_def_ghi");
+        assert_eq!(sanitize_component("ok.name-1_2.png"), "ok.name-1_2.png");
+        assert_eq!(sanitize_component(""), "file");
+        assert_eq!(sanitize_component("/////"), "_____");
+        assert!(sanitize_component(&"x".repeat(500)).len() <= 96);
     }
 
     #[test]
@@ -1706,12 +1953,12 @@ mod tests {
         });
         // No allowlist ⇒ both senders answered.
         assert_eq!(
-            extract_messages(sync_from(json.clone()), "@bot:hs", None, None).len(),
+            extract_messages(sync_from(json.clone()), "@bot:hs", None, None, false).len(),
             2
         );
         // Allowlist ⇒ only the listed sender.
         let allowed: HashSet<String> = ["@alice:hs".to_string()].into_iter().collect();
-        let msgs = extract_messages(sync_from(json), "@bot:hs", Some(&allowed), None);
+        let msgs = extract_messages(sync_from(json), "@bot:hs", Some(&allowed), None, false);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "@alice:hs");
     }
@@ -1733,12 +1980,18 @@ mod tests {
         });
         // No room allowlist ⇒ both rooms answered.
         assert_eq!(
-            extract_messages(sync_from(json.clone()), "@bot:hs", None, None).len(),
+            extract_messages(sync_from(json.clone()), "@bot:hs", None, None, false).len(),
             2
         );
         // Room allowlist ⇒ only the listed room.
         let rooms: HashSet<String> = ["!ok:hs".to_string()].into_iter().collect();
-        let msgs = extract_messages(sync_from(json.clone()), "@bot:hs", None, Some(&rooms));
+        let msgs = extract_messages(
+            sync_from(json.clone()),
+            "@bot:hs",
+            None,
+            Some(&rooms),
+            false,
+        );
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].room, "!ok:hs");
         // Conjunction: an allowed sender in a disallowed room is still dropped.
@@ -1746,7 +1999,13 @@ mod tests {
         let only_other: HashSet<String> = ["!nope:hs".to_string()].into_iter().collect();
         // alice is allowed, but the only allowed room here is !nope:hs, so her !ok:hs message and
         // the !nope:hs one both pass the *sender* check — but room-wise only !nope:hs survives.
-        let msgs = extract_messages(sync_from(json), "@bot:hs", Some(&users), Some(&only_other));
+        let msgs = extract_messages(
+            sync_from(json),
+            "@bot:hs",
+            Some(&users),
+            Some(&only_other),
+            false,
+        );
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].room, "!nope:hs");
     }
@@ -1845,7 +2104,7 @@ mod tests {
                                "m.relates_to": { "m.in_reply_to": { "event_id": "$mine" } } } }
             ] } } } }
         }));
-        let msgs = extract_messages(sync, "@lav:hs", None, None);
+        let msgs = extract_messages(sync, "@lav:hs", None, None, false);
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].event_id, "$plain");
         assert!(!msgs[0].mentions_bot && msgs[0].in_reply_to.is_none());
@@ -1923,7 +2182,7 @@ mod tests {
         let value = serde_json::json!({ "next_batch": "s5" });
         assert_eq!(parse_next_batch(&value).unwrap(), "s5");
         let sync: SyncResponse = serde_json::from_value(value).unwrap();
-        assert!(extract_messages(sync, "@bot:hs", None, None).is_empty());
+        assert!(extract_messages(sync, "@bot:hs", None, None, false).is_empty());
     }
 
     #[test]

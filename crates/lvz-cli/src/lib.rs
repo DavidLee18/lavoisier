@@ -226,6 +226,13 @@ struct Cli {
     #[arg(long)]
     matrix_no_auto_join: bool,
 
+    /// Directory to download inbound Matrix media (images/files) into. Setting it **enables** media
+    /// ingest: an engaged image/file message is fetched here and its local path handed to the agent
+    /// so a tool can act on it. Unset ⇒ media messages are ignored. Env `MATRIX_MEDIA_DIR` or
+    /// `[gateway] matrix_media_dir` also set it.
+    #[arg(long, value_name = "DIR", env = "MATRIX_MEDIA_DIR")]
+    matrix_media_dir: Option<PathBuf>,
+
     /// Serve as a Slack gateway (Socket Mode; one session per channel/thread) instead of a one-shot
     /// turn. Reads `SLACK_APP_TOKEN` (`xapp-…`) and `SLACK_BOT_TOKEN` (`xoxb-…`); optional
     /// `SLACK_ALLOWED_USERS` (comma-separated user ids). Runs alongside `--serve`/`--serve-matrix`.
@@ -699,6 +706,13 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
                 if let Some(home) = &config.gateway.matrix_home_room {
                     matrix = matrix.with_home_room(home.clone());
                 }
+            }
+            // Media ingest dir: the CLI flag (which also reads `MATRIX_MEDIA_DIR` via clap) wins;
+            // fall back to the config file only when neither is set (env > file).
+            if let Some(dir) = &cli.matrix_media_dir {
+                matrix = matrix.with_media_dir(dir.clone());
+            } else if let Some(dir) = &config.gateway.matrix_media_dir {
+                matrix = matrix.with_media_dir(dir.clone());
             }
             // Per-room/per-member tool permissions are config-file-only (too structured for env).
             if let Some(room_tools) = &config.gateway.matrix_room_tools {

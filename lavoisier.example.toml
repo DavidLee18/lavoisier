@@ -66,6 +66,11 @@
 #                                                   # an allowed user must also be in an allowed room.
 # matrix_home_room    = "!ops:hs"                   # receives the "shutting down" notice on
 #                                                   # SIGTERM/Ctrl-C (env MATRIX_HOME_ROOM wins)
+# matrix_media_dir    = "./.lavoisier/media"        # ENABLES media ingest: an engaged image/file
+#                                                   # message is downloaded here and its local path
+#                                                   # handed to the agent so a tool can act on it
+#                                                   # (env MATRIX_MEDIA_DIR / --matrix-media-dir win;
+#                                                   # unset = media messages ignored)
 # Per-room / per-member tool permissions (config-file only). A room/user absent from a map is
 # unconstrained; when both a room and a member policy apply, the effective set is their INTERSECTION
 # (a tool must be permitted by the room AND the member). Pair with matrix_allowed_rooms/_users for a

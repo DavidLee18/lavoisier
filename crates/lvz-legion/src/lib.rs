@@ -258,7 +258,7 @@ impl Deliberator for Panel {
         // Progress notices so a slow multi-model debate isn't dead air on the frontend (the agent
         // wires `ctx.progress` to the turn's `Event::Notice` stream).
         ctx.notify(&format!(
-            "🧠 council convened — {} debaters drafting…",
+            "🧠 위원회 소집 — 토론자 {}명이 초안 작성 중…",
             self.debaters.len()
         ));
 
@@ -290,7 +290,7 @@ impl Deliberator for Panel {
         // Phase 2 — critique rounds: each debater sees the board and revises, concurrently.
         let critique_system = critique_system.as_str();
         for round in 0..self.rounds {
-            ctx.notify(&format!("⚖️ critique round {}/{}…", round + 1, self.rounds));
+            ctx.notify(&format!("🗣 비평 라운드 {}/{}…", round + 1, self.rounds));
             let board = render_positions(&self.debaters, &positions);
             let crit_futs = self.debaters.iter().enumerate().map(|(i, d)| {
                 let user = format!(
@@ -310,7 +310,7 @@ impl Deliberator for Panel {
         }
 
         // Phase 3 — judge synthesis.
-        ctx.notify("⚖️ judge synthesising the verdict…");
+        ctx.notify("⚖️ 심판이 결론을 종합하는 중…");
         let board = render_positions(&self.debaters, &positions);
         let judge_user = format!("TASK:\n{task}\n\nFINAL PANEL POSITIONS:\n{board}");
         match ask(&self.judge, &judge_system, judge_user, JUDGE_MAX_TOKENS).await {
@@ -544,9 +544,9 @@ mod tests {
         panel.deliberate_with_context("task", &ctx).await.unwrap();
 
         let notices = notices.lock().unwrap();
-        assert!(notices.iter().any(|m| m.contains("council convened")));
-        assert!(notices.iter().any(|m| m.contains("critique round 1/1")));
-        assert!(notices.iter().any(|m| m.contains("judge synthesising")));
+        assert!(notices.iter().any(|m| m.contains("위원회 소집")));
+        assert!(notices.iter().any(|m| m.contains("비평 라운드 1/1")));
+        assert!(notices.iter().any(|m| m.contains("결론을 종합")));
     }
 
     #[tokio::test]

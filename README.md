@@ -162,6 +162,12 @@ plaintext and encrypted rooms:
   advertised to the model nor runnable. Pair with allowed-rooms/-users for a deny-by-default perimeter.
 - **Home room** — `MATRIX_HOME_ROOM` (or `[gateway] matrix_home_room`) names one room that receives a
   "shutting down" notice when the gateway is stopped (SIGTERM / Ctrl-C); the process then exits cleanly.
+- **Media ingest** — `--matrix-media-dir <DIR>` (or `MATRIX_MEDIA_DIR` / `[gateway] matrix_media_dir`)
+  **enables** inbound image/file handling: when the bot is engaged by a message carrying a file, it
+  downloads the bytes to `<DIR>` and appends the local path to the turn so a tool can act on it — the
+  "bytes-to-tool" path (the model never sees the image, it just gets a path to hand to a tool, e.g. a
+  custom upload tool). Unset ⇒ media messages are ignored, as before. Unencrypted rooms only for now
+  (encrypted media, whose reference lives under `file` with decryption keys, isn't ingested yet).
 
 A worked example — a deny-by-default perimeter where the bot answers only Alice and Bob, only in the
 `!ops` and `!general` rooms, runs the shell only in `!ops`, treats `!general` as read-only, and limits
@@ -305,7 +311,8 @@ Env: `XAI_API_KEY` / `XAI_TRANSPORT=grpc|http` (default `grpc`) / `XAI_GRPC_ENDP
 `XAI_BASE_URL` · `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` · `GOOGLE_API_KEY` (or `GEMINI_API_KEY`)
 / `GOOGLE_THINKING` · Matrix: `MATRIX_HOMESERVER` / `MATRIX_ACCESS_TOKEN` /
 `MATRIX_USER` / `MATRIX_PASSWORD` / `MATRIX_DEVICE_ID` / `MATRIX_STATE_DIR` /
-`MATRIX_CRYPTO_STORE_KEY` / `MATRIX_ALLOWED_USERS` / `MATRIX_ALLOWED_ROOMS` / `MATRIX_HOME_ROOM` ·
+`MATRIX_CRYPTO_STORE_KEY` / `MATRIX_ALLOWED_USERS` / `MATRIX_ALLOWED_ROOMS` / `MATRIX_HOME_ROOM` /
+`MATRIX_MEDIA_DIR` ·
 Slack: `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN` /
 `SLACK_ALLOWED_USERS` · `LVZ_PROVIDER` / `LVZ_MODEL` / `LVZ_API_KEYS` / `LVZ_RATE_LIMIT` /
 `LVZ_SERVE_ADDR` / `LVZ_LOG_LEVEL`.

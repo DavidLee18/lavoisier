@@ -228,6 +228,7 @@ impl Crypto {
         self_user: String,
         allowed: Option<HashSet<String>>,
         allowed_rooms: Option<HashSet<String>>,
+        media: bool,
     ) -> Vec<crate::IncomingMessage> {
         let mut out = Vec::new();
         let settings = DecryptionSettings {
@@ -288,6 +289,7 @@ impl Crypto {
                             sender.clone(),
                             event_id.clone(),
                             &self_user,
+                            media,
                         ) {
                             out.push(msg);
                         }
@@ -535,19 +537,22 @@ fn raw_cast<T>(v: &impl serde::Serialize) -> Result<Raw<T>, E2eeError> {
 }
 
 /// Build an [`IncomingMessage`](crate::IncomingMessage) from a decrypted timeline event, when it's
-/// an `m.text` message. The mention/reply signals live in the (now-cleartext) content, so they're
-/// read here via the same shared helpers the plaintext path uses — keeping detection identical.
-/// Returns `None` for non-text events. The `event_id` is the cleartext wrapper's, passed in.
+/// an answerable message. The mention/reply signals live in the (now-cleartext) content, so they're
+/// read here via the same shared [`message_content`](crate::message_content) helper the plaintext
+/// path uses — keeping detection identical. Returns `None` for events the bot won't answer. The
+/// `event_id` is the cleartext wrapper's, passed in. (Encrypted media has no plaintext `url`, so
+/// `message_content` yields no attachment for it even with `media` on — see its docs.)
 fn to_incoming<T>(
     event: &Raw<T>,
     room: String,
     sender: String,
     event_id: String,
     self_user: &str,
+    media: bool,
 ) -> Option<crate::IncomingMessage> {
     let v: Value = serde_json::from_str(event.json().get()).ok()?;
     let content: crate::EventContent = serde_json::from_value(v.get("content")?.clone()).ok()?;
-    let body = crate::message_text(&content)?;
+    let (body, attachment) = crate::message_content(&content, media)?;
     Some(crate::IncomingMessage {
         room,
         sender,
@@ -555,6 +560,7 @@ fn to_incoming<T>(
         event_id,
         mentions_bot: crate::mentions_bot(&content, self_user),
         in_reply_to: crate::reply_target(&content),
+        attachment,
     })
 }
 
@@ -578,6 +584,7 @@ mod tests {
             "@alice:hs".into(),
             "$e1".into(),
             "@lav:hs",
+            false,
         )
         .unwrap();
         assert_eq!(msg.body, "@lav:hs help");
@@ -587,10 +594,33 @@ mod tests {
     }
 
     #[test]
-    fn to_incoming_skips_non_text() {
-        let img = raw(r#"{"content":{"msgtype":"m.image","body":"p.png"}}"#);
-        assert!(
-            to_incoming(&img, "!r:hs".into(), "@a:hs".into(), "$e".into(), "@lav:hs").is_none()
-        );
+    fn to_incoming_skips_media_when_media_off() {
+        let img = raw(r#"{"content":{"msgtype":"m.image","body":"p.png","url":"mxc://hs/abc"}}"#);
+        assert!(to_incoming(
+            &img,
+            "!r:hs".into(),
+            "@a:hs".into(),
+            "$e".into(),
+            "@lav:hs",
+            false
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn to_incoming_captures_media_when_on() {
+        let img = raw(r#"{"content":{"msgtype":"m.image","body":"p.png","url":"mxc://hs/abc"}}"#);
+        let msg = to_incoming(
+            &img,
+            "!r:hs".into(),
+            "@a:hs".into(),
+            "$e".into(),
+            "@lav:hs",
+            true,
+        )
+        .unwrap();
+        let att = msg.attachment.expect("attachment captured");
+        assert_eq!(att.mxc, "mxc://hs/abc");
+        assert_eq!(att.filename, "p.png");
     }
 }

@@ -138,6 +138,11 @@ pub struct GatewaySection {
     /// The Matrix "home" room that receives the shutdown notice on SIGTERM / Ctrl-C. The
     /// `MATRIX_HOME_ROOM` env var takes precedence.
     pub matrix_home_room: Option<String>,
+    /// Directory inbound Matrix media (images/files) is downloaded to. Setting it **enables** media
+    /// ingest — an engaged image/file message is fetched here and its local path handed to the agent
+    /// so a tool can act on it. Unset ⇒ media messages are ignored. `MATRIX_MEDIA_DIR` takes
+    /// precedence.
+    pub matrix_media_dir: Option<PathBuf>,
     /// Only answer these Slack user ids; empty/unset ⇒ answer everyone. The `SLACK_ALLOWED_USERS`
     /// env var (comma-separated) takes precedence.
     pub slack_allowed_users: Option<Vec<String>>,
@@ -392,6 +397,7 @@ mod tests {
             matrix_allowed_users = ["@a:hs", "@b:hs"]
             matrix_allowed_rooms = ["!ops:hs", "!general:hs"]
             matrix_home_room = "!ops:hs"
+            matrix_media_dir = "/var/lib/lav/media"
             slack_allowed_users = ["U_A"]
 
             [gateway.matrix_room_tools]
@@ -417,6 +423,10 @@ mod tests {
             Some(&["!ops:hs".to_string(), "!general:hs".to_string()][..])
         );
         assert_eq!(cfg.gateway.matrix_home_room.as_deref(), Some("!ops:hs"));
+        assert_eq!(
+            cfg.gateway.matrix_media_dir.as_deref(),
+            Some(Path::new("/var/lib/lav/media"))
+        );
         assert_eq!(
             cfg.gateway.matrix_room_tools.as_ref().unwrap()["!ops:hs"],
             vec!["shell".to_string(), "read_file".to_string()]

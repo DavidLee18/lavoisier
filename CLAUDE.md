@@ -97,15 +97,30 @@ streamed `Event::ToolUseStart/Delta/End` args via `tool_hint`). The typing indic
 calls) — the homeserver's typing timeout is 30 s, and a **silent legion deliberation emits no tool
 events for ~60 s+**, so without the timer the indicator would lapse into dead air mid-turn. The gateway
 also renders **`Event::Notice`** progress lines as short messages (and refreshes typing) — the agent
-streams these for the council's deliberation phases (`🧠 council convened…` → `⚖️ critique round…` →
-`⚖️ judge synthesising…`), so a slow multi-model debate shows visible progress instead of silence. When the turn resolves it **swaps the 👀 for a ✅/❌ outcome reaction** — `finish_reaction`
+streams these for the council's deliberation phases (Korean, `🧠 위원회 소집…` → `🗣 비평 라운드…` →
+`⚖️ 심판이 결론을 종합하는 중…`), so a slow multi-model debate shows visible progress instead of silence. When the turn resolves it **swaps the 👀 for a ✅/❌ outcome reaction** — `finish_reaction`
 redacts the transient ack (`PUT …/redact/…`) and reacts ✅ on success or ❌ when the agent errored, the
 event stream errored, or the answer failed to send (`react` now returns the reaction's event id so the
 ack can be retracted). The shared `handle_message` runs this whole flow; `Reply::{Plain,Encrypted}` is the one
 seam that picks plaintext vs E2EE for the outbound messages, so the orchestration stays
 modality-agnostic. Mention/reply signals on encrypted messages are read post-decrypt (they live inside
-the ciphertext), reusing the same `mentions_bot`/`reply_target`/`message_text` helpers as the plaintext
+the ciphertext), reusing the same `mentions_bot`/`reply_target`/`message_content` helpers as the plaintext
 path so detection is identical.
+
+**Matrix media ingest** (`--matrix-media-dir <DIR>` / `MATRIX_MEDIA_DIR` / `[gateway]
+matrix_media_dir`): setting a media dir **enables** inbound image/file handling — otherwise
+`m.image`/`m.file`/`m.audio`/`m.video` messages are ignored as before. The shared `message_content`
+helper (which replaced `message_text`) returns `(body, Option<Attachment>)`: an `m.text` yields
+`(body, None)`; a media message with a plaintext `url` yields `(caption, Some(Attachment{mxc,
+filename, mimetype}))`. When enabled and a message is engaged, `handle_message` downloads the bytes
+via the **authenticated** media endpoint (`/_matrix/client/v1/media/download`, Matrix 1.11+) to
+`<DIR>/<event-id>_<filename>` (both `sanitize_component`'d so nothing escapes the dir), then appends
+an `[attachment] …saved locally at <path>…` line to the turn text. This is the **bytes-to-tool**
+path: the model never *sees* the image, it just receives a local path to hand to a tool (e.g. a
+custom upload tool via the `main_with` extension point). No `lvz-protocol`/`lvz-agent` change — it's
+contained to the Matrix gateway. **Unencrypted rooms only** for now: E2EE media puts the reference
+under `content.file` with AES-CTR keys (not a plaintext `url`), so `message_content` yields no
+attachment for it even with media on — decrypting attachments is a deferred follow-up.
 
 The **Slack gateway** (`lvz-gw-slack`, `--serve-slack`) is a thin **Socket Mode** client (no inbound
 port): `apps.connections.open` → `tokio-tungstenite` WebSocket → `message`/`app_mention` events →

@@ -58,10 +58,10 @@ lvz-agent = { path = "crates/lvz-agent", version = "0.1.4" }
 lvz-context = { path = "crates/lvz-context", version = "0.1.0" }
 lvz-memory = { path = "crates/lvz-memory", version = "0.3.0" }
 lvz-tune = { path = "crates/lvz-tune", version = "0.1.0" }
-lvz-legion = { path = "crates/lvz-legion", version = "0.1.2" }
+lvz-legion = { path = "crates/lvz-legion", version = "0.1.3" }
 lvz-schedule = { path = "crates/lvz-schedule", version = "0.2.0" }
 lvz-gw-http = { path = "crates/lvz-gw-http", version = "0.1.0" }
-lvz-gw-matrix = { path = "crates/lvz-gw-matrix", version = "0.5.1" }
+lvz-gw-matrix = { path = "crates/lvz-gw-matrix", version = "0.6.0" }
 lvz-gw-cron = { path = "crates/lvz-gw-cron", version = "0.4.0" }
 lvz-gw-slack = { path = "crates/lvz-gw-slack", version = "0.2.0" }
 
