@@ -15,7 +15,7 @@ Companion docs — read the relevant one before working in that area:
 ## Status
 
 Complete and live-verified against real `XAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY`:
-all 16 crates, provider streaming (SSE + xAI gRPC), the agent loop, the token engine, session
+all 17 crates, provider streaming (SSE + xAI gRPC), the agent loop, the token engine, session
 memory, the HTTP/Matrix/Slack/cron gateways, AWS packaging (`infra/`), and the ATO learner. `cargo
 test`, `cargo clippy --all-targets`, and `cargo fmt --check` are kept green.
 
@@ -112,6 +112,26 @@ the turn runs spawned off the read loop (keeps acks/pings flowing). Reconnects o
 **Persona prompt** (`--persona <PATH>`, default `./PERSONA.md`): a persistent persona/priorities file
 layered *above* `DEFAULT_SYSTEM` in `build_agent`, so it sits in the cached prefix. `--no-persona`
 disables auto-load.
+
+**Legion council** (`lvz-legion`, `--legion-debater <PROVIDER:MODEL>` repeatable, `--legion-judge`,
+`--legion-rounds`, env `LVZ_LEGION_ROUNDS`, `[legion]` config): a panel of models that **argue a
+task out before the agent acts**. It generalises the advisor pre-pass: each debater (a
+`provider:model` spec — cross-provider is first-class, e.g. `anthropic:opus` vs `xai:grok-4`) drafts
+a position, then critiques the others (`--legion-rounds`, default 1), then a **judge** synthesises
+one agreed plan-of-action + reply points. That plan seeds the executor as its opening move
+(**deliberate-then-act**) — the debaters are tool-less; the normal loop runs the tools **once**. The
+council is a new **`Deliberator` contract** in `lvz-protocol` (mirroring `Tuner`) implemented by
+`lvz-legion`'s `Panel`; the agent holds it as `Arc<dyn Deliberator>` on the `Agent` struct (the tuner
+pattern — *not* in the Debug-derived `AgentConfig`) and runs it at the single advisor seam in
+`run_loop`, which it **supersedes**. It is **best-effort**: a failed deliberation is logged (`warn!`)
+and the turn proceeds unseeded, never dying. The debate is **internal** — the round-by-round
+transcript goes to `tracing` (`lvz_legion=debug`), and only the judge's synthesis (and the reply the
+executor then produces) is user-visible. The panel needs **≥2 debaters** (one is just
+`--advisor-model`); the CLI builds each debater's provider fresh from env, so a missing key fails
+fast with a clear message. Cross-provider token costs are summed under one `CostWeights` set (an
+accepted approximation — the budget is a single ceiling regardless). `lvz-legion` is a **leaf
+library** (depends only on `lvz-protocol`); the CLI composition root (`build_legion`) is the one
+place that builds the concrete `Panel` and injects it via `build_agent`.
 
 **Logging** (`--log-level <FILTER>`, env `LVZ_LOG_LEVEL`, or `[log] level`): operator diagnostics are
 structured **`tracing`** events on stderr. The `tracing` *facade* is free — already in every build
@@ -251,7 +271,7 @@ register. Mechanisms, all live:
   `lvz-gw-slack/src/lib.rs:149`). Only the `Value::method` *path* form breaks; passing a `Value`
   as a field value is fine. Bites any crate that parses JSON and logs — i.e. the gateways.
 - **Add every new crate to `DEFAULT_LOG_FILTER`** (`lvz-cli/src/lib.rs`). `EnvFilter` has no glob,
-  so "our crates at `info`, dependencies at `warn`" is an explicit 16-crate roll-call. A crate
+  so "our crates at `info`, dependencies at `warn`" is an explicit 17-crate roll-call. A crate
   missing from it silently falls to the `warn` floor and its `info!` milestones vanish — no error,
   just absent output. A unit test guards the list. Directives match the event target by **prefix**,
   so `lvz_gw_matrix=info` also covers `lvz_gw_matrix::e2ee` (also unit-tested).

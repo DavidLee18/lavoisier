@@ -26,10 +26,11 @@ use lvz_gw_cron::{CronGateway, CronJob};
 use lvz_gw_http::{GatewayConfig, HttpGateway};
 use lvz_gw_matrix::MatrixGateway;
 use lvz_gw_slack::SlackGateway;
+use lvz_legion::{Debater, Panel};
 use lvz_memory::SessionAgent;
 use lvz_protocol::{
-    AgentHandle, BatchProvider, ChatRequest, CostWeights, Event, Gateway, Knobs, Message, Outcome,
-    Provider, TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, Tuner,
+    AgentHandle, BatchProvider, ChatRequest, CostWeights, Deliberator, Event, Gateway, Knobs,
+    Message, Outcome, Provider, TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, Tuner,
 };
 use lvz_schedule::{
     ScheduleJob, ScheduleListTool, ScheduleRegistry, ScheduleRunTool, ScheduleStatusTool,
@@ -59,7 +60,7 @@ struct Cli {
 
     /// Path to a TOML config file (defaults for most flags; CLI/env still win). Without it,
     /// `./lavoisier.toml` is auto-loaded if present. See `[provider]`/`[agent]`/`[memory]`/
-    /// `[gateway]`/`[log]` sections.
+    /// `[gateway]`/`[legion]`/`[log]` sections.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
@@ -177,6 +178,21 @@ struct Cli {
     /// expensive model is paid for once, e.g. an Opus advisor planning for a Sonnet executor.
     #[arg(long, value_name = "MODEL")]
     advisor_model: Option<String>,
+
+    /// A **legion** council debater, `provider:model` (repeatable). Pass two or more: the models
+    /// draft, critique each other, and a judge synthesises one agreed plan that seeds the agent
+    /// before it acts (--agent/--serve). Supersedes --advisor-model. Each named provider needs its
+    /// API key in the env. E.g. `--legion-debater anthropic:claude-opus-4-8 --legion-debater xai:grok-4`.
+    #[arg(long = "legion-debater", value_name = "PROVIDER:MODEL")]
+    legion_debater: Vec<String>,
+
+    /// The legion judge, `provider:model`. Defaults to the first --legion-debater.
+    #[arg(long = "legion-judge", value_name = "PROVIDER:MODEL")]
+    legion_judge: Option<String>,
+
+    /// Critique rounds the legion runs after the initial draft (default 1; 0 = draft then judge).
+    #[arg(long = "legion-rounds", value_name = "N", env = "LVZ_LEGION_ROUNDS")]
+    legion_rounds: Option<usize>,
 
     /// Serve the agent as an HTTP/WebSocket gateway on this `host:port` (e.g. `127.0.0.1:8080`)
     /// instead of running a one-shot turn. Implies the agent tool loop. No prompt is required.
@@ -483,6 +499,7 @@ const DEFAULT_LOG_FILTER: &str = "warn,\
     lvz_gw_http=info,\
     lvz_gw_matrix=info,\
     lvz_gw_slack=info,\
+    lvz_legion=info,\
     lvz_memory=info,\
     lvz_protocol=info,\
     lvz_schedule=info,\
@@ -609,6 +626,11 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
         .clone()
         .unwrap_or_else(|| provider_kind.default_model().to_string());
 
+    // The legion council (if `--legion-debater`/`[legion]` is set): a panel of provider+model
+    // debaters that argue the task out before the loop. Built once here at the composition root so
+    // both the serving and one-shot paths share it. Fails fast on a bad spec or a missing key.
+    let legion = build_legion(&cli, cli.thinking.as_deref(), serving)?;
+
     // Gateway mode: build the shared agent once — wrapped in process-local session memory so each
     // `session` continues across turns (§7.3) — then run every active gateway (HTTP, Matrix, cron)
     // concurrently until shutdown. No prompt is consumed.
@@ -624,7 +646,7 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             &extra_tools,
             schedule.as_ref(),
         );
-        let inner = Arc::new(build_agent(provider, model, &cli, tools.clone()));
+        let inner = Arc::new(build_agent(provider, model, &cli, tools.clone(), legion));
         let agent: Arc<dyn AgentHandle> = Arc::new(SessionAgent::new(inner, store));
 
         let mut gateways: Vec<Arc<dyn Gateway>> = Vec::new();
@@ -743,7 +765,7 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
 
     if cli.agent {
         let tools = build_tool_registry(&cli, batch_provider, model.clone(), &extra_tools, None);
-        let mut agent = build_agent(provider, model, &cli, tools);
+        let mut agent = build_agent(provider, model, &cli, tools, legion);
         if cli.telemetry {
             agent = agent.with_telemetry(Arc::new(StderrTelemetry));
         }
@@ -852,6 +874,65 @@ fn load_persona(cli: &Cli) -> Option<String> {
 /// Assemble the agent's tool set: built-ins, the optional `batch_edit` fan-out tool, the
 /// `schedule_*` tools when a schedule is configured, then any caller-provided tools.
 ///
+/// Parse a legion debater/judge spec `provider:model` (e.g. `anthropic:claude-opus-4-8`) into its
+/// [`ProviderKind`] and model id. The provider names match the `--provider` value set.
+fn parse_debater_spec(spec: &str) -> Result<(ProviderKind, String), String> {
+    let (prov, model) = spec.split_once(':').ok_or_else(|| {
+        format!("bad legion spec {spec:?}: expected `provider:model` (e.g. `anthropic:claude-opus-4-8`)")
+    })?;
+    if model.is_empty() {
+        return Err(format!("bad legion spec {spec:?}: empty model after `:`"));
+    }
+    let kind = <ProviderKind as ValueEnum>::from_str(prov, true).map_err(|_| {
+        format!("bad legion spec {spec:?}: unknown provider {prov:?} (expected xai|anthropic|google|claude-cli)")
+    })?;
+    Ok((kind, model.to_string()))
+}
+
+/// Build the **legion** council (`lvz-legion`) from the `--legion-*` flags / `[legion]` config, or
+/// `None` when no debaters were configured. Each debater's provider is built fresh from the env so
+/// a cross-provider panel picks up each provider's own API key; a missing key surfaces as a clear
+/// error here rather than a mid-turn failure. Requires at least two debaters — a one-model council
+/// is just `--advisor-model`.
+fn build_legion(
+    cli: &Cli,
+    thinking: Option<&str>,
+    serving: bool,
+) -> Result<Option<Arc<dyn Deliberator>>, Box<dyn std::error::Error>> {
+    if cli.legion_debater.is_empty() {
+        return Ok(None);
+    }
+    if cli.legion_debater.len() < 2 {
+        return Err(
+            "legion needs at least 2 --legion-debater specs (a one-model council is just --advisor-model)"
+                .into(),
+        );
+    }
+    let build_one = |spec: &str| -> Result<Debater, Box<dyn std::error::Error>> {
+        let (kind, model) = parse_debater_spec(spec)?;
+        let (provider, _batch) = kind
+            .build(thinking, serving)
+            .map_err(|e| format!("legion debater {spec:?}: {e}"))?;
+        Ok(Debater::new(spec, provider, model, None))
+    };
+    let mut debaters = Vec::with_capacity(cli.legion_debater.len());
+    for spec in &cli.legion_debater {
+        debaters.push(build_one(spec)?);
+    }
+    let judge = match &cli.legion_judge {
+        Some(spec) => build_one(spec)?,
+        None => debaters[0].clone(),
+    };
+    let rounds = cli.legion_rounds.unwrap_or(1);
+    let panel = Panel::new(debaters, judge, rounds).map_err(|e| e.to_string())?;
+    tracing::info!(
+        debaters = panel.debaters().len(),
+        rounds = panel.rounds(),
+        "legion configured"
+    );
+    Ok(Some(Arc::new(panel)))
+}
+
 /// Built at the composition root (rather than inside [`build_agent`]) so the *same* registry can
 /// also be handed to the Matrix gateway's scheduler — a scheduled `tool` job then dispatches
 /// through the identical tool instances the model uses, with no second construction to drift.
@@ -897,6 +978,7 @@ fn build_agent(
     model: String,
     cli: &Cli,
     registry: ToolRegistry,
+    legion: Option<Arc<dyn Deliberator>>,
 ) -> Agent {
     let mut config = AgentConfig::default()
         .with_model(model)
@@ -970,6 +1052,11 @@ fn build_agent(
         config = config.with_repo_root(cwd);
     }
     let mut agent = Agent::new(provider, registry, config);
+    // Install the legion council (if configured), so its agreed plan seeds the loop; supersedes
+    // the single advisor pre-pass inside the agent.
+    if let Some(legion) = legion {
+        agent = agent.with_legion(legion);
+    }
     if cli.tune_bayes {
         // The experimental Bayesian (Thompson-sampling) learner; takes precedence over the
         // ε-greedy `--tune` and a fixed `--compact-after`. Persists like `--tune` when a
@@ -1166,6 +1253,7 @@ mod tests {
             "lvz_gw_slack",
             "lvz_gw_cron",
             "lvz_gw_http",
+            "lvz_legion",
             "lvz_schedule",
             "lvz_memory",
             "lvz_tools",
@@ -1204,6 +1292,43 @@ mod tests {
         // A bad directive must be reported, not silently swallowed into "logs nothing".
         assert!(build_log_filter("=====").is_none());
         assert!(build_log_filter("lvz_gw_matrix=nonsense").is_none());
+    }
+
+    #[test]
+    fn legion_spec_parses_provider_and_model() {
+        assert_eq!(
+            parse_debater_spec("anthropic:claude-opus-4-8").unwrap(),
+            (ProviderKind::Anthropic, "claude-opus-4-8".to_string())
+        );
+        assert_eq!(
+            parse_debater_spec("xai:grok-4").unwrap(),
+            (ProviderKind::Xai, "grok-4".to_string())
+        );
+        assert_eq!(
+            parse_debater_spec("google:gemini-3").unwrap(),
+            (ProviderKind::Google, "gemini-3".to_string())
+        );
+    }
+
+    #[test]
+    fn legion_spec_rejects_bad_forms() {
+        assert!(parse_debater_spec("no-colon").is_err()); // missing `:`
+        assert!(parse_debater_spec("bogus:model").is_err()); // unknown provider
+        assert!(parse_debater_spec("anthropic:").is_err()); // empty model
+    }
+
+    #[test]
+    fn build_legion_is_none_without_debaters_and_needs_two() {
+        use clap::Parser;
+
+        // No `--legion-debater` ⇒ no council.
+        let cli = Cli::parse_from(["lav"]);
+        assert!(build_legion(&cli, None, false).unwrap().is_none());
+
+        // A single debater is refused before any provider is built (a one-model council is just
+        // the advisor pre-pass), so this needs no API keys in the env.
+        let cli = Cli::parse_from(["lav", "--legion-debater", "anthropic:opus"]);
+        assert!(build_legion(&cli, None, false).is_err());
     }
 
     /// A writer that appends into a shared buffer, so a scoped subscriber's output is inspectable.

@@ -4,7 +4,8 @@
 //! `--serve-matrix` / `--cron` process can be configured from a file instead of a long command
 //! line. **Precedence: an explicit CLI flag (or env var) always wins over the file, which wins
 //! over the built-in default.** The file is split into `[provider]`, `[agent]`, `[memory]`,
-//! `[gateway]`, and `[log]` sections; unknown keys are rejected so typos surface immediately.
+//! `[gateway]`, `[legion]`, and `[log]` sections; unknown keys are rejected so typos surface
+//! immediately.
 //!
 //! Memory in particular is configured here: the in-memory store is unbounded by default, but
 //! `[memory]` can cap it (`max_messages`, `max_sessions`) or switch to a durable file store.
@@ -26,6 +27,7 @@ pub struct Config {
     pub agent: AgentSection,
     pub memory: MemorySection,
     pub gateway: GatewaySection,
+    pub legion: LegionSection,
     pub log: LogSection,
     /// Where this config was read from, or `None` if no file was found.
     ///
@@ -43,6 +45,22 @@ pub struct LogSection {
     /// `RUST_LOG`-style filter: a bare level (`info`) or per-target directives
     /// (`lvz_gw_matrix=debug,warn`). `--log-level` / `LVZ_LOG_LEVEL` take precedence.
     pub level: Option<String>,
+}
+
+/// `[legion]` — a multi-model council that argues the task out before the agent acts. Absent ⇒
+/// no council (the single `--advisor-model` pre-pass, if any, applies instead).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LegionSection {
+    /// Debater specs, each `provider:model` (e.g. `anthropic:claude-opus-4-8`, `xai:grok-4`). Two
+    /// or more required to convene. `--legion-debater` (repeatable) takes precedence.
+    pub debaters: Option<Vec<String>>,
+    /// The judge spec, `provider:model`; defaults to the first debater. `--legion-judge` takes
+    /// precedence.
+    pub judge: Option<String>,
+    /// Critique rounds after the draft (default 1; 0 = draft then judge). `--legion-rounds` /
+    /// `LVZ_LEGION_ROUNDS` take precedence.
+    pub rounds: Option<usize>,
 }
 
 /// `[provider]` — which model/provider to drive.
@@ -211,6 +229,15 @@ impl Config {
                 cli.api_key = keys.clone();
             }
         }
+
+        // [legion]
+        if cli.legion_debater.is_empty() {
+            if let Some(debaters) = &self.legion.debaters {
+                cli.legion_debater = debaters.clone();
+            }
+        }
+        merge(&mut cli.legion_judge, &self.legion.judge);
+        merge_copy(&mut cli.legion_rounds, self.legion.rounds);
 
         // [log]
         merge(&mut cli.log_level, &self.log.level);
@@ -402,6 +429,61 @@ mod tests {
             cfg.gateway.slack_allowed_users.as_deref(),
             Some(&["U_A".to_string()][..])
         );
+    }
+
+    #[test]
+    fn parses_legion_section_and_rejects_unknown_keys() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [legion]
+            debaters = ["anthropic:claude-opus-4-8", "xai:grok-4"]
+            judge = "anthropic:claude-opus-4-8"
+            rounds = 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.legion.debaters.as_deref(),
+            Some(
+                &[
+                    "anthropic:claude-opus-4-8".to_string(),
+                    "xai:grok-4".to_string()
+                ][..]
+            )
+        );
+        assert_eq!(
+            cfg.legion.judge.as_deref(),
+            Some("anthropic:claude-opus-4-8")
+        );
+        assert_eq!(cfg.legion.rounds, Some(2));
+
+        // Absent `[legion]` ⇒ no council.
+        let empty: Config = toml::from_str("").unwrap();
+        assert_eq!(empty.legion.debaters, None);
+
+        assert!(toml::from_str::<Config>("[legion]\ndebators = []\n").is_err());
+    }
+
+    #[test]
+    fn cli_legion_flags_win_over_the_file() {
+        use clap::Parser;
+        let cfg: Config = toml::from_str(
+            "[legion]\ndebaters = [\"anthropic:opus\", \"xai:grok-4\"]\nrounds = 3\n",
+        )
+        .unwrap();
+
+        // Unset on the CLI ⇒ the file fills them in.
+        let mut cli = Cli::parse_from(["lav"]);
+        cli.legion_rounds = None; // ignore any ambient LVZ_LEGION_ROUNDS
+        cfg.apply_to(&mut cli);
+        assert_eq!(cli.legion_debater, vec!["anthropic:opus", "xai:grok-4"]);
+        assert_eq!(cli.legion_rounds, Some(3));
+
+        // Explicit on the CLI ⇒ the file must not override.
+        let mut cli = Cli::parse_from(["lav", "--legion-debater", "google:gemini-3"]);
+        cli.legion_rounds = None;
+        cfg.apply_to(&mut cli);
+        assert_eq!(cli.legion_debater, vec!["google:gemini-3"]);
     }
 
     #[test]

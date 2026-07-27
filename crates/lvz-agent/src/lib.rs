@@ -38,9 +38,9 @@ use lvz_context::tokens::estimate_tokens;
 use lvz_context::Lang;
 use lvz_protocol::{
     AgentError, AgentHandle, Archetype, Capabilities, ChatRequest, ContentBlock, CostWeights,
-    Event, Knobs, Message, ModelTier, NoopTuner, Outcome, Provider, RepoProfile, Role, StopReason,
-    SystemPrompt, TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, ToolDef, Tuner,
-    TurnRequest, Usage,
+    Deliberator, Event, Knobs, Message, ModelTier, NoopTuner, Outcome, Provider, RepoProfile, Role,
+    StopReason, SystemPrompt, TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, ToolDef,
+    Tuner, TurnRequest, Usage,
 };
 use lvz_tools::ToolRegistry;
 use serde_json::{json, Value};
@@ -414,6 +414,13 @@ pub struct Agent {
     config: AgentConfig,
     tuner: Arc<dyn Tuner>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
+    /// Optional **legion council** ("legion"): a panel of models that argue the task out before
+    /// the loop (draft → critique → judge) and hand back one agreed plan, which seeds the executor
+    /// as its opening move (deliberate-then-act). When present it **supersedes** the single
+    /// [`advisor_model`](AgentConfig::advisor_model) — they share the same pre-pass seam. Held as
+    /// an `Arc<dyn Deliberator>` (the tuner pattern) so the concrete council (`lvz-legion`) is
+    /// injected by the composition root without the agent depending on it. `None` = no council.
+    legion: Option<Arc<dyn Deliberator>>,
     /// Lazily-built, shared cache of the per-file repo skeletons (§6.1): the expensive walk +
     /// tree-sitter skeletonisation of every source file (`(relative path, skeleton)`) runs once on
     /// the first turn that needs it, so a long-running `--serve` walks the repo only once. The
@@ -433,6 +440,7 @@ impl Agent {
             config,
             tuner: Arc::new(NoopTuner),
             telemetry: None,
+            legion: None,
             repo_skeleton: Arc::new(OnceLock::new()),
         }
     }
@@ -441,6 +449,14 @@ impl Agent {
     /// default [`NoopTuner`].
     pub fn with_tuner(mut self, tuner: Arc<dyn Tuner>) -> Self {
         self.tuner = tuner;
+        self
+    }
+
+    /// Install a **legion council** (`lvz-legion`'s `Panel`) that argues the task out before the
+    /// loop and seeds the executor with the agreed plan. Supersedes the single advisor pre-pass.
+    /// Without one, no council runs and the advisor (if any) is used instead.
+    pub fn with_legion(mut self, legion: Arc<dyn Deliberator>) -> Self {
+        self.legion = Some(legion);
         self
     }
 
@@ -485,6 +501,7 @@ impl Agent {
         let config = self.config.clone();
         let tuner = self.tuner.clone();
         let telemetry = self.telemetry.clone();
+        let legion = self.legion.clone();
         let skeleton_cell = self.repo_skeleton.clone();
         let allowed_tools = allowed_tools.map(|v| v.into_iter().collect::<HashSet<String>>());
 
@@ -495,6 +512,7 @@ impl Agent {
                 config,
                 tuner,
                 telemetry,
+                legion,
                 skeleton_cell,
                 allowed_tools,
                 history,
@@ -529,6 +547,7 @@ async fn run_loop(
     config: AgentConfig,
     tuner: Arc<dyn Tuner>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
+    legion: Option<Arc<dyn Deliberator>>,
     skeleton_cell: Arc<OnceLock<Vec<(String, String)>>>,
     allowed_tools: Option<HashSet<String>>,
     mut history: Vec<Message>,
@@ -618,11 +637,27 @@ async fn run_loop(
     // unless `config.radius_counterfactual` is set.
     let mut radius_traces: Vec<RadiusTrace> = Vec::new();
 
-    // Advisor pre-pass (§8 advisor+executor split): a smarter, more expensive model drafts a
-    // plan that seeds the cheaper executor (the main `model`), so the expensive model is paid
-    // for once while the cheap model runs the many execution turns. Disabled unless
-    // advisor_model is set. The plan becomes the assistant's opening move.
-    if config.advisor_model.is_some() {
+    // Pre-pass that seeds the executor with a plan as its opening move. Two forms, sharing this
+    // one seam:
+    //   * Legion council (§legion): a panel of models argues the task out (draft → critique →
+    //     judge) and hands back one agreed plan. Supersedes the single advisor when configured.
+    //   * Advisor+executor split (§8): a single smarter, more expensive model drafts the plan.
+    // Both are best-effort — a failed pre-pass is logged and the loop proceeds unseeded — and both
+    // count their tokens toward the task total (§6.4).
+    if let Some(panel) = &legion {
+        match panel.deliberate(&task_text).await {
+            Ok(d) => {
+                total.accumulate(&d.usage);
+                history.push(Message::assistant(format!(
+                    "Agreed plan (council):\n{}",
+                    d.plan
+                )));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "legion deliberation failed; proceeding without a council plan")
+            }
+        }
+    } else if config.advisor_model.is_some() {
         if let Some(advice) = advise(&provider, &config, &task_text).await {
             total.accumulate(&advice.usage);
             history.push(Message::assistant(format!("Plan:\n{}", advice.plan)));
@@ -3760,5 +3795,96 @@ fn target() -> u32 { helper() + 10 }
         // Second call = the cheaper executor (the main model), seeded with task + plan (2 msgs).
         assert_eq!(seen[1].0, "cheap-executor");
         assert_eq!(seen[1].2, 2);
+    }
+
+    /// A council that always returns a fixed agreed plan and a fixed usage.
+    struct SeedingDeliberator {
+        plan: String,
+        usage: Usage,
+    }
+
+    #[async_trait]
+    impl Deliberator for SeedingDeliberator {
+        async fn deliberate(
+            &self,
+            _task: &str,
+        ) -> Result<lvz_protocol::Deliberation, lvz_protocol::DeliberateError> {
+            Ok(lvz_protocol::Deliberation {
+                plan: self.plan.clone(),
+                usage: self.usage,
+            })
+        }
+    }
+
+    /// A council whose deliberation always fails.
+    struct FailingDeliberator;
+
+    #[async_trait]
+    impl Deliberator for FailingDeliberator {
+        async fn deliberate(
+            &self,
+            _task: &str,
+        ) -> Result<lvz_protocol::Deliberation, lvz_protocol::DeliberateError> {
+            Err(lvz_protocol::DeliberateError::NoPositions)
+        }
+    }
+
+    #[tokio::test]
+    async fn legion_prepass_seeds_the_agreed_plan_and_counts_its_usage() {
+        let provider = Arc::new(AdvisorRecorder {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(BigTool)); // executor requests advertise tools
+
+        let legion = Arc::new(SeedingDeliberator {
+            plan: "1. do X\n2. reply Y".into(),
+            usage: Usage {
+                output_tokens: 42,
+                ..Default::default()
+            },
+        });
+        let config = AgentConfig::default().with_model("executor");
+        let agent = Agent::new(provider.clone(), registry, config).with_legion(legion);
+
+        let events = collect(agent.run("implement X")).await;
+
+        // The council does NOT run through the provider, so the very first provider call is the
+        // executor — seeded with task + the agreed council plan (2 messages).
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen[0].0, "executor");
+        assert_eq!(seen[0].2, 2);
+        // The council's tokens are folded into the one terminal task-total Usage event.
+        let total: u64 = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Usage(u) => Some(u.output_tokens),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(total, 42);
+    }
+
+    #[tokio::test]
+    async fn a_failing_legion_leaves_the_turn_running() {
+        let provider = Arc::new(AdvisorRecorder {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(BigTool));
+
+        let config = AgentConfig::default().with_model("executor");
+        let agent = Agent::new(provider.clone(), registry, config)
+            .with_legion(Arc::new(FailingDeliberator));
+
+        let events = collect(agent.run("do it")).await;
+
+        // No plan seeded → the executor's first call sees just the task (1 message)…
+        {
+            let seen = provider.seen.lock().unwrap();
+            assert_eq!(seen[0].2, 1);
+        }
+        // …and the turn still finishes cleanly.
+        assert!(matches!(events.last(), Some(Event::Done(_))));
     }
 }

@@ -81,6 +81,20 @@
 #                                                   # SLACK_ALLOWED_USERS wins; empty = everyone)
 
 # ---------------------------------------------------------------------------------------------
+# [legion] — a multi-model council that argues the task out before the agent acts.
+#
+# Two or more debaters (each `provider:model`) draft a position, critique each other (`rounds`,
+# default 1), and a judge synthesises one agreed plan that seeds the executor (deliberate-then-act).
+# Cross-provider is first-class; each named provider needs its API key in the env. Supersedes
+# `[agent] advisor_model`. The debate is internal — watch it with `--log-level 'lvz_legion=debug'`.
+# `--legion-debater` / `--legion-judge` / `--legion-rounds` (env LVZ_LEGION_ROUNDS) take precedence.
+# ---------------------------------------------------------------------------------------------
+# [legion]
+# debaters = ["anthropic:claude-opus-4-8", "xai:grok-4"]   # two or more required to convene
+# judge    = "anthropic:claude-opus-4-8"                   # default: the first debater
+# rounds   = 1                                             # critique rounds after the draft (0 = none)
+
+# ---------------------------------------------------------------------------------------------
 # [log] — structured logging to stderr (tracing).
 #
 # Operator diagnostics (gateways, scheduler, memory) are tracing events. The DEFAULT filter is our

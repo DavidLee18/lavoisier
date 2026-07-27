@@ -1,7 +1,7 @@
 //! `lvz-protocol` — the only stable public contract in Lavoisier.
 //!
 //! It defines the normalised [`Event`] stream plus the [`Provider`], [`Tool`],
-//! [`Gateway`], and [`Tuner`] traits and their supporting types. It performs **no I/O**
+//! [`Gateway`], [`Tuner`], and [`Deliberator`] traits and their supporting types. It performs **no I/O**
 //! and has **zero** provider- or gateway-specific knowledge: every other crate depends on
 //! it, and it depends on nothing of theirs. Swapping a transport, adding a provider, or
 //! adding a gateway never touches this crate (see §3–§5).
@@ -16,6 +16,7 @@
 
 mod agent;
 mod batch;
+mod deliberate;
 mod event;
 mod gateway;
 mod message;
@@ -27,6 +28,7 @@ mod tune;
 
 pub use agent::{AgentError, AgentHandle, TurnRequest};
 pub use batch::{BatchItem, BatchProvider, BatchTask};
+pub use deliberate::{DeliberateError, Deliberation, Deliberator};
 pub use event::{CostWeights, Event, StopReason, Usage};
 pub use gateway::{Gateway, GatewayError};
 pub use message::{

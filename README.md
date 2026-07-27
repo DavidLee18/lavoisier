@@ -269,6 +269,14 @@ Efficiency / cost levers: `--repo-skeleton <TOKENS>` (cache-aware repo-skeleton 
 `--summary-model` / `--compact-after` / `--context-limit` (compaction + eviction) ·
 `--cheap-model` / `--escalate-after` (cheap-model-first) · `--advisor-model` (advisor+executor split).
 
+Legion (multi-model council): `--legion-debater <PROVIDER:MODEL>` (repeatable — pass two or more,
+e.g. `--legion-debater anthropic:claude-opus-4-8 --legion-debater xai:grok-4`) makes those models
+**argue the task out before the agent acts**: each drafts a position, they critique each other
+(`--legion-rounds <N>`, default 1), and a judge (`--legion-judge <PROVIDER:MODEL>`, default the first
+debater) synthesises one agreed plan that seeds the executor (deliberate-then-act). Cross-provider is
+first-class; each named provider needs its API key in the env. Configurable via `[legion]`. Supersedes
+`--advisor-model`; the debate itself is internal (see it with `--log-level 'lvz_legion=debug'`).
+
 ATO: `--tune` (ε-greedy) or `--tune-bayes` (Thompson sampling) · `--verify-cmd <cmd>` (real
 success gate, e.g. `cargo test`) · `--tune-state <path>` (persist learned profiles) · `--tune-decay`
 · `--telemetry` (per-task token/cost summary to stderr).
