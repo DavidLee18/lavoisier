@@ -161,7 +161,8 @@ plaintext and encrypted rooms:
   by the room *and* the member). Enforced in the agent core per turn, so a disallowed tool is neither
   advertised to the model nor runnable. Pair with allowed-rooms/-users for a deny-by-default perimeter.
 - **Home room** — `MATRIX_HOME_ROOM` (or `[gateway] matrix_home_room`) names one room that receives a
-  "shutting down" notice when the gateway is stopped (SIGTERM / Ctrl-C); the process then exits cleanly.
+  friendly "going offline" notice when the gateway is stopped (SIGTERM / Ctrl-C); the process then exits
+  cleanly. The notice is localised (Korean when `--lang`/`LANG` is `KO_KR`, English otherwise).
 - **Media ingest** — `--matrix-media-dir <DIR>` (or `MATRIX_MEDIA_DIR` / `[gateway] matrix_media_dir`)
   **enables** inbound image/file handling: when the bot is engaged by a message carrying a file, it
   downloads the bytes to `<DIR>` and appends the local path to the turn so a tool can act on it — the
@@ -178,7 +179,7 @@ Bob to reads. The simple gates are env vars; the per-room/-member tool maps are 
 export MATRIX_ACCESS_TOKEN=…                        # bot identity (or MATRIX_USER + MATRIX_PASSWORD)
 export MATRIX_ALLOWED_USERS="@alice:hs,@bob:hs"      # answer only these senders
 export MATRIX_ALLOWED_ROOMS="!ops:hs,!general:hs"    # …and only in these rooms (AND'd with the above)
-export MATRIX_HOME_ROOM="!ops:hs"                    # gets the "shutting down" notice on SIGTERM
+export MATRIX_HOME_ROOM="!ops:hs"                    # gets the friendly "going offline" notice on SIGTERM
 ANTHROPIC_API_KEY=… lav --serve-matrix --config lavoisier.toml
 ```
 

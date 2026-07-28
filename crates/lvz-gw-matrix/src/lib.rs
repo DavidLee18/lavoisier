@@ -49,6 +49,33 @@ mod e2ee;
 /// arrives or this elapses.
 const SYNC_TIMEOUT_MS: u64 = 30_000;
 
+/// UI language for notices this gateway *authors itself* — currently just the graceful-shutdown
+/// message posted to the home room. Inbound turns and the agent's replies are unaffected; this only
+/// picks the language of gateway-emitted copy. The CLI resolves it from `--lang`/`LANG` (only
+/// `KO_KR` selects Korean), matching how the legion council localises its progress notices.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Language {
+    /// English (the default).
+    #[default]
+    English,
+    /// Korean, selected when the resolved locale is `KO_KR`.
+    Korean,
+}
+
+impl Language {
+    /// The friendly graceful-shutdown notice posted to the home room, in this language.
+    fn shutdown_notice(self) -> &'static str {
+        match self {
+            Language::English => {
+                "👋 Lavoisier is going offline for a bit — thanks for chatting, and see you soon!"
+            }
+            Language::Korean => {
+                "👋 Lavoisier가 잠시 자리를 비웁니다 — 함께해 주셔서 고마워요. 곧 다시 올게요!"
+            }
+        }
+    }
+}
+
 /// A Matrix gateway bound to a homeserver and a bot account.
 pub struct MatrixGateway {
     homeserver: String,
@@ -99,6 +126,8 @@ pub struct MatrixGateway {
     /// an engaged image/file message is fetched here and its local path handed to the agent so a
     /// tool can act on it. `None` (the default) ⇒ media messages are ignored, as before.
     media_dir: Option<PathBuf>,
+    /// Language for gateway-authored notices (the shutdown message). Defaults to English.
+    lang: Language,
 }
 
 impl MatrixGateway {
@@ -130,6 +159,7 @@ impl MatrixGateway {
             schedule_tools: ToolRegistry::new(),
             schedule_room: None,
             media_dir: None,
+            lang: Language::English,
         }
     }
 
@@ -185,6 +215,13 @@ impl MatrixGateway {
     /// under `file` with decryption keys, not a plaintext `url`) is not yet ingested.
     pub fn with_media_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.media_dir = Some(dir.into());
+        self
+    }
+
+    /// Set the language for gateway-authored notices (currently the graceful-shutdown message).
+    /// Defaults to [`Language::English`]. Inbound turns and the agent's replies are unaffected.
+    pub fn with_language(mut self, lang: Language) -> Self {
+        self.lang = lang;
         self
     }
 
@@ -593,6 +630,63 @@ impl MatrixGateway {
         Ok(parsed.event_id)
     }
 
+    /// Send a **gateway-initiated** message (the shutdown notice, a schedule report) to `room`,
+    /// encrypting it when the room is encrypted and a `crypto` handle is available, else plaintext.
+    /// Unlike a reply, these have no inbound event to infer the room's modality from, so we consult
+    /// the room's `m.room.encryption` state ([`Self::room_encrypted`]) to decide. Returns the
+    /// event id. Without the `e2ee` feature this is always a plaintext send.
+    async fn send_gateway_message(
+        &self,
+        token: &str,
+        room: &str,
+        body: String,
+        #[cfg(feature = "e2ee")] crypto: Option<&e2ee::Crypto>,
+    ) -> Result<String, GatewayError> {
+        #[cfg(feature = "e2ee")]
+        if let Some(c) = crypto {
+            if self.room_encrypted(token, room).await {
+                return c
+                    .encrypt_and_send(room.to_string(), body)
+                    .await
+                    .map_err(|e| GatewayError::Io(e.to_string()));
+            }
+        }
+        self.send_message(token, room, &body).await
+    }
+
+    /// Whether `room` has encryption enabled — i.e. carries an `m.room.encryption` state event with
+    /// an algorithm. Used to pick the modality for gateway-initiated messages. Any failure (a `404`
+    /// for an unencrypted room, or a transient error) is treated as **unencrypted**, so the caller
+    /// falls back to a spec-valid plaintext send rather than blocking on the notice.
+    #[cfg(feature = "e2ee")]
+    async fn room_encrypted(&self, token: &str, room: &str) -> bool {
+        let path = format!(
+            "/_matrix/client/v3/rooms/{}/state/m.room.encryption/",
+            urlencode(room)
+        );
+        let Ok(resp) = self
+            .http
+            .get(self.url(&path))
+            .bearer_auth(token)
+            .send()
+            .await
+        else {
+            return false;
+        };
+        if !resp.status().is_success() {
+            return false;
+        }
+        resp.json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| {
+                v.get("algorithm")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|_| ())
+            })
+            .is_some()
+    }
+
     /// Download a piece of Matrix media (`mxc://server/mediaId`) into `dir`, returning the saved
     /// path. Uses the **authenticated** media endpoint (`/_matrix/client/v1/media/download`, Matrix
     /// 1.11+) — the bot holds a token and unauthenticated media is being retired. The saved name is
@@ -796,15 +890,26 @@ impl MatrixGateway {
         Ok(parsed.joined.len())
     }
 
-    /// Post the shutdown notice to the home room (if one is configured). Best-effort and sent in
-    /// plaintext — an innocuous "shutting down" line, kept simple so it works in both encrypted and
-    /// unencrypted home rooms without tracking per-room encryption state.
-    async fn send_shutdown_notice(&self, token: &str) {
+    /// Post the shutdown notice to the home room (if one is configured). Best-effort — a friendly
+    /// "going offline" line (localised via [`Self::with_language`]), **encrypted when the home room
+    /// is encrypted** (under the `e2ee` feature), else plaintext, via [`Self::send_gateway_message`].
+    async fn send_shutdown_notice(
+        &self,
+        token: &str,
+        #[cfg(feature = "e2ee")] crypto: Option<&e2ee::Crypto>,
+    ) {
         let Some(home) = &self.home_room else {
             return;
         };
+        let body = self.lang.shutdown_notice().to_string();
         if let Err(e) = self
-            .send_message(token, home, "⚠️ Lavoisier gateway shutting down.")
+            .send_gateway_message(
+                token,
+                home,
+                body,
+                #[cfg(feature = "e2ee")]
+                crypto,
+            )
             .await
         {
             error!(room = %home, error = %e, "failed to send shutdown notice");
@@ -886,17 +991,19 @@ impl MatrixGateway {
 
     /// Fire every due scheduled job and post its report.
     ///
-    /// Reports go out **in the clear**, like the shutdown notice: unlike a reply, a scheduled fire
-    /// has no inbound event to infer the room's modality from, and a report room need not be
-    /// encrypted at all. Each report's event id is recorded in `sent` so **replying to a report
-    /// re-engages the bot** — that is what makes "why did this fail?" work in a group room, reusing
-    /// the existing reply-trigger gate rather than adding new machinery.
+    /// A report is **encrypted when its report room is encrypted** (under the `e2ee` feature), else
+    /// sent in the clear — unlike a reply, a scheduled fire has no inbound event to infer the room's
+    /// modality from, so [`Self::send_gateway_message`] consults the room's encryption state. Each
+    /// report's event id is recorded in `sent` so **replying to a report re-engages the bot** — that
+    /// is what makes "why did this fail?" work in a group room, reusing the existing reply-trigger
+    /// gate rather than adding new machinery.
     async fn run_scheduled(
         &self,
         agent: &Arc<dyn AgentHandle>,
         token: &str,
         due: &[usize],
         sent: &mut RecentIds,
+        #[cfg(feature = "e2ee")] crypto: Option<&e2ee::Crypto>,
     ) {
         let Some(schedule) = &self.schedule else {
             return;
@@ -906,7 +1013,16 @@ impl MatrixGateway {
                 continue;
             };
             match self.report_room(report.room.as_deref()) {
-                Some(room) => match self.send_message(token, &room, &report.body).await {
+                Some(room) => match self
+                    .send_gateway_message(
+                        token,
+                        &room,
+                        report.body,
+                        #[cfg(feature = "e2ee")]
+                        crypto,
+                    )
+                    .await
+                {
                     Ok(eid) => sent.insert(eid),
                     Err(e) => {
                         error!(
@@ -1280,11 +1396,24 @@ impl MatrixGateway {
                 biased;
                 _ = &mut shutdown => {
                     info!("shutdown signal received, stopping");
-                    self.send_shutdown_notice(&token).await;
+                    self.send_shutdown_notice(
+                        &token,
+                        #[cfg(feature = "e2ee")]
+                        crypto.as_ref(),
+                    )
+                    .await;
                     return Ok(());
                 }
                 due = wait_schedule(self.schedule.as_ref()) => {
-                    self.run_scheduled(&agent, &token, &due, &mut sent).await;
+                    self.run_scheduled(
+                        &agent,
+                        &token,
+                        &due,
+                        &mut sent,
+                        #[cfg(feature = "e2ee")]
+                        crypto.as_ref(),
+                    )
+                    .await;
                     continue;
                 }
                 res = self.sync_once(&token, Some(&since)) => match res {
@@ -1862,6 +1991,22 @@ mod tests {
 
     fn sync_from(json: serde_json::Value) -> SyncResponse {
         serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn shutdown_notice_localises_and_defaults_to_english() {
+        // Default is English; the gateway builder can switch it to Korean.
+        assert_eq!(Language::default(), Language::English);
+        // "Lavoisier" is a name — kept verbatim in both languages, not transliterated.
+        assert!(Language::English.shutdown_notice().contains("Lavoisier"));
+        assert!(Language::Korean.shutdown_notice().contains("Lavoisier"));
+        assert!(Language::Korean
+            .shutdown_notice()
+            .contains("자리를 비웁니다"));
+        // A gateway carries English unless told otherwise, and `with_language` overrides it.
+        let gw = MatrixGateway::new("https://hs", "@bot:hs", "pw");
+        assert_eq!(gw.lang, Language::English);
+        assert_eq!(gw.with_language(Language::Korean).lang, Language::Korean);
     }
 
     #[test]

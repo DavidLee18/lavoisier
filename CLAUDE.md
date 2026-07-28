@@ -42,10 +42,11 @@ model, and the `ScheduleRegistry` holding live per-job state. Retry mirrors cron
 (`--schedule-retry-max`/`-wait`, per-job overridable, next slot recomputed once the chain resolves)
 but a pending retry is just another due time, not a blocking sleep. The chat surface is **tools**,
 not commands — `schedule_list`/`schedule_status`/`schedule_run` are registered into the agent so
-"how's the disk job?" and "run it again" work in natural language; reports are sent in the clear
-(like the shutdown notice — a scheduled fire has no inbound event to infer modality from) and their
-event ids go into `RecentIds`, so **replying to a report re-engages the bot** via the existing
-reply gate. `build_tool_registry` in `lvz-cli` is the composition root: the *same* registry goes to
+"how's the disk job?" and "run it again" work in natural language; a report is **encrypted when its
+report room is encrypted** (under the `e2ee` feature), else sent in the clear — like the shutdown
+notice, a scheduled fire has no inbound event to infer modality from, so the gateway consults the
+room's `m.room.encryption` state (`room_encrypted` → `send_gateway_message`) to decide. Their event
+ids go into `RecentIds`, so **replying to a report re-engages the bot** via the existing reply gate. `build_tool_registry` in `lvz-cli` is the composition root: the *same* registry goes to
 the agent and to the gateway's scheduler. Job state is in-memory (history resets on restart). The
 room report is a *summary* (600-char cap); the **full account goes to stderr** per fire via
 `log_verbose` — untruncated output, duration, attempt, tools used, and token usage (kept even when a
@@ -75,9 +76,17 @@ is their **intersection**. The mechanism is a keystone change — a new
 `TurnRequest.allowed_tools: Option<Vec<String>>` enforced in the agent's `run_loop` (filters the
 advertised `tool_defs` *and* refuses a non-allowed `invoke`); the *policy* (`tools_for(room, sender)`)
 stays in the Matrix gateway. A **home room** (`MATRIX_HOME_ROOM` / `[gateway] matrix_home_room`) gets a
-plaintext "shutting down" notice on SIGTERM/Ctrl-C — the serve loop races `/sync` against a shutdown
+friendly "going offline" notice on SIGTERM/Ctrl-C — the serve loop races `/sync` against a shutdown
 signal and returns `Ok`, and the CLI joins gateways with `select_all` (not `join_all`) so the first to
-finish ⇒ a clean whole-process exit. **Startup resilience**: the bind path (`whoami`/`login` and the
+finish ⇒ a clean whole-process exit. Both this notice and schedule reports are **gateway-initiated**
+(no inbound event to infer modality from), so they route through `send_gateway_message`, which
+**encrypts when the target room is encrypted** (under the `e2ee` feature — it checks the room's
+`m.room.encryption` state via `room_encrypted`) and falls back to a plaintext send otherwise. The
+notice is also **localised** the same way the council notices are: a `lvz_gw_matrix::Language` (English
+default, Korean only when `--lang`/`LANG` resolves to `KO_KR`, via the shared `Language::from_locale`
+rule) set on the gateway with `with_language`; the CLI maps its resolved locale onto it. Only the
+shutdown notice localises — inbound turns and the agent's replies are unaffected. Reactions and typing
+indicators are still always plaintext (conventional, and they carry no message content). **Startup resilience**: the bind path (`whoami`/`login` and the
 baseline `/sync`) retries *transient* failures (5xx/429/transport, classified to `GatewayError::Io`)
 with exponential backoff (`with_retry`, 1s→30s cap), mirroring the in-loop `/sync` retry, so a
 homeserver that's briefly down while a fresh task boots doesn't kill the gateway; genuine auth/config

@@ -720,6 +720,18 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             } else if let Some(dir) = &config.gateway.matrix_media_dir {
                 matrix = matrix.with_media_dir(dir.clone());
             }
+            // Localise the gateway's shutdown notice off the same `--lang`/`LANG` locale the council
+            // notices use (one locale rule, `Language::from_locale`; only KO_KR ⇒ Korean).
+            let matrix_lang = match cli
+                .lang
+                .as_deref()
+                .map(Language::from_locale)
+                .unwrap_or_default()
+            {
+                Language::Korean => lvz_gw_matrix::Language::Korean,
+                Language::English => lvz_gw_matrix::Language::English,
+            };
+            matrix = matrix.with_language(matrix_lang);
             // Per-room/per-member tool permissions are config-file-only (too structured for env).
             if let Some(room_tools) = &config.gateway.matrix_room_tools {
                 matrix = matrix.with_room_tools(room_tools.clone());
