@@ -54,7 +54,7 @@ lvz-google = { path = "crates/lvz-google", version = "0.1.0" }
 lvz-claude-cli = { path = "crates/lvz-claude-cli", version = "0.1.0" }
 lvz-xai = { path = "crates/lvz-xai", version = "0.1.1" }
 lvz-tools = { path = "crates/lvz-tools", version = "0.1.0" }
-lvz-agent = { path = "crates/lvz-agent", version = "0.1.4" }
+lvz-agent = { path = "crates/lvz-agent", version = "0.1.5" }
 lvz-context = { path = "crates/lvz-context", version = "0.1.0" }
 lvz-memory = { path = "crates/lvz-memory", version = "0.3.0" }
 lvz-tune = { path = "crates/lvz-tune", version = "0.1.0" }

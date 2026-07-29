@@ -181,6 +181,32 @@ accepted approximation — the budget is a single ceiling regardless). `lvz-legi
 library** (depends only on `lvz-protocol`); the CLI composition root (`build_legion`) is the one
 place that builds the concrete `Panel` and injects it via `build_agent`.
 
+**Model fallback** (`--fallback <PROVIDER:MODEL>` repeatable/ordered, `--fallback-cooldown <SECONDS>`,
+`[provider] fallback`/`fallback_cooldown`): an ordered chain the executor reroutes to when the
+**primary model is unresponsive or errors before streaming any output** for a round-trip — a connect
+timeout, an open error, or a stall/error *before the first token*. On timeout the in-flight request
+is **cancelled by drop** (verified: all three providers wrap the live reqwest/tonic response with no
+detached `spawn`, so dropping the future aborts the HTTP/gRPC request — no zombie call keeps billing).
+Cross-provider is first-class (each spec builds its own provider from env, reusing the legion
+`parse_provider_spec`). Held on the `Agent` struct as `fallbacks: Vec<(Arc<dyn Provider>, String)>`
+(the `provider`/`legion` pattern — *not* in the Debug-derived `AgentConfig`) and threaded into
+`run_loop`, which wraps the per-round-trip send in an `'attempt` loop over a cursor (0 = primary with
+cheap-model-first applied; `i>0` = `fallbacks[i-1]`). **Within** a turn the cursor only advances (a
+failed model is skipped for the rest of the turn). **Across** turns a shared `Arc<CircuitBreaker>`
+(lock-free `AtomicU64` deadline per chain position, monotonic base, `0` = healthy) demotes a failed
+position for `--fallback-cooldown` (default 60s): each turn *starts* at `breaker.first_available()`
+(skipping still-demoted positions, so a persistently-down provider's timeout isn't re-paid every
+turn), a pre-token failure `trip`s the position, a success `reset`s it, and once the cooldown elapses
+the position is re-probed (half-open). `--fallback-cooldown 0` ⇒ re-probe every turn (per-turn-only
+demotion). The switch is gated on `forwarded_any`: **only before the first event is forwarded** — once
+output is streaming a restart would double the user-visible text, so a later mid-stream failure
+surfaces as an error exactly as before (and does **not** trip the breaker — the model *was*
+responding). Each candidate's request is built with *its own* provider `Capabilities` (so e.g.
+Anthropic `cache_control` is never attached to an xAI request); the turn-level `caps` (for
+observation/compaction) stays the primary's. Contained to `lvz-agent` + the CLI composition root
+(`build_fallbacks`) — no protocol/gateway change, so every frontend gets it for free. Empty chain ⇒
+byte-identical to before.
+
 **Logging** (`--log-level <FILTER>`, env `LVZ_LOG_LEVEL`, or `[log] level`): operator diagnostics are
 structured **`tracing`** events on stderr. The `tracing` *facade* is free — already in every build
 because axum/tonic/tower/h2 emit through it — so instrumenting library crates costs no new

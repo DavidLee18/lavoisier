@@ -190,6 +190,26 @@ struct Cli {
     #[arg(long = "legion-judge", value_name = "PROVIDER:MODEL")]
     legion_judge: Option<String>,
 
+    /// A **fallback model**, `provider:model` (repeatable, ordered). If the primary model is
+    /// unresponsive or errors *before streaming any output* for a round-trip (a connect timeout,
+    /// an open error, or a stall/error before the first token), the agent transparently retries on
+    /// the next fallback — so a slow or down provider doesn't hang the turn. Cross-provider is
+    /// first-class; each named provider needs its API key in the env. Once a model fails it is
+    /// skipped for the rest of the turn. E.g. `--fallback anthropic:claude-sonnet-4-6 --fallback google:gemini-3-flash-preview`.
+    #[arg(long = "fallback", value_name = "PROVIDER:MODEL")]
+    fallback: Vec<String>,
+
+    /// Seconds a failed fallback-chain model stays demoted before it's re-probed (circuit breaker;
+    /// default 60). A model that is unresponsive/errors is skipped from the start of subsequent
+    /// turns for this long, so a persistently-down provider isn't re-tried every turn; after the
+    /// cooldown it's tried again. `0` ⇒ re-probe every turn (demotion lasts only the current turn).
+    #[arg(
+        long = "fallback-cooldown",
+        value_name = "SECONDS",
+        env = "LVZ_FALLBACK_COOLDOWN"
+    )]
+    fallback_cooldown: Option<u64>,
+
     /// Critique rounds the legion runs after the initial draft (default 1; 0 = draft then judge).
     #[arg(long = "legion-rounds", value_name = "N", env = "LVZ_LEGION_ROUNDS")]
     legion_rounds: Option<usize>,
@@ -644,6 +664,11 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
     // both the serving and one-shot paths share it. Fails fast on a bad spec or a missing key.
     let legion = build_legion(&cli, cli.thinking.as_deref(), serving)?;
 
+    // The fallback chain (if `--fallback`/`[provider] fallback` is set): built once here so both the
+    // serving and one-shot paths share it, and a bad spec / missing key fails fast rather than
+    // mid-turn.
+    let fallbacks = build_fallbacks(&cli, cli.thinking.as_deref(), serving)?;
+
     // Gateway mode: build the shared agent once — wrapped in process-local session memory so each
     // `session` continues across turns (§7.3) — then run every active gateway (HTTP, Matrix, cron)
     // concurrently until shutdown. No prompt is consumed.
@@ -659,7 +684,14 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             &extra_tools,
             schedule.as_ref(),
         );
-        let inner = Arc::new(build_agent(provider, model, &cli, tools.clone(), legion));
+        let inner = Arc::new(build_agent(
+            provider,
+            model,
+            &cli,
+            tools.clone(),
+            legion,
+            fallbacks,
+        ));
         let agent: Arc<dyn AgentHandle> = Arc::new(SessionAgent::new(inner, store));
 
         let mut gateways: Vec<Arc<dyn Gateway>> = Vec::new();
@@ -797,7 +829,7 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
 
     if cli.agent {
         let tools = build_tool_registry(&cli, batch_provider, model.clone(), &extra_tools, None);
-        let mut agent = build_agent(provider, model, &cli, tools, legion);
+        let mut agent = build_agent(provider, model, &cli, tools, legion, fallbacks);
         if cli.telemetry {
             agent = agent.with_telemetry(Arc::new(StderrTelemetry));
         }
@@ -906,19 +938,47 @@ fn load_persona(cli: &Cli) -> Option<String> {
 /// Assemble the agent's tool set: built-ins, the optional `batch_edit` fan-out tool, the
 /// `schedule_*` tools when a schedule is configured, then any caller-provided tools.
 ///
-/// Parse a legion debater/judge spec `provider:model` (e.g. `anthropic:claude-opus-4-8`) into its
-/// [`ProviderKind`] and model id. The provider names match the `--provider` value set.
-fn parse_debater_spec(spec: &str) -> Result<(ProviderKind, String), String> {
+/// Parse a `provider:model` spec (e.g. `anthropic:claude-opus-4-8`) into its [`ProviderKind`] and
+/// model id. Shared by legion debater/judge specs and `--fallback` specs; the provider names match
+/// the `--provider` value set.
+fn parse_provider_spec(spec: &str) -> Result<(ProviderKind, String), String> {
     let (prov, model) = spec.split_once(':').ok_or_else(|| {
-        format!("bad legion spec {spec:?}: expected `provider:model` (e.g. `anthropic:claude-opus-4-8`)")
+        format!("bad spec {spec:?}: expected `provider:model` (e.g. `anthropic:claude-opus-4-8`)")
     })?;
     if model.is_empty() {
-        return Err(format!("bad legion spec {spec:?}: empty model after `:`"));
+        return Err(format!("bad spec {spec:?}: empty model after `:`"));
     }
     let kind = <ProviderKind as ValueEnum>::from_str(prov, true).map_err(|_| {
-        format!("bad legion spec {spec:?}: unknown provider {prov:?} (expected xai|anthropic|google|claude-cli)")
+        format!("bad spec {spec:?}: unknown provider {prov:?} (expected xai|anthropic|google|claude-cli)")
     })?;
     Ok((kind, model.to_string()))
+}
+
+/// An ordered fallback chain: `(provider, model)` pairs the agent reroutes to when the primary is
+/// unresponsive before streaming output. Built once at the composition root, handed to the agent.
+type FallbackChain = Vec<(Arc<dyn Provider>, String)>;
+
+/// Build the ordered **fallback chain** (`--fallback` / `[provider] fallback`): a `(provider, model)`
+/// pair per spec, each provider built fresh from the env so a cross-provider chain picks up each
+/// provider's own API key. A missing key surfaces here as a clear error rather than a mid-turn
+/// failure. Empty when no fallback is configured (no behaviour change).
+fn build_fallbacks(
+    cli: &Cli,
+    thinking: Option<&str>,
+    serving: bool,
+) -> Result<FallbackChain, Box<dyn std::error::Error>> {
+    let mut chain = Vec::with_capacity(cli.fallback.len());
+    for spec in &cli.fallback {
+        let (kind, model) = parse_provider_spec(spec)?;
+        let (provider, _batch) = kind
+            .build(thinking, serving)
+            .map_err(|e| format!("fallback {spec:?}: {e}"))?;
+        chain.push((provider, model));
+    }
+    if !chain.is_empty() {
+        tracing::info!(fallbacks = chain.len(), "fallback chain configured");
+    }
+    Ok(chain)
 }
 
 /// Build the **legion** council (`lvz-legion`) from the `--legion-*` flags / `[legion]` config, or
@@ -941,7 +1001,7 @@ fn build_legion(
         );
     }
     let build_one = |spec: &str| -> Result<Debater, Box<dyn std::error::Error>> {
-        let (kind, model) = parse_debater_spec(spec)?;
+        let (kind, model) = parse_provider_spec(spec)?;
         let (provider, _batch) = kind
             .build(thinking, serving)
             .map_err(|e| format!("legion debater {spec:?}: {e}"))?;
@@ -1020,6 +1080,7 @@ fn build_agent(
     cli: &Cli,
     registry: ToolRegistry,
     legion: Option<Arc<dyn Deliberator>>,
+    fallbacks: FallbackChain,
 ) -> Agent {
     let mut config = AgentConfig::default()
         .with_model(model)
@@ -1097,6 +1158,13 @@ fn build_agent(
     // the single advisor pre-pass inside the agent.
     if let Some(legion) = legion {
         agent = agent.with_legion(legion);
+    }
+    // Install the fallback chain (if configured): the loop transparently reroutes to the next model
+    // when the primary is unresponsive before streaming any output, and a circuit breaker demotes a
+    // failed model across turns for `--fallback-cooldown` seconds. No-op when empty.
+    if !fallbacks.is_empty() {
+        let cooldown = std::time::Duration::from_secs(cli.fallback_cooldown.unwrap_or(60));
+        agent = agent.with_fallbacks(fallbacks, cooldown);
     }
     if cli.tune_bayes {
         // The experimental Bayesian (Thompson-sampling) learner; takes precedence over the
@@ -1339,24 +1407,24 @@ mod tests {
     #[test]
     fn legion_spec_parses_provider_and_model() {
         assert_eq!(
-            parse_debater_spec("anthropic:claude-opus-4-8").unwrap(),
+            parse_provider_spec("anthropic:claude-opus-4-8").unwrap(),
             (ProviderKind::Anthropic, "claude-opus-4-8".to_string())
         );
         assert_eq!(
-            parse_debater_spec("xai:grok-4").unwrap(),
+            parse_provider_spec("xai:grok-4").unwrap(),
             (ProviderKind::Xai, "grok-4".to_string())
         );
         assert_eq!(
-            parse_debater_spec("google:gemini-3").unwrap(),
+            parse_provider_spec("google:gemini-3").unwrap(),
             (ProviderKind::Google, "gemini-3".to_string())
         );
     }
 
     #[test]
     fn legion_spec_rejects_bad_forms() {
-        assert!(parse_debater_spec("no-colon").is_err()); // missing `:`
-        assert!(parse_debater_spec("bogus:model").is_err()); // unknown provider
-        assert!(parse_debater_spec("anthropic:").is_err()); // empty model
+        assert!(parse_provider_spec("no-colon").is_err()); // missing `:`
+        assert!(parse_provider_spec("bogus:model").is_err()); // unknown provider
+        assert!(parse_provider_spec("anthropic:").is_err()); // empty model
     }
 
     #[test]

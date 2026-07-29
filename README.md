@@ -276,6 +276,17 @@ Efficiency / cost levers: `--repo-skeleton <TOKENS>` (cache-aware repo-skeleton 
 `--summary-model` / `--compact-after` / `--context-limit` (compaction + eviction) ·
 `--cheap-model` / `--escalate-after` (cheap-model-first) · `--advisor-model` (advisor+executor split).
 
+Resilience: `--fallback <PROVIDER:MODEL>` (repeatable, ordered) sets a **fallback chain** — if the
+primary model is unresponsive or errors *before streaming any output* for a round-trip (a connect
+timeout, an open error, or a stall/error before the first token), the in-flight request is cancelled
+and the agent transparently reroutes to the next model, so a slow or down provider doesn't hang the
+turn. Cross-provider is first-class (each named provider needs its API key in the env). A failed
+model is demoted by a **circuit breaker** (`--fallback-cooldown <SECONDS>`, default 60): it is
+skipped from the start of subsequent turns for the cooldown — so a persistently-down provider isn't
+re-tried every turn — then re-probed once it elapses (a probe success clears it, a failure re-trips
+it). `--fallback-cooldown 0` re-probes every turn. Configurable via `[provider] fallback` /
+`fallback_cooldown`. E.g. `--fallback anthropic:claude-sonnet-4-6 --fallback google:gemini-3-flash-preview`.
+
 Legion (multi-model council): `--legion-debater <PROVIDER:MODEL>` (repeatable — pass two or more,
 e.g. `--legion-debater anthropic:claude-opus-4-8 --legion-debater xai:grok-4`) makes those models
 **argue the task out before the agent acts**: each drafts a position, they critique each other

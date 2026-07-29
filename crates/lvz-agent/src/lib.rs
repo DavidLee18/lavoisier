@@ -28,7 +28,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::channel::mpsc;
@@ -407,6 +409,64 @@ impl Tuner for FixedTuner {
     fn observe(&self, _ctx: &TaskContext, _used: &Knobs, _out: &Outcome) {}
 }
 
+/// A per-position **circuit breaker** for the fallback chain (§fallback), shared across turns so a
+/// dead model isn't re-probed on every turn. Position `0` is the primary; `i > 0` is `fallbacks[i-1]`.
+/// A position that fails (unresponsive/errors before the first token) is **demoted** for a cooldown;
+/// while demoted it is skipped at turn start, so we don't re-pay its timeout each turn. Once the
+/// cooldown elapses it is re-probed (half-open); a probe success clears it, a probe failure re-trips
+/// it for another cooldown. Lock-free: each position holds an `AtomicU64` deadline in ms on a
+/// monotonic clock (`0` = healthy), so concurrent turns can trip/read without a mutex.
+struct CircuitBreaker {
+    /// `deadlines[i]` = the ms-since-`base` until which position `i` stays demoted; `0` = healthy.
+    deadlines: Vec<AtomicU64>,
+    /// How long a demotion lasts before the position is re-probed.
+    cooldown_ms: u64,
+    /// Monotonic origin the deadlines are measured against (immune to wall-clock changes).
+    base: Instant,
+}
+
+impl CircuitBreaker {
+    /// A breaker for `positions` chain slots (`1 + fallbacks.len()`), all initially healthy.
+    fn new(positions: usize, cooldown: Duration) -> Self {
+        Self {
+            deadlines: (0..positions.max(1)).map(|_| AtomicU64::new(0)).collect(),
+            cooldown_ms: cooldown.as_millis() as u64,
+            base: Instant::now(),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.base.elapsed().as_millis() as u64
+    }
+
+    /// Whether position `i` is currently demoted (its cooldown has not yet elapsed).
+    fn is_open(&self, i: usize) -> bool {
+        self.deadlines
+            .get(i)
+            .is_some_and(|d| d.load(Ordering::Relaxed) > self.now_ms())
+    }
+
+    /// Demote position `i` for one cooldown (idempotent; last write wins under concurrency).
+    fn trip(&self, i: usize) {
+        if let Some(d) = self.deadlines.get(i) {
+            d.store(self.now_ms() + self.cooldown_ms, Ordering::Relaxed);
+        }
+    }
+
+    /// Mark position `i` healthy again (a successful use clears any prior demotion).
+    fn reset(&self, i: usize) {
+        if let Some(d) = self.deadlines.get(i) {
+            d.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// The first chain position (`0..=fallbacks_len`) not currently demoted — where a turn starts.
+    /// If every position is demoted we still must try *something*, so fall back to the primary (`0`).
+    fn first_available(&self, fallbacks_len: usize) -> usize {
+        (0..=fallbacks_len).find(|&i| !self.is_open(i)).unwrap_or(0)
+    }
+}
+
 /// The reasoning loop bound to a concrete provider, tool set, and tuner.
 pub struct Agent {
     provider: Arc<dyn Provider>,
@@ -421,6 +481,18 @@ pub struct Agent {
     /// an `Arc<dyn Deliberator>` (the tuner pattern) so the concrete council (`lvz-legion`) is
     /// injected by the composition root without the agent depending on it. `None` = no council.
     legion: Option<Arc<dyn Deliberator>>,
+    /// Ordered **fallback chain** for an unresponsive or erroring primary model: each entry is a
+    /// `(provider, model)` pair (cross-provider is first-class — the composition root builds each
+    /// from its own env key). When the primary model fails to respond *before any output has been
+    /// streamed this round-trip* — a connect timeout, an open error, or a stall/error before the
+    /// first token — the loop transparently retries on the next entry, so a dead provider doesn't
+    /// hang the turn. The cursor is **sticky**: once a model fails it is skipped for the rest of the
+    /// turn (its timeout isn't re-paid every round-trip). Empty = no fallback (today's behaviour).
+    fallbacks: Vec<(Arc<dyn Provider>, String)>,
+    /// Shared, cross-turn [`CircuitBreaker`] over the fallback chain: a model that fails is demoted
+    /// for a cooldown so it isn't re-probed on every turn, then re-tried once the cooldown elapses.
+    /// `Arc` so every turn (spawned task) shares the same state. Sized `1 + fallbacks.len()`.
+    breaker: Arc<CircuitBreaker>,
     /// Lazily-built, shared cache of the per-file repo skeletons (§6.1): the expensive walk +
     /// tree-sitter skeletonisation of every source file (`(relative path, skeleton)`) runs once on
     /// the first turn that needs it, so a long-running `--serve` walks the repo only once. The
@@ -441,6 +513,8 @@ impl Agent {
             tuner: Arc::new(NoopTuner),
             telemetry: None,
             legion: None,
+            fallbacks: Vec::new(),
+            breaker: Arc::new(CircuitBreaker::new(1, Duration::from_secs(60))),
             repo_skeleton: Arc::new(OnceLock::new()),
         }
     }
@@ -457,6 +531,21 @@ impl Agent {
     /// Without one, no council runs and the advisor (if any) is used instead.
     pub fn with_legion(mut self, legion: Arc<dyn Deliberator>) -> Self {
         self.legion = Some(legion);
+        self
+    }
+
+    /// Install an ordered **fallback chain** of `(provider, model)` pairs. When the primary model
+    /// is unresponsive or errors before streaming any output for a round-trip, the loop retries on
+    /// the next entry. A failed model is demoted across turns for `cooldown` (a
+    /// [`CircuitBreaker`]) before it is re-probed, so a persistently-down provider isn't re-tried on
+    /// every turn. Empty chain ⇒ no fallback (and `cooldown` is inert).
+    pub fn with_fallbacks(
+        mut self,
+        fallbacks: Vec<(Arc<dyn Provider>, String)>,
+        cooldown: Duration,
+    ) -> Self {
+        self.breaker = Arc::new(CircuitBreaker::new(1 + fallbacks.len(), cooldown));
+        self.fallbacks = fallbacks;
         self
     }
 
@@ -502,6 +591,8 @@ impl Agent {
         let tuner = self.tuner.clone();
         let telemetry = self.telemetry.clone();
         let legion = self.legion.clone();
+        let fallbacks = self.fallbacks.clone();
+        let breaker = self.breaker.clone();
         let skeleton_cell = self.repo_skeleton.clone();
         let allowed_tools = allowed_tools.map(|v| v.into_iter().collect::<HashSet<String>>());
 
@@ -513,6 +604,8 @@ impl Agent {
                 tuner,
                 telemetry,
                 legion,
+                fallbacks,
+                breaker,
                 skeleton_cell,
                 allowed_tools,
                 history,
@@ -548,6 +641,8 @@ async fn run_loop(
     tuner: Arc<dyn Tuner>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
     legion: Option<Arc<dyn Deliberator>>,
+    fallbacks: Vec<(Arc<dyn Provider>, String)>,
+    breaker: Arc<CircuitBreaker>,
     skeleton_cell: Arc<OnceLock<Vec<(String, String)>>>,
     allowed_tools: Option<HashSet<String>>,
     mut history: Vec<Message>,
@@ -679,6 +774,13 @@ async fn run_loop(
         }
     }
 
+    // Fallback cursor (§fallback): 0 = the primary `(provider, model)`; `i > 0` selects
+    // `fallbacks[i-1]`. Within a turn it only ever advances (once a model fails we skip it for the
+    // rest of the turn). It *starts* at the first position the cross-turn circuit breaker considers
+    // healthy — so a model demoted by an earlier turn's failure is skipped from the outset (its
+    // timeout isn't re-paid) until its cooldown elapses and it is re-probed.
+    let mut model_cursor = breaker.first_available(fallbacks.len());
+
     for _step in 0..config.max_steps {
         // Staleness eviction (§6.3): once a file has been edited, replace earlier reads/outlines
         // of it with a short pointer — their bytes are now wrong and re-billing them wastes tokens.
@@ -707,76 +809,153 @@ async fn run_loop(
             evict_to_fit(&mut history, limit);
         }
 
-        // Cheap-model-first (§8): run the early round-trips on the cheap model, then escalate
-        // to the strong model once the easy turns are spent. No-op unless cheap_model is set.
-        let active_model = match &config.cheap_model {
-            Some(cheap) if (round_trips as usize) < config.escalate_after => cheap.as_str(),
-            _ => config.model.as_str(),
-        };
-
-        let req = build_request(
-            &config,
-            active_model,
-            &tool_defs,
-            &caps,
-            &knobs,
-            &history,
-            repo_skeleton,
-            task_thinking,
-        );
-        // Bound the initial send too (connect + response headers): a connection that hangs before
-        // the first byte must also fail fast, not block forever (no provider sets an HTTP timeout).
-        let opened = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, provider.stream(req)).await {
-            Ok(r) => r,
-            Err(_) => {
-                obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
-                let _ = tx.unbounded_send(Err(AgentError::Provider(format!(
-                    "provider did not respond within {}s",
-                    STREAM_IDLE_TIMEOUT.as_secs()
-                ))));
-                return;
-            }
-        };
-        let mut stream = match opened {
-            Ok(s) => s,
-            Err(e) => {
-                obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
-                let _ = tx.unbounded_send(Err(AgentError::Provider(e.to_string())));
-                return;
-            }
-        };
-
+        // Fallback-aware send (§fallback): try the model at `model_cursor`, then each remaining
+        // fallback in order. We only switch models *before any output has been forwarded* this
+        // round-trip — a connect timeout, an open error, or a stall/error before the first token.
+        // Once bytes are streaming we can't cleanly restart on another model, so a later failure
+        // surfaces as an error like before. Within the turn the cursor only advances (a dead model
+        // is skipped for the rest of the turn); across turns each failure `trip`s the circuit
+        // breaker (demote for a cooldown) and a success `reset`s it, so a persistently-down model is
+        // skipped from turn start until re-probed.
         let mut turn = TurnAccumulator::default();
-        // Idle-timeout guard: a provider stream that stalls mid-response (a hung/throttled
-        // connection with no bytes arriving) must not freeze the agent forever — wrap each poll
-        // in a timeout so a silent gap surfaces as a recoverable error instead of an infinite
-        // wait. Bounds time *between* events, not total turn length, so a slow-but-progressing
-        // stream is fine.
-        loop {
-            let next = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await {
-                Ok(item) => item,
+        'attempt: loop {
+            // Resolve the candidate `(provider, model)` at the cursor. Cheap-model-first (§8) only
+            // applies to the primary: fallbacks name their model explicitly.
+            let (active_provider, active_model): (&Arc<dyn Provider>, &str) = if model_cursor == 0 {
+                let m = match &config.cheap_model {
+                    Some(cheap) if (round_trips as usize) < config.escalate_after => cheap.as_str(),
+                    _ => config.model.as_str(),
+                };
+                (&provider, m)
+            } else {
+                let (p, m) = &fallbacks[model_cursor - 1];
+                (p, m.as_str())
+            };
+            // Whether another candidate exists to fall back to (drives the pre-token retry).
+            let has_next = model_cursor < fallbacks.len();
+            // The candidate provider's own capabilities gate the wire request (e.g. never attach
+            // Anthropic `cache_control` to an xAI request); the turn-level `caps` stays the primary's.
+            let cand_caps = active_provider.capabilities();
+
+            let req = build_request(
+                &config,
+                active_model,
+                &tool_defs,
+                &cand_caps,
+                &knobs,
+                &history,
+                repo_skeleton,
+                task_thinking,
+            );
+            // Bound the initial send too (connect + response headers): a connection that hangs before
+            // the first byte must also fail fast, not block forever (no provider sets an HTTP timeout).
+            let opened = match tokio::time::timeout(
+                STREAM_IDLE_TIMEOUT,
+                active_provider.stream(req),
+            )
+            .await
+            {
+                Ok(r) => r,
                 Err(_) => {
+                    breaker.trip(model_cursor);
+                    if has_next {
+                        tracing::warn!(
+                            model = active_model,
+                            timeout_s = STREAM_IDLE_TIMEOUT.as_secs(),
+                            "model did not respond; falling back to the next model"
+                        );
+                        model_cursor += 1;
+                        continue 'attempt;
+                    }
                     obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
                     let _ = tx.unbounded_send(Err(AgentError::Provider(format!(
-                        "provider stream stalled (no data for {}s)",
+                        "provider did not respond within {}s",
                         STREAM_IDLE_TIMEOUT.as_secs()
                     ))));
                     return;
                 }
             };
-            let Some(event) = next else { break };
-            match event {
-                Ok(event) => {
-                    if let Some(forward) = turn.observe(event) {
-                        let _ = tx.unbounded_send(Ok(forward));
-                    }
-                }
+            let mut stream = match opened {
+                Ok(s) => s,
                 Err(e) => {
+                    breaker.trip(model_cursor);
+                    if has_next {
+                        tracing::warn!(
+                            model = active_model,
+                            error = %e,
+                            "model errored on open; falling back to the next model"
+                        );
+                        model_cursor += 1;
+                        continue 'attempt;
+                    }
                     obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
                     let _ = tx.unbounded_send(Err(AgentError::Provider(e.to_string())));
                     return;
                 }
+            };
+
+            // Idle-timeout guard: a provider stream that stalls mid-response (a hung/throttled
+            // connection with no bytes arriving) must not freeze the agent forever — wrap each poll
+            // in a timeout so a silent gap surfaces as a recoverable error instead of an infinite
+            // wait. Bounds time *between* events, not total turn length, so a slow-but-progressing
+            // stream is fine.
+            let mut forwarded_any = false;
+            loop {
+                let next = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await {
+                    Ok(item) => item,
+                    Err(_) => {
+                        if !forwarded_any {
+                            breaker.trip(model_cursor);
+                            if has_next {
+                                tracing::warn!(
+                                    model = active_model,
+                                    "stream stalled before the first token; falling back"
+                                );
+                                model_cursor += 1;
+                                turn = TurnAccumulator::default();
+                                continue 'attempt;
+                            }
+                        }
+                        obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
+                        let _ = tx.unbounded_send(Err(AgentError::Provider(format!(
+                            "provider stream stalled (no data for {}s)",
+                            STREAM_IDLE_TIMEOUT.as_secs()
+                        ))));
+                        return;
+                    }
+                };
+                let Some(event) = next else { break };
+                match event {
+                    Ok(event) => {
+                        if let Some(forward) = turn.observe(event) {
+                            forwarded_any = true;
+                            let _ = tx.unbounded_send(Ok(forward));
+                        }
+                    }
+                    Err(e) => {
+                        if !forwarded_any {
+                            breaker.trip(model_cursor);
+                            if has_next {
+                                tracing::warn!(
+                                    model = active_model,
+                                    error = %e,
+                                    "stream errored before the first token; falling back"
+                                );
+                                model_cursor += 1;
+                                turn = TurnAccumulator::default();
+                                continue 'attempt;
+                            }
+                        }
+                        obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
+                        let _ = tx.unbounded_send(Err(AgentError::Provider(e.to_string())));
+                        return;
+                    }
+                }
             }
+            // Stream completed on this candidate — mark it healthy (clears any prior demotion) and
+            // proceed. The cursor stays here for the rest of the turn.
+            breaker.reset(model_cursor);
+            break 'attempt;
         }
 
         round_trips += 1;
@@ -3904,5 +4083,251 @@ fn target() -> u32 { helper() + 10 }
         }
         // …and the turn still finishes cleanly.
         assert!(matches!(events.last(), Some(Event::Done(_))));
+    }
+
+    /// A provider whose `stream()` open always errors (an unavailable/erroring backend). Counts
+    /// how many times it was hit so a test can prove the primary was tried before the fallback.
+    struct ErroringProvider {
+        calls: AtomicUsize,
+    }
+    impl ErroringProvider {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+            })
+        }
+    }
+    #[async_trait]
+    impl Provider for ErroringProvider {
+        async fn stream(
+            &self,
+            _req: ChatRequest,
+        ) -> Result<
+            BoxStream<'static, Result<Event, lvz_protocol::ProviderError>>,
+            lvz_protocol::ProviderError,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(lvz_protocol::ProviderError::Api {
+                status: 503,
+                message: "unavailable".into(),
+            })
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    /// A provider that streams one text token then errors mid-stream — used to prove the fallback
+    /// does NOT engage once output has already been forwarded this round-trip.
+    struct PartialThenErrorProvider;
+    #[async_trait]
+    impl Provider for PartialThenErrorProvider {
+        async fn stream(
+            &self,
+            _req: ChatRequest,
+        ) -> Result<
+            BoxStream<'static, Result<Event, lvz_protocol::ProviderError>>,
+            lvz_protocol::ProviderError,
+        > {
+            let items: Vec<Result<Event, lvz_protocol::ProviderError>> = vec![
+                Ok(Event::TextDelta("partial".into())),
+                Err(lvz_protocol::ProviderError::Transport(
+                    "mid-stream drop".into(),
+                )),
+            ];
+            Ok(stream::iter(items).boxed())
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_the_next_model_when_the_primary_errors_on_open() {
+        let primary = ErroringProvider::new();
+        let fallback = ScriptedProvider::new(vec![vec![
+            Event::TextDelta("fallback answer".into()),
+            Event::Usage(Usage {
+                output_tokens: 5,
+                ..Default::default()
+            }),
+            Event::Done(StopReason::EndTurn),
+        ]]);
+        let agent = Agent::new(primary.clone(), ToolRegistry::new(), AgentConfig::default())
+            .with_fallbacks(
+                vec![(fallback.clone(), "backup".into())],
+                Duration::from_secs(60),
+            );
+
+        // `collect` panics on any surfaced agent error, so reaching here proves the error was
+        // swallowed and the fallback answered transparently.
+        let events = collect(agent.run("do it")).await;
+
+        assert_eq!(
+            primary.calls.load(Ordering::SeqCst),
+            1,
+            "primary tried once"
+        );
+        assert_eq!(
+            fallback.calls.load(Ordering::SeqCst),
+            1,
+            "fallback answered"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::TextDelta(t) if t == "fallback answer")));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Done(StopReason::EndTurn))
+        ));
+    }
+
+    #[tokio::test]
+    async fn surfaces_the_error_when_no_fallback_is_configured() {
+        let primary = ErroringProvider::new();
+        let agent = Agent::new(primary.clone(), ToolRegistry::new(), AgentConfig::default());
+
+        let mut s = agent.run("do it");
+        let mut saw_err = false;
+        while let Some(e) = s.next().await {
+            saw_err |= e.is_err();
+        }
+        assert!(saw_err, "with no fallback the provider error must surface");
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn does_not_fall_back_after_the_first_token_has_streamed() {
+        let primary = Arc::new(PartialThenErrorProvider);
+        // If the gate were wrong, this fallback's text would appear; it must NOT.
+        let fallback = ScriptedProvider::new(vec![vec![
+            Event::TextDelta("SHOULD NOT APPEAR".into()),
+            Event::Done(StopReason::EndTurn),
+        ]]);
+        let agent = Agent::new(primary, ToolRegistry::new(), AgentConfig::default())
+            .with_fallbacks(
+                vec![(fallback.clone(), "backup".into())],
+                Duration::from_secs(60),
+            );
+
+        let mut s = agent.run("do it");
+        let (mut events, mut saw_err) = (Vec::new(), false);
+        while let Some(e) = s.next().await {
+            match e {
+                Ok(ev) => events.push(ev),
+                Err(_) => saw_err = true,
+            }
+        }
+        assert!(
+            saw_err,
+            "a mid-stream error after a token must surface, not silently reroute"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::TextDelta(t) if t == "partial")));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::TextDelta(t) if t == "SHOULD NOT APPEAR")),
+            "the fallback must not engage once output was forwarded"
+        );
+        assert_eq!(
+            fallback.calls.load(Ordering::SeqCst),
+            0,
+            "fallback provider never called"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_trips_skips_and_resets() {
+        let cb = CircuitBreaker::new(3, Duration::from_secs(300));
+        assert_eq!(
+            cb.first_available(2),
+            0,
+            "all healthy ⇒ start at the primary"
+        );
+
+        cb.trip(0);
+        assert!(cb.is_open(0));
+        assert!(!cb.is_open(1));
+        assert_eq!(
+            cb.first_available(2),
+            1,
+            "primary demoted ⇒ skip to the next"
+        );
+
+        cb.trip(1);
+        assert_eq!(cb.first_available(2), 2);
+
+        cb.reset(0);
+        assert!(!cb.is_open(0));
+        assert_eq!(
+            cb.first_available(2),
+            0,
+            "reset ⇒ the primary is preferred again"
+        );
+
+        // Every position demoted ⇒ we must still try something: fall back to the primary.
+        cb.trip(0);
+        cb.trip(1);
+        cb.trip(2);
+        assert_eq!(cb.first_available(2), 0);
+    }
+
+    /// A two-turn answer script for the fallback provider (each turn a full reply).
+    fn two_answers() -> Vec<Vec<Event>> {
+        let one = || {
+            vec![
+                Event::TextDelta("fallback answer".into()),
+                Event::Done(StopReason::EndTurn),
+            ]
+        };
+        vec![one(), one()]
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_demotes_a_failed_model_across_turns() {
+        let primary = ErroringProvider::new();
+        let fallback = ScriptedProvider::new(two_answers());
+        // A long cooldown: once the primary fails on turn 1, it stays demoted through turn 2.
+        let agent = Agent::new(primary.clone(), ToolRegistry::new(), AgentConfig::default())
+            .with_fallbacks(
+                vec![(fallback.clone(), "backup".into())],
+                Duration::from_secs(300),
+            );
+
+        let _ = collect(agent.run("turn one")).await;
+        let _ = collect(agent.run("turn two")).await;
+
+        assert_eq!(
+            primary.calls.load(Ordering::SeqCst),
+            1,
+            "the demoted primary must NOT be re-tried on turn 2 (its timeout isn't re-paid)"
+        );
+        assert_eq!(
+            fallback.calls.load(Ordering::SeqCst),
+            2,
+            "the fallback answers both turns"
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_reprobes_the_primary_after_the_cooldown() {
+        let primary = ErroringProvider::new();
+        let fallback = ScriptedProvider::new(two_answers());
+        // Zero cooldown: the demotion elapses immediately, so each turn re-probes the primary
+        // (half-open) — the sound recovery path once a provider comes back.
+        let agent = Agent::new(primary.clone(), ToolRegistry::new(), AgentConfig::default())
+            .with_fallbacks(vec![(fallback.clone(), "backup".into())], Duration::ZERO);
+
+        let _ = collect(agent.run("turn one")).await;
+        let _ = collect(agent.run("turn two")).await;
+
+        assert_eq!(
+            primary.calls.load(Ordering::SeqCst),
+            2,
+            "with no cooldown the primary is re-probed every turn"
+        );
+        assert_eq!(fallback.calls.load(Ordering::SeqCst), 2);
     }
 }

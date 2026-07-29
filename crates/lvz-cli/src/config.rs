@@ -70,6 +70,12 @@ pub struct ProviderSection {
     /// `xai` | `anthropic` | `google` | `claude-cli`.
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Ordered fallback chain, each `provider:model`. If the primary is unresponsive or errors
+    /// before streaming output, the agent retries on the next. `--fallback` (repeatable) wins.
+    pub fallback: Option<Vec<String>>,
+    /// Seconds a failed fallback model stays demoted before re-probe (circuit breaker; default 60).
+    /// `--fallback-cooldown` / `LVZ_FALLBACK_COOLDOWN` take precedence.
+    pub fallback_cooldown: Option<u64>,
 }
 
 /// `[agent]` — the tool loop, compaction, routing, and accuracy levers.
@@ -194,6 +200,13 @@ impl Config {
             }
         }
         merge(&mut cli.model, &self.provider.model);
+        // A Vec flag: the file supplies it only when the CLI passed none (CLI wins wholesale).
+        if cli.fallback.is_empty() {
+            if let Some(fallback) = &self.provider.fallback {
+                cli.fallback = fallback.clone();
+            }
+        }
+        merge_copy(&mut cli.fallback_cooldown, self.provider.fallback_cooldown);
 
         // [agent]
         merge(&mut cli.summary_model, &self.agent.summary_model);
@@ -494,6 +507,36 @@ mod tests {
         cli.legion_rounds = None;
         cfg.apply_to(&mut cli);
         assert_eq!(cli.legion_debater, vec!["google:gemini-3"]);
+    }
+
+    #[test]
+    fn cli_fallback_flags_win_over_the_file() {
+        use clap::Parser;
+        let cfg: Config = toml::from_str(
+            "[provider]\nfallback = [\"anthropic:claude-sonnet-4-6\", \"google:gemini-3-flash-preview\"]\nfallback_cooldown = 120\n",
+        )
+        .unwrap();
+
+        // Unset on the CLI ⇒ the file supplies the whole chain (and the cooldown).
+        let mut cli = Cli::parse_from(["lav"]);
+        cli.fallback_cooldown = None; // ignore any ambient LVZ_FALLBACK_COOLDOWN
+        cfg.apply_to(&mut cli);
+        assert_eq!(
+            cli.fallback,
+            vec![
+                "anthropic:claude-sonnet-4-6",
+                "google:gemini-3-flash-preview"
+            ]
+        );
+        assert_eq!(cli.fallback_cooldown, Some(120));
+
+        // Explicit on the CLI ⇒ the file must not override.
+        let mut cli = Cli::parse_from(["lav", "--fallback", "xai:grok-4"]);
+        cfg.apply_to(&mut cli);
+        assert_eq!(cli.fallback, vec!["xai:grok-4"]);
+
+        // Unknown key still rejected.
+        assert!(toml::from_str::<Config>("[provider]\nfalback = []\n").is_err());
     }
 
     #[test]

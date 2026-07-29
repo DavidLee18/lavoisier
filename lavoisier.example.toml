@@ -5,6 +5,14 @@
 [provider]
 # provider = "anthropic"        # xai | anthropic | google | claude-cli  (default: xai)
 # model    = "claude-..."       # default: the provider's default model
+# Fallback chain (ordered, each `provider:model`): if the primary model is unresponsive or errors
+# before streaming any output, the in-flight request is cancelled and the agent transparently
+# reroutes to the next — so a slow/down provider doesn't hang the turn. Cross-provider; each named
+# provider needs its API key in the env.
+# fallback = ["anthropic:claude-sonnet-4-6", "google:gemini-3-flash-preview"]
+# A failed model is demoted by a circuit breaker for this many seconds (default 60) before it's
+# re-probed, so a persistently-down provider isn't re-tried every turn. `0` = re-probe every turn.
+# fallback_cooldown = 60
 
 [agent]
 # Context compaction / eviction
