@@ -22,6 +22,7 @@ import Lavoisier.Config (FileConfig (..), loadConfig)
 import Lavoisier.Gateway.A2A (a2aGateway, defaultA2aConfig)
 import Lavoisier.Gateway.Acp (acpGateway, defaultAcpConfig)
 import Lavoisier.Gateway.Http (defaultGatewayConfig, httpGateway)
+import Lavoisier.Mcp (connectTools, mssLabel, parseServerSpec, renderMcpError)
 import Lavoisier.Memory (newFileStore, newInMemoryStore, sessionAgentHandle)
 import Lavoisier.Protocol.Agent (turnRequest)
 import Lavoisier.Protocol.Event
@@ -31,7 +32,7 @@ import Lavoisier.Protocol.Provider (Provider (..), ProviderError)
 import Lavoisier.Protocol.Stream (Producer (..))
 import Lavoisier.Provider.Anthropic (anthropicFromEnv)
 import Lavoisier.Provider.Google (googleFromEnv)
-import Lavoisier.Tool.Registry (withBuiltins)
+import Lavoisier.Tool.Registry (ToolRegistry, registerTools, withBuiltins)
 import Options.Applicative
 import System.Directory (doesFileExist)
 import System.Exit (exitFailure)
@@ -50,6 +51,7 @@ data Options = Options
     optServeAcp :: Maybe Int,
     optSessionDir :: Maybe FilePath,
     optConfig :: Maybe FilePath,
+    optMcpServers :: [String],
     optWords :: [String]
   }
 
@@ -67,6 +69,7 @@ optionsParser =
     <*> optional (option auto (long "serve-acp" <> metavar "PORT" <> help "Serve the agent as an ACP (Agent Communication Protocol) gateway on this port"))
     <*> optional (strOption (long "session-dir" <> metavar "DIR" <> help "Persist gateway session transcripts under DIR (durable file store; default in-memory)"))
     <*> optional (strOption (long "config" <> metavar "PATH" <> help "Dhall config file (default ./lavoisier.dhall if present)"))
+    <*> many (strOption (long "mcp-server" <> metavar "LABEL:TARGET" <> help "Connect to an MCP server and expose its tools (stdio command or http(s):// URL); repeatable"))
     <*> many (argument str (metavar "PROMPT..."))
 
 thinkingReader :: ReadM ThinkingLevel
@@ -88,16 +91,16 @@ runCli = do
     Right (prov, defModel) -> do
       let model = fromMaybe defModel (optModel opts)
       case (optServeAcp opts, optServeA2a opts, optServe opts) of
-        (Just port, _, _) -> serveGateway (acpGateway port defaultAcpConfig) prov opts model
-        (_, Just port, _) -> serveGateway (a2aGateway port defaultA2aConfig) prov opts model
-        (_, _, Just port) -> serveGateway (httpGateway port defaultGatewayConfig) prov opts model
+        (Just port, _, _) -> withRegistry opts $ serveGateway (acpGateway port defaultAcpConfig) prov opts model
+        (_, Just port, _) -> withRegistry opts $ serveGateway (a2aGateway port defaultA2aConfig) prov opts model
+        (_, _, Just port) -> withRegistry opts $ serveGateway (httpGateway port defaultGatewayConfig) prov opts model
         _ -> do
           prompt <- resolvePrompt (optWords opts)
           if T.null prompt
             then errExit "empty prompt (pass it as arguments or on stdin)"
             else
               if optAgent opts
-                then runAgentMode prov opts model prompt
+                then withRegistry opts (runAgentMode prov opts model prompt)
                 else runAskMode prov opts model prompt
   where
     pinfo =
@@ -137,7 +140,11 @@ applyConfig fc o =
       optServe = optServe o <|> fmap fromIntegral (serve fc),
       optServeA2a = optServeA2a o <|> fmap fromIntegral (serveA2a fc),
       optServeAcp = optServeAcp o <|> fmap fromIntegral (serveAcp fc),
-      optSessionDir = optSessionDir o <|> fmap T.unpack (sessionDir fc)
+      optSessionDir = optSessionDir o <|> fmap T.unpack (sessionDir fc),
+      -- A CLI --mcp-server (non-empty) wins wholesale; otherwise take the file's list.
+      optMcpServers = case optMcpServers o of
+        [] -> maybe [] (map T.unpack) (mcpServers fc)
+        given -> given
     }
 
 parseThinking :: Text -> Maybe ThinkingLevel
@@ -174,12 +181,29 @@ runAskMode prov opts model prompt = do
     Left e -> errExit (tshow e)
     Right stream -> renderStream stream
 
+-- | Build the tool registry the agent will use: the built-ins plus any @--mcp-server@'s tools
+-- (namespaced @\<label\>_\<tool\>@), then hand it to the continuation. Connecting only happens for
+-- tool-using modes (@--agent@ or a gateway) — a plain @ask@ spawns nothing. A bad spec or a dead
+-- server fails fast with the offending label.
+withRegistry :: Options -> (ToolRegistry -> IO ()) -> IO ()
+withRegistry opts k = do
+  toolss <- mapM connectOne (optMcpServers opts)
+  k (registerTools (concat toolss) withBuiltins)
+  where
+    connectOne raw = case parseServerSpec (T.pack raw) of
+      Left e -> errExit ("mcp: " <> renderMcpError e)
+      Right spec -> do
+        r <- connectTools spec
+        case r of
+          Left e -> errExit ("mcp '" <> mssLabel spec <> "': " <> renderMcpError e)
+          Right ts -> pure ts
+
 -- | Serve the agent through any 'Gateway', wrapped with a session store (durable if --session-dir).
-serveGateway :: Gateway -> Provider -> Options -> Text -> IO ()
-serveGateway gw prov opts model = do
+serveGateway :: Gateway -> Provider -> Options -> Text -> ToolRegistry -> IO ()
+serveGateway gw prov opts model registry = do
   let base = defaultAgentConfig model
       cfg = base {acThinking = optThinking opts, acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts), acMaxSteps = fromMaybe (acMaxSteps base) (optMaxSteps opts)}
-      agent = Agent prov withBuiltins cfg
+      agent = Agent prov registry cfg
   store <- maybe (newInMemoryStore (Just 200)) (`newFileStore` Just 200) (optSessionDir opts)
   herr ("gateway '" <> gatewayName gw <> "' starting")
   res <- gatewayServe gw (sessionAgentHandle store agent)
@@ -187,8 +211,8 @@ serveGateway gw prov opts model = do
     Left e -> errExit (tshow e)
     Right () -> pure ()
 
-runAgentMode :: Provider -> Options -> Text -> Text -> IO ()
-runAgentMode prov opts model prompt = do
+runAgentMode :: Provider -> Options -> Text -> Text -> ToolRegistry -> IO ()
+runAgentMode prov opts model prompt registry = do
   let base = defaultAgentConfig model
       cfg =
         base
@@ -196,7 +220,7 @@ runAgentMode prov opts model prompt = do
             acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts),
             acMaxSteps = fromMaybe (acMaxSteps base) (optMaxSteps opts)
           }
-      agent = Agent prov withBuiltins cfg
+      agent = Agent prov registry cfg
   res <- runAgent agent (turnRequest "cli" prompt) renderEvent
   case res of
     Left e -> errExit (tshow e)

@@ -14,4 +14,8 @@
 , serveA2a = None Natural -- A2A gateway port
 , serveAcp = None Natural -- ACP gateway port
 , sessionDir = None Text -- durable session store dir (else in-memory)
+, mcpServers = -- external MCP servers whose tools are exposed to the agent (--agent / --serve*)
+    Some [ "fs: npx -y @modelcontextprotocol/server-filesystem ." ]
+    -- each entry is "label: target"; target is a stdio command or an http(s):// URL.
+    -- tools are namespaced <label>_<tool>. None (List Text) to set none.
 }

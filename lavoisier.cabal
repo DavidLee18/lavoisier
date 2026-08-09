@@ -38,6 +38,7 @@ library
     Lavoisier.Gateway.A2A
     Lavoisier.Gateway.Acp
     Lavoisier.Gateway.Http
+    Lavoisier.Mcp
     Lavoisier.Memory
     Lavoisier.Protocol
     Lavoisier.Protocol.Agent
@@ -97,6 +98,8 @@ test-suite lavoisier-test
     , filepath
     , http-types
     , lavoisier
+    , process
+    , scientific
     , QuickCheck
     , tasty
     , tasty-hunit

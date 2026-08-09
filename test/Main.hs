@@ -3,11 +3,17 @@
 
 module Main (main) where
 
+import Control.Concurrent (forkIO)
+import Control.Exception (IOException, try)
 import Data.Aeson (Value (..), decode, encode, object, (.=))
+import Data.Aeson.Key qualified as K
+import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.ByteString.Char8 qualified as BS8
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef
+import Data.Scientific (toBoundedInteger)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient)
@@ -17,6 +23,24 @@ import Lavoisier.Config (FileConfig (..), defaultConfig, loadConfig)
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
 import Lavoisier.Gateway.Acp (defaultAcpConfig, newAcpApp)
 import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp)
+import Lavoisier.Mcp
+  ( CallResult (..),
+    McpClient,
+    McpError (..),
+    McpServerSpec (..),
+    RemoteTool (..),
+    TransportSpec (..),
+    advertisedName,
+    mcCallTool,
+    mcInitialize,
+    mcListTools,
+    mkClient,
+    newPipeTransport,
+    parseHttpReply,
+    parseServerSpec,
+    renderCall,
+    toTool,
+  )
 import Lavoisier.Protocol.Agent (AgentError (..), AgentHandle (..), turnRequest)
 import Lavoisier.Protocol.Event
 import Lavoisier.Protocol.Message
@@ -35,6 +59,8 @@ import Network.Wai (defaultRequest, pathInfo, requestHeaders, requestMethod)
 import Network.Wai.Test (SRequest (..), runSession, simpleBody, simpleStatus, srequest)
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
 import System.FilePath ((</>))
+import System.IO (Handle, hClose, hFlush, hSetBinaryMode)
+import System.Process (createPipe)
 import Test.QuickCheck (Arbitrary (..), Gen, choose, elements, listOf, oneof, resize)
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -58,7 +84,8 @@ tests =
       a2aTests,
       acpTests,
       memoryTests,
-      configTests
+      configTests,
+      mcpTests
     ]
 
 -- --- Phase 1: protocol wire shapes, as QuickCheck round-trip properties ----------------------------
@@ -590,6 +617,150 @@ configTests =
         fc <- loadConfig f
         fc @?= defaultConfig
     ]
+
+-- --- Phase 13: MCP client (offline; specs/rendering + a real in-process pipe server) --------------
+
+mcpTests :: TestTree
+mcpTests =
+  testGroup
+    "mcp client"
+    [ testCase "parses stdio and http specs" $ do
+        parseServerSpec "fs: npx -y server-filesystem ."
+          @?= Right (McpServerSpec "fs" (StdioSpec ["npx", "-y", "server-filesystem", "."]))
+        parseServerSpec "remote: https://mcp.example.com/rpc"
+          @?= Right (McpServerSpec "remote" (HttpSpec "https://mcp.example.com/rpc")),
+      testCase "rejects malformed specs" $ do
+        assertBool "no colon" (isLeft (parseServerSpec "no-colon"))
+        assertBool "empty label" (isLeft (parseServerSpec ": missing label"))
+        assertBool "empty target" (isLeft (parseServerSpec "empty:")),
+      testCase "advertised names are namespaced and sanitized" $ do
+        advertisedName "fs" "read_file" @?= "fs_read_file"
+        advertisedName "gh" "list/issues" @?= "gh_list_issues"
+        assertBool "truncated to 64" (T.length (advertisedName "x" (T.replicate 200 "a")) <= 64),
+      testCase "renders content blocks and falls back to JSON" $ do
+        let r =
+              CallResult
+                [ object ["type" .= ("text" :: Text), "text" .= ("hello" :: Text)],
+                  object ["type" .= ("text" :: Text), "text" .= ("world" :: Text)],
+                  object ["type" .= ("image" :: Text), "data" .= ("…" :: Text)]
+                ]
+                False
+            out = renderCall r
+        assertBool "hello" ("hello" `T.isInfixOf` out)
+        assertBool "world" ("world" `T.isInfixOf` out)
+        assertBool "image preserved as JSON" ("image" `T.isInfixOf` out),
+      testCase "parses http json and sse replies" $ do
+        parseHttpReply "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}" "application/json" (Just 1)
+          @?= Right (object ["ok" .= True])
+        let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"n\":5}}\n\n"
+        parseHttpReply sse "text/event-stream" (Just 2) @?= Right (object ["n" .= (5 :: Int)])
+        case parseHttpReply "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"nope\"}}" "application/json" (Just 1) of
+          Left (Rpc m) -> m @?= "nope"
+          other -> assertFailure ("expected Rpc, got " <> show other),
+      testCase "discovers and invokes tools over a real pipe" $ do
+        client <- mkPipeClient "fs"
+        mcInitialize client >>= (@?= Right ())
+        et <- mcListTools client
+        case et of
+          Right [rt] -> rtName rt @?= "echo"
+          other -> assertFailure ("expected one tool, got " <> show other)
+        ec <- mcCallTool client "echo" (object ["text" .= ("hi there" :: Text)])
+        case ec of
+          Right res -> do
+            resIsError res @?= False
+            renderCall res @?= "hi there"
+          Left e -> assertFailure ("call failed: " <> show e),
+      testCase "adapter maps a call into a ToolOutput" $ do
+        client <- mkPipeClient "fs"
+        _ <- mcInitialize client
+        let tool = toTool client "fs" (RemoteTool "echo" (Just "echo") (Just (object ["type" .= ("object" :: Text)])))
+        toolName tool @?= "fs_echo"
+        out <- toolInvoke tool (object ["text" .= ("pong" :: Text)])
+        case out of
+          Right o -> do
+            toIsError o @?= False
+            toContent o @?= "pong"
+          Left e -> assertFailure ("invoke failed: " <> show e),
+      testCase "a closed pipe fails fast, not on timeout" $ do
+        -- Server ends closed at both ends: the client's write breaks (or its reader drains pending).
+        (aR, aW) <- createPipe
+        (bR, bW) <- createPipe
+        hClose bW
+        hClose aR
+        tr <- newPipeTransport bR aW Nothing
+        let client = mkClient "dead" tr
+        r <- mcInitialize client
+        case r of
+          Left Closed -> pure ()
+          Left (Io _) -> pure ()
+          other -> assertFailure ("expected Closed/Io, got " <> show other)
+    ]
+
+-- | Wire an in-process mock MCP server to a client over two OS pipes (the offline analogue of Rust's
+-- @tokio::io::duplex@): client→server on one pipe, server→client on the other.
+mkPipeClient :: Text -> IO McpClient
+mkPipeClient label = do
+  (aR, aW) <- createPipe -- client writes aW, server reads aR
+  (bR, bW) <- createPipe -- server writes bW, client reads bR
+  _ <- forkIO (mockServer aR bW)
+  tr <- newPipeTransport bR aW Nothing
+  pure (mkClient label tr)
+
+-- | A minimal MCP server over a handle pair: answers initialize/tools/list/tools/call, swallows the
+-- initialized notification. Exercises the real stdio framing/demux path.
+mockServer :: Handle -> Handle -> IO ()
+mockServer readH writeH = do
+  hSetBinaryMode readH True
+  hSetBinaryMode writeH True
+  let loop = do
+        r <- try (BS8.hGetLine readH) :: IO (Either IOException BS.ByteString)
+        case r of
+          Left _ -> pure ()
+          Right line
+            | BS.null (BS.dropWhile isSpaceW line) -> loop
+            | otherwise -> do
+                case decode (BL.fromStrict line) :: Maybe Value of
+                  Nothing -> loop
+                  Just msg -> case msgIdOf msg of
+                    Nothing -> loop -- a notification: no reply
+                    Just i -> do
+                      let result = case methodOf msg of
+                            "initialize" -> object ["protocolVersion" .= ("2025-06-18" :: Text), "capabilities" .= object []]
+                            "tools/list" ->
+                              object
+                                ["tools" .= [object ["name" .= ("echo" :: Text), "description" .= ("echo back" :: Text), "inputSchema" .= object ["type" .= ("object" :: Text)]]]]
+                            "tools/call" -> object ["content" .= [object ["type" .= ("text" :: Text), "text" .= argText msg]], "isError" .= False]
+                            _ -> Null
+                          out = BL.toStrict (encode (object ["jsonrpc" .= ("2.0" :: Text), "id" .= i, "result" .= result])) <> "\n"
+                      BS.hPut writeH out
+                      hFlush writeH
+                      loop
+  loop
+  where
+    isSpaceW w = w == 32 || w == 9 || w == 10 || w == 13
+
+objLookup :: Text -> Value -> Maybe Value
+objLookup k (Object o) = KM.lookup (K.fromText k) o
+objLookup _ _ = Nothing
+
+msgIdOf :: Value -> Maybe Int
+msgIdOf msg = case objLookup "id" msg of
+  Just (Number n) -> toBoundedInteger n
+  _ -> Nothing
+
+methodOf :: Value -> Text
+methodOf msg = case objLookup "method" msg of
+  Just (String s) -> s
+  _ -> ""
+
+argText :: Value -> Text
+argText msg = case objLookup "params" msg >>= objLookup "arguments" >>= objLookup "text" of
+  Just (String s) -> s
+  _ -> ""
+
+isLeft :: Either a b -> Bool
+isLeft (Left _) = True
+isLeft (Right _) = False
 
 -- Run an action in a fresh temp directory, cleaned up afterwards.
 withTmp :: String -> (FilePath -> IO a) -> IO a
