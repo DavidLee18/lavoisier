@@ -22,9 +22,11 @@ import Lavoisier.Config (FileConfig (..), loadConfig)
 import Lavoisier.Gateway.A2A (a2aGateway, defaultA2aConfig)
 import Lavoisier.Gateway.Acp (acpGateway, defaultAcpConfig)
 import Lavoisier.Gateway.Http (defaultGatewayConfig, httpGateway)
+import Lavoisier.Legion (Debater, languageFromLocale, mkDebater, newPanel, panelDeliberator, renderLegionError, withLanguage)
 import Lavoisier.Mcp (connectTools, mssLabel, parseServerSpec, renderMcpError)
 import Lavoisier.Memory (newFileStore, newInMemoryStore, sessionAgentHandle)
 import Lavoisier.Protocol.Agent (turnRequest)
+import Lavoisier.Protocol.Deliberate (Deliberator)
 import Lavoisier.Protocol.Event
 import Lavoisier.Protocol.Gateway (Gateway (..))
 import Lavoisier.Protocol.Message
@@ -39,6 +41,7 @@ import Lavoisier.Tune (LearningTuner, asTuner, defaultTuneConfig, learningTuner,
 import Lavoisier.Tune.Bayes (BayesTuner, asBayesTuner, bayesTuner, loadBayes, saveBayes)
 import Options.Applicative
 import System.Directory (doesFileExist)
+import System.Environment (lookupEnv)
 import System.Exit (exitFailure)
 import System.IO (hFlush, stderr, stdout)
 
@@ -59,6 +62,10 @@ data Options = Options
     optTune :: Bool,
     optTuneBayes :: Bool,
     optTuneState :: Maybe FilePath,
+    optLegionDebaters :: [String],
+    optLegionJudge :: Maybe String,
+    optLegionRounds :: Maybe Int,
+    optLang :: Maybe String,
     optWords :: [String]
   }
 
@@ -80,6 +87,10 @@ optionsParser =
     <*> switch (long "tune" <> help "Enable the ATO learner (ε-greedy knob tuning); off ⇒ static baseline knobs")
     <*> switch (long "tune-bayes" <> help "Use the Bayesian (Thompson-sampling) ATO learner instead of ε-greedy")
     <*> optional (strOption (long "tune-state" <> metavar "PATH" <> help "Load/persist learned ATO profiles at PATH (implies --tune; saved after an --agent turn)"))
+    <*> many (strOption (long "legion-debater" <> metavar "PROVIDER:MODEL" <> help "Add a legion council debater (repeatable; ≥2 enables the council pre-pass)"))
+    <*> optional (strOption (long "legion-judge" <> metavar "PROVIDER:MODEL" <> help "The legion judge that synthesises the verdict (default: the first debater)"))
+    <*> optional (option auto (long "legion-rounds" <> metavar "N" <> help "Number of critique rounds after the draft (default 1)"))
+    <*> optional (strOption (long "lang" <> metavar "LOCALE" <> help "Locale for council progress notices (only ko_KR selects Korean; default English/LANG)"))
     <*> many (argument str (metavar "PROMPT..."))
 
 thinkingReader :: ReadM ThinkingLevel
@@ -158,7 +169,13 @@ applyConfig fc o =
       -- --tune is a flag (default False); the file can turn it on when the flag was absent.
       optTune = optTune o || fromMaybe False (tune fc),
       optTuneBayes = optTuneBayes o || fromMaybe False (tuneBayes fc),
-      optTuneState = optTuneState o <|> fmap T.unpack (tuneState fc)
+      optTuneState = optTuneState o <|> fmap T.unpack (tuneState fc),
+      optLegionDebaters = case optLegionDebaters o of
+        [] -> maybe [] (map T.unpack) (legionDebaters fc)
+        given -> given,
+      optLegionJudge = optLegionJudge o <|> fmap T.unpack (legionJudge fc),
+      optLegionRounds = optLegionRounds o <|> fmap fromIntegral (legionRounds fc),
+      optLang = optLang o <|> fmap T.unpack (lang fc)
     }
 
 parseThinking :: Text -> Maybe ThinkingLevel
@@ -235,13 +252,45 @@ buildTuner opts
           Left e -> errExit ("tune-state " <> T.pack path <> ": " <> T.pack e)
           Right (lt :: LearningTuner) -> pure (asTuner lt, saveTuner lt path)
 
+-- | Build the legion council: 'Nothing' unless ≥2 @--legion-debater@s are given (a one-model council
+-- is just the advisor pre-pass), else a 'Deliberator' 'Panel'. Each debater\/judge spec is
+-- @provider:model@, its provider built from env via 'selectProvider'; a bad spec\/too-few debaters
+-- fails fast. The judge defaults to the first debater. Progress notices localize via @--lang@\/@LANG@.
+buildLegion :: Options -> IO (Maybe Deliberator)
+buildLegion opts
+  | null (optLegionDebaters opts) = pure Nothing
+  | otherwise = do
+      debs <- mapM buildDebater (optLegionDebaters opts)
+      judge <- case (optLegionJudge opts, debs) of
+        (Just js, _) -> buildDebater js
+        (Nothing, d : _) -> pure d
+        (Nothing, []) -> errExit "legion: no debaters configured"
+      langRaw <- maybe (fmap (fromMaybe "") (lookupEnv "LANG")) pure (optLang opts)
+      let lg = languageFromLocale (T.pack langRaw)
+      case newPanel debs judge (fromMaybe 1 (optLegionRounds opts)) of
+        Left e -> errExit ("legion: " <> renderLegionError e)
+        Right panel -> pure (Just (panelDeliberator (withLanguage lg panel)))
+
+-- | Build one council debater from a @provider:model@ spec, its provider from env.
+buildDebater :: String -> IO Debater
+buildDebater spec = case break (== ':') spec of
+  (_, "") -> errExit ("legion: bad debater spec (want provider:model): " <> T.pack spec)
+  (provName, _ : modelPart)
+    | null modelPart -> errExit ("legion: empty model in spec: " <> T.pack spec)
+    | otherwise -> do
+        ep <- selectProvider provName
+        case ep of
+          Left e -> errExit ("legion: " <> e)
+          Right (p, _def) -> pure (mkDebater (T.pack spec) p (T.pack modelPart) Nothing)
+
 -- | Serve the agent through any 'Gateway', wrapped with a session store (durable if --session-dir).
 serveGateway :: Gateway -> Provider -> Options -> Text -> ToolRegistry -> IO ()
 serveGateway gw prov opts model registry = do
   (tuner, _persist) <- buildTuner opts
+  delib <- buildLegion opts
   let base = defaultAgentConfig model
       cfg = base {acThinking = optThinking opts, acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts), acMaxSteps = fromMaybe (acMaxSteps base) (optMaxSteps opts)}
-      agent = Agent prov registry cfg tuner
+      agent = Agent prov registry cfg tuner delib
   store <- maybe (newInMemoryStore (Just 200)) (`newFileStore` Just 200) (optSessionDir opts)
   herr ("gateway '" <> gatewayName gw <> "' starting")
   res <- gatewayServe gw (sessionAgentHandle store agent)
@@ -252,6 +301,7 @@ serveGateway gw prov opts model registry = do
 runAgentMode :: Provider -> Options -> Text -> Text -> ToolRegistry -> IO ()
 runAgentMode prov opts model prompt registry = do
   (tuner, persist) <- buildTuner opts
+  delib <- buildLegion opts
   let base = defaultAgentConfig model
       cfg =
         base
@@ -259,7 +309,7 @@ runAgentMode prov opts model prompt registry = do
             acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts),
             acMaxSteps = fromMaybe (acMaxSteps base) (optMaxSteps opts)
           }
-      agent = Agent prov registry cfg tuner
+      agent = Agent prov registry cfg tuner delib
   res <- runAgent agent (turnRequest "cli" prompt) renderEvent
   persist -- snapshot learned ATO profiles when --tune-state is set (a no-op otherwise)
   case res of

@@ -28,6 +28,11 @@ import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Word (Word32)
 import Lavoisier.Protocol.Agent
+import Lavoisier.Protocol.Deliberate
+  ( Deliberation (..),
+    DeliberationContext (..),
+    Deliberator (..),
+  )
 import Lavoisier.Protocol.Event
   ( Event (..),
     StopReason (EndTurn, ToolUse),
@@ -59,13 +64,16 @@ data AgentConfig = AgentConfig
 defaultAgentConfig :: Text -> AgentConfig
 defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing
 
--- | The tool-using agent: a provider, a tool registry, the loop config, and an ATO 'Tuner'.
--- 'noopTuner' (the default) makes ATO a no-op; @Lavoisier.Tune@'s learner swaps in to tune knobs.
+-- | The tool-using agent: a provider, a tool registry, the loop config, an ATO 'Tuner', and an
+-- optional legion 'Deliberator'. 'noopTuner' (the default) makes ATO a no-op; @Lavoisier.Tune@'s
+-- learner swaps in to tune knobs. 'Nothing' for the deliberator skips the council pre-pass;
+-- @Lavoisier.Legion@'s panel swaps in to argue the task out before the loop (deliberate-then-act).
 data Agent = Agent
   { agProvider :: Provider,
     agTools :: ToolRegistry,
     agConfig :: AgentConfig,
-    agTuner :: Tuner
+    agTuner :: Tuner,
+    agDeliberator :: Maybe Deliberator
   }
 
 -- | The default operating instructions layered above the user's task.
@@ -106,8 +114,23 @@ runLoopSeeded agent allowed initial emit = do
   knobs <- tunerSelect (agTuner agent) ctx
   usageRef <- newIORef emptyUsage
   stepRef <- newIORef (0 :: Int)
+  -- Legion pre-pass (best-effort, deliberate-then-act): if a council is configured, ask it to argue
+  -- the task out — grounded in the executor's system prompt + this turn's tools, with progress
+  -- streamed as Event.Notice — and seed the transcript with the agreed plan as an assistant opening
+  -- move. A failed deliberation is swallowed and the turn proceeds unseeded. Its token cost is folded
+  -- into the turn's usage so it flows into the tuner's outcome.
+  seeded <- case agDeliberator agent of
+    Nothing -> pure initial
+    Just delib -> do
+      let dctx = DeliberationContext systemText defs (Just (emit . Notice))
+      r <- runDeliberation delib (lastUserText initial) dctx
+      case r of
+        Left _ -> pure initial
+        Right del -> do
+          modifyIORef' usageRef (accumulateUsage (delUsage del))
+          pure (initial <> [Message Assistant [TextBlock (delPlan del) False]])
   let effThinking = maybe (acThinking cfg) Just (knobThinking knobs)
-  result <- go effThinking usageRef stepRef initial 0
+  result <- go effThinking usageRef stepRef seeded 0
   finalUsage <- readIORef usageRef
   steps <- readIORef stepRef
   let out =
@@ -122,7 +145,8 @@ runLoopSeeded agent allowed initial emit = do
   where
     cfg = agConfig agent
     defs = filterDefs allowed (registryDefs (agTools agent))
-    system = SystemPrompt (fromMaybe defaultSystemPrompt (acSystem cfg)) True
+    systemText = fromMaybe defaultSystemPrompt (acSystem cfg)
+    system = SystemPrompt systemText True
 
     go :: Maybe ThinkingLevel -> IORef Usage -> IORef Int -> [Message] -> Int -> IO (Either AgentError [Message])
     go effThinking usageRef stepRef msgs step
@@ -215,6 +239,12 @@ taskContextFor agent =
       tcModelId = acModel (agConfig agent),
       tcRepoId = ""
     }
+
+-- | The task the council deliberates: the text of the latest user message in the seed transcript.
+lastUserText :: [Message] -> Text
+lastUserText msgs = case [messageText m | m <- msgs, msgRole m == User] of
+  [] -> ""
+  xs -> last xs
 
 -- | Coarse capability tier from the model name.
 tierOf :: Text -> ModelTier

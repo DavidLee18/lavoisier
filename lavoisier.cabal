@@ -38,10 +38,12 @@ library
     Lavoisier.Gateway.A2A
     Lavoisier.Gateway.Acp
     Lavoisier.Gateway.Http
+    Lavoisier.Legion
     Lavoisier.Mcp
     Lavoisier.Memory
     Lavoisier.Protocol
     Lavoisier.Protocol.Agent
+    Lavoisier.Protocol.Deliberate
     Lavoisier.Protocol.Event
     Lavoisier.Protocol.Gateway
     Lavoisier.Protocol.Message
@@ -61,6 +63,7 @@ library
   build-depends:
     , base                  >=4.19 && <5
     , aeson                 >=2.1
+    , async
     , bytestring
     , containers
     , dhall

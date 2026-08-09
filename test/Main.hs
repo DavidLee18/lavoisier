@@ -26,6 +26,7 @@ import Lavoisier.Config (FileConfig (..), defaultConfig, loadConfig)
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
 import Lavoisier.Gateway.Acp (defaultAcpConfig, newAcpApp)
 import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp)
+import Lavoisier.Legion (Debater, Language (..), LegionError (..), languageFromLocale, mkDebater, newPanel, panelDeliberator, withLanguage)
 import Lavoisier.Mcp
   ( CallResult (..),
     McpClient,
@@ -46,6 +47,7 @@ import Lavoisier.Mcp
   )
 import Lavoisier.Memory (SessionStore (..), newFileStore, newInMemoryStore, sessionAgentHandle, trimTo)
 import Lavoisier.Protocol.Agent (AgentError (..), AgentHandle (..), turnRequest)
+import Lavoisier.Protocol.Deliberate (DeliberateError (..), Deliberation (..), DeliberationContext (..), deliberate, runDeliberation)
 import Lavoisier.Protocol.Event
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider
@@ -95,7 +97,8 @@ tests =
       mcpTests,
       tuneTests,
       bayesTests,
-      claudeCliTests
+      claudeCliTests,
+      legionTests
     ]
 
 -- --- Phase 1: protocol wire shapes, as QuickCheck round-trip properties ----------------------------
@@ -439,7 +442,7 @@ agentTests =
                   providerCapabilities = noCapabilities,
                   providerCountTokens = \_ -> pure (Right Nothing)
                 }
-            agent = Agent stub withBuiltins (defaultAgentConfig "stub-model") Tn.noopTuner
+            agent = Agent stub withBuiltins (defaultAgentConfig "stub-model") Tn.noopTuner Nothing
         res <- runAgent agent (turnRequest "t" "please write the file") (\ev -> modifyIORef' emitted (ev :))
         res @?= (Right () :: Either AgentError ())
         written <- TIO.readFile f
@@ -585,7 +588,7 @@ memoryTests =
                   providerCapabilities = noCapabilities,
                   providerCountTokens = \_ -> pure (Right Nothing)
                 }
-            agent = Agent stub withBuiltins (defaultAgentConfig "stub") Tn.noopTuner
+            agent = Agent stub withBuiltins (defaultAgentConfig "stub") Tn.noopTuner Nothing
             handle = sessionAgentHandle store agent
             runTurn input = do
               e <- submit handle (turnRequest "s" input)
@@ -1009,6 +1012,137 @@ claudeCliTests =
                 ["{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}}"]
         truncated @?= [TextDelta "hi", Done EndTurn]
     ]
+
+-- --- Phase 16: legion council (offline; scripted providers, ports lvz-legion tests) ---------------
+
+-- A provider that replies with one fixed text (+ usage), or always errors.
+scriptedProv :: Text -> Usage -> Bool -> Provider
+scriptedProv reply usage failing =
+  Provider
+    { providerStream = \_ ->
+        if failing
+          then pure (Left (PTransport "scripted failure"))
+          else do
+            s <- fromList [Right (TextDelta reply), Right (Usage usage), Right (Done EndTurn)]
+            pure (Right s),
+      providerCapabilities = noCapabilities,
+      providerCountTokens = \_ -> pure (Right Nothing)
+    }
+
+-- A debater whose every call yields `reply` and 10 output tokens.
+debaterD :: Text -> Text -> Debater
+debaterD name reply = mkDebater name (scriptedProv reply (MkUsage 0 10 0 0) False) (name <> "-model") Nothing
+
+-- A debater whose every call errors.
+failingD :: Text -> Debater
+failingD name = mkDebater name (scriptedProv "" emptyUsage True) (name <> "-model") Nothing
+
+-- A provider that records every system prompt it streams under, then replies with a fixed text.
+capturingProv :: IORef [Text] -> Text -> Provider
+capturingProv ref reply =
+  Provider
+    { providerStream = \req -> do
+        modifyIORef' ref (<> [maybe "" spText (crSystem req)])
+        s <- fromList [Right (TextDelta reply), Right (Usage emptyUsage), Right (Done EndTurn)]
+        pure (Right s),
+      providerCapabilities = noCapabilities,
+      providerCountTokens = \_ -> pure (Right Nothing)
+    }
+
+legionTests :: TestTree
+legionTests =
+  testGroup
+    "legion council"
+    [ testCase "a panel rejects fewer than two debaters" $
+        case newPanel [debaterD "solo" "x"] (debaterD "judge" "v") 1 of
+          Left (TooFewDebaters 1) -> pure ()
+          Left e -> assertFailure ("expected TooFewDebaters 1, got " <> show e)
+          Right _ -> assertFailure "expected TooFewDebaters, got a valid panel",
+      testCase "deliberate drafts, critiques, and judges" $
+        withPanel [debaterD "a" "position A", debaterD "b" "position B"] (debaterD "judge" "AGREED PLAN") 1 $ \panel -> do
+          r <- deliberate (panelDeliberator panel) "do the thing"
+          case r of
+            Right del -> do
+              delPlan del @?= "AGREED PLAN"
+              -- 2 drafts + 2 critiques (1 round) + 1 judge = 5 calls × 10 output tokens.
+              outputTokens (delUsage del) @?= 50
+            Left e -> assertFailure ("deliberation failed: " <> show e),
+      testCase "the rounds knob changes the call count" $
+        withPanel [debaterD "a" "A", debaterD "b" "B"] (debaterD "judge" "PLAN") 0 $ \panel -> do
+          r <- deliberate (panelDeliberator panel) "task"
+          case r of
+            -- 2 drafts + 0 critiques + 1 judge = 3 × 10.
+            Right del -> outputTokens (delUsage del) @?= 30
+            Left e -> assertFailure ("deliberation failed: " <> show e),
+      testCase "a failing debater is tolerated" $
+        withPanel [failingD "a", debaterD "b" "position B"] (debaterD "judge" "PLAN") 1 $ \panel -> do
+          r <- deliberate (panelDeliberator panel) "task"
+          case r of
+            Right del -> do
+              delPlan del @?= "PLAN"
+              -- Only debater b contributes: 1 draft + 1 critique + 1 judge = 3 × 10.
+              outputTokens (delUsage del) @?= 30
+            Left e -> assertFailure ("deliberation failed: " <> show e),
+      testCase "all debaters failing yields NoPositions" $
+        withPanel [failingD "a", failingD "b"] (debaterD "judge" "PLAN") 1 $ \panel -> do
+          r <- deliberate (panelDeliberator panel) "task"
+          case r of
+            Left NoPositions -> pure ()
+            other -> assertFailure ("expected NoPositions, got " <> show (fmap delPlan other)),
+      testCase "context grounds every debater with the persona and tools" $ do
+        ref <- newIORef []
+        let a = mkDebater "a" (capturingProv ref "A") "a-model" Nothing
+            b = mkDebater "b" (capturingProv ref "B") "b-model" Nothing
+            judge = mkDebater "judge" (capturingProv ref "PLAN") "judge-model" Nothing
+            tools = [ToolDef "start_broadcast" "Start a live broadcast" (object []) False False]
+            dctx = DeliberationContext "You are Lav, the parish broadcast bot." tools Nothing
+        withPanel [a, b] judge 1 $ \panel -> do
+          r <- runDeliberation (panelDeliberator panel) "start the service" dctx
+          case r of
+            Right del -> delPlan del @?= "PLAN"
+            Left e -> assertFailure ("deliberation failed: " <> show e)
+          seen <- readIORef ref
+          assertBool "some system prompts captured" (not (null seen))
+          mapM_
+            ( \s -> do
+                assertBool "persona present" ("You are Lav, the parish broadcast bot." `T.isInfixOf` s)
+                assertBool "tool catalogue present" ("start_broadcast" `T.isInfixOf` s)
+            )
+            seen,
+      testCase "progress notices are emitted per phase (English)" $ do
+        notices <- newIORef []
+        let dctx = DeliberationContext "" [] (Just (\m -> modifyIORef' notices (<> [m])))
+        withPanel [debaterD "a" "A", debaterD "b" "B"] (debaterD "judge" "PLAN") 1 $ \panel -> do
+          _ <- runDeliberation (panelDeliberator panel) "task" dctx
+          ns <- readIORef notices
+          assertBool "convened" (any ("council convened" `T.isInfixOf`) ns)
+          assertBool "critique 1/1" (any ("critique round 1/1" `T.isInfixOf`) ns)
+          assertBool "judge" (any ("judge synthesising" `T.isInfixOf`) ns),
+      testCase "progress notices localise to Korean when set" $ do
+        notices <- newIORef []
+        let dctx = DeliberationContext "" [] (Just (\m -> modifyIORef' notices (<> [m])))
+        case newPanel [debaterD "a" "A", debaterD "b" "B"] (debaterD "judge" "PLAN") 1 of
+          Left e -> assertFailure (show e)
+          Right panel0 -> do
+            _ <- runDeliberation (panelDeliberator (withLanguage Korean panel0)) "task" dctx
+            ns <- readIORef notices
+            assertBool "convened" (any ("위원회 소집" `T.isInfixOf`) ns)
+            assertBool "critique" (any ("비평 라운드 1/1" `T.isInfixOf`) ns)
+            assertBool "judge" (any ("결론을 종합" `T.isInfixOf`) ns),
+      testCase "languageFromLocale only ko_KR selects Korean" $ do
+        languageFromLocale "ko_KR.UTF-8" @?= Korean
+        languageFromLocale "KO_KR" @?= Korean
+        languageFromLocale "ko_kr.utf-8" @?= Korean
+        languageFromLocale "en_US.UTF-8" @?= English
+        languageFromLocale "ko" @?= English
+        languageFromLocale "" @?= English
+    ]
+  where
+    -- Build a panel and run the body, failing the test if the panel is rejected.
+    withPanel debs judge rounds body =
+      case newPanel debs judge rounds of
+        Left e -> assertFailure ("panel build failed: " <> show e)
+        Right panel -> body panel
 
 -- Run an action in a fresh temp directory, cleaned up afterwards.
 withTmp :: String -> (FilePath -> IO a) -> IO a

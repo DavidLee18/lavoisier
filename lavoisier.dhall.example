@@ -21,4 +21,9 @@
 , tune = None Bool -- Some True enables the ATO learner (ε-greedy knob tuning)
 , tuneBayes = None Bool -- Some True uses the Bayesian (Thompson) learner instead of ε-greedy
 , tuneState = None Text -- Some "path" to load/persist learned ATO profiles as JSON
+, legionDebaters = -- the council pre-pass: ≥2 "provider:model" debaters draft→critique→judge a plan
+    None (List Text) -- e.g. Some [ "anthropic:claude-sonnet-4-5", "google:gemini-2.5-flash" ]
+, legionJudge = None Text -- Some "provider:model" for the judge (default: the first debater)
+, legionRounds = None Natural -- critique rounds after the draft (default 1; 0 = draft then judge)
+, lang = None Text -- locale for council progress notices (only ko_KR selects Korean)
 }
