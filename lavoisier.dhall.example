@@ -27,4 +27,9 @@
 , legionJudge = None Text -- Some "provider:model" for the judge (default: the first debater)
 , legionRounds = None Natural -- critique rounds after the draft (default 1; 0 = draft then judge)
 , lang = None Text -- locale for council progress notices (only ko_KR selects Korean)
+, cron = -- cron jobs: 5 schedule fields then a prompt (fires TurnRequests on a UTC schedule)
+    None (List Text) -- e.g. Some [ "*/30 9-17 * * 1-5 check CI and report failures" ]
+, cronFile = None Text -- Some "path" to a JSON file of {schedule,session?,prompt,retry_max?,retry_wait?}
+, cronRetryMax = None Natural -- global default retries after a failed cron fire (default 0)
+, cronRetryWait = None Natural -- global default seconds between cron retries (default 0)
 }

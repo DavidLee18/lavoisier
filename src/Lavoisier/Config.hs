@@ -38,7 +38,11 @@ data FileConfig = FileConfig
     legionDebaters :: Maybe [Text],
     legionJudge :: Maybe Text,
     legionRounds :: Maybe Natural,
-    lang :: Maybe Text
+    lang :: Maybe Text,
+    cron :: Maybe [Text],
+    cronFile :: Maybe Text,
+    cronRetryMax :: Maybe Natural,
+    cronRetryWait :: Maybe Natural
   }
   deriving stock (Generic, Show, Eq)
 
@@ -46,7 +50,7 @@ instance Dhall.FromDhall FileConfig
 
 -- | The all-unset config (one 'Nothing' per 'FileConfig' field).
 defaultConfig :: FileConfig
-defaultConfig = FileConfig n n n n n n n n n n n n n n n n n n
+defaultConfig = FileConfig n n n n n n n n n n n n n n n n n n n n n n
   where
     n :: Maybe a
     n = Nothing
@@ -79,5 +83,9 @@ defaultsDhall =
       ", legionDebaters = None (List Text)",
       ", legionJudge = None Text",
       ", legionRounds = None Natural",
-      ", lang = None Text }"
+      ", lang = None Text",
+      ", cron = None (List Text)",
+      ", cronFile = None Text",
+      ", cronRetryMax = None Natural",
+      ", cronRetryWait = None Natural }"
     ]

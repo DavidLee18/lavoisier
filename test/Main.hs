@@ -26,6 +26,7 @@ import Lavoisier.Agent
 import Lavoisier.Config (FileConfig (..), defaultConfig, loadConfig)
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
 import Lavoisier.Gateway.Acp (defaultAcpConfig, newAcpApp)
+import Lavoisier.Gateway.Cron (CronConfigError (..), CronJob (..), parseCliJob, parseFileJobs)
 import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp)
 import Lavoisier.Gateway.Slack (SlackMessage (..), parseEvent, senderAllowed, slackSession)
 import Lavoisier.Legion (Debater, Language (..), LegionError (..), languageFromLocale, mkDebater, newPanel, panelDeliberator, withLanguage)
@@ -61,6 +62,7 @@ import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
 import Lavoisier.Provider.ClaudeCli (eofDecoder, initDecoder, pushLine, renderPrompt)
 import Lavoisier.Provider.Google qualified as G
 import Lavoisier.Provider.Google.Sse qualified as GS
+import Lavoisier.Schedule.Cron (Civil (..), CronError (..), civilFromUnix, nextAfter, parseCron)
 import Lavoisier.Tool.Builtins
 import Lavoisier.Tool.Registry
 import Lavoisier.Tune
@@ -101,7 +103,8 @@ tests =
       bayesTests,
       claudeCliTests,
       legionTests,
-      slackTests
+      slackTests,
+      cronTests
     ]
 
 -- --- Phase 1: protocol wire shapes, as QuickCheck round-trip properties ----------------------------
@@ -1195,6 +1198,97 @@ slackTests =
         ["type" .= t etype, "user" .= t user, "text" .= t text, "channel" .= t channel]
           <> maybe [] (\ts -> ["thread_ts" .= t ts]) threadTs
     t = id :: Text -> Text
+
+-- --- Phase 18: cron engine + gateway (offline; ports lvz-schedule cron.rs + lvz-gw-cron) ----------
+
+cronTests :: TestTree
+cronTests =
+  testGroup
+    "cron"
+    [ testCase "civil epoch is a Thursday" $ do
+        let c = civilFromUnix 0
+        (cvMonth c, cvDom c, cvHour c, cvMinute c) @?= (1, 1, 0, 0)
+        cvDow c @?= 4,
+      testCase "civil known timestamp" $ do
+        -- 1_700_000_000 = 2023-11-14 22:13:20 UTC, a Tuesday.
+        let c = civilFromUnix 1700000000
+        (cvMonth c, cvDom c) @?= (11, 14)
+        (cvHour c, cvMinute c) @?= (22, 13)
+        cvDow c @?= 2,
+      testCase "every minute matches the next minute" $ do
+        s <- parseOk "* * * * *"
+        nextAfter s 100 @?= Just 120
+        nextAfter s 120 @?= Just 180,
+      testCase "step minutes fire on the quarter hours" $ do
+        s <- parseOk "*/15 * * * *"
+        let base = 16 * 3600 + 7 * 60
+        (cvMinute . civilFromUnix <$> nextAfter s base) @?= Just 15,
+      testCase "daily midnight rolls to the next day" $ do
+        s <- parseOk "0 0 * * *"
+        case nextAfter s 1700000000 of
+          Just next -> do
+            let c = civilFromUnix next
+            (cvHour c, cvMinute c) @?= (0, 0)
+            cvDom c @?= 15
+          Nothing -> assertFailure "expected a fire",
+      testCase "the 7 alias equals Sunday 0" $ do
+        a <- parseOk "0 0 * * 0"
+        b <- parseOk "0 0 * * 7"
+        nextAfter a 0 @?= nextAfter b 0
+        (cvDow . civilFromUnix <$> nextAfter a 0) @?= Just 0,
+      testCase "dom-or-dow when both are restricted (Vixie)" $ do
+        s <- parseOk "0 0 1 * 1"
+        case nextAfter s 0 of
+          Just next -> let c = civilFromUnix next in assertBool "1st or Monday" (cvDom c == 1 || cvDow c == 1)
+          Nothing -> assertFailure "expected a fire",
+      testCase "an impossible date has no fire" $ do
+        s <- parseOk "0 0 30 2 *" -- Feb 30 never occurs
+        nextAfter s 0 @?= Nothing,
+      testCase "rejects bad expressions" $ do
+        parseCron "* * * *" @?= Left (CronFieldCount 4)
+        assertBool "minute > 59" (isLeftE (parseCron "60 * * * *"))
+        assertBool "hour > 23" (isLeftE (parseCron "* 24 * * *"))
+        assertBool "zero step" (isLeftE (parseCron "*/0 * * * *"))
+        assertBool "inverted range" (isLeftE (parseCron "5-1 * * * *"))
+        assertBool "non-numeric" (isLeftE (parseCron "x * * * *")),
+      testCase "parse_cli splits the schedule from the prompt" $
+        case parseCliJob "*/30 9-17 * * 1-5 check CI and report failures" 2 0 0 of
+          Right j -> do
+            cjSession j @?= "cron-2"
+            cjPrompt j @?= "check CI and report failures"
+          Left e -> assertFailure (show e),
+      testCase "parse_cli requires a prompt" $
+        case parseCliJob "* * * * *" 0 0 0 of
+          Left (CCEMissingPrompt _) -> pure ()
+          other -> assertFailure ("expected MissingPrompt, got " <> show other),
+      testCase "parse_cli applies the global retry defaults" $
+        case parseCliJob "* * * * * ping" 0 3 30 of
+          Right j -> (cjRetryMax j, cjRetryWait j) @?= (3, 30)
+          Left e -> assertFailure (show e),
+      testCase "parse_file reads jobs with session defaults" $ do
+        let json = "[{\"schedule\":\"0 9 * * *\",\"session\":\"digest\",\"prompt\":\"morning digest\"},{\"schedule\":\"*/15 * * * *\",\"prompt\":\"poll the queue\"}]"
+        case parseFileJobs json 0 0 of
+          Right [j0, j1] -> do
+            cjSession j0 @?= "digest"
+            cjSession j1 @?= "cron-1"
+            cjPrompt j1 @?= "poll the queue"
+          Right _ -> assertFailure "expected two jobs"
+          Left e -> assertFailure (show e),
+      testCase "parse_file per-job retry overrides the global default" $ do
+        let json = "[{\"schedule\":\"0 9 * * *\",\"prompt\":\"defaults\"},{\"schedule\":\"0 9 * * *\",\"prompt\":\"override\",\"retry_max\":5,\"retry_wait\":120}]"
+        case parseFileJobs json 2 60 of
+          Right [j0, j1] -> do
+            (cjRetryMax j0, cjRetryWait j0) @?= (2, 60)
+            (cjRetryMax j1, cjRetryWait j1) @?= (5, 120)
+          Right _ -> assertFailure "expected two jobs"
+          Left e -> assertFailure (show e),
+      testCase "parse_file surfaces a bad schedule" $
+        assertBool "bad schedule" (isLeftCfg (parseFileJobs "[{\"schedule\":\"bad\",\"prompt\":\"x\"}]" 0 0))
+    ]
+  where
+    parseOk e = either (assertFailure . ("bad cron: " <>) . show) pure (parseCron e)
+    isLeftE = either (const True) (const False)
+    isLeftCfg = either (const True) (const False)
 
 -- Run an action in a fresh temp directory, cleaned up afterwards.
 withTmp :: String -> (FilePath -> IO a) -> IO a

@@ -37,6 +37,7 @@ library
     Lavoisier.Config
     Lavoisier.Gateway.A2A
     Lavoisier.Gateway.Acp
+    Lavoisier.Gateway.Cron
     Lavoisier.Gateway.Http
     Lavoisier.Gateway.Slack
     Lavoisier.Legion
@@ -52,6 +53,7 @@ library
     Lavoisier.Protocol.Stream
     Lavoisier.Protocol.Tool
     Lavoisier.Protocol.Tune
+    Lavoisier.Schedule.Cron
     Lavoisier.Provider.Anthropic
     Lavoisier.Provider.Anthropic.Sse
     Lavoisier.Provider.ClaudeCli
@@ -78,6 +80,7 @@ library
     , optparse-applicative
     , scientific
     , text
+    , time
     , typed-process
     , unordered-containers
     , vector

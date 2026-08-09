@@ -12,7 +12,8 @@ module Lavoisier.CLI
 where
 
 import Control.Exception (SomeException, try)
-import Data.Maybe (fromMaybe)
+import Data.ByteString.Lazy qualified as BL
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -21,6 +22,7 @@ import Lavoisier.Agent
 import Lavoisier.Config (FileConfig (..), loadConfig)
 import Lavoisier.Gateway.A2A (a2aGateway, defaultA2aConfig)
 import Lavoisier.Gateway.Acp (acpGateway, defaultAcpConfig)
+import Lavoisier.Gateway.Cron (CronJob, cronGateway, parseCliJob, parseFileJobs)
 import Lavoisier.Gateway.Http (defaultGatewayConfig, httpGateway)
 import Lavoisier.Gateway.Slack (slackFromEnv, slackGateway)
 import Lavoisier.Legion (Debater, languageFromLocale, mkDebater, newPanel, panelDeliberator, renderLegionError, withLanguage)
@@ -68,6 +70,10 @@ data Options = Options
     optLegionJudge :: Maybe String,
     optLegionRounds :: Maybe Int,
     optLang :: Maybe String,
+    optCron :: [String],
+    optCronFile :: Maybe FilePath,
+    optCronRetryMax :: Maybe Int,
+    optCronRetryWait :: Maybe Int,
     optWords :: [String]
   }
 
@@ -94,6 +100,10 @@ optionsParser =
     <*> optional (strOption (long "legion-judge" <> metavar "PROVIDER:MODEL" <> help "The legion judge that synthesises the verdict (default: the first debater)"))
     <*> optional (option auto (long "legion-rounds" <> metavar "N" <> help "Number of critique rounds after the draft (default 1)"))
     <*> optional (strOption (long "lang" <> metavar "LOCALE" <> help "Locale for council progress notices (only ko_KR selects Korean; default English/LANG)"))
+    <*> many (strOption (long "cron" <> metavar "SPEC" <> help "A cron job: 5 schedule fields then a prompt (repeatable), e.g. '*/30 9-17 * * 1-5 check CI'"))
+    <*> optional (strOption (long "cron-file" <> metavar "PATH" <> help "A JSON file of cron jobs [{schedule,session?,prompt,retry_max?,retry_wait?}]"))
+    <*> optional (option auto (long "cron-retry-max" <> metavar "N" <> help "Global default retries after a failed cron fire (default 0)"))
+    <*> optional (option auto (long "cron-retry-wait" <> metavar "SECS" <> help "Global default seconds between cron retries (default 0)"))
     <*> many (argument str (metavar "PROMPT..."))
 
 thinkingReader :: ReadM ThinkingLevel
@@ -114,15 +124,18 @@ runCli = do
     Left e -> errExit e
     Right (prov, defModel) -> do
       let model = fromMaybe defModel (optModel opts)
-      case (optServeSlack opts, optServeAcp opts, optServeA2a opts, optServe opts) of
-        (True, _, _, _) -> do
+      case (cronActive opts, optServeSlack opts, optServeAcp opts, optServeA2a opts, optServe opts) of
+        (True, _, _, _, _) -> do
+          jobs <- buildCronJobs opts
+          withRegistry opts $ serveGateway (cronGateway jobs) prov opts model
+        (_, True, _, _, _) -> do
           escfg <- slackFromEnv
           case escfg of
             Left e -> errExit (tshow e)
             Right scfg -> withRegistry opts $ serveGateway (slackGateway scfg) prov opts model
-        (_, Just port, _, _) -> withRegistry opts $ serveGateway (acpGateway port defaultAcpConfig) prov opts model
-        (_, _, Just port, _) -> withRegistry opts $ serveGateway (a2aGateway port defaultA2aConfig) prov opts model
-        (_, _, _, Just port) -> withRegistry opts $ serveGateway (httpGateway port defaultGatewayConfig) prov opts model
+        (_, _, Just port, _, _) -> withRegistry opts $ serveGateway (acpGateway port defaultAcpConfig) prov opts model
+        (_, _, _, Just port, _) -> withRegistry opts $ serveGateway (a2aGateway port defaultA2aConfig) prov opts model
+        (_, _, _, _, Just port) -> withRegistry opts $ serveGateway (httpGateway port defaultGatewayConfig) prov opts model
         _ -> do
           prompt <- resolvePrompt (optWords opts)
           if T.null prompt
@@ -184,7 +197,13 @@ applyConfig fc o =
         given -> given,
       optLegionJudge = optLegionJudge o <|> fmap T.unpack (legionJudge fc),
       optLegionRounds = optLegionRounds o <|> fmap fromIntegral (legionRounds fc),
-      optLang = optLang o <|> fmap T.unpack (lang fc)
+      optLang = optLang o <|> fmap T.unpack (lang fc),
+      optCron = case optCron o of
+        [] -> maybe [] (map T.unpack) (cron fc)
+        given -> given,
+      optCronFile = optCronFile o <|> fmap T.unpack (cronFile fc),
+      optCronRetryMax = optCronRetryMax o <|> fmap fromIntegral (cronRetryMax fc),
+      optCronRetryWait = optCronRetryWait o <|> fmap fromIntegral (cronRetryWait fc)
     }
 
 parseThinking :: Text -> Maybe ThinkingLevel
@@ -279,6 +298,29 @@ buildLegion opts
       case newPanel debs judge (fromMaybe 1 (optLegionRounds opts)) of
         Left e -> errExit ("legion: " <> renderLegionError e)
         Right panel -> pure (Just (panelDeliberator (withLanguage lg panel)))
+
+-- | True when any @--cron@\/@--cron-file@ jobs are configured (selects the cron serve mode).
+cronActive :: Options -> Bool
+cronActive opts = not (null (optCron opts)) || isJust (optCronFile opts)
+
+-- | Build the cron jobs from @--cron@ specs and a @--cron-file@, applying the global retry defaults;
+-- a bad spec\/schedule\/file fails fast.
+buildCronJobs :: Options -> IO [CronJob]
+buildCronJobs opts = do
+  let rmax = fromMaybe 0 (optCronRetryMax opts)
+      rwait = fromMaybe 0 (optCronRetryWait opts)
+  cliJobs <-
+    mapM
+      (\(i, spec) -> either (errExit . cronErr) pure (parseCliJob (T.pack spec) i rmax rwait))
+      (zip [0 ..] (optCron opts))
+  fileJobs <- case optCronFile opts of
+    Nothing -> pure []
+    Just path -> do
+      json <- BL.readFile path
+      either (errExit . cronErr) pure (parseFileJobs json rmax rwait)
+  pure (cliJobs <> fileJobs)
+  where
+    cronErr e = "cron: " <> tshow e
 
 -- | Build one council debater from a @provider:model@ spec, its provider from env.
 buildDebater :: String -> IO Debater
