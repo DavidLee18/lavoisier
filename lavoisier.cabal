@@ -34,6 +34,7 @@ library
   exposed-modules:
     Lavoisier.Agent
     Lavoisier.CLI
+    Lavoisier.Gateway.Http
     Lavoisier.Protocol
     Lavoisier.Protocol.Agent
     Lavoisier.Protocol.Event
@@ -62,11 +63,15 @@ library
     , typed-process
     , unordered-containers
     , vector
+    , wai
+    , warp
 
 executable lav
   import:           lang
   hs-source-dirs:   app
   main-is:          Main.hs
+  -- warp needs the threaded runtime (its timer manager); -N uses all cores.
+  ghc-options:      -threaded -rtsopts -with-rtsopts=-N
   build-depends:
     , base
     , lavoisier
@@ -83,9 +88,12 @@ test-suite lavoisier-test
     , bytestring
     , directory
     , filepath
+    , http-types
     , lavoisier
     , QuickCheck
     , tasty
     , tasty-hunit
     , tasty-quickcheck
     , text
+    , wai
+    , wai-extra

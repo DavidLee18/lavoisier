@@ -17,8 +17,10 @@ import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Word (Word32)
 import Lavoisier.Agent
+import Lavoisier.Gateway.Http (defaultGatewayConfig, httpGateway)
 import Lavoisier.Protocol.Agent (turnRequest)
 import Lavoisier.Protocol.Event
+import Lavoisier.Protocol.Gateway (Gateway (..))
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider (Provider (..), ProviderError)
 import Lavoisier.Protocol.Stream (Producer (..))
@@ -35,6 +37,7 @@ data Options = Options
     optModel :: Maybe Text,
     optThinking :: Maybe ThinkingLevel,
     optMaxTokens :: Maybe Word32,
+    optServe :: Maybe Int,
     optWords :: [String]
   }
 
@@ -52,6 +55,7 @@ optionsParser =
     <*> optional (strOption (long "model" <> metavar "MODEL" <> help "Model id"))
     <*> optional (option thinkingReader (long "thinking" <> metavar "LEVEL" <> help "off|low|medium|high"))
     <*> optional (option auto (long "max-tokens" <> metavar "N" <> help "Generated-token ceiling"))
+    <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
     <*> many (argument str (metavar "PROMPT..."))
 
 thinkingReader :: ReadM ThinkingLevel
@@ -69,16 +73,19 @@ runCli = do
   if optProvider opts /= "anthropic"
     then errExit ("unsupported provider: " <> T.pack (optProvider opts) <> " (only 'anthropic' is ported so far)")
     else do
-      prompt <- resolvePrompt (optWords opts)
-      if T.null prompt
-        then errExit "empty prompt (pass it as arguments or on stdin)"
-        else do
-          eprov <- anthropicFromEnv
-          case eprov of
-            Left e -> errExit (tshow e)
-            Right prov ->
-              let model = fromMaybe "claude-sonnet-4-5" (optModel opts)
-               in if optAgent opts
+      eprov <- anthropicFromEnv
+      case eprov of
+        Left e -> errExit (tshow e)
+        Right prov -> do
+          let model = fromMaybe "claude-sonnet-4-5" (optModel opts)
+          case optServe opts of
+            Just port -> runServe prov opts model port
+            Nothing -> do
+              prompt <- resolvePrompt (optWords opts)
+              if T.null prompt
+                then errExit "empty prompt (pass it as arguments or on stdin)"
+                else
+                  if optAgent opts
                     then runAgentMode prov opts model prompt
                     else runAskMode prov opts model prompt
   where
@@ -106,6 +113,18 @@ runAskMode prov opts model prompt = do
   case estream of
     Left e -> errExit (tshow e)
     Right stream -> renderStream stream
+
+runServe :: Provider -> Options -> Text -> Int -> IO ()
+runServe prov opts model port = do
+  let base = defaultAgentConfig model
+      cfg = base {acThinking = optThinking opts, acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts)}
+      agent = Agent prov withBuiltins cfg
+      gw = httpGateway port defaultGatewayConfig
+  herr ("HTTP gateway listening on port " <> tshow port <> " (POST /v1/turns, GET /health)")
+  res <- gatewayServe gw (agentHandle agent)
+  case res of
+    Left e -> errExit (tshow e)
+    Right () -> pure ()
 
 runAgentMode :: Provider -> Options -> Text -> Text -> IO ()
 runAgentMode prov opts model prompt = do

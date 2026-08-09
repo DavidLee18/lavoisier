@@ -13,7 +13,8 @@ import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient)
 import Data.Text.IO qualified as TIO
 import Lavoisier.Agent
-import Lavoisier.Protocol.Agent (AgentError, turnRequest)
+import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp)
+import Lavoisier.Protocol.Agent (AgentError (..), AgentHandle (..), turnRequest)
 import Lavoisier.Protocol.Event
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider
@@ -23,6 +24,9 @@ import Lavoisier.Provider.Anthropic (buildBody)
 import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
 import Lavoisier.Tool.Builtins
 import Lavoisier.Tool.Registry
+import Network.HTTP.Types (hAuthorization, hContentType, status200, status401)
+import Network.Wai (defaultRequest, pathInfo, requestHeaders, requestMethod)
+import Network.Wai.Test (SRequest (..), runSession, simpleBody, simpleStatus, srequest)
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
 import System.FilePath ((</>))
 import Test.QuickCheck (Arbitrary (..), Gen, choose, oneof)
@@ -42,7 +46,8 @@ tests =
       sseTests,
       anthropicBodyTests,
       toolTests,
-      agentTests
+      agentTests,
+      gatewayTests
     ]
 
 -- --- Phase 1: protocol wire shapes, as QuickCheck round-trip properties ----------------------------
@@ -296,6 +301,45 @@ agentTests =
         evs <- reverse <$> readIORef emitted
         assertBool "emitted the final text" (TextDelta "all done" `elem` evs)
     ]
+
+-- --- Phase 6: the HTTP gateway (offline; WAI test harness, no socket or API) ----------------------
+
+gatewayTests :: TestTree
+gatewayTests =
+  testGroup
+    "http gateway"
+    [ testCase "GET /health" $ do
+        r <- runSession (srequest (SRequest (get ["health"]) "")) (httpApp defaultGatewayConfig deadAgent)
+        simpleStatus r @?= status200
+        simpleBody r @?= "ok",
+      testCase "POST /v1/turns streams events as SSE" $ do
+        let app = httpApp defaultGatewayConfig (stubAgent [TextDelta "hi there", Usage emptyUsage, Done EndTurn])
+        r <- runSession (srequest (SRequest (post ["v1", "turns"] []) "{\"input\":\"hello\"}")) app
+        simpleStatus r @?= status200
+        let body = decodeUtf8Lenient (BL.toStrict (simpleBody r))
+        assertBool "streams text_delta frames" ("text_delta" `T.isInfixOf` body)
+        assertBool "carries the answer text" ("hi there" `T.isInfixOf` body)
+        assertBool "ends with a done event" ("\"kind\":\"done\"" `T.isInfixOf` body),
+      testCase "protected route rejects a missing key" $ do
+        let app = httpApp (GatewayConfig ["secret"]) (stubAgent [])
+        r <- runSession (srequest (SRequest (post ["v1", "turns"] []) "{\"input\":\"x\"}")) app
+        simpleStatus r @?= status401,
+      testCase "protected route accepts a valid bearer key" $ do
+        let app = httpApp (GatewayConfig ["secret"]) (stubAgent [Done EndTurn])
+            auth = [(hAuthorization, "Bearer secret")]
+        r <- runSession (srequest (SRequest (post ["v1", "turns"] auth) "{\"input\":\"x\"}")) app
+        simpleStatus r @?= status200
+    ]
+  where
+    get p = defaultRequest {requestMethod = "GET", pathInfo = p}
+    post p hdrs =
+      defaultRequest
+        { requestMethod = "POST",
+          pathInfo = p,
+          requestHeaders = (hContentType, "application/json") : hdrs
+        }
+    stubAgent evs = AgentHandle $ \_ -> do s <- fromList (map Right evs); pure (Right s)
+    deadAgent = AgentHandle $ \_ -> pure (Left (AEProvider "unused"))
 
 -- Run an action in a fresh temp directory, cleaned up afterwards.
 withTmp :: (FilePath -> IO a) -> IO a
