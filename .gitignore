@@ -1,6 +1,13 @@
+# Rust (now under reference-rust/)
 /target
+reference-rust/target
 **/*.rs.bk
 *.pdb
+
+# Haskell / Cabal build output
+dist-newstyle/
+*.hi
+*.o
 
 # Secrets — never commit keys (RECIPE.md §10)
 .env

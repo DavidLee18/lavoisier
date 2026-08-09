@@ -1,0 +1,64 @@
+cabal-version:      3.0
+name:               lavoisier
+version:            0.13.0
+synopsis:           Token-efficient CLI coding agent — a Haskell port of the Rust `lavoisier`.
+description:
+  A modular, token-efficient CLI coding agent with a provider-agnostic core.
+  This is the Haskell port (see reference-rust/ for the original Rust workspace).
+license:            MIT
+license-file:       LICENSE
+author:             Jaehyun Lee
+maintainer:         djwodus@gmail.com
+homepage:           https://github.com/DavidLee18/lavoisier
+category:           Development
+build-type:         Simple
+
+common lang
+  default-language:   GHC2021
+  default-extensions:
+    OverloadedStrings
+    LambdaCase
+    RecordWildCards
+    DerivingStrategies
+    StrictData
+    ImportQualifiedPost
+    DeriveGeneric
+  ghc-options:        -Wall
+
+library
+  import:           lang
+  hs-source-dirs:   src
+  exposed-modules:
+    Lavoisier.Protocol.Event
+  build-depends:
+    , base                  >=4.19 && <5
+    , aeson                 >=2.1
+    , bytestring
+    , containers
+    , scientific
+    , text
+    , unordered-containers
+    , vector
+
+executable lav
+  import:           lang
+  hs-source-dirs:   app
+  main-is:          Main.hs
+  build-depends:
+    , base
+    , lavoisier
+    , text
+
+test-suite lavoisier-test
+  import:           lang
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Main.hs
+  build-depends:
+    , base
+    , aeson
+    , bytestring
+    , lavoisier
+    , tasty
+    , tasty-hunit
+    , text
