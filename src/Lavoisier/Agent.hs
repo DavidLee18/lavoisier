@@ -12,6 +12,7 @@ module Lavoisier.Agent
     defaultAgentConfig,
     Agent (..),
     runAgent,
+    runLoopSeeded,
     agentHandle,
     defaultSystemPrompt,
   )
@@ -70,16 +71,29 @@ type PendingCall = (Text, Text, Text)
 -- | Run the loop, streaming every 'Event' to @emit@. Returns '()' on a clean finish, or an
 -- 'AgentError' if a round-trip failed before completing.
 runAgent :: Agent -> TurnRequest -> (Event -> IO ()) -> IO (Either AgentError ())
-runAgent agent turn emit = go [userMessage (trInput turn)] 0
+runAgent agent turn emit =
+  fmap (const ())
+    <$> runLoopSeeded agent (trAllowedTools turn) [userMessage (trInput turn)] emit
+
+-- | The loop, seeded with an initial transcript (@initial@ already includes this turn's user
+-- message). Streams events to @emit@ and returns the **full transcript** — @initial@ plus every
+-- assistant\/tool-result message produced — so a session store can persist it (see
+-- "Lavoisier.Memory").
+runLoopSeeded ::
+  Agent ->
+  Maybe [Text] ->
+  [Message] ->
+  (Event -> IO ()) ->
+  IO (Either AgentError [Message])
+runLoopSeeded agent allowed initial emit = go initial 0
   where
     cfg = agConfig agent
-    allowed = trAllowedTools turn
     defs = filterDefs allowed (registryDefs (agTools agent))
     system = SystemPrompt (fromMaybe defaultSystemPrompt (acSystem cfg)) True
 
-    go :: [Message] -> Int -> IO (Either AgentError ())
+    go :: [Message] -> Int -> IO (Either AgentError [Message])
     go msgs step
-      | step >= acMaxSteps cfg = pure (Right ())
+      | step >= acMaxSteps cfg = pure (Right msgs)
       | otherwise = do
           let req =
                 (chatRequest (acModel cfg))
@@ -103,7 +117,7 @@ runAgent agent turn emit = go [userMessage (trInput turn)] 0
                       let assistantMsg = Message Assistant (textPart txt <> map callBlock calls)
                           userMsg = Message User (map resultBlock results)
                       go (msgs <> [assistantMsg, userMsg]) (step + 1)
-                    else pure (Right ())
+                    else pure (Right (msgs <> [Message Assistant blocks | let blocks = textPart txt, not (null blocks)]))
 
     -- Drain one round-trip: forward each event, accumulate text + tool calls + the stop reason.
     consume :: Producer (Either ProviderError Event) -> IO (Either AgentError (Text, [PendingCall], StopReason))

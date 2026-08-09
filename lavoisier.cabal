@@ -35,6 +35,7 @@ library
     Lavoisier.Agent
     Lavoisier.CLI
     Lavoisier.Gateway.Http
+    Lavoisier.Memory
     Lavoisier.Protocol
     Lavoisier.Protocol.Agent
     Lavoisier.Protocol.Event

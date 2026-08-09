@@ -18,6 +18,7 @@ import Data.Text.IO qualified as TIO
 import Data.Word (Word32)
 import Lavoisier.Agent
 import Lavoisier.Gateway.Http (defaultGatewayConfig, httpGateway)
+import Lavoisier.Memory (newInMemoryStore, sessionAgentHandle)
 import Lavoisier.Protocol.Agent (turnRequest)
 import Lavoisier.Protocol.Event
 import Lavoisier.Protocol.Gateway (Gateway (..))
@@ -120,8 +121,9 @@ runServe prov opts model port = do
       cfg = base {acThinking = optThinking opts, acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts)}
       agent = Agent prov withBuiltins cfg
       gw = httpGateway port defaultGatewayConfig
+  store <- newInMemoryStore (Just 200)
   herr ("HTTP gateway listening on port " <> tshow port <> " (POST /v1/turns, GET /health)")
-  res <- gatewayServe gw (agentHandle agent)
+  res <- gatewayServe gw (sessionAgentHandle store agent)
   case res of
     Left e -> errExit (tshow e)
     Right () -> pure ()

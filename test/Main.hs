@@ -18,7 +18,8 @@ import Lavoisier.Protocol.Agent (AgentError (..), AgentHandle (..), turnRequest)
 import Lavoisier.Protocol.Event
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider
-import Lavoisier.Protocol.Stream (fromList)
+import Lavoisier.Memory (SessionStore (..), newInMemoryStore, sessionAgentHandle, trimTo)
+import Lavoisier.Protocol.Stream (drain, fromList)
 import Lavoisier.Protocol.Tool
 import Lavoisier.Provider.Anthropic (buildBody)
 import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
@@ -47,7 +48,8 @@ tests =
       anthropicBodyTests,
       toolTests,
       agentTests,
-      gatewayTests
+      gatewayTests,
+      memoryTests
     ]
 
 -- --- Phase 1: protocol wire shapes, as QuickCheck round-trip properties ----------------------------
@@ -340,6 +342,48 @@ gatewayTests =
         }
     stubAgent evs = AgentHandle $ \_ -> do s <- fromList (map Right evs); pure (Right s)
     deadAgent = AgentHandle $ \_ -> pure (Left (AEProvider "unused"))
+
+-- --- Phase 7: session memory (offline; stub provider) ---------------------------------------------
+
+memoryTests :: TestTree
+memoryTests =
+  testGroup
+    "session memory"
+    [ testCase "store round-trips and trims to most recent" $ do
+        store <- newInMemoryStore (Just 2)
+        m0 <- loadSession store "missing"
+        m0 @?= []
+        saveSession store "s" [userMessage "a", assistantMessage "b", userMessage "c"]
+        back <- loadSession store "s"
+        length back @?= 2
+        map msgRole back @?= [Assistant, User],
+      testCase "trimTo keeps the most recent, or all when unbounded" $ do
+        let h = [userMessage "1", userMessage "2", userMessage "3"]
+        map messageText (trimTo (Just 2) h) @?= ["2", "3"]
+        trimTo Nothing h @?= h,
+      testCase "session agent threads the transcript across turns" $ do
+        store <- newInMemoryStore Nothing
+        let stub =
+              Provider
+                { providerStream = \_ -> do
+                    s <- fromList (map Right [TextDelta "ok", Usage emptyUsage, Done EndTurn])
+                    pure (Right s),
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+            agent = Agent stub withBuiltins (defaultAgentConfig "stub")
+            handle = sessionAgentHandle store agent
+            runTurn input = do
+              e <- submit handle (turnRequest "s" input)
+              case e of
+                Right prod -> drain prod >> pure ()
+                Left err -> assertFailure ("submit failed: " <> show err)
+        runTurn "hello"
+        runTurn "again"
+        transcript <- loadSession store "s"
+        length transcript @?= 4
+        map msgRole transcript @?= [User, Assistant, User, Assistant]
+    ]
 
 -- Run an action in a fresh temp directory, cleaned up afterwards.
 withTmp :: (FilePath -> IO a) -> IO a
