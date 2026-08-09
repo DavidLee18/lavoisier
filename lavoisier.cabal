@@ -34,6 +34,7 @@ library
   exposed-modules:
     Lavoisier.Agent
     Lavoisier.CLI
+    Lavoisier.Gateway.A2A
     Lavoisier.Gateway.Http
     Lavoisier.Memory
     Lavoisier.Protocol

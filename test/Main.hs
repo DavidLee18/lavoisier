@@ -13,6 +13,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient)
 import Data.Text.IO qualified as TIO
 import Lavoisier.Agent
+import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
 import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp)
 import Lavoisier.Protocol.Agent (AgentError (..), AgentHandle (..), turnRequest)
 import Lavoisier.Protocol.Event
@@ -49,6 +50,7 @@ tests =
       toolTests,
       agentTests,
       gatewayTests,
+      a2aTests,
       memoryTests
     ]
 
@@ -375,6 +377,42 @@ gatewayTests =
         }
     stubAgent evs = AgentHandle $ \_ -> do s <- fromList (map Right evs); pure (Right s)
     deadAgent = AgentHandle $ \_ -> pure (Left (AEProvider "unused"))
+
+-- --- Phase 9: the A2A gateway (offline; WAI harness, stub agent) -----------------------------------
+
+a2aTests :: TestTree
+a2aTests =
+  testGroup
+    "a2a gateway"
+    [ testCase "serves the agent card" $ do
+        app <- newA2aApp defaultA2aConfig (a2aStub [])
+        r <- runSession (srequest (SRequest (getP [".well-known", "agent-card.json"]) "")) app
+        simpleStatus r @?= status200
+        assertBool "name" ("Lavoisier" `T.isInfixOf` a2aBody r)
+        assertBool "streaming" ("streaming" `T.isInfixOf` a2aBody r),
+      testCase "message/send returns a completed task" $ do
+        app <- newA2aApp defaultA2aConfig (a2aStub [TextDelta "PONG", Done EndTurn])
+        r <- runSession (srequest (SRequest postRoot sendBody)) app
+        simpleStatus r @?= status200
+        assertBool "completed" ("completed" `T.isInfixOf` a2aBody r)
+        assertBool "carries the answer" ("PONG" `T.isInfixOf` a2aBody r),
+      testCase "tasks/get returns the stored task" $ do
+        app <- newA2aApp defaultA2aConfig (a2aStub [TextDelta "PONG", Done EndTurn])
+        _ <- runSession (srequest (SRequest postRoot sendBody)) app
+        r <- runSession (srequest (SRequest postRoot getBody)) app
+        assertBool "found + completed" ("completed" `T.isInfixOf` a2aBody r),
+      testCase "unknown method is -32601" $ do
+        app <- newA2aApp defaultA2aConfig (a2aStub [])
+        r <- runSession (srequest (SRequest postRoot "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"frobnicate\",\"params\":{}}")) app
+        assertBool "-32601" ("-32601" `T.isInfixOf` a2aBody r)
+    ]
+  where
+    getP p = defaultRequest {requestMethod = "GET", pathInfo = p}
+    postRoot = defaultRequest {requestMethod = "POST", pathInfo = [], requestHeaders = [(hContentType, "application/json")]}
+    sendBody = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"message/send\",\"params\":{\"message\":{\"role\":\"user\",\"contextId\":\"c1\",\"parts\":[{\"kind\":\"text\",\"text\":\"hi\"}]}}}"
+    getBody = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tasks/get\",\"params\":{\"id\":\"task-0\"}}"
+    a2aBody = decodeUtf8Lenient . BL.toStrict . simpleBody
+    a2aStub evs = AgentHandle $ \_ -> do s <- fromList (map Right evs); pure (Right s)
 
 -- --- Phase 7: session memory (offline; stub provider) ---------------------------------------------
 

@@ -17,6 +17,7 @@ import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Word (Word32)
 import Lavoisier.Agent
+import Lavoisier.Gateway.A2A (a2aGateway, defaultA2aConfig)
 import Lavoisier.Gateway.Http (defaultGatewayConfig, httpGateway)
 import Lavoisier.Memory (newFileStore, newInMemoryStore, sessionAgentHandle)
 import Lavoisier.Protocol.Agent (turnRequest)
@@ -39,6 +40,7 @@ data Options = Options
     optThinking :: Maybe ThinkingLevel,
     optMaxTokens :: Maybe Word32,
     optServe :: Maybe Int,
+    optServeA2a :: Maybe Int,
     optSessionDir :: Maybe FilePath,
     optWords :: [String]
   }
@@ -58,6 +60,7 @@ optionsParser =
     <*> optional (option thinkingReader (long "thinking" <> metavar "LEVEL" <> help "off|low|medium|high"))
     <*> optional (option auto (long "max-tokens" <> metavar "N" <> help "Generated-token ceiling"))
     <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
+    <*> optional (option auto (long "serve-a2a" <> metavar "PORT" <> help "Serve the agent as an A2A (Agent-to-Agent) gateway on this port"))
     <*> optional (strOption (long "session-dir" <> metavar "DIR" <> help "Persist gateway session transcripts under DIR (durable file store; default in-memory)"))
     <*> many (argument str (metavar "PROMPT..."))
 
@@ -81,9 +84,10 @@ runCli = do
         Left e -> errExit (tshow e)
         Right prov -> do
           let model = fromMaybe "claude-sonnet-4-5" (optModel opts)
-          case optServe opts of
-            Just port -> runServe prov opts model port
-            Nothing -> do
+          case (optServeA2a opts, optServe opts) of
+            (Just port, _) -> serveGateway (a2aGateway port defaultA2aConfig) prov opts model
+            (_, Just port) -> serveGateway (httpGateway port defaultGatewayConfig) prov opts model
+            _ -> do
               prompt <- resolvePrompt (optWords opts)
               if T.null prompt
                 then errExit "empty prompt (pass it as arguments or on stdin)"
@@ -117,14 +121,14 @@ runAskMode prov opts model prompt = do
     Left e -> errExit (tshow e)
     Right stream -> renderStream stream
 
-runServe :: Provider -> Options -> Text -> Int -> IO ()
-runServe prov opts model port = do
+-- | Serve the agent through any 'Gateway', wrapped with a session store (durable if --session-dir).
+serveGateway :: Gateway -> Provider -> Options -> Text -> IO ()
+serveGateway gw prov opts model = do
   let base = defaultAgentConfig model
       cfg = base {acThinking = optThinking opts, acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts)}
       agent = Agent prov withBuiltins cfg
-      gw = httpGateway port defaultGatewayConfig
   store <- maybe (newInMemoryStore (Just 200)) (`newFileStore` Just 200) (optSessionDir opts)
-  herr ("HTTP gateway listening on port " <> tshow port <> " (POST /v1/turns, GET /health)")
+  herr ("gateway '" <> gatewayName gw <> "' starting")
   res <- gatewayServe gw (sessionAgentHandle store agent)
   case res of
     Left e -> errExit (tshow e)
