@@ -230,6 +230,21 @@ chatRequest model =
 -- @kind@. The boolean flags are always emitted here (Rust skips them when false, but reads them
 -- either way; our decoder defaults a missing flag to @False@).
 
+instance ToJSON ThinkingLevel where
+  toJSON = \case
+    ThinkOff -> "off"
+    ThinkLow -> "low"
+    ThinkMedium -> "medium"
+    ThinkHigh -> "high"
+
+instance FromJSON ThinkingLevel where
+  parseJSON = withText "ThinkingLevel" $ \case
+    "off" -> pure ThinkOff
+    "low" -> pure ThinkLow
+    "medium" -> pure ThinkMedium
+    "high" -> pure ThinkHigh
+    t -> fail ("unknown thinking level: " <> show t)
+
 instance ToJSON Role where
   toJSON User = "user"
   toJSON Assistant = "assistant"

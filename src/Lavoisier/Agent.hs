@@ -21,17 +21,28 @@ where
 import Control.Concurrent (forkIO)
 import Control.Concurrent.Chan
 import Data.Aeson (Value (..), decodeStrict, object)
+import Data.IORef
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Word (Word32)
 import Lavoisier.Protocol.Agent
-import Lavoisier.Protocol.Event (Event (..), StopReason (..))
+import Lavoisier.Protocol.Event
+  ( Event (..),
+    StopReason (EndTurn, ToolUse),
+    Usage,
+    accumulateUsage,
+    cacheHitRate,
+    defaultCostWeights,
+    emptyUsage,
+    usageCost,
+  )
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider (Provider (..), ProviderError)
 import Lavoisier.Protocol.Stream (Producer (..))
 import Lavoisier.Protocol.Tool (ToolOutput (..))
+import Lavoisier.Protocol.Tune
 import Lavoisier.Tool.Registry
 
 -- | The tool-loop configuration.
@@ -48,11 +59,13 @@ data AgentConfig = AgentConfig
 defaultAgentConfig :: Text -> AgentConfig
 defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing
 
--- | The tool-using agent: a provider, a tool registry, and the loop config.
+-- | The tool-using agent: a provider, a tool registry, the loop config, and an ATO 'Tuner'.
+-- 'noopTuner' (the default) makes ATO a no-op; @Lavoisier.Tune@'s learner swaps in to tune knobs.
 data Agent = Agent
   { agProvider :: Provider,
     agTools :: ToolRegistry,
-    agConfig :: AgentConfig
+    agConfig :: AgentConfig,
+    agTuner :: Tuner
   }
 
 -- | The default operating instructions layered above the user's task.
@@ -85,14 +98,34 @@ runLoopSeeded ::
   [Message] ->
   (Event -> IO ()) ->
   IO (Either AgentError [Message])
-runLoopSeeded agent allowed initial emit = go initial 0
+runLoopSeeded agent allowed initial emit = do
+  -- ATO: pick knobs for this task, honour the tuned thinking dial (the one knob the loop can act on
+  -- today — the skeleton/truncate/compact/batch dials await the context engine), then observe the
+  -- realised cost-weighted outcome so the learner improves. With 'noopTuner' this is inert.
+  let ctx = taskContextFor agent
+  knobs <- tunerSelect (agTuner agent) ctx
+  usageRef <- newIORef emptyUsage
+  stepRef <- newIORef (0 :: Int)
+  let effThinking = maybe (acThinking cfg) Just (knobThinking knobs)
+  result <- go effThinking usageRef stepRef initial 0
+  finalUsage <- readIORef usageRef
+  steps <- readIORef stepRef
+  let out =
+        defaultOutcome
+          { otTotalTokens = usageCost finalUsage defaultCostWeights,
+            otRoundTrips = fromIntegral steps,
+            otCacheHitRate = cacheHitRate finalUsage,
+            otSuccess = either (const False) (const True) result
+          }
+  tunerObserve (agTuner agent) ctx knobs out
+  pure result
   where
     cfg = agConfig agent
     defs = filterDefs allowed (registryDefs (agTools agent))
     system = SystemPrompt (fromMaybe defaultSystemPrompt (acSystem cfg)) True
 
-    go :: [Message] -> Int -> IO (Either AgentError [Message])
-    go msgs step
+    go :: Maybe ThinkingLevel -> IORef Usage -> IORef Int -> [Message] -> Int -> IO (Either AgentError [Message])
+    go effThinking usageRef stepRef msgs step
       | step >= acMaxSteps cfg = pure (Right msgs)
       | otherwise = do
           let req =
@@ -101,7 +134,7 @@ runLoopSeeded agent allowed initial emit = go initial 0
                     crMessages = msgs,
                     crTools = defs,
                     crMaxTokens = acMaxTokens cfg,
-                    crThinking = acThinking cfg
+                    crThinking = effThinking
                   }
           estream <- providerStream (agProvider agent) req
           case estream of
@@ -110,32 +143,35 @@ runLoopSeeded agent allowed initial emit = go initial 0
               res <- consume stream
               case res of
                 Left e -> pure (Left e)
-                Right (txt, calls, stop) ->
+                Right (txt, calls, stop, roundUsage) -> do
+                  modifyIORef' usageRef (accumulateUsage roundUsage)
+                  writeIORef stepRef (step + 1)
                   if stop == ToolUse && not (null calls)
                     then do
                       results <- mapM runCall calls
                       let assistantMsg = Message Assistant (textPart txt <> map callBlock calls)
                           userMsg = Message User (map resultBlock results)
-                      go (msgs <> [assistantMsg, userMsg]) (step + 1)
+                      go effThinking usageRef stepRef (msgs <> [assistantMsg, userMsg]) (step + 1)
                     else pure (Right (msgs <> [Message Assistant blocks | let blocks = textPart txt, not (null blocks)]))
 
-    -- Drain one round-trip: forward each event, accumulate text + tool calls + the stop reason.
-    consume :: Producer (Either ProviderError Event) -> IO (Either AgentError (Text, [PendingCall], StopReason))
-    consume stream = loop "" [] Nothing
+    -- Drain one round-trip: forward each event, accumulate text + tool calls + stop reason + usage.
+    consume :: Producer (Either ProviderError Event) -> IO (Either AgentError (Text, [PendingCall], StopReason, Usage))
+    consume stream = loop "" [] Nothing emptyUsage
       where
-        loop txt calls stop =
+        loop txt calls stop usg =
           nextItem stream >>= \case
-            Nothing -> pure (Right (txt, calls, fromMaybe EndTurn stop))
+            Nothing -> pure (Right (txt, calls, fromMaybe EndTurn stop, usg))
             Just (Left e) -> pure (Left (AEProvider (tshow e)))
             Just (Right ev) -> do
               emit ev
               case ev of
-                TextDelta t -> loop (txt <> t) calls stop
-                ToolUseStart i n -> loop txt (calls <> [(i, n, "")]) stop
-                ToolUseDelta i j -> loop txt (appendJson i j calls) stop
-                ToolUseEnd _ -> loop txt calls stop
-                Done sr -> loop txt calls (Just sr)
-                _ -> loop txt calls stop
+                TextDelta t -> loop (txt <> t) calls stop usg
+                ToolUseStart i n -> loop txt (calls <> [(i, n, "")]) stop usg
+                ToolUseDelta i j -> loop txt (appendJson i j calls) stop usg
+                ToolUseEnd _ -> loop txt calls stop usg
+                Usage u -> loop txt calls stop (accumulateUsage u usg)
+                Done sr -> loop txt calls (Just sr) usg
+                _ -> loop txt calls stop usg
 
     runCall :: PendingCall -> IO (Text, Text, Bool)
     runCall (i, name, jsonT)
@@ -165,6 +201,27 @@ agentHandle agent = AgentHandle $ \turn -> do
   pure (Right (Producer (readChan chan)))
 
 -- --- helpers --------------------------------------------------------------------------------------
+
+-- | The ATO 'TaskContext' for this turn. Archetype classification and repo profiling are deferred
+-- (no context engine yet), so it reports 'Other' over an empty repo; the model tier is a coarse
+-- name heuristic, and the concrete model id keys the learner's profiles apart across upgrades.
+taskContextFor :: Agent -> TaskContext
+taskContextFor agent =
+  TaskContext
+    { tcArchetype = Other,
+      tcRepo = defaultRepoProfile,
+      tcCaps = providerCapabilities (agProvider agent),
+      tcModel = tierOf (acModel (agConfig agent)),
+      tcModelId = acModel (agConfig agent),
+      tcRepoId = ""
+    }
+
+-- | Coarse capability tier from the model name.
+tierOf :: Text -> ModelTier
+tierOf m
+  | any (`T.isInfixOf` m) ["haiku", "flash", "fast", "lite"] = Fast
+  | any (`T.isInfixOf` m) ["opus", "heavy", "ultra"] = Deep
+  | otherwise = Balanced
 
 filterDefs :: Maybe [Text] -> [ToolDef] -> [ToolDef]
 filterDefs Nothing ds = ds

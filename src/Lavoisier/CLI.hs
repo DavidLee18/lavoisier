@@ -30,6 +30,8 @@ import Lavoisier.Protocol.Gateway (Gateway (..))
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider (Provider (..), ProviderError)
 import Lavoisier.Protocol.Stream (Producer (..))
+import Lavoisier.Protocol.Tune (Tuner, noopTuner)
+import Lavoisier.Tune (LearningTuner, asTuner, defaultTuneConfig, learningTuner, loadTuner, saveTuner)
 import Lavoisier.Provider.Anthropic (anthropicFromEnv)
 import Lavoisier.Provider.Google (googleFromEnv)
 import Lavoisier.Tool.Registry (ToolRegistry, registerTools, withBuiltins)
@@ -52,6 +54,8 @@ data Options = Options
     optSessionDir :: Maybe FilePath,
     optConfig :: Maybe FilePath,
     optMcpServers :: [String],
+    optTune :: Bool,
+    optTuneState :: Maybe FilePath,
     optWords :: [String]
   }
 
@@ -70,6 +74,8 @@ optionsParser =
     <*> optional (strOption (long "session-dir" <> metavar "DIR" <> help "Persist gateway session transcripts under DIR (durable file store; default in-memory)"))
     <*> optional (strOption (long "config" <> metavar "PATH" <> help "Dhall config file (default ./lavoisier.dhall if present)"))
     <*> many (strOption (long "mcp-server" <> metavar "LABEL:TARGET" <> help "Connect to an MCP server and expose its tools (stdio command or http(s):// URL); repeatable"))
+    <*> switch (long "tune" <> help "Enable the ATO learner (ε-greedy knob tuning); off ⇒ static baseline knobs")
+    <*> optional (strOption (long "tune-state" <> metavar "PATH" <> help "Load/persist learned ATO profiles at PATH (implies --tune; saved after an --agent turn)"))
     <*> many (argument str (metavar "PROMPT..."))
 
 thinkingReader :: ReadM ThinkingLevel
@@ -144,7 +150,10 @@ applyConfig fc o =
       -- A CLI --mcp-server (non-empty) wins wholesale; otherwise take the file's list.
       optMcpServers = case optMcpServers o of
         [] -> maybe [] (map T.unpack) (mcpServers fc)
-        given -> given
+        given -> given,
+      -- --tune is a flag (default False); the file can turn it on when the flag was absent.
+      optTune = optTune o || fromMaybe False (tune fc),
+      optTuneState = optTuneState o <|> fmap T.unpack (tuneState fc)
     }
 
 parseThinking :: Text -> Maybe ThinkingLevel
@@ -198,12 +207,27 @@ withRegistry opts k = do
           Left e -> errExit ("mcp '" <> mssLabel spec <> "': " <> renderMcpError e)
           Right ts -> pure ts
 
+-- | Build the ATO tuner: 'noopTuner' unless @--tune@ (or @--tune-state@), else a learner — loaded
+-- from @--tune-state@ when present (a missing file loads cold). Returns the tuner plus a persist
+-- action (a no-op without @--tune-state@) the caller runs when a turn completes.
+buildTuner :: Options -> IO (Tuner, IO ())
+buildTuner opts
+  | not (optTune opts) = pure (noopTuner, pure ())
+  | otherwise = case optTuneState opts of
+      Nothing -> do t <- learningTuner defaultTuneConfig; pure (t, pure ())
+      Just path -> do
+        r <- loadTuner path defaultTuneConfig
+        case r of
+          Left e -> errExit ("tune-state " <> T.pack path <> ": " <> T.pack e)
+          Right (lt :: LearningTuner) -> pure (asTuner lt, saveTuner lt path)
+
 -- | Serve the agent through any 'Gateway', wrapped with a session store (durable if --session-dir).
 serveGateway :: Gateway -> Provider -> Options -> Text -> ToolRegistry -> IO ()
 serveGateway gw prov opts model registry = do
+  (tuner, _persist) <- buildTuner opts
   let base = defaultAgentConfig model
       cfg = base {acThinking = optThinking opts, acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts), acMaxSteps = fromMaybe (acMaxSteps base) (optMaxSteps opts)}
-      agent = Agent prov registry cfg
+      agent = Agent prov registry cfg tuner
   store <- maybe (newInMemoryStore (Just 200)) (`newFileStore` Just 200) (optSessionDir opts)
   herr ("gateway '" <> gatewayName gw <> "' starting")
   res <- gatewayServe gw (sessionAgentHandle store agent)
@@ -213,6 +237,7 @@ serveGateway gw prov opts model registry = do
 
 runAgentMode :: Provider -> Options -> Text -> Text -> ToolRegistry -> IO ()
 runAgentMode prov opts model prompt registry = do
+  (tuner, persist) <- buildTuner opts
   let base = defaultAgentConfig model
       cfg =
         base
@@ -220,8 +245,9 @@ runAgentMode prov opts model prompt registry = do
             acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts),
             acMaxSteps = fromMaybe (acMaxSteps base) (optMaxSteps opts)
           }
-      agent = Agent prov registry cfg
+      agent = Agent prov registry cfg tuner
   res <- runAgent agent (turnRequest "cli" prompt) renderEvent
+  persist -- snapshot learned ATO profiles when --tune-state is set (a no-op otherwise)
   case res of
     Left e -> errExit (tshow e)
     Right () -> TIO.putStrLn ""

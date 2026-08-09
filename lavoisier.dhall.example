@@ -18,4 +18,6 @@
     Some [ "fs: npx -y @modelcontextprotocol/server-filesystem ." ]
     -- each entry is "label: target"; target is a stdio command or an http(s):// URL.
     -- tools are namespaced <label>_<tool>. None (List Text) to set none.
+, tune = None Bool -- Some True enables the ATO learner (ε-greedy knob tuning)
+, tuneState = None Text -- Some "path" to load/persist learned ATO profiles as JSON
 }

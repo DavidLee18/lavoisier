@@ -5,6 +5,7 @@ module Main (main) where
 
 import Control.Concurrent (forkIO)
 import Control.Exception (IOException, try)
+import Control.Monad (replicateM_)
 import Data.Aeson (Value (..), decode, encode, object, (.=))
 import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
@@ -13,11 +14,13 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef
+import Data.Maybe (isJust)
 import Data.Scientific (toBoundedInteger)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient)
 import Data.Text.IO qualified as TIO
+import Data.Word (Word64)
 import Lavoisier.Agent
 import Lavoisier.Config (FileConfig (..), defaultConfig, loadConfig)
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
@@ -48,6 +51,8 @@ import Lavoisier.Protocol.Provider
 import Lavoisier.Memory (SessionStore (..), newFileStore, newInMemoryStore, sessionAgentHandle, trimTo)
 import Lavoisier.Protocol.Stream (drain, fromList)
 import Lavoisier.Protocol.Tool
+import Lavoisier.Protocol.Tune qualified as Tn
+import Lavoisier.Tune
 import Lavoisier.Provider.Anthropic (buildBody)
 import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
 import Lavoisier.Provider.Google qualified as G
@@ -85,7 +90,8 @@ tests =
       acpTests,
       memoryTests,
       configTests,
-      mcpTests
+      mcpTests,
+      tuneTests
     ]
 
 -- --- Phase 1: protocol wire shapes, as QuickCheck round-trip properties ----------------------------
@@ -240,10 +246,10 @@ decodeAll input =
 
 decodeChunked :: ByteString -> [Event]
 decodeChunked input =
-  let (st, evs) = BS.foldl' step (initSse, []) input
+  let (st, evs) = BS.foldl' stepByte (initSse, []) input
    in [e | Right e <- evs <> sseEof st]
   where
-    step (s, acc) b = let (s', more) = ssePush s (BS.singleton b) in (s', acc <> more)
+    stepByte (s, acc) b = let (s', more) = ssePush s (BS.singleton b) in (s', acc <> more)
 
 textStream :: ByteString
 textStream =
@@ -429,7 +435,7 @@ agentTests =
                   providerCapabilities = noCapabilities,
                   providerCountTokens = \_ -> pure (Right Nothing)
                 }
-            agent = Agent stub withBuiltins (defaultAgentConfig "stub-model")
+            agent = Agent stub withBuiltins (defaultAgentConfig "stub-model") Tn.noopTuner
         res <- runAgent agent (turnRequest "t" "please write the file") (\ev -> modifyIORef' emitted (ev :))
         res @?= (Right () :: Either AgentError ())
         written <- TIO.readFile f
@@ -575,7 +581,7 @@ memoryTests =
                   providerCapabilities = noCapabilities,
                   providerCountTokens = \_ -> pure (Right Nothing)
                 }
-            agent = Agent stub withBuiltins (defaultAgentConfig "stub")
+            agent = Agent stub withBuiltins (defaultAgentConfig "stub") Tn.noopTuner
             handle = sessionAgentHandle store agent
             runTurn input = do
               e <- submit handle (turnRequest "s" input)
@@ -761,6 +767,116 @@ argText msg = case objLookup "params" msg >>= objLookup "arguments" >>= objLooku
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True
 isLeft (Right _) = False
+
+-- --- Phase 14: ATO tuner (offline; ε-greedy learner, ports lvz-tune tests) ------------------------
+
+-- A single-file-edit context over the default (uncached) capabilities.
+tnCtx :: Tn.TaskContext
+tnCtx =
+  Tn.TaskContext
+    { Tn.tcArchetype = Tn.SingleFileEdit,
+      Tn.tcRepo = Tn.defaultRepoProfile,
+      Tn.tcCaps = noCapabilities,
+      Tn.tcModel = Tn.Balanced,
+      Tn.tcModelId = "test-model",
+      Tn.tcRepoId = "test-repo"
+    }
+
+outc :: Word64 -> Bool -> Tn.Outcome
+outc tokens ok = Tn.defaultOutcome {Tn.otTotalTokens = tokens, Tn.otRoundTrips = 1, Tn.otSuccess = ok}
+
+-- Deterministic (no-explore) config with an explicit trust bar.
+strictCfg :: Double -> TuneConfig
+strictCfg d = TuneConfig {epsilon = 0, successTarget = 0.9, minTrials = 3, decay = d}
+
+tuneTests :: TestTree
+tuneTests =
+  testGroup
+    "ato tuner"
+    [ testCase "cold select returns the baseline" $ do
+        t <- learningTuner (strictCfg 1.0)
+        Tn.tunerSelect t tnCtx >>= (@?= Tn.defaultKnobs),
+      testCase "thinking is a reachable tunable dial" $ do
+        assertBool
+          "a thinking-varied neighbour exists"
+          (any (isJust . Tn.knobThinking) (allNeighbours Tn.defaultKnobs))
+        let up = step Tn.defaultKnobs (dials - 1) True
+        assertBool "stepping thinking up leaves the baseline" (isJust (Tn.knobThinking up) && up /= Tn.defaultKnobs),
+      testCase "exploits a cheaper trusted candidate" $ do
+        t <- learningTuner (strictCfg 1.0)
+        let cheaper = Tn.defaultKnobs {Tn.skeletonRadius = 0}
+        replicateM_ 3 (Tn.tunerObserve t tnCtx Tn.defaultKnobs (outc 1000 True))
+        replicateM_ 3 (Tn.tunerObserve t tnCtx cheaper (outc 600 True))
+        Tn.tunerSelect t tnCtx >>= (@?= cheaper),
+      testCase "never picks a cheaper-but-failing candidate" $ do
+        t <- learningTuner (strictCfg 1.0)
+        replicateM_ 4 (Tn.tunerObserve t tnCtx Tn.defaultKnobs (outc 1000 True))
+        let starved = Tn.defaultKnobs {Tn.skeletonRadius = 0, Tn.truncateBytes = 2048}
+        Tn.tunerObserve t tnCtx starved (outc 300 True)
+        replicateM_ 4 (Tn.tunerObserve t tnCtx starved (outc 300 False))
+        Tn.tunerSelect t tnCtx >>= (@?= Tn.defaultKnobs),
+      testCase "exploration steps one knob and stays within bounds" $ do
+        t <- learningTuner (TuneConfig {epsilon = 1, successTarget = 0.9, minTrials = 3, decay = 1})
+        replicateM_ 200 $ do
+          k <- Tn.tunerSelect t tnCtx
+          assertBool "radius" (Tn.skeletonRadius k >= 0 && Tn.skeletonRadius k <= 3)
+          assertBool "truncate" (Tn.truncateBytes k >= 2048 && Tn.truncateBytes k <= 32768)
+          assertBool "compact" (Tn.compactAfter k >= 8000 && Tn.compactAfter k <= 64000)
+          assertBool "batch" (Tn.batchWidth k >= 1 && Tn.batchWidth k <= 8),
+      testCase "profiles are isolated by the caching confounder" $ do
+        t <- learningTuner (TuneConfig {epsilon = 0, successTarget = 0.9, minTrials = 2, decay = 1})
+        let cached = tnCtx {Tn.tcCaps = noCapabilities {promptCaching = True}}
+            uncached = tnCtx {Tn.tcCaps = noCapabilities {promptCaching = False}}
+            cheaper = Tn.defaultKnobs {Tn.batchWidth = 8}
+        replicateM_ 2 (Tn.tunerObserve t cached cheaper (outc 500 True))
+        Tn.tunerSelect t uncached >>= (@?= Tn.defaultKnobs)
+        Tn.tunerSelect t cached >>= (@?= cheaper),
+      testCase "model id keys profiles apart" $ do
+        t <- learningTuner (TuneConfig {epsilon = 0, successTarget = 0.9, minTrials = 2, decay = 1})
+        let v1 = tnCtx {Tn.tcModelId = "model-v1"}
+            v2 = tnCtx {Tn.tcModelId = "model-v2"}
+            cheaper = Tn.defaultKnobs {Tn.batchWidth = 8}
+        replicateM_ 2 (Tn.tunerObserve t v1 cheaper (outc 500 True))
+        Tn.tunerSelect t v1 >>= (@?= cheaper)
+        Tn.tunerSelect t v2 >>= (@?= Tn.defaultKnobs),
+      testCase "decay lets recent failures dethrone a stale winner" $ do
+        let run d = do
+              t <- learningTuner (TuneConfig {epsilon = 0, successTarget = 0.9, minTrials = 2, decay = d})
+              let cheaper = Tn.defaultKnobs {Tn.skeletonRadius = 0}
+              replicateM_ 30 (Tn.tunerObserve t tnCtx cheaper (outc 600 True))
+              replicateM_ 3 (Tn.tunerObserve t tnCtx cheaper (outc 600 False))
+              Tn.tunerSelect t tnCtx
+        let cheaper = Tn.defaultKnobs {Tn.skeletonRadius = 0}
+        run 1.0 >>= (@?= cheaper) -- 30/33 ≈ 0.909 ≥ target: still trusted
+        run 0.9 >>= (@?= Tn.defaultKnobs), -- EWMA: recent failures drop it below target
+      testCase "counterfactual credits a provably-equivalent cheaper truncate" $ do
+        t <- learningTuner (strictCfg 1.0)
+        let out = (outc 1000 True) {Tn.otMaxToolResultBytes = Just 1500}
+        replicateM_ 3 (Tn.tunerObserve t tnCtx Tn.defaultKnobs out)
+        chosen <- Tn.truncateBytes <$> Tn.tunerSelect t tnCtx
+        assertBool "credited a cheaper value (2048/4096)" (chosen == 2048 || chosen == 4096)
+        assertBool "below the default 8192" (chosen < Tn.truncateBytes Tn.defaultKnobs),
+      testCase "save and load round-trips profiles" $ withTmp "tune" $ \dir -> do
+        let path = dir </> "state.json"
+        lt <- newLearningTuner (strictCfg 1.0)
+        let t = asTuner lt
+            cheaper = Tn.defaultKnobs {Tn.skeletonRadius = 0}
+        replicateM_ 3 $ do
+          Tn.tunerObserve t tnCtx Tn.defaultKnobs (outc 1000 True)
+          Tn.tunerObserve t tnCtx cheaper (outc 600 True)
+        Tn.tunerSelect t tnCtx >>= (@?= cheaper)
+        saveTuner lt path
+        -- A fresh tuner loaded from the snapshot picks the same learned winner.
+        reloaded <- loadTuner path (strictCfg 1.0)
+        case reloaded of
+          Left e -> assertFailure ("load failed: " <> e)
+          Right lt2 -> Tn.tunerSelect (asTuner lt2) tnCtx >>= (@?= cheaper)
+        -- A missing file loads cold (baseline), not an error.
+        cold <- loadTuner (dir </> "does-not-exist.json") (strictCfg 1.0)
+        case cold of
+          Left e -> assertFailure ("cold load errored: " <> e)
+          Right ltc -> Tn.tunerSelect (asTuner ltc) tnCtx >>= (@?= Tn.defaultKnobs)
+    ]
 
 -- Run an action in a fresh temp directory, cleaned up afterwards.
 withTmp :: String -> (FilePath -> IO a) -> IO a
