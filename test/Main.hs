@@ -14,6 +14,7 @@ import Data.Text.Encoding (decodeUtf8Lenient)
 import Data.Text.IO qualified as TIO
 import Lavoisier.Agent
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
+import Lavoisier.Gateway.Acp (defaultAcpConfig, newAcpApp)
 import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp)
 import Lavoisier.Protocol.Agent (AgentError (..), AgentHandle (..), turnRequest)
 import Lavoisier.Protocol.Event
@@ -51,6 +52,7 @@ tests =
       agentTests,
       gatewayTests,
       a2aTests,
+      acpTests,
       memoryTests
     ]
 
@@ -413,6 +415,40 @@ a2aTests =
     getBody = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tasks/get\",\"params\":{\"id\":\"task-0\"}}"
     a2aBody = decodeUtf8Lenient . BL.toStrict . simpleBody
     a2aStub evs = AgentHandle $ \_ -> do s <- fromList (map Right evs); pure (Right s)
+
+-- --- Phase 10: the ACP gateway (offline; WAI harness, stub agent) ----------------------------------
+
+acpTests :: TestTree
+acpTests =
+  testGroup
+    "acp gateway"
+    [ testCase "lists the manifest" $ do
+        app <- newAcpApp defaultAcpConfig (acpStub [])
+        r <- runSession (srequest (SRequest (getP ["agents"]) "")) app
+        simpleStatus r @?= status200
+        assertBool "agent name" ("lavoisier" `T.isInfixOf` acpBody r),
+      testCase "sync run returns completed with output" $ do
+        app <- newAcpApp defaultAcpConfig (acpStub [TextDelta "ACPOK", Done EndTurn])
+        r <- runSession (srequest (SRequest postRuns syncBody)) app
+        simpleStatus r @?= status200
+        assertBool "completed" ("completed" `T.isInfixOf` acpBody r)
+        assertBool "carries the answer" ("ACPOK" `T.isInfixOf` acpBody r),
+      testCase "GET /runs/{id} reflects the store" $ do
+        app <- newAcpApp defaultAcpConfig (acpStub [TextDelta "ACPOK", Done EndTurn])
+        _ <- runSession (srequest (SRequest postRuns syncBody)) app
+        r <- runSession (srequest (SRequest (getP ["runs", "run-0"]) "")) app
+        assertBool "completed" ("completed" `T.isInfixOf` acpBody r),
+      testCase "ping" $ do
+        app <- newAcpApp defaultAcpConfig (acpStub [])
+        r <- runSession (srequest (SRequest (getP ["ping"]) "")) app
+        simpleBody r @?= "pong"
+    ]
+  where
+    getP p = defaultRequest {requestMethod = "GET", pathInfo = p}
+    postRuns = defaultRequest {requestMethod = "POST", pathInfo = ["runs"], requestHeaders = [(hContentType, "application/json")]}
+    syncBody = "{\"agent_name\":\"lavoisier\",\"session_id\":\"s1\",\"input\":[{\"parts\":[{\"content_type\":\"text/plain\",\"content\":\"hi\"}]}]}"
+    acpBody = decodeUtf8Lenient . BL.toStrict . simpleBody
+    acpStub evs = AgentHandle $ \_ -> do s <- fromList (map Right evs); pure (Right s)
 
 -- --- Phase 7: session memory (offline; stub provider) ---------------------------------------------
 

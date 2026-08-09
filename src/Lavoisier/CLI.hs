@@ -18,6 +18,7 @@ import Data.Text.IO qualified as TIO
 import Data.Word (Word32)
 import Lavoisier.Agent
 import Lavoisier.Gateway.A2A (a2aGateway, defaultA2aConfig)
+import Lavoisier.Gateway.Acp (acpGateway, defaultAcpConfig)
 import Lavoisier.Gateway.Http (defaultGatewayConfig, httpGateway)
 import Lavoisier.Memory (newFileStore, newInMemoryStore, sessionAgentHandle)
 import Lavoisier.Protocol.Agent (turnRequest)
@@ -41,6 +42,7 @@ data Options = Options
     optMaxTokens :: Maybe Word32,
     optServe :: Maybe Int,
     optServeA2a :: Maybe Int,
+    optServeAcp :: Maybe Int,
     optSessionDir :: Maybe FilePath,
     optWords :: [String]
   }
@@ -61,6 +63,7 @@ optionsParser =
     <*> optional (option auto (long "max-tokens" <> metavar "N" <> help "Generated-token ceiling"))
     <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
     <*> optional (option auto (long "serve-a2a" <> metavar "PORT" <> help "Serve the agent as an A2A (Agent-to-Agent) gateway on this port"))
+    <*> optional (option auto (long "serve-acp" <> metavar "PORT" <> help "Serve the agent as an ACP (Agent Communication Protocol) gateway on this port"))
     <*> optional (strOption (long "session-dir" <> metavar "DIR" <> help "Persist gateway session transcripts under DIR (durable file store; default in-memory)"))
     <*> many (argument str (metavar "PROMPT..."))
 
@@ -84,9 +87,10 @@ runCli = do
         Left e -> errExit (tshow e)
         Right prov -> do
           let model = fromMaybe "claude-sonnet-4-5" (optModel opts)
-          case (optServeA2a opts, optServe opts) of
-            (Just port, _) -> serveGateway (a2aGateway port defaultA2aConfig) prov opts model
-            (_, Just port) -> serveGateway (httpGateway port defaultGatewayConfig) prov opts model
+          case (optServeAcp opts, optServeA2a opts, optServe opts) of
+            (Just port, _, _) -> serveGateway (acpGateway port defaultAcpConfig) prov opts model
+            (_, Just port, _) -> serveGateway (a2aGateway port defaultA2aConfig) prov opts model
+            (_, _, Just port) -> serveGateway (httpGateway port defaultGatewayConfig) prov opts model
             _ -> do
               prompt <- resolvePrompt (optWords opts)
               if T.null prompt
