@@ -1,0 +1,17 @@
+-- Example Dhall config for `lav` (the Haskell port uses Dhall, not TOML).
+--
+-- Copy to `lavoisier.dhall` (auto-loaded from the working dir) or pass `--config <PATH>`.
+-- Every field is optional: this record is merged over an all-`None` defaults record, so you only
+-- need to write the fields you want to set. An explicit CLI flag always wins over the file.
+-- Dhall type-checks the file at load, so a typo or wrong type is a clear error.
+
+{ provider = Some "anthropic" -- "anthropic" | "google"
+, model = None Text -- e.g. Some "claude-sonnet-4-5" / Some "gemini-2.5-flash"
+, thinking = None Text -- "off" | "low" | "medium" | "high"
+, maxTokens = None Natural -- generated-token ceiling
+, maxSteps = Some 12 -- agent tool-loop step budget
+, serve = None Natural -- HTTP gateway port (POST /v1/turns, GET /health)
+, serveA2a = None Natural -- A2A gateway port
+, serveAcp = None Natural -- ACP gateway port
+, sessionDir = None Text -- durable session store dir (else in-memory)
+}

@@ -13,6 +13,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient)
 import Data.Text.IO qualified as TIO
 import Lavoisier.Agent
+import Lavoisier.Config (FileConfig (..), defaultConfig, loadConfig)
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
 import Lavoisier.Gateway.Acp (defaultAcpConfig, newAcpApp)
 import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp)
@@ -56,7 +57,8 @@ tests =
       gatewayTests,
       a2aTests,
       acpTests,
-      memoryTests
+      memoryTests,
+      configTests
     ]
 
 -- --- Phase 1: protocol wire shapes, as QuickCheck round-trip properties ----------------------------
@@ -566,6 +568,27 @@ memoryTests =
         back <- loadSession s2 "sess/one"
         length back @?= 2
         map msgRole back @?= [Assistant, User]
+    ]
+
+-- --- Phase 12: Dhall config (offline; loads real Dhall from a temp file) --------------------------
+
+configTests :: TestTree
+configTests =
+  testGroup
+    "Dhall config"
+    [ testCase "a partial config merges over all-None defaults" $ withTmp "config" $ \dir -> do
+        let f = dir </> "c.dhall"
+        TIO.writeFile f "{ provider = Some \"google\", serve = Some 8080 }"
+        fc <- loadConfig f
+        provider fc @?= Just "google"
+        serve fc @?= Just 8080
+        model fc @?= Nothing
+        maxTokens fc @?= Nothing,
+      testCase "an empty config is all defaults" $ withTmp "config2" $ \dir -> do
+        let f = dir </> "c.dhall"
+        TIO.writeFile f "{=}"
+        fc <- loadConfig f
+        fc @?= defaultConfig
     ]
 
 -- Run an action in a fresh temp directory, cleaned up afterwards.

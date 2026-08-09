@@ -11,12 +11,14 @@ module Lavoisier.CLI
   )
 where
 
+import Control.Exception (SomeException, try)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Word (Word32)
 import Lavoisier.Agent
+import Lavoisier.Config (FileConfig (..), loadConfig)
 import Lavoisier.Gateway.A2A (a2aGateway, defaultA2aConfig)
 import Lavoisier.Gateway.Acp (acpGateway, defaultAcpConfig)
 import Lavoisier.Gateway.Http (defaultGatewayConfig, httpGateway)
@@ -31,20 +33,23 @@ import Lavoisier.Provider.Anthropic (anthropicFromEnv)
 import Lavoisier.Provider.Google (googleFromEnv)
 import Lavoisier.Tool.Registry (withBuiltins)
 import Options.Applicative
+import System.Directory (doesFileExist)
 import System.Exit (exitFailure)
 import System.IO (hFlush, stderr, stdout)
 
 -- | Parsed command-line options.
 data Options = Options
   { optAgent :: Bool,
-    optProvider :: String,
+    optProvider :: Maybe String,
     optModel :: Maybe Text,
     optThinking :: Maybe ThinkingLevel,
     optMaxTokens :: Maybe Word32,
+    optMaxSteps :: Maybe Int,
     optServe :: Maybe Int,
     optServeA2a :: Maybe Int,
     optServeAcp :: Maybe Int,
     optSessionDir :: Maybe FilePath,
+    optConfig :: Maybe FilePath,
     optWords :: [String]
   }
 
@@ -52,20 +57,16 @@ optionsParser :: Parser Options
 optionsParser =
   Options
     <$> switch (long "agent" <> help "Run the plan->act->observe tool loop instead of a single ask")
-    <*> strOption
-      ( long "provider"
-          <> value "anthropic"
-          <> showDefault
-          <> metavar "PROVIDER"
-          <> help "Model provider (anthropic|google)"
-      )
+    <*> optional (strOption (long "provider" <> metavar "PROVIDER" <> help "Model provider (anthropic|google; default anthropic)"))
     <*> optional (strOption (long "model" <> metavar "MODEL" <> help "Model id"))
     <*> optional (option thinkingReader (long "thinking" <> metavar "LEVEL" <> help "off|low|medium|high"))
     <*> optional (option auto (long "max-tokens" <> metavar "N" <> help "Generated-token ceiling"))
+    <*> optional (option auto (long "max-steps" <> metavar "N" <> help "Agent tool-loop step budget"))
     <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
     <*> optional (option auto (long "serve-a2a" <> metavar "PORT" <> help "Serve the agent as an A2A (Agent-to-Agent) gateway on this port"))
     <*> optional (option auto (long "serve-acp" <> metavar "PORT" <> help "Serve the agent as an ACP (Agent Communication Protocol) gateway on this port"))
     <*> optional (strOption (long "session-dir" <> metavar "DIR" <> help "Persist gateway session transcripts under DIR (durable file store; default in-memory)"))
+    <*> optional (strOption (long "config" <> metavar "PATH" <> help "Dhall config file (default ./lavoisier.dhall if present)"))
     <*> many (argument str (metavar "PROMPT..."))
 
 thinkingReader :: ReadM ThinkingLevel
@@ -79,8 +80,9 @@ thinkingReader = maybeReader $ \s -> case s of
 -- | Parse arguments and run the requested mode.
 runCli :: IO ()
 runCli = do
-  opts <- execParser pinfo
-  eprov <- selectProvider (optProvider opts)
+  opts0 <- execParser pinfo
+  opts <- mergeConfig opts0
+  eprov <- selectProvider (fromMaybe "anthropic" (optProvider opts))
   case eprov of
     Left e -> errExit e
     Right (prov, defModel) -> do
@@ -105,6 +107,46 @@ runCli = do
             <> progDesc "Token-efficient CLI coding agent (Haskell port): ask, --agent, or --serve*; Anthropic + Google."
             <> header "lav - lavoisier"
         )
+
+-- | Resolve the config file (explicit @--config@, else @./lavoisier.dhall@ if present), load it,
+-- and fill any option the user left unset (CLI/env wins over the file, which wins over defaults).
+mergeConfig :: Options -> IO Options
+mergeConfig opts = do
+  path <- case optConfig opts of
+    Just p -> pure (Just p)
+    Nothing -> do
+      here <- doesFileExist "lavoisier.dhall"
+      pure (if here then Just "lavoisier.dhall" else Nothing)
+  case path of
+    Nothing -> pure opts
+    Just p -> do
+      r <- try (loadConfig p) :: IO (Either SomeException FileConfig)
+      case r of
+        Left e -> errExit ("config " <> T.pack p <> ": " <> T.pack (show e))
+        Right fc -> pure (applyConfig fc opts)
+
+-- | Fill each unset 'Options' field from the config (CLI value wins via '<|>').
+applyConfig :: FileConfig -> Options -> Options
+applyConfig fc o =
+  o
+    { optProvider = optProvider o <|> fmap T.unpack (provider fc),
+      optModel = optModel o <|> model fc,
+      optThinking = optThinking o <|> (thinking fc >>= parseThinking),
+      optMaxTokens = optMaxTokens o <|> fmap fromIntegral (maxTokens fc),
+      optMaxSteps = optMaxSteps o <|> fmap fromIntegral (maxSteps fc),
+      optServe = optServe o <|> fmap fromIntegral (serve fc),
+      optServeA2a = optServeA2a o <|> fmap fromIntegral (serveA2a fc),
+      optServeAcp = optServeAcp o <|> fmap fromIntegral (serveAcp fc),
+      optSessionDir = optSessionDir o <|> fmap T.unpack (sessionDir fc)
+    }
+
+parseThinking :: Text -> Maybe ThinkingLevel
+parseThinking = \case
+  "off" -> Just ThinkOff
+  "low" -> Just ThinkLow
+  "medium" -> Just ThinkMedium
+  "high" -> Just ThinkHigh
+  _ -> Nothing
 
 -- | Build the requested provider and its default model, or an error message.
 selectProvider :: String -> IO (Either Text (Provider, Text))
@@ -136,7 +178,7 @@ runAskMode prov opts model prompt = do
 serveGateway :: Gateway -> Provider -> Options -> Text -> IO ()
 serveGateway gw prov opts model = do
   let base = defaultAgentConfig model
-      cfg = base {acThinking = optThinking opts, acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts)}
+      cfg = base {acThinking = optThinking opts, acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts), acMaxSteps = fromMaybe (acMaxSteps base) (optMaxSteps opts)}
       agent = Agent prov withBuiltins cfg
   store <- maybe (newInMemoryStore (Just 200)) (`newFileStore` Just 200) (optSessionDir opts)
   herr ("gateway '" <> gatewayName gw <> "' starting")
@@ -151,7 +193,8 @@ runAgentMode prov opts model prompt = do
       cfg =
         base
           { acThinking = optThinking opts,
-            acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts)
+            acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts),
+            acMaxSteps = fromMaybe (acMaxSteps base) (optMaxSteps opts)
           }
       agent = Agent prov withBuiltins cfg
   res <- runAgent agent (turnRequest "cli" prompt) renderEvent
