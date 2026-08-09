@@ -1,0 +1,23 @@
+[package]
+name = "lvz-mcp"
+version = "0.1.0"
+description = "Model Context Protocol (MCP) client for Lavoisier: connect to external MCP servers (stdio or HTTP) and expose their tools as Lavoisier tools."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+lvz-protocol.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

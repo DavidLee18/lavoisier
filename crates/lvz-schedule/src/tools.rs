@@ -283,6 +283,7 @@ mod tests {
                 },
                 room: Some("!ops:hs".into()),
                 session: "schedule-disk".into(),
+                summarize: None,
                 retry_max: 2,
                 retry_wait: 60,
             },
@@ -295,6 +296,7 @@ mod tests {
                 },
                 room: None,
                 session: "schedule-build".into(),
+                summarize: None,
                 retry_max: 0,
                 retry_wait: 0,
             },
@@ -324,7 +326,7 @@ mod tests {
     async fn status_reports_detail_and_history() {
         let reg = registry();
         let job = reg.jobs()[0].clone();
-        reg.record(&job, &Ok("Filesystem 42% used".into()));
+        reg.record(&job, &Ok("Filesystem 42% used".into()), None);
         let out = ScheduleStatusTool::new(reg)
             .invoke(json!({"id": "disk"}))
             .await

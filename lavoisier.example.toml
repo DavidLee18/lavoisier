@@ -46,7 +46,9 @@
 # serve            = "127.0.0.1:8080"
 # serve_matrix     = true
 # serve_slack      = true        # Slack Socket Mode (needs SLACK_APP_TOKEN + SLACK_BOT_TOKEN)
-# api_keys         = ["key1", "key2"]
+# serve_a2a        = "127.0.0.1:8081"   # A2A (Agent-to-Agent) server: Agent Card + JSON-RPC/SSE
+# serve_acp        = "127.0.0.1:8082"   # ACP (Agent Communication Protocol) server: REST agents/runs
+# api_keys         = ["key1", "key2"]   # also gate the A2A/ACP endpoints
 # rate_limit       = 60          # requests per 60s window
 # Cron gateway (--cron / --cron-file): retry a failed fire (rejected submit or mid-turn stream error)
 # cron_retry_max   = 2           # global default max retries (0 = no retry); --cron-file job overrides
@@ -56,6 +58,13 @@
 #   [{"id":"disk","schedule":"0 9 * * *","room":"!ops:hs","tool":"shell",
 #     "args":{"command":"df -h"},"retry_max":2,"retry_wait":60},
 #    {"id":"build","schedule":"*/15 * * * *","prompt":"check the build"}]
+# A tool job may add "summarize":"<instruction>" to post prose instead of the tool's raw output: the
+# tool still runs deterministically, then a *tool-less* turn (empty allowlist — it can only write
+# text) rewrites a SUCCESSFUL result under the instruction. A failure is never summarised (its retry
+# countdown must reach the room verbatim), and a provider outage degrades to the raw output. Set the
+# job's "session" to the report room id so a reply to the summary has the room's conversation context.
+#   [{"id":"wake","schedule":"25 10 * * 2,3,4","room":"!ops:hs","session":"!ops:hs",
+#     "tool":"server_wake","args":{},"summarize":"Say what happened in one plain sentence."}]
 # schedule_file       = "./jobs.json"          # requires serve_matrix
 # schedule_room       = "!ops:example.org"     # default report room (falls back to matrix_home_room)
 # schedule_retry_max  = 2        # global default max retries (0 = no retry); a job overrides it
@@ -106,6 +115,20 @@
 # debaters = ["anthropic:claude-opus-4-8", "xai:grok-4"]   # two or more required to convene
 # judge    = "anthropic:claude-opus-4-8"                   # default: the first debater
 # rounds   = 1                                             # critique rounds after the draft (0 = none)
+
+# ---------------------------------------------------------------------------------------------
+# [mcp] — external Model Context Protocol servers whose tools Lavoisier connects to and exposes.
+#
+# Lavoisier is the MCP *client*: each server's tools are discovered at startup and adapted into the
+# tool set the agent uses, so every frontend (CLI, HTTP/Matrix/Slack/cron gateways) gains them. Each
+# spec is `label: target` — a command to spawn (stdio transport) or an `http(s)://` URL. Tools are
+# namespaced `<label>_<tool>` so they never shadow the built-ins. `--mcp-server` (repeatable) wins.
+# ---------------------------------------------------------------------------------------------
+# [mcp]
+# servers = [
+#   "fs: npx -y @modelcontextprotocol/server-filesystem .",   # stdio: spawned child process
+#   "remote: https://mcp.example.com/rpc",                     # HTTP: Streamable-HTTP endpoint
+# ]
 
 # ---------------------------------------------------------------------------------------------
 # [log] — structured logging to stderr (tracing).

@@ -298,6 +298,22 @@ council streams short progress notices per phase (`🧠 council convened…` →
 `⚖️ judge synthesising…`); these **localise** via `--lang <LOCALE>` (falls back to the `LANG` env var)
 — `KO_KR` renders them in Korean, anything else keeps English.
 
+A2A (Agent-to-Agent server): `--serve-a2a <ADDR>` exposes Lavoisier as a Google **A2A** agent — an
+Agent Card at `/.well-known/agent-card.json` plus a JSON-RPC endpoint (`message/send`,
+`message/stream` over SSE, `tasks/get`) so other agents can delegate tasks to it. Reuses `--api-key`
+for auth; runs alongside the other gateways. Configurable via `[gateway] serve_a2a`.
+
+ACP (Agent Communication Protocol server, BeeAI/IBM): `--serve-acp <ADDR>` exposes Lavoisier over the
+**ACP** REST agents/runs API — `GET /agents`, `POST /runs` (sync / SSE-stream / async modes),
+`GET /runs/{id}` — so ACP clients can run it. Reuses `--api-key` for auth. Configurable via
+`[gateway] serve_acp`.
+
+MCP (Model Context Protocol client): `--mcp-server <LABEL:TARGET>` (repeatable) connects to an
+external MCP server and exposes **its** tools as Lavoisier tools, so the agent and every gateway gain
+them. `TARGET` is either a command to spawn (stdio transport) or an `http(s)://` URL (Streamable
+HTTP). Tools are namespaced `<label>_<tool>` so they never shadow the built-ins. E.g.
+`--mcp-server 'fs: npx -y @modelcontextprotocol/server-filesystem .'`. Configurable via `[mcp] servers`.
+
 ATO: `--tune` (ε-greedy) or `--tune-bayes` (Thompson sampling) · `--verify-cmd <cmd>` (real
 success gate, e.g. `cargo test`) · `--tune-state <path>` (persist learned profiles) · `--tune-decay`
 · `--telemetry` (per-task token/cost summary to stderr).

@@ -28,6 +28,7 @@ pub struct Config {
     pub memory: MemorySection,
     pub gateway: GatewaySection,
     pub legion: LegionSection,
+    pub mcp: McpSection,
     pub log: LogSection,
     /// Where this config was read from, or `None` if no file was found.
     ///
@@ -61,6 +62,16 @@ pub struct LegionSection {
     /// Critique rounds after the draft (default 1; 0 = draft then judge). `--legion-rounds` /
     /// `LVZ_LEGION_ROUNDS` take precedence.
     pub rounds: Option<usize>,
+}
+
+/// `[mcp]` — external Model Context Protocol servers whose tools Lavoisier connects to and exposes.
+/// Absent ⇒ no MCP servers.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpSection {
+    /// Server specs, each `label: target` (a spawn command for stdio, or an `http(s)://` URL) —
+    /// the same grammar as `--mcp-server`, which takes precedence.
+    pub servers: Option<Vec<String>>,
 }
 
 /// `[provider]` — which model/provider to drive.
@@ -121,6 +132,10 @@ pub struct GatewaySection {
     pub serve: Option<String>,
     pub serve_matrix: Option<bool>,
     pub serve_slack: Option<bool>,
+    /// A2A server bind address (`host:port`). `--serve-a2a` / `LVZ_SERVE_A2A` take precedence.
+    pub serve_a2a: Option<String>,
+    /// ACP server bind address (`host:port`). `--serve-acp` / `LVZ_SERVE_ACP` take precedence.
+    pub serve_acp: Option<String>,
     pub api_keys: Option<Vec<String>>,
     pub rate_limit: Option<u32>,
     /// Auto-accept Matrix room invites (default `true`).
@@ -232,6 +247,8 @@ impl Config {
         merge(&mut cli.serve, &self.gateway.serve);
         cli.serve_matrix |= self.gateway.serve_matrix.unwrap_or(false);
         cli.serve_slack |= self.gateway.serve_slack.unwrap_or(false);
+        merge(&mut cli.serve_a2a, &self.gateway.serve_a2a);
+        merge(&mut cli.serve_acp, &self.gateway.serve_acp);
         merge_copy(&mut cli.rate_limit, self.gateway.rate_limit);
         merge_copy(&mut cli.cron_retry_max, self.gateway.cron_retry_max);
         merge_copy(&mut cli.cron_retry_wait, self.gateway.cron_retry_wait);
@@ -256,6 +273,13 @@ impl Config {
         }
         merge(&mut cli.legion_judge, &self.legion.judge);
         merge_copy(&mut cli.legion_rounds, self.legion.rounds);
+
+        // [mcp] — a Vec flag: the file supplies it only when the CLI passed none (CLI wins wholesale).
+        if cli.mcp_server.is_empty() {
+            if let Some(servers) = &self.mcp.servers {
+                cli.mcp_server = servers.clone();
+            }
+        }
 
         // [log]
         merge(&mut cli.log_level, &self.log.level);

@@ -22,11 +22,14 @@ use lvz_agent::{Agent, AgentConfig, FixedTuner};
 use lvz_anthropic::AnthropicProvider;
 use lvz_claude_cli::ClaudeCliProvider;
 use lvz_google::GoogleProvider;
+use lvz_gw_a2a::A2aGateway;
+use lvz_gw_acp::AcpGateway;
 use lvz_gw_cron::{CronGateway, CronJob};
 use lvz_gw_http::{GatewayConfig, HttpGateway};
 use lvz_gw_matrix::MatrixGateway;
 use lvz_gw_slack::SlackGateway;
 use lvz_legion::{Debater, Language, Panel};
+use lvz_mcp::McpServerSpec;
 use lvz_memory::SessionAgent;
 use lvz_protocol::{
     AgentHandle, BatchProvider, ChatRequest, CostWeights, Deliberator, Event, Gateway, Knobs,
@@ -214,6 +217,15 @@ struct Cli {
     #[arg(long = "legion-rounds", value_name = "N", env = "LVZ_LEGION_ROUNDS")]
     legion_rounds: Option<usize>,
 
+    /// Connect to an external **MCP** (Model Context Protocol) server and expose its tools as
+    /// Lavoisier tools (repeatable). Each spec is `label: target`, where `target` is either a
+    /// command to spawn (stdio transport) or an `http(s)://` URL. The tools are namespaced
+    /// `<label>_<tool>` so they never shadow built-ins, and every frontend (CLI, gateways) gets
+    /// them. E.g. `--mcp-server 'fs: npx -y @modelcontextprotocol/server-filesystem .'`. Also
+    /// `[mcp] servers`.
+    #[arg(long = "mcp-server", value_name = "LABEL:TARGET")]
+    mcp_server: Vec<String>,
+
     /// Locale for the legion council's progress notices (POSIX form, e.g. `ko_KR.UTF-8`). Only
     /// `KO_KR` selects Korean; anything else — including unset — keeps them English. Falls back to
     /// the `LANG` env var.
@@ -264,6 +276,20 @@ struct Cli {
     /// `SLACK_ALLOWED_USERS` (comma-separated user ids). Runs alongside `--serve`/`--serve-matrix`.
     #[arg(long)]
     serve_slack: bool,
+
+    /// Serve as an **A2A (Agent-to-Agent) server** on this `host:port` — an Agent Card at
+    /// `/.well-known/agent-card.json` plus a JSON-RPC endpoint (`message/send`, `message/stream`,
+    /// `tasks/get`) so other agents can delegate tasks to Lavoisier. Reuses `--api-key` for auth.
+    /// Runs alongside the other gateways. Also `[gateway] serve_a2a`.
+    #[arg(long = "serve-a2a", value_name = "ADDR", env = "LVZ_SERVE_A2A")]
+    serve_a2a: Option<String>,
+
+    /// Serve as an **ACP (Agent Communication Protocol) server** on this `host:port` — the REST
+    /// agents/runs API (`GET /agents`, `POST /runs` with sync/stream/async modes, `GET /runs/{id}`)
+    /// so ACP clients can run Lavoisier. Reuses `--api-key` for auth. Runs alongside the other
+    /// gateways. Also `[gateway] serve_acp`.
+    #[arg(long = "serve-acp", value_name = "ADDR", env = "LVZ_SERVE_ACP")]
+    serve_acp: Option<String>,
 
     /// Schedule a recurring agent turn (in-process cron, UTC). The first **five** whitespace
     /// tokens are a standard cron schedule (`min hour dom month dow`); the rest is the prompt.
@@ -528,11 +554,14 @@ const DEFAULT_LOG_FILTER: &str = "warn,\
     lvz_claude_cli=info,\
     lvz_context=info,\
     lvz_google=info,\
+    lvz_gw_a2a=info,\
+    lvz_gw_acp=info,\
     lvz_gw_cron=info,\
     lvz_gw_http=info,\
     lvz_gw_matrix=info,\
     lvz_gw_slack=info,\
     lvz_legion=info,\
+    lvz_mcp=info,\
     lvz_memory=info,\
     lvz_protocol=info,\
     lvz_schedule=info,\
@@ -651,8 +680,12 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
 
     // Long-running gateways (HTTP/Matrix/Slack/cron) get the 1-hour cache TTL on the immutable
     // prefix.
-    let serving =
-        cli.serve.is_some() || cli.serve_matrix || cli.serve_slack || !cron_jobs.is_empty();
+    let serving = cli.serve.is_some()
+        || cli.serve_matrix
+        || cli.serve_slack
+        || cli.serve_a2a.is_some()
+        || cli.serve_acp.is_some()
+        || !cron_jobs.is_empty();
     let (provider, batch_provider) = provider_kind.build(cli.thinking.as_deref(), serving)?;
     let model = cli
         .model
@@ -668,6 +701,18 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
     // serving and one-shot paths share it, and a bad spec / missing key fails fast rather than
     // mid-turn.
     let fallbacks = build_fallbacks(&cli, cli.thinking.as_deref(), serving)?;
+
+    // External MCP servers (`--mcp-server` / `[mcp] servers`): connect and adapt their tools. Only
+    // when the tools can actually be used (a gateway, or the `--agent` loop) — a plain one-shot ask
+    // runs no tools, so there is no point spawning server processes. Merged ahead of the caller's
+    // `extra_tools` so both reach the registry through the identical path (and a downstream tool can
+    // still shadow an MCP tool, last-registration-wins).
+    let mcp_tools = if serving || cli.agent {
+        build_mcp_tools(&cli).await?
+    } else {
+        Vec::new()
+    };
+    let extra_tools: Vec<Arc<dyn Tool>> = mcp_tools.into_iter().chain(extra_tools).collect();
 
     // Gateway mode: build the shared agent once — wrapped in process-local session memory so each
     // `session` continues across turns (§7.3) — then run every active gateway (HTTP, Matrix, cron)
@@ -794,6 +839,35 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             }
             tracing::info!("Slack gateway (Socket Mode)");
             gateways.push(Arc::new(slack));
+        }
+
+        if let Some(addr) = cli.serve_a2a.clone() {
+            // Reuse the same API-key policy as the HTTP gateway for the JSON-RPC endpoint.
+            let mut a2a = A2aGateway::bind(&addr)?;
+            if !cli.api_key.is_empty() {
+                a2a = a2a.with_api_keys(cli.api_key.clone());
+            }
+            let auth = if cli.api_key.is_empty() {
+                "open"
+            } else {
+                "API-key required"
+            };
+            tracing::info!(%addr, %auth, "A2A gateway listening on http://{addr}");
+            gateways.push(Arc::new(a2a));
+        }
+
+        if let Some(addr) = cli.serve_acp.clone() {
+            let mut acp = AcpGateway::bind(&addr)?;
+            if !cli.api_key.is_empty() {
+                acp = acp.with_api_keys(cli.api_key.clone());
+            }
+            let auth = if cli.api_key.is_empty() {
+                "open"
+            } else {
+                "API-key required"
+            };
+            tracing::info!(%addr, %auth, "ACP gateway listening on http://{addr}");
+            gateways.push(Arc::new(acp));
         }
 
         if !cron_jobs.is_empty() {
@@ -979,6 +1053,25 @@ fn build_fallbacks(
         tracing::info!(fallbacks = chain.len(), "fallback chain configured");
     }
     Ok(chain)
+}
+
+/// Connect to every configured **MCP server** (`--mcp-server` / `[mcp] servers`) and return their
+/// tools, adapted to the [`Tool`] contract. Built once at the composition root and merged into the
+/// `extra_tools` set, so the remote tools reach the agent through the same registry as the built-ins
+/// and every frontend gets them. A bad spec or a server that fails to start surfaces here as a clear
+/// error (with the offending label) rather than a mid-turn failure. Empty when none are configured.
+async fn build_mcp_tools(cli: &Cli) -> Result<Vec<Arc<dyn Tool>>, Box<dyn std::error::Error>> {
+    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+    for spec in &cli.mcp_server {
+        let parsed = McpServerSpec::parse(spec)?;
+        let label = parsed.label.clone();
+        let connected = lvz_mcp::connect_tools(&parsed)
+            .await
+            .map_err(|e| format!("MCP server {label:?}: {e}"))?;
+        tracing::info!(server = %label, tools = connected.len(), "mcp server connected");
+        tools.extend(connected);
+    }
+    Ok(tools)
 }
 
 /// Build the **legion** council (`lvz-legion`) from the `--legion-*` flags / `[legion]` config, or
@@ -1361,9 +1454,12 @@ mod tests {
             "lavoisier",
             "lvz_gw_matrix",
             "lvz_gw_slack",
+            "lvz_gw_a2a",
+            "lvz_gw_acp",
             "lvz_gw_cron",
             "lvz_gw_http",
             "lvz_legion",
+            "lvz_mcp",
             "lvz_schedule",
             "lvz_memory",
             "lvz_tools",

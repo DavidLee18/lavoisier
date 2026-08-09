@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "lavoisier"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "clap",
  "futures",
@@ -1358,11 +1358,14 @@ dependencies = [
  "lvz-anthropic",
  "lvz-claude-cli",
  "lvz-google",
+ "lvz-gw-a2a",
+ "lvz-gw-acp",
  "lvz-gw-cron",
  "lvz-gw-http",
  "lvz-gw-matrix",
  "lvz-gw-slack",
  "lvz-legion",
+ "lvz-mcp",
  "lvz-memory",
  "lvz-protocol",
  "lvz-schedule",
@@ -1515,8 +1518,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "lvz-gw-a2a"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures",
+ "lvz-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "lvz-gw-acp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures",
+ "lvz-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lvz-gw-cron"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1545,7 +1578,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-matrix"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1593,6 +1626,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lvz-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "lvz-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lvz-memory"
 version = "0.3.0"
 dependencies = [
@@ -1620,7 +1668,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-schedule"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",

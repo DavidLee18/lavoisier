@@ -90,6 +90,12 @@ pub struct ScheduleJob {
     pub room: Option<String>,
     /// Agent session for `Action::Prompt`, so a job accrues memory across fires.
     pub session: String,
+    /// Optional instruction to render a **successful** tool action's raw output as prose before it
+    /// is posted to the room. When set on an [`Action::Tool`] job, the tool still runs
+    /// deterministically; its output is then handed to a **tool-less** turn (empty allowlist) that
+    /// rewrites it under this instruction. `None` ⇒ post the raw output as before. A failure is
+    /// never summarised — its body carries the retry countdown the operator needs verbatim.
+    pub summarize: Option<String>,
     /// Retries after a failed fire; 0 = no retry.
     pub retry_max: u32,
     /// Fixed seconds between retries; ignored when `retry_max == 0`.
@@ -112,6 +118,8 @@ struct JobSpec {
     args: Option<serde_json::Value>,
     #[serde(default)]
     prompt: Option<String>,
+    #[serde(default)]
+    summarize: Option<String>,
     #[serde(default)]
     retry_max: Option<u32>,
     #[serde(default)]
@@ -184,6 +192,7 @@ impl ScheduleJob {
                 action,
                 room: spec.room.clone(),
                 session,
+                summarize: spec.summarize.clone(),
                 retry_max: spec.retry_max.unwrap_or(retry_max),
                 retry_wait: spec.retry_wait.unwrap_or(retry_wait),
                 id: spec.id,
@@ -253,6 +262,9 @@ pub struct FireReport {
 struct ActionOutcome {
     result: Result<String, String>,
     usage: Option<Usage>,
+    /// Prose rendering of a successful tool action's output, when the job set `summarize`. This is
+    /// what the room sees; `result` (the raw output) still drives the verdict and the history trail.
+    summary: Option<String>,
     /// Tools the agent called, for a prompt job.
     tools_used: Vec<String>,
 }
@@ -391,13 +403,22 @@ impl ScheduleRegistry {
         let started = std::time::Instant::now();
         let outcome = run_action(&job, tools, agent).await;
         let elapsed = started.elapsed();
-        let report = self.record(&job, &outcome.result);
+        let report = self.record(&job, &outcome.result, outcome.summary.as_deref());
         log_verbose(&job, &outcome, &report, elapsed);
         Some(report)
     }
 
     /// Fold one attempt's result into the job's state and build its report.
-    fn record(&self, job: &ScheduleJob, result: &Result<String, String>) -> FireReport {
+    ///
+    /// `summary` is the prose rendering of a successful tool action (present only when the job set
+    /// `summarize` and the render succeeded). The raw `result` still drives the verdict, the stored
+    /// `Outcome.detail`, and the history trail — only the posted body prefers the prose.
+    fn record(
+        &self,
+        job: &ScheduleJob,
+        result: &Result<String, String>,
+        summary: Option<&str>,
+    ) -> FireReport {
         let now = now_unix();
         let ok = result.is_ok();
         let detail = truncate(
@@ -452,11 +473,17 @@ impl ScheduleRegistry {
             }
         }
 
+        // Prose when we have it, raw output otherwise. Failures never carry a summary, so the
+        // failure branch of `report_body` keeps receiving `detail` automatically.
+        let shown = summary
+            .map(|s| truncate(s, DETAIL_CAP))
+            .unwrap_or_else(|| detail.clone());
+
         FireReport {
             job_id: job.id.clone(),
             room: job.room.clone(),
             ok,
-            body: report_body(job, ok, &detail, attempt, retry_in, gave_up),
+            body: report_body(job, ok, &shown, attempt, retry_in, gave_up),
             attempt,
         }
     }
@@ -481,10 +508,17 @@ async fn run_action(
                 Ok(out) if out.is_error => Err(format!("tool `{name}` reported: {}", out.content)),
                 Ok(out) => Ok(out.content),
             };
+            // Summarise a SUCCESSFUL fire only: a failure's body carries the retry countdown and the
+            // operator needs it verbatim, unsoftened by a model. The tool call itself never reaches
+            // a provider (nothing to bill); the summary turn does, so its usage flows in here.
+            let (summary, usage) = match (&result, job.summarize.as_deref()) {
+                (Ok(raw), Some(instruction)) => summarise(job, agent, instruction, raw).await,
+                _ => (None, None),
+            };
             ActionOutcome {
                 result,
-                // A direct tool call never reaches a provider, so there is nothing to bill.
-                usage: None,
+                usage,
+                summary,
                 tools_used: vec![name.clone()],
             }
         }
@@ -496,6 +530,7 @@ async fn run_action(
                     return ActionOutcome {
                         result: Err(format!("submit failed: {e}")),
                         usage: None,
+                        summary: None,
                         tools_used: Vec::new(),
                     }
                 }
@@ -529,10 +564,50 @@ async fn run_action(
                     None => Ok(format!("{}{tools_note}", answer.trim())),
                 },
                 usage,
+                // A prompt turn is already prose; there is nothing to re-render.
+                summary: None,
                 tools_used: used,
             }
         }
     }
+}
+
+/// Render a tool's raw output as prose for the room.
+///
+/// Tool-less **by construction**: the turn is submitted with an EMPTY allowlist, so the model can
+/// only write text — it cannot act. That is what makes this safe where [`Action::Prompt`] is not (a
+/// prompt job carries no room/sender identity, so `matrix_room_tools` cannot scope it). Any failure
+/// returns `None` so the caller degrades to the raw JSON; a provider outage must never swallow a
+/// scheduled report.
+async fn summarise(
+    job: &ScheduleJob,
+    agent: &Arc<dyn AgentHandle>,
+    instruction: &str,
+    raw: &str,
+) -> (Option<String>, Option<Usage>) {
+    let turn = TurnRequest::new(job.session.clone(), format!("{instruction}\n\n{raw}"))
+        .with_allowed_tools(Vec::new());
+    let mut stream = match agent.submit(turn).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(job = %job.id, error = %e, "summary submit failed; posting raw output");
+            return (None, None);
+        }
+    };
+    let (mut text, mut usage) = (String::new(), None);
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(Event::TextDelta(t)) => text.push_str(&t),
+            Ok(Event::Usage(u)) => usage = Some(u),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(job = %job.id, error = %e, "summary stream error; posting raw output");
+                return (None, usage);
+            }
+        }
+    }
+    let text = text.trim().to_string();
+    ((!text.is_empty()).then_some(text), usage)
 }
 
 /// Emit the full account of one fire as a single `tracing` event.
@@ -576,6 +651,7 @@ fn log_verbose(
                 duration_ms = ms,
                 bytes = output.len(),
                 output = %output,
+                summary = outcome.summary.as_deref().unwrap_or("-"),
                 "job fired ok{tools_note}{usage_note}",
             );
         }
@@ -673,6 +749,7 @@ mod tests {
             action,
             room: None,
             session: format!("schedule-{id}"),
+            summarize: None,
             retry_max: 0,
             retry_wait: 0,
         }
@@ -784,7 +861,7 @@ mod tests {
     #[test]
     fn success_records_history_and_rearms() {
         let reg = ScheduleRegistry::new(vec![tool_job("a")]);
-        let report = reg.record(&reg.jobs[0].clone(), &Ok("all good".into()));
+        let report = reg.record(&reg.jobs[0].clone(), &Ok("all good".into()), None);
         assert!(report.ok);
         assert!(report.body.starts_with("✅ `a`"));
         assert!(report.body.contains("all good"));
@@ -801,7 +878,7 @@ mod tests {
     #[test]
     fn failure_without_retries_gives_up_immediately() {
         let reg = ScheduleRegistry::new(vec![tool_job("a")]);
-        let report = reg.record(&reg.jobs[0].clone(), &Err("boom".into()));
+        let report = reg.record(&reg.jobs[0].clone(), &Err("boom".into()), None);
         assert!(!report.ok);
         assert!(report.body.starts_with("❌ `a` failed (attempt 1)"));
         assert!(report.body.contains("boom"));
@@ -823,7 +900,7 @@ mod tests {
         let j = reg.jobs[0].clone();
 
         // Attempt 1 fails → retry 1/2 queued, cron slot suppressed so it can't race the retry.
-        let r1 = reg.record(&j, &Err("boom".into()));
+        let r1 = reg.record(&j, &Err("boom".into()), None);
         assert!(r1.body.contains("↻ retry 1/2 in 30s"));
         let s = reg.state_of("a").unwrap();
         assert!(s.retry_at.is_some());
@@ -831,12 +908,12 @@ mod tests {
         assert_eq!(s.attempt, 1);
 
         // Attempt 2 fails → retry 2/2 queued.
-        let r2 = reg.record(&j, &Err("boom".into()));
+        let r2 = reg.record(&j, &Err("boom".into()), None);
         assert!(r2.body.contains("↻ retry 2/2 in 30s"));
         assert_eq!(reg.state_of("a").unwrap().attempt, 2);
 
         // Attempt 3 exhausts the budget → give up and re-arm the cron slot from now.
-        let r3 = reg.record(&j, &Err("boom".into()));
+        let r3 = reg.record(&j, &Err("boom".into()), None);
         assert!(r3.body.contains("⛔ gave up after 2 retries"));
         let s = reg.state_of("a").unwrap();
         assert!(s.retry_at.is_none());
@@ -852,8 +929,8 @@ mod tests {
         j.retry_wait = 5;
         let reg = ScheduleRegistry::new(vec![j]);
         let j = reg.jobs[0].clone();
-        reg.record(&j, &Err("boom".into()));
-        let ok = reg.record(&j, &Ok("recovered".into()));
+        reg.record(&j, &Err("boom".into()), None);
+        let ok = reg.record(&j, &Ok("recovered".into()), None);
         assert!(ok.ok);
         assert!(ok.body.contains("after 2 attempts"));
         let s = reg.state_of("a").unwrap();
@@ -867,7 +944,7 @@ mod tests {
         let reg = ScheduleRegistry::new(vec![tool_job("a")]);
         let j = reg.jobs[0].clone();
         for _ in 0..(HISTORY_CAP + 5) {
-            reg.record(&j, &Ok("x".into()));
+            reg.record(&j, &Ok("x".into()), None);
         }
         assert_eq!(reg.state_of("a").unwrap().history.len(), HISTORY_CAP);
     }
@@ -877,14 +954,14 @@ mod tests {
         let mut j = tool_job("a");
         j.room = Some("!ops:hs".into());
         let reg = ScheduleRegistry::new(vec![j]);
-        let report = reg.record(&reg.jobs[0].clone(), &Ok("x".into()));
+        let report = reg.record(&reg.jobs[0].clone(), &Ok("x".into()), None);
         assert_eq!(report.room.as_deref(), Some("!ops:hs"));
     }
 
     #[test]
     fn long_output_is_truncated() {
         let reg = ScheduleRegistry::new(vec![tool_job("a")]);
-        let report = reg.record(&reg.jobs[0].clone(), &Ok("x".repeat(5_000)));
+        let report = reg.record(&reg.jobs[0].clone(), &Ok("x".repeat(5_000)), None);
         assert!(report.body.contains("[truncated]"));
         assert!(report.body.chars().count() < DETAIL_CAP + 100);
     }
@@ -1046,5 +1123,157 @@ mod tests {
         let report = reg.fire(0, &tools, &agent).await.unwrap();
         assert!(!report.ok);
         assert!(report.body.contains("nosuchtool"));
+    }
+
+    /// A tool that always succeeds with a fixed JSON payload — the `bcast-*` shape.
+    struct JsonTool;
+    #[async_trait::async_trait]
+    impl lvz_protocol::Tool for JsonTool {
+        fn name(&self) -> &str {
+            "server_wake"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<lvz_protocol::ToolOutput, lvz_protocol::ToolError> {
+            Ok(lvz_protocol::ToolOutput::ok(
+                serde_json::json!({"status": "wake started", "success": true}).to_string(),
+            ))
+        }
+    }
+
+    /// An agent that streams a scripted answer and records the turn it was handed, so a test can
+    /// assert what the summary turn actually submitted.
+    struct StubAgent {
+        answer: String,
+        seen: Arc<Mutex<Option<TurnRequest>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentHandle for StubAgent {
+        async fn submit(
+            &self,
+            turn: TurnRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<Event, lvz_protocol::AgentError>>,
+            lvz_protocol::AgentError,
+        > {
+            *self.seen.lock().unwrap() = Some(turn);
+            let answer = self.answer.clone();
+            Ok(futures::stream::iter(vec![Ok(Event::TextDelta(answer))]).boxed())
+        }
+    }
+
+    fn summarising_job(id: &str) -> ScheduleJob {
+        let mut j = job(
+            id,
+            Action::Tool {
+                name: "server_wake".into(),
+                args: serde_json::json!({}),
+            },
+        );
+        j.summarize = Some("Say what happened in one plain sentence.".into());
+        j.session = "!room:hs".into();
+        j
+    }
+
+    #[tokio::test]
+    async fn summarize_renders_prose_and_keeps_raw_output_in_history() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(JsonTool));
+        let seen = Arc::new(Mutex::new(None));
+        let agent: Arc<dyn AgentHandle> = Arc::new(StubAgent {
+            answer: "The machine woke up and is logging in.".into(),
+            seen: seen.clone(),
+        });
+
+        let reg = ScheduleRegistry::new(vec![summarising_job("w")]);
+        let report = reg.fire(0, &tools, &agent).await.unwrap();
+
+        // The room sees the prose, not the raw JSON.
+        assert!(report.ok);
+        assert!(report.body.contains("The machine woke up"));
+        assert!(!report.body.contains("\"success\""));
+
+        // The verdict stays the tool's, and the raw JSON is still stored for debugging.
+        let state = reg.state_of("w").unwrap();
+        let detail = &state.history.back().unwrap().detail;
+        assert!(detail.contains("\"success\""));
+
+        // Tool-less by construction: the summary turn carried an EMPTY allowlist and the raw output.
+        let turn = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(turn.allowed_tools, Some(Vec::new()));
+        assert_eq!(turn.session, "!room:hs");
+        assert!(turn.input.contains("\"success\""));
+    }
+
+    #[tokio::test]
+    async fn summarize_failure_degrades_to_raw_output() {
+        // The summary turn's provider is down; the scheduled report must still go out with the raw
+        // JSON rather than being swallowed.
+        struct DeadAgent;
+        #[async_trait::async_trait]
+        impl AgentHandle for DeadAgent {
+            async fn submit(
+                &self,
+                _turn: TurnRequest,
+            ) -> Result<
+                futures::stream::BoxStream<'static, Result<Event, lvz_protocol::AgentError>>,
+                lvz_protocol::AgentError,
+            > {
+                Err(lvz_protocol::AgentError::Provider("down".into()))
+            }
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(JsonTool));
+        let agent: Arc<dyn AgentHandle> = Arc::new(DeadAgent);
+        let reg = ScheduleRegistry::new(vec![summarising_job("w")]);
+        let report = reg.fire(0, &tools, &agent).await.unwrap();
+        assert!(report.ok);
+        assert!(report.body.contains("\"success\""));
+    }
+
+    #[tokio::test]
+    async fn a_failing_tool_is_never_summarised() {
+        // A tool failure must reach the room verbatim (retry countdown intact); the summary agent
+        // must not even be consulted, so its softening can never leak in.
+        struct FailTool;
+        #[async_trait::async_trait]
+        impl lvz_protocol::Tool for FailTool {
+            fn name(&self) -> &str {
+                "server_wake"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn invoke(
+                &self,
+                _args: serde_json::Value,
+            ) -> Result<lvz_protocol::ToolOutput, lvz_protocol::ToolError> {
+                Ok(lvz_protocol::ToolOutput::error("ATX call refused"))
+            }
+        }
+        struct PanicAgent;
+        #[async_trait::async_trait]
+        impl AgentHandle for PanicAgent {
+            async fn submit(
+                &self,
+                _turn: TurnRequest,
+            ) -> Result<
+                futures::stream::BoxStream<'static, Result<Event, lvz_protocol::AgentError>>,
+                lvz_protocol::AgentError,
+            > {
+                panic!("the summary agent must not be consulted for a failed fire");
+            }
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(FailTool));
+        let agent: Arc<dyn AgentHandle> = Arc::new(PanicAgent);
+        let reg = ScheduleRegistry::new(vec![summarising_job("w")]);
+        let report = reg.fire(0, &tools, &agent).await.unwrap();
+        assert!(!report.ok);
+        assert!(report.body.contains("ATX call refused"));
     }
 }

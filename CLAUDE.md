@@ -15,9 +15,12 @@ Companion docs — read the relevant one before working in that area:
 ## Status
 
 Complete and live-verified against real `XAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY`:
-all 17 crates, provider streaming (SSE + xAI gRPC), the agent loop, the token engine, session
-memory, the HTTP/Matrix/Slack/cron gateways, AWS packaging (`infra/`), and the ATO learner. `cargo
-test`, `cargo clippy --all-targets`, and `cargo fmt --check` are kept green.
+the original 17 crates, provider streaming (SSE + xAI gRPC), the agent loop, the token engine,
+session memory, the HTTP/Matrix/Slack/cron gateways, AWS packaging (`infra/`), and the ATO learner.
+The three protocol-interop crates added since — `lvz-mcp` (MCP client), `lvz-gw-a2a` (A2A server),
+`lvz-gw-acp` (ACP server) — are unit-tested (offline, against in-process mock servers/pipes) with
+**live verification against real external MCP servers / A2A / ACP clients still pending**, 20 crates
+in all. `cargo test`, `cargo clippy --all-targets`, and `cargo fmt --check` are kept green.
 
 The **cron gateway** (`lvz-gw-cron`, `--cron`/`--cron-file`) is an in-process scheduler shaped as a
 `Gateway`: it fires `TurnRequest`s on a hand-rolled UTC cron schedule (no `chrono`/`cron` dep) into
@@ -36,7 +39,15 @@ jobs run *inside* the Matrix serve loop (a third `select!` branch alongside `/sy
 it shares the task with the non-`Send` `crypto`) and **report each outcome to a room**. A job's
 `Action` is either a **direct tool call** — dispatched straight through the shared `ToolRegistry`, so
 it runs *unconditionally* with no model round-trip and no tokens — or a **prompt turn** (the cron
-shape). `lvz-schedule` is a **leaf library** (no gateway→gateway edge); it owns the cron engine
+shape). A tool job may carry a **`summarize` instruction** (a `ScheduleJob`/`JobSpec` field, *not* an
+`Action` variant, so it's a reporting concern sibling to `room`/`session`): the tool still runs
+deterministically, then a **successful** result is rewritten as prose for the room by a **tool-less**
+`summarise` turn — submitted with an **empty `allowed_tools`** so the model can only write text, never
+act (this is what keeps it safe where `Action::Prompt` — which carries no room/sender and so escapes
+`matrix_room_tools` scoping — is not). The verdict stays the **tool's** (retry semantics untouched);
+only the posted body changes — the raw output is still stored in `Outcome.detail`/history. A **failure
+is never summarised** (its retry countdown must reach the room verbatim) and any summary failure
+degrades to the raw output. `lvz-schedule` is a **leaf library** (no gateway→gateway edge); it owns the cron engine
 (moved here from `lvz-gw-cron`, which now re-exports `CronSchedule`/`CronError` unchanged), the job
 model, and the `ScheduleRegistry` holding live per-job state. Retry mirrors cron
 (`--schedule-retry-max`/`-wait`, per-job overridable, next slot recomputed once the chain resolves)
@@ -207,6 +218,53 @@ observation/compaction) stays the primary's. Contained to `lvz-agent` + the CLI 
 (`build_fallbacks`) — no protocol/gateway change, so every frontend gets it for free. Empty chain ⇒
 byte-identical to before.
 
+**MCP client** (`lvz-mcp`, `--mcp-server <LABEL:TARGET>` repeatable, `[mcp] servers`): Lavoisier as a
+**Model Context Protocol client** — connect to external MCP servers and expose *their* tools as
+Lavoisier tools, so every frontend (CLI + all gateways) gains them with **zero core change**. It is a
+**leaf crate** (depends only on `lvz-protocol`): each remote tool is wrapped as an `McpTool`
+implementing the core `Tool` contract, and the tools flow through the *same* `ToolRegistry` the
+built-ins use. Each `--mcp-server` spec is `label: target` — `target` is either a command to spawn
+(**stdio** transport: a child process, newline-delimited JSON-RPC 2.0 over its stdin/stdout,
+`kill_on_drop`) or an `http(s)://` URL (**Streamable HTTP** transport: POST JSON-RPC, accept a JSON or
+SSE reply, carry any `Mcp-Session-Id`). The two sit behind a `Transport` trait so the JSON-RPC client
+(`McpClient`: `initialize` → `tools/list` paginated → `tools/call`) is transport-agnostic; the stdio
+path is a generic `PipeTransport` over any reader/writer, so it's unit-tested offline against an
+in-process mock server over a `tokio::io::duplex`. Remote tool names are **namespaced `<label>_<tool>`**
+(and coerced to the provider tool-name charset `^[A-Za-z0-9_-]{1,64}$`) so they never silently shadow
+a built-in (the registry is last-registration-wins). A tool-level `isError` maps onto
+`ToolOutput::error` (model-visible, recoverable), never aborting the turn. The protocol is
+**hand-rolled** over `tokio`/`reqwest` — no MCP SDK. The CLI composition root is the one wiring site:
+`build_mcp_tools` connects every configured server (failing fast with the offending label on a bad
+spec / dead server) and merges the tools ahead of `main_with`'s `extra_tools`; it only runs when the
+tools can be used (a gateway, or `--agent`), so a plain one-shot ask spawns nothing.
+
+**A2A server gateway** (`lvz-gw-a2a`, `--serve-a2a <ADDR>` / `[gateway] serve_a2a`): Lavoisier as a
+Google **A2A (Agent-to-Agent) server** — a new `Gateway` (axum, modelled on `lvz-gw-http`) so other
+agents can discover and delegate to it, driving the *same* shared agent as every other gateway. It
+serves an **Agent Card** at `/.well-known/agent-card.json` (`capabilities.streaming = true`, one
+skill; name/description/url overridable) and a **JSON-RPC 2.0** endpoint at `POST /`:
+`message/send` (fold the turn's `TextDelta`s → a completed `Task`, the Slack reduce-to-answer
+pattern), `message/stream` (SSE: a `working` status-update → one `artifact-update` per delta →
+a final `completed` status-update), `tasks/get` (from a bounded in-memory store), `tasks/cancel`
+(best-effort), else JSON-RPC `-32601`. The A2A **`contextId` maps to a Lavoisier session** so a
+multi-turn A2A conversation accrues memory through the shared `SessionAgent`. Reuses `--api-key` as an
+optional `Authorization: Bearer` gate on the endpoint (the card stays public). Own `shutdown_signal()`
++ `axum::serve(..).with_graceful_shutdown(..)` so SIGTERM exits cleanly under the CLI's `select_all`
+join. JSON-RPC is hand-rolled over `axum`/`serde_json` — no A2A SDK; no protocol/agent change.
+
+**ACP server gateway** (`lvz-gw-acp`, `--serve-acp <ADDR>` / `[gateway] serve_acp`): Lavoisier as an
+**Agent Communication Protocol** server (BeeAI/IBM — the REST agent-interop protocol, **not** Zed's
+Agent Client Protocol). Another `Gateway` (axum) driving the same shared agent, exposing the REST
+**agents/runs** surface: `GET /agents` + `GET /agents/{name}` (the agent **manifest**), `POST /runs`
+with a `mode` — **`sync`** (fold the turn to a completed `Run`), **`stream`** (SSE: `run.in-progress`
+→ `message.part` per delta → `run.completed`), or **`async`** (return an in-progress `Run`, finish it
+on a spawned task) — `GET /runs/{run_id}` (from a bounded in-memory store, so `async` results are
+pollable), `POST /runs/{run_id}/cancel` (best-effort), `GET /ping`. The ACP **`session_id` maps to a
+Lavoisier session**. Input text is pulled from each message's `text/*` `parts`; the reply is one
+`agent/lavoisier` message. Same optional `--api-key` bearer gate (manifest stays public), same
+`shutdown_signal()` + graceful shutdown. Hand-rolled REST over `axum`/`serde_json` — no ACP SDK; no
+protocol/agent change.
+
 **Logging** (`--log-level <FILTER>`, env `LVZ_LOG_LEVEL`, or `[log] level`): operator diagnostics are
 structured **`tracing`** events on stderr. The `tracing` *facade* is free — already in every build
 because axum/tonic/tower/h2 emit through it — so instrumenting library crates costs no new
@@ -345,7 +403,7 @@ register. Mechanisms, all live:
   `lvz-gw-slack/src/lib.rs:149`). Only the `Value::method` *path* form breaks; passing a `Value`
   as a field value is fine. Bites any crate that parses JSON and logs — i.e. the gateways.
 - **Add every new crate to `DEFAULT_LOG_FILTER`** (`lvz-cli/src/lib.rs`). `EnvFilter` has no glob,
-  so "our crates at `info`, dependencies at `warn`" is an explicit 17-crate roll-call. A crate
+  so "our crates at `info`, dependencies at `warn`" is an explicit 20-crate roll-call. A crate
   missing from it silently falls to the `warn` floor and its `info!` milestones vanish — no error,
   just absent output. A unit test guards the list. Directives match the event target by **prefix**,
   so `lvz_gw_matrix=info` also covers `lvz_gw_matrix::e2ee` (also unit-tested).

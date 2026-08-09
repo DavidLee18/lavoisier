@@ -37,6 +37,7 @@ fn job(id: &str, command: &str) -> ScheduleJob {
         },
         room: None,
         session: format!("schedule-{id}"),
+        summarize: None,
         retry_max: 0,
         retry_wait: 0,
     }
