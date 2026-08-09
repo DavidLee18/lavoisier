@@ -30,6 +30,9 @@ module Lavoisier.Tune
     asTuner,
     saveTuner,
     loadTuner,
+    -- shared with the Bayesian tuner (@Lavoisier.Tune.Bayes@)
+    ContextKey (..),
+    keyOf,
     -- exposed for testing
     allNeighbours,
     step,

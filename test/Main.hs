@@ -5,7 +5,7 @@ module Main (main) where
 
 import Control.Concurrent (forkIO)
 import Control.Exception (IOException, try)
-import Control.Monad (replicateM_)
+import Control.Monad (replicateM, replicateM_)
 import Data.Aeson (Value (..), decode, encode, object, (.=))
 import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
@@ -59,6 +59,7 @@ import Lavoisier.Provider.Google.Sse qualified as GS
 import Lavoisier.Tool.Builtins
 import Lavoisier.Tool.Registry
 import Lavoisier.Tune
+import Lavoisier.Tune.Bayes (asBayesTuner, bayesTuner, loadBayes, newBayesTuner, sampleBeta, saveBayes)
 import Network.HTTP.Types (hAuthorization, hContentType, status200, status401)
 import Network.Wai (defaultRequest, pathInfo, requestHeaders, requestMethod)
 import Network.Wai.Test (SRequest (..), runSession, simpleBody, simpleStatus, srequest)
@@ -91,7 +92,8 @@ tests =
       memoryTests,
       configTests,
       mcpTests,
-      tuneTests
+      tuneTests,
+      bayesTests
     ]
 
 -- --- Phase 1: protocol wire shapes, as QuickCheck round-trip properties ----------------------------
@@ -876,6 +878,74 @@ tuneTests =
         case cold of
           Left e -> assertFailure ("cold load errored: " <> e)
           Right ltc -> Tn.tunerSelect (asTuner ltc) tnCtx >>= (@?= Tn.defaultKnobs)
+    ]
+
+-- --- Phase 14b: Bayesian (Thompson) ATO tuner (offline; ports lvz-tune bayes.rs tests) ------------
+
+-- Count how often selecting over @tnCtx@ returns a given knob vector, across @n@ draws.
+countPicks :: Tn.Tuner -> Tn.Knobs -> Int -> IO Int
+countPicks t k n = length . filter (== k) <$> replicateM n (Tn.tunerSelect t tnCtx)
+
+-- Mean of @n@ Beta(a,b) samples threaded from a seed (the PRNG is pure/explicit).
+betaMean :: Double -> Double -> Int -> Word64 -> Double
+betaMean a b n seed = go n seed 0 / fromIntegral n
+  where
+    go 0 _ acc = acc
+    go k r acc = let (x, r') = sampleBeta a b r in go (k - 1) r' (acc + x)
+
+bayesTests :: TestTree
+bayesTests =
+  testGroup
+    "ato tuner (bayes)"
+    [ testCase "beta samples track their parameters" $ do
+        let high = betaMean 20 2 4000 12345
+            low = betaMean 2 20 4000 6789
+        assertBool ("high mean " <> show high) (high > 0.82 && high < 0.97)
+        assertBool ("low mean " <> show low) (low > 0.03 && low < 0.18),
+      testCase "converges to a cheaper reliable vector" $ do
+        t <- bayesTuner defaultTuneConfig
+        let cheaper = Tn.defaultKnobs {Tn.skeletonRadius = 0}
+        replicateM_ 60 $ do
+          Tn.tunerObserve t tnCtx Tn.defaultKnobs (outc 1000 True)
+          Tn.tunerObserve t tnCtx cheaper (outc 600 True)
+        cheaperPicks <- countPicks t cheaper 200
+        baselinePicks <- countPicks t Tn.defaultKnobs 200
+        assertBool
+          ("cheaper=" <> show cheaperPicks <> " baseline=" <> show baselinePicks)
+          (cheaperPicks > baselinePicks * 3 && cheaperPicks > 80),
+      testCase "avoids a cheap but failing vector" $ do
+        t <- bayesTuner defaultTuneConfig
+        let starved = Tn.defaultKnobs {Tn.skeletonRadius = 0, Tn.truncateBytes = 2048}
+        replicateM_ 40 (Tn.tunerObserve t tnCtx Tn.defaultKnobs (outc 1000 True))
+        Tn.tunerObserve t tnCtx starved (outc 300 True)
+        replicateM_ 40 (Tn.tunerObserve t tnCtx starved (outc 300 False))
+        picks <- countPicks t starved 200
+        assertBool ("starved picked " <> show picks <> "/200") (picks < 20),
+      testCase "save and load round-trips posteriors" $ withTmp "bayes" $ \dir -> do
+        let path = dir </> "state.json"
+        bt <- newBayesTuner defaultTuneConfig
+        let t = asBayesTuner bt
+            cheaper = Tn.defaultKnobs {Tn.skeletonRadius = 0}
+        replicateM_ 60 $ do
+          Tn.tunerObserve t tnCtx Tn.defaultKnobs (outc 1000 True)
+          Tn.tunerObserve t tnCtx cheaper (outc 600 True)
+        saveBayes bt path
+        reloaded <- loadBayes path defaultTuneConfig
+        case reloaded of
+          Left e -> assertFailure ("load failed: " <> e)
+          Right bt2 -> do
+            cp <- countPicks (asBayesTuner bt2) cheaper 200
+            bp <- countPicks (asBayesTuner bt2) Tn.defaultKnobs 200
+            assertBool
+              ("reloaded cheaper=" <> show cp <> " baseline=" <> show bp)
+              (cp > bp * 3 && cp > 80)
+        -- A missing file loads cold (no error); a cold Thompson sampler still selects a valid vector.
+        cold <- loadBayes (dir </> "missing.json") defaultTuneConfig
+        case cold of
+          Left e -> assertFailure ("cold load errored: " <> e)
+          Right btc -> do
+            k <- Tn.tunerSelect (asBayesTuner btc) tnCtx
+            assertBool "valid grid vector" (Tn.skeletonRadius k <= 3 && Tn.batchWidth k >= 1 && Tn.batchWidth k <= 8)
     ]
 
 -- Run an action in a fresh temp directory, cleaned up afterwards.

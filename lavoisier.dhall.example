@@ -19,5 +19,6 @@
     -- each entry is "label: target"; target is a stdio command or an http(s):// URL.
     -- tools are namespaced <label>_<tool>. None (List Text) to set none.
 , tune = None Bool -- Some True enables the ATO learner (ε-greedy knob tuning)
+, tuneBayes = None Bool -- Some True uses the Bayesian (Thompson) learner instead of ε-greedy
 , tuneState = None Text -- Some "path" to load/persist learned ATO profiles as JSON
 }

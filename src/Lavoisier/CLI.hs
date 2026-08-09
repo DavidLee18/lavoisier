@@ -35,6 +35,7 @@ import Lavoisier.Provider.Anthropic (anthropicFromEnv)
 import Lavoisier.Provider.Google (googleFromEnv)
 import Lavoisier.Tool.Registry (ToolRegistry, registerTools, withBuiltins)
 import Lavoisier.Tune (LearningTuner, asTuner, defaultTuneConfig, learningTuner, loadTuner, saveTuner)
+import Lavoisier.Tune.Bayes (BayesTuner, asBayesTuner, bayesTuner, loadBayes, saveBayes)
 import Options.Applicative
 import System.Directory (doesFileExist)
 import System.Exit (exitFailure)
@@ -55,6 +56,7 @@ data Options = Options
     optConfig :: Maybe FilePath,
     optMcpServers :: [String],
     optTune :: Bool,
+    optTuneBayes :: Bool,
     optTuneState :: Maybe FilePath,
     optWords :: [String]
   }
@@ -75,6 +77,7 @@ optionsParser =
     <*> optional (strOption (long "config" <> metavar "PATH" <> help "Dhall config file (default ./lavoisier.dhall if present)"))
     <*> many (strOption (long "mcp-server" <> metavar "LABEL:TARGET" <> help "Connect to an MCP server and expose its tools (stdio command or http(s):// URL); repeatable"))
     <*> switch (long "tune" <> help "Enable the ATO learner (ε-greedy knob tuning); off ⇒ static baseline knobs")
+    <*> switch (long "tune-bayes" <> help "Use the Bayesian (Thompson-sampling) ATO learner instead of ε-greedy")
     <*> optional (strOption (long "tune-state" <> metavar "PATH" <> help "Load/persist learned ATO profiles at PATH (implies --tune; saved after an --agent turn)"))
     <*> many (argument str (metavar "PROMPT..."))
 
@@ -153,6 +156,7 @@ applyConfig fc o =
         given -> given,
       -- --tune is a flag (default False); the file can turn it on when the flag was absent.
       optTune = optTune o || fromMaybe False (tune fc),
+      optTuneBayes = optTuneBayes o || fromMaybe False (tuneBayes fc),
       optTuneState = optTuneState o <|> fmap T.unpack (tuneState fc)
     }
 
@@ -207,11 +211,19 @@ withRegistry opts k = do
           Left e -> errExit ("mcp '" <> mssLabel spec <> "': " <> renderMcpError e)
           Right ts -> pure ts
 
--- | Build the ATO tuner: 'noopTuner' unless @--tune@ (or @--tune-state@), else a learner — loaded
--- from @--tune-state@ when present (a missing file loads cold). Returns the tuner plus a persist
--- action (a no-op without @--tune-state@) the caller runs when a turn completes.
+-- | Build the ATO tuner: 'noopTuner' unless @--tune@\/@--tune-bayes@, else a learner — Bayesian
+-- (Thompson) when @--tune-bayes@, else ε-greedy — loaded from @--tune-state@ when present (a missing
+-- file loads cold). Returns the tuner plus a persist action (a no-op without @--tune-state@) the
+-- caller runs when a turn completes.
 buildTuner :: Options -> IO (Tuner, IO ())
 buildTuner opts
+  | optTuneBayes opts = case optTuneState opts of
+      Nothing -> do t <- bayesTuner defaultTuneConfig; pure (t, pure ())
+      Just path -> do
+        r <- loadBayes path defaultTuneConfig
+        case r of
+          Left e -> errExit ("tune-state " <> T.pack path <> ": " <> T.pack e)
+          Right (bt :: BayesTuner) -> pure (asBayesTuner bt, saveBayes bt path)
   | not (optTune opts) = pure (noopTuner, pure ())
   | otherwise = case optTuneState opts of
       Nothing -> do t <- learningTuner defaultTuneConfig; pure (t, pure ())
