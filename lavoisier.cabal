@@ -38,6 +38,7 @@ library
     Lavoisier.Gateway.A2A
     Lavoisier.Gateway.Acp
     Lavoisier.Gateway.Http
+    Lavoisier.Gateway.Slack
     Lavoisier.Legion
     Lavoisier.Mcp
     Lavoisier.Memory
@@ -72,6 +73,8 @@ library
     , http-client
     , http-client-tls
     , http-types
+    , network
+    , network-uri
     , optparse-applicative
     , scientific
     , text
@@ -80,6 +83,8 @@ library
     , vector
     , wai
     , warp
+    , websockets
+    , wuss
 
 executable lav
   import:           lang
@@ -101,6 +106,7 @@ test-suite lavoisier-test
     , base
     , aeson
     , bytestring
+    , containers
     , directory
     , filepath
     , http-types

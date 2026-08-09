@@ -13,6 +13,7 @@
 , serve = None Natural -- HTTP gateway port (POST /v1/turns, GET /health)
 , serveA2a = None Natural -- A2A gateway port
 , serveAcp = None Natural -- ACP gateway port
+, serveSlack = None Bool -- Some True serves over Slack Socket Mode (needs SLACK_APP_TOKEN + SLACK_BOT_TOKEN)
 , sessionDir = None Text -- durable session store dir (else in-memory)
 , mcpServers = -- external MCP servers whose tools are exposed to the agent (--agent / --serve*)
     Some [ "fs: npx -y @modelcontextprotocol/server-filesystem ." ]

@@ -14,8 +14,9 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import Data.Scientific (toBoundedInteger)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient)
@@ -26,6 +27,7 @@ import Lavoisier.Config (FileConfig (..), defaultConfig, loadConfig)
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
 import Lavoisier.Gateway.Acp (defaultAcpConfig, newAcpApp)
 import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp)
+import Lavoisier.Gateway.Slack (SlackMessage (..), parseEvent, senderAllowed, slackSession)
 import Lavoisier.Legion (Debater, Language (..), LegionError (..), languageFromLocale, mkDebater, newPanel, panelDeliberator, withLanguage)
 import Lavoisier.Mcp
   ( CallResult (..),
@@ -98,7 +100,8 @@ tests =
       tuneTests,
       bayesTests,
       claudeCliTests,
-      legionTests
+      legionTests,
+      slackTests
     ]
 
 -- --- Phase 1: protocol wire shapes, as QuickCheck round-trip properties ----------------------------
@@ -1143,6 +1146,55 @@ legionTests =
       case newPanel debs judge rounds of
         Left e -> assertFailure ("panel build failed: " <> show e)
         Right panel -> body panel
+
+-- --- Phase 17: Slack gateway (offline; the pure Socket-Mode event parser, ports lvz-gw-slack) ------
+
+slackTests :: TestTree
+slackTests =
+  testGroup
+    "slack gateway"
+    [ testCase "parses a plain message" $
+        case parseEvent (payload (ev "message" "U_ALICE" "hello bot" "C1" Nothing)) "U_BOT" Nothing of
+          Just m -> do
+            smChannel m @?= "C1"
+            smText m @?= "hello bot"
+            smThreadTs m @?= Nothing
+            slackSession m @?= "slack:C1"
+          Nothing -> assertFailure "expected a message",
+      testCase "app_mention strips the bot mention and threads" $
+        case parseEvent (payload (ev "app_mention" "U_ALICE" "<@U_BOT> do a thing" "C1" (Just "1700000000.0001"))) "U_BOT" Nothing of
+          Just m -> do
+            smText m @?= "do a thing"
+            smThreadTs m @?= Just "1700000000.0001"
+            slackSession m @?= "slack:C1:1700000000.0001"
+          Nothing -> assertFailure "expected a threaded message",
+      testCase "skips self, bots, subtypes, non-message, and empty text" $ do
+        let skip lbl e = assertBool lbl (isNothing (parseEvent (payload e) "U_BOT" Nothing))
+        skip "own message" (ev "message" "U_BOT" "hi" "C1" Nothing)
+        skip "bot message" (object ["type" .= t "message", "bot_id" .= t "B1", "text" .= t "hi", "channel" .= t "C1"])
+        skip "edited (subtype)" (object ["type" .= t "message", "subtype" .= t "message_changed", "user" .= t "U_A", "text" .= t "hi", "channel" .= t "C1"])
+        skip "non-message" (object ["type" .= t "reaction_added", "user" .= t "U_A", "channel" .= t "C1"])
+        skip "empty text" (ev "message" "U_A" "   " "C1" Nothing),
+      testCase "the allowlist filters senders" $ do
+        let allowed = Just (Set.fromList ["U_ALICE"])
+            alice = ev "message" "U_ALICE" "hi" "C1" Nothing
+            mallory = ev "message" "U_MALLORY" "hi" "C1" Nothing
+        assertBool "alice allowed" (isJust (parseEvent (payload alice) "U_BOT" allowed))
+        assertBool "mallory blocked" (isNothing (parseEvent (payload mallory) "U_BOT" allowed))
+        assertBool "no allowlist ⇒ answered" (isJust (parseEvent (payload mallory) "U_BOT" Nothing)),
+      testCase "senderAllowed semantics" $ do
+        let allowed = Just (Set.fromList ["U_A"])
+        senderAllowed Nothing "U_ANYONE" @?= True
+        senderAllowed allowed "U_A" @?= True
+        senderAllowed allowed "U_B" @?= False
+    ]
+  where
+    payload e = object ["event" .= e]
+    ev etype user text channel threadTs =
+      object $
+        ["type" .= t etype, "user" .= t user, "text" .= t text, "channel" .= t channel]
+          <> maybe [] (\ts -> ["thread_ts" .= t ts]) threadTs
+    t = id :: Text -> Text
 
 -- Run an action in a fresh temp directory, cleaned up afterwards.
 withTmp :: String -> (FilePath -> IO a) -> IO a

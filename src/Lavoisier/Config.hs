@@ -29,6 +29,7 @@ data FileConfig = FileConfig
     serve :: Maybe Natural,
     serveA2a :: Maybe Natural,
     serveAcp :: Maybe Natural,
+    serveSlack :: Maybe Bool,
     sessionDir :: Maybe Text,
     mcpServers :: Maybe [Text],
     tune :: Maybe Bool,
@@ -43,27 +44,12 @@ data FileConfig = FileConfig
 
 instance Dhall.FromDhall FileConfig
 
--- | The all-unset config.
+-- | The all-unset config (one 'Nothing' per 'FileConfig' field).
 defaultConfig :: FileConfig
-defaultConfig =
-  FileConfig
-    Nothing
-    Nothing
-    Nothing
-    Nothing
-    Nothing
-    Nothing
-    Nothing
-    Nothing
-    Nothing
-    Nothing
-    Nothing
-    Nothing
-    Nothing
-    Nothing
-    Nothing
-    Nothing
-    Nothing
+defaultConfig = FileConfig n n n n n n n n n n n n n n n n n n
+  where
+    n :: Maybe a
+    n = Nothing
 
 -- | Load a Dhall config file, merged over an all-@None@ defaults record so the file may set only the
 -- fields it cares about. Throws (a @Dhall@ exception) on a parse or type error.
@@ -84,6 +70,7 @@ defaultsDhall =
       ", serve = None Natural",
       ", serveA2a = None Natural",
       ", serveAcp = None Natural",
+      ", serveSlack = None Bool",
       ", sessionDir = None Text",
       ", mcpServers = None (List Text)",
       ", tune = None Bool",

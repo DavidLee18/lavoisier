@@ -22,6 +22,7 @@ import Lavoisier.Config (FileConfig (..), loadConfig)
 import Lavoisier.Gateway.A2A (a2aGateway, defaultA2aConfig)
 import Lavoisier.Gateway.Acp (acpGateway, defaultAcpConfig)
 import Lavoisier.Gateway.Http (defaultGatewayConfig, httpGateway)
+import Lavoisier.Gateway.Slack (slackFromEnv, slackGateway)
 import Lavoisier.Legion (Debater, languageFromLocale, mkDebater, newPanel, panelDeliberator, renderLegionError, withLanguage)
 import Lavoisier.Mcp (connectTools, mssLabel, parseServerSpec, renderMcpError)
 import Lavoisier.Memory (newFileStore, newInMemoryStore, sessionAgentHandle)
@@ -56,6 +57,7 @@ data Options = Options
     optServe :: Maybe Int,
     optServeA2a :: Maybe Int,
     optServeAcp :: Maybe Int,
+    optServeSlack :: Bool,
     optSessionDir :: Maybe FilePath,
     optConfig :: Maybe FilePath,
     optMcpServers :: [String],
@@ -81,6 +83,7 @@ optionsParser =
     <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
     <*> optional (option auto (long "serve-a2a" <> metavar "PORT" <> help "Serve the agent as an A2A (Agent-to-Agent) gateway on this port"))
     <*> optional (option auto (long "serve-acp" <> metavar "PORT" <> help "Serve the agent as an ACP (Agent Communication Protocol) gateway on this port"))
+    <*> switch (long "serve-slack" <> help "Serve the agent as a Slack gateway over Socket Mode (needs SLACK_APP_TOKEN + SLACK_BOT_TOKEN)")
     <*> optional (strOption (long "session-dir" <> metavar "DIR" <> help "Persist gateway session transcripts under DIR (durable file store; default in-memory)"))
     <*> optional (strOption (long "config" <> metavar "PATH" <> help "Dhall config file (default ./lavoisier.dhall if present)"))
     <*> many (strOption (long "mcp-server" <> metavar "LABEL:TARGET" <> help "Connect to an MCP server and expose its tools (stdio command or http(s):// URL); repeatable"))
@@ -111,10 +114,15 @@ runCli = do
     Left e -> errExit e
     Right (prov, defModel) -> do
       let model = fromMaybe defModel (optModel opts)
-      case (optServeAcp opts, optServeA2a opts, optServe opts) of
-        (Just port, _, _) -> withRegistry opts $ serveGateway (acpGateway port defaultAcpConfig) prov opts model
-        (_, Just port, _) -> withRegistry opts $ serveGateway (a2aGateway port defaultA2aConfig) prov opts model
-        (_, _, Just port) -> withRegistry opts $ serveGateway (httpGateway port defaultGatewayConfig) prov opts model
+      case (optServeSlack opts, optServeAcp opts, optServeA2a opts, optServe opts) of
+        (True, _, _, _) -> do
+          escfg <- slackFromEnv
+          case escfg of
+            Left e -> errExit (tshow e)
+            Right scfg -> withRegistry opts $ serveGateway (slackGateway scfg) prov opts model
+        (_, Just port, _, _) -> withRegistry opts $ serveGateway (acpGateway port defaultAcpConfig) prov opts model
+        (_, _, Just port, _) -> withRegistry opts $ serveGateway (a2aGateway port defaultA2aConfig) prov opts model
+        (_, _, _, Just port) -> withRegistry opts $ serveGateway (httpGateway port defaultGatewayConfig) prov opts model
         _ -> do
           prompt <- resolvePrompt (optWords opts)
           if T.null prompt
@@ -161,6 +169,7 @@ applyConfig fc o =
       optServe = optServe o <|> fmap fromIntegral (serve fc),
       optServeA2a = optServeA2a o <|> fmap fromIntegral (serveA2a fc),
       optServeAcp = optServeAcp o <|> fmap fromIntegral (serveAcp fc),
+      optServeSlack = optServeSlack o || fromMaybe False (serveSlack fc),
       optSessionDir = optSessionDir o <|> fmap T.unpack (sessionDir fc),
       -- A CLI --mcp-server (non-empty) wins wholesale; otherwise take the file's list.
       optMcpServers = case optMcpServers o of
