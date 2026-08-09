@@ -37,11 +37,16 @@ library
     Lavoisier.Protocol.Provider
     Lavoisier.Protocol.Stream
     Lavoisier.Protocol.Tool
+    Lavoisier.Provider.Anthropic
+    Lavoisier.Provider.Anthropic.Sse
   build-depends:
     , base                  >=4.19 && <5
     , aeson                 >=2.1
     , bytestring
     , containers
+    , http-client
+    , http-client-tls
+    , http-types
     , scientific
     , text
     , unordered-containers
