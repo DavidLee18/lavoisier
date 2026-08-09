@@ -154,7 +154,7 @@ buildBody reasoningFloor req =
     toolsArr = declTools <> concatMap serverTool (crServerTools req)
     declTools =
       [ kobj [("functionDeclarations", arr [funcDecl t | t <- crTools req])]
-        | not (null (crTools req))
+      | not (null (crTools req))
       ]
     funcDecl t = kobj [("name", String (tdName t)), ("description", String (tdDescription t)), ("parameters", tdSchema t)]
     generation =

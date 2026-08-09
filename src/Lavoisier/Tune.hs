@@ -295,8 +295,8 @@ saveTuner lt path = do
   st <- readIORef (ltState lt)
   let rows =
         [ Row key knobs stats
-          | (key, cands) <- Map.toList (profiles st),
-            (knobs, stats) <- Map.toList cands
+        | (key, cands) <- Map.toList (profiles st),
+          (knobs, stats) <- Map.toList cands
         ]
   BL.writeFile path (encode (Snapshot rows (rng st)))
 

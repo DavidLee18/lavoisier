@@ -31,10 +31,10 @@ import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider (Provider (..), ProviderError)
 import Lavoisier.Protocol.Stream (Producer (..))
 import Lavoisier.Protocol.Tune (Tuner, noopTuner)
-import Lavoisier.Tune (LearningTuner, asTuner, defaultTuneConfig, learningTuner, loadTuner, saveTuner)
 import Lavoisier.Provider.Anthropic (anthropicFromEnv)
 import Lavoisier.Provider.Google (googleFromEnv)
 import Lavoisier.Tool.Registry (ToolRegistry, registerTools, withBuiltins)
+import Lavoisier.Tune (LearningTuner, asTuner, defaultTuneConfig, learningTuner, loadTuner, saveTuner)
 import Options.Applicative
 import System.Directory (doesFileExist)
 import System.Exit (exitFailure)

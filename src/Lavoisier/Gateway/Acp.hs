@@ -209,11 +209,11 @@ extractInput body =
     Just msgs ->
       T.concat
         [ c
-          | msg <- msgs,
-            Just parts <- [look "parts" msg >>= asArray],
-            p <- parts,
-            isText p,
-            Just c <- [look "content" p >>= asText]
+        | msg <- msgs,
+          Just parts <- [look "parts" msg >>= asArray],
+          p <- parts,
+          isText p,
+          Just c <- [look "content" p >>= asText]
         ]
   where
     isText p = case look "content_type" p >>= asText of
@@ -222,12 +222,12 @@ extractInput body =
 
 answerOutput :: Text -> Value
 answerOutput answer =
-  Array $
-    V.singleton $
-      object
-        [ "role" .= t "agent/lavoisier",
-          "parts" .= [object ["content_type" .= t "text/plain", "content" .= answer]]
-        ]
+  Array
+    $ V.singleton
+    $ object
+      [ "role" .= t "agent/lavoisier",
+        "parts" .= [object ["content_type" .= t "text/plain", "content" .= answer]]
+      ]
 
 buildRun :: Text -> Text -> Text -> Value -> Value
 buildRun runId session status output =

@@ -66,7 +66,7 @@ import Lavoisier.Protocol.Tool
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types.Status (statusCode, statusIsSuccessful)
-import System.IO (Handle, hFlush, hSetBinaryMode, hSetBuffering, BufferMode (LineBuffering))
+import System.IO (BufferMode (LineBuffering), Handle, hFlush, hSetBinaryMode, hSetBuffering)
 import System.Process.Typed
   ( Process,
     createPipe,

@@ -44,21 +44,21 @@ import Lavoisier.Mcp
     renderCall,
     toTool,
   )
+import Lavoisier.Memory (SessionStore (..), newFileStore, newInMemoryStore, sessionAgentHandle, trimTo)
 import Lavoisier.Protocol.Agent (AgentError (..), AgentHandle (..), turnRequest)
 import Lavoisier.Protocol.Event
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider
-import Lavoisier.Memory (SessionStore (..), newFileStore, newInMemoryStore, sessionAgentHandle, trimTo)
 import Lavoisier.Protocol.Stream (drain, fromList)
 import Lavoisier.Protocol.Tool
 import Lavoisier.Protocol.Tune qualified as Tn
-import Lavoisier.Tune
 import Lavoisier.Provider.Anthropic (buildBody)
 import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
 import Lavoisier.Provider.Google qualified as G
 import Lavoisier.Provider.Google.Sse qualified as GS
 import Lavoisier.Tool.Builtins
 import Lavoisier.Tool.Registry
+import Lavoisier.Tune
 import Network.HTTP.Types (hAuthorization, hContentType, status200, status401)
 import Network.Wai (defaultRequest, pathInfo, requestHeaders, requestMethod)
 import Network.Wai.Test (SRequest (..), runSession, simpleBody, simpleStatus, srequest)

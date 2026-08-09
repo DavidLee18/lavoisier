@@ -30,7 +30,7 @@ import Data.Word (Word32, Word64)
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider
 import Lavoisier.Protocol.Stream (Producer (..))
-import Lavoisier.Provider.Anthropic.Sse (initSse, ssePush, sseEof)
+import Lavoisier.Provider.Anthropic.Sse (initSse, sseEof, ssePush)
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (RequestHeaders)
@@ -193,7 +193,7 @@ buildBody ttl req =
           [("stop_sequences", toJSON (crStopSequences req)) | not (null (crStopSequences req))],
           [("tool_choice", buildToolChoice (crDisableParallelToolUse req) tc) | Just tc <- [crToolChoice req]],
           [ ("output_config", kobj [("format", kobj [("type", String "json_schema"), ("schema", sch)])])
-            | Just (JsonSchema sch) <- [crOutputFormat req]
+          | Just (JsonSchema sch) <- [crOutputFormat req]
           ]
         ]
     hasAnyTools = not (null (crTools req)) || not (null (crServerTools req)) || not (null (crBuiltinTools req))

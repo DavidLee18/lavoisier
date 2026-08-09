@@ -136,11 +136,11 @@ messageText :: Message -> Text
 messageText m =
   T.concat
     [ t
-      | block <- msgContent m,
-        t <- case block of
-          TextBlock t _ -> [t]
-          ThinkingBlock t -> [t]
-          _ -> []
+    | block <- msgContent m,
+      t <- case block of
+        TextBlock t _ -> [t]
+        ThinkingBlock t -> [t]
+        _ -> []
     ]
 
 -- | A tool advertised to the model: name, description, JSON-Schema argument shape, and the
