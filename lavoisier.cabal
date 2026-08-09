@@ -39,6 +39,7 @@ library
     Lavoisier.Gateway.Acp
     Lavoisier.Gateway.Cron
     Lavoisier.Gateway.Http
+    Lavoisier.Gateway.Matrix
     Lavoisier.Gateway.Slack
     Lavoisier.Legion
     Lavoisier.Mcp

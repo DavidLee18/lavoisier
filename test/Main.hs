@@ -14,6 +14,7 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef
+import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, isNothing)
 import Data.Scientific (toBoundedInteger)
 import Data.Set qualified as Set
@@ -29,6 +30,7 @@ import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
 import Lavoisier.Gateway.Acp (defaultAcpConfig, newAcpApp)
 import Lavoisier.Gateway.Cron (CronConfigError (..), CronJob (..), parseCliJob, parseFileJobs)
 import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp)
+import Lavoisier.Gateway.Matrix qualified as MX
 import Lavoisier.Gateway.Slack (SlackMessage (..), parseEvent, senderAllowed, slackSession)
 import Lavoisier.Legion (Debater, Language (..), LegionError (..), languageFromLocale, mkDebater, newPanel, panelDeliberator, withLanguage)
 import Lavoisier.Mcp
@@ -108,7 +110,8 @@ tests =
       legionTests,
       slackTests,
       cronTests,
-      xaiTests
+      xaiTests,
+      matrixTests
     ]
 
 -- --- Phase 1: protocol wire shapes, as QuickCheck round-trip properties ----------------------------
@@ -1388,6 +1391,94 @@ xaiTests =
       [(n, "")] | n >= 0 && n < V.length a -> walk ks (a V.! n)
       _ -> Nothing
     walk _ _ = Nothing
+
+-- --- Phase 20: plaintext Matrix gateway (offline; the pure engagement/extraction logic) -----------
+
+-- A minimal /sync response with one m.room.message in a joined room.
+syncWith :: Value -> Value
+syncWith event =
+  object ["next_batch" .= t "s2", "rooms" .= object ["join" .= object ["!room:hs" .= joined]]]
+  where
+    joined = object ["timeline" .= object ["events" .= [event]]]
+    t = id :: Text -> Text
+
+msgEvent :: Text -> Text -> Value -> Value
+msgEvent sender eid content =
+  object ["type" .= t "m.room.message", "sender" .= sender, "event_id" .= eid, "content" .= content]
+  where
+    t = id :: Text -> Text
+
+textContent :: Text -> Value
+textContent body = object ["msgtype" .= t "m.text", "body" .= body] where t = id :: Text -> Text
+
+matrixTests :: TestTree
+matrixTests =
+  testGroup
+    "matrix gateway"
+    [ testCase "extracts an m.text message and skips the bot's own" $ do
+        let sync = object ["next_batch" .= t "s", "rooms" .= object ["join" .= object ["!r:hs" .= room]]]
+            room = object ["timeline" .= object ["events" .= [mine, theirs]]]
+            mine = msgEvent "@bot:hs" "$1" (textContent "i am the bot")
+            theirs = msgEvent "@alice:hs" "$2" (textContent "hello bot")
+            msgs = MX.extractMessages sync "@bot:hs" Nothing Nothing
+        map MX.imSender msgs @?= ["@alice:hs"]
+        map MX.imBody msgs @?= ["hello bot"],
+      testCase "the sender allowlist filters extraction" $ do
+        let sync = syncWith (msgEvent "@mallory:hs" "$1" (textContent "hi"))
+            allowed = Just (Set.fromList ["@alice:hs"])
+        MX.extractMessages sync "@bot:hs" allowed Nothing @?= []
+        length (MX.extractMessages sync "@bot:hs" Nothing Nothing) @?= 1,
+      testCase "the room allowlist filters extraction" $ do
+        let sync = syncWith (msgEvent "@alice:hs" "$1" (textContent "hi")) -- room is !room:hs
+        MX.extractMessages sync "@bot:hs" Nothing (Just (Set.fromList ["!other:hs"])) @?= []
+        length (MX.extractMessages sync "@bot:hs" Nothing (Just (Set.fromList ["!room:hs"]))) @?= 1,
+      testCase "mentionsBot: m.mentions, textual @localpart, and MXID" $ do
+        let viaMentions = object ["msgtype" .= t "m.text", "body" .= t "hey", "m.mentions" .= object ["user_ids" .= [t "@bot:hs"]]]
+            viaHandle = textContent "hey @bot please help"
+            viaMxid = textContent "cc @bot:hs"
+            noMention = textContent "just chatting"
+        MX.mentionsBot viaMentions "@bot:hs" @?= True
+        MX.mentionsBot viaHandle "@bot:hs" @?= True
+        MX.mentionsBot viaMxid "@bot:hs" @?= True
+        MX.mentionsBot noMention "@bot:hs" @?= False,
+      testCase "replyTarget reads m.relates_to → m.in_reply_to" $ do
+        let content = object ["msgtype" .= t "m.text", "body" .= t "re", "m.relates_to" .= object ["m.in_reply_to" .= object ["event_id" .= t "$orig"]]]
+        MX.replyTarget content @?= Just "$orig"
+        MX.replyTarget (textContent "plain") @?= Nothing,
+      testCase "messageTriggers: DM always, else mention or reply-to-own" $ do
+        recent <- MX.newRecentIds 8
+        MX.insertRecent recent "$mine"
+        (MX.messageTriggers True False Nothing recent >>= (@?= True)) -- DM
+        (MX.messageTriggers False True Nothing recent >>= (@?= True)) -- mention
+        (MX.messageTriggers False False (Just "$mine") recent >>= (@?= True)) -- reply to ours
+        (MX.messageTriggers False False (Just "$other") recent >>= (@?= False))
+        MX.messageTriggers False False Nothing recent >>= (@?= False),
+      testCase "toolsFor intersects room and user permissions" $ do
+        let cfg =
+              (MX.defaultMatrixConfig "https://hs" "@bot:hs")
+                { MX.mcRoomTools = Map.fromList [("!r:hs", ["read_file", "shell", "write_file"])],
+                  MX.mcUserTools = Map.fromList [("@alice:hs", ["read_file", "shell"])]
+                }
+        MX.toolsFor cfg "!r:hs" "@alice:hs" @?= Just ["read_file", "shell"] -- intersection
+        MX.toolsFor cfg "!r:hs" "@bob:hs" @?= Just ["read_file", "shell", "write_file"] -- room only
+        MX.toolsFor cfg "!other:hs" "@alice:hs" @?= Just ["read_file", "shell"] -- user only
+        MX.toolsFor cfg "!other:hs" "@bob:hs" @?= Nothing, -- unconstrained
+      testCase "RecentIds is bounded and FIFO-evicts" $ do
+        recent <- MX.newRecentIds 2
+        mapM_ (MX.insertRecent recent) ["$a", "$b", "$c"]
+        -- \$a evicted
+        MX.containsRecent recent "$a" >>= (@?= False)
+        MX.containsRecent recent "$b" >>= (@?= True)
+        MX.containsRecent recent "$c" >>= (@?= True),
+      testCase "extractInvites and parseNextBatch" $ do
+        let sync = object ["next_batch" .= t "tok", "rooms" .= object ["invite" .= object ["!inv:hs" .= object []]]]
+        MX.extractInvites sync @?= ["!inv:hs"]
+        MX.parseNextBatch sync @?= Right "tok"
+        assertBool "no next_batch is an error" (isLeftE (MX.parseNextBatch (object [])))
+    ]
+  where
+    t = id :: Text -> Text
+    isLeftE = either (const True) (const False)
 
 -- Run an action in a fresh temp directory, cleaned up afterwards.
 withTmp :: String -> (FilePath -> IO a) -> IO a

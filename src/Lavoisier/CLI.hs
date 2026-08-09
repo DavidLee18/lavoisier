@@ -24,6 +24,7 @@ import Lavoisier.Gateway.A2A (a2aGateway, defaultA2aConfig)
 import Lavoisier.Gateway.Acp (acpGateway, defaultAcpConfig)
 import Lavoisier.Gateway.Cron (CronJob, cronGateway, parseCliJob, parseFileJobs)
 import Lavoisier.Gateway.Http (defaultGatewayConfig, httpGateway)
+import Lavoisier.Gateway.Matrix (matrixFromEnv, matrixGateway)
 import Lavoisier.Gateway.Slack (slackFromEnv, slackGateway)
 import Lavoisier.Legion (Debater, languageFromLocale, mkDebater, newPanel, panelDeliberator, renderLegionError, withLanguage)
 import Lavoisier.Mcp (connectTools, mssLabel, parseServerSpec, renderMcpError)
@@ -61,6 +62,7 @@ data Options = Options
     optServeA2a :: Maybe Int,
     optServeAcp :: Maybe Int,
     optServeSlack :: Bool,
+    optServeMatrix :: Bool,
     optSessionDir :: Maybe FilePath,
     optConfig :: Maybe FilePath,
     optMcpServers :: [String],
@@ -91,6 +93,7 @@ optionsParser =
     <*> optional (option auto (long "serve-a2a" <> metavar "PORT" <> help "Serve the agent as an A2A (Agent-to-Agent) gateway on this port"))
     <*> optional (option auto (long "serve-acp" <> metavar "PORT" <> help "Serve the agent as an ACP (Agent Communication Protocol) gateway on this port"))
     <*> switch (long "serve-slack" <> help "Serve the agent as a Slack gateway over Socket Mode (needs SLACK_APP_TOKEN + SLACK_BOT_TOKEN)")
+    <*> switch (long "serve-matrix" <> help "Serve the agent as a Matrix gateway (needs MATRIX_HOMESERVER + MATRIX_USER + token/password)")
     <*> optional (strOption (long "session-dir" <> metavar "DIR" <> help "Persist gateway session transcripts under DIR (durable file store; default in-memory)"))
     <*> optional (strOption (long "config" <> metavar "PATH" <> help "Dhall config file (default ./lavoisier.dhall if present)"))
     <*> many (strOption (long "mcp-server" <> metavar "LABEL:TARGET" <> help "Connect to an MCP server and expose its tools (stdio command or http(s):// URL); repeatable"))
@@ -125,26 +128,28 @@ runCli = do
     Left e -> errExit e
     Right (prov, defModel) -> do
       let model = fromMaybe defModel (optModel opts)
-      case (cronActive opts, optServeSlack opts, optServeAcp opts, optServeA2a opts, optServe opts) of
-        (True, _, _, _, _) -> do
-          jobs <- buildCronJobs opts
-          withRegistry opts $ serveGateway (cronGateway jobs) prov opts model
-        (_, True, _, _, _) -> do
-          escfg <- slackFromEnv
-          case escfg of
-            Left e -> errExit (tshow e)
-            Right scfg -> withRegistry opts $ serveGateway (slackGateway scfg) prov opts model
-        (_, _, Just port, _, _) -> withRegistry opts $ serveGateway (acpGateway port defaultAcpConfig) prov opts model
-        (_, _, _, Just port, _) -> withRegistry opts $ serveGateway (a2aGateway port defaultA2aConfig) prov opts model
-        (_, _, _, _, Just port) -> withRegistry opts $ serveGateway (httpGateway port defaultGatewayConfig) prov opts model
-        _ -> do
-          prompt <- resolvePrompt (optWords opts)
-          if T.null prompt
-            then errExit "empty prompt (pass it as arguments or on stdin)"
+          serveWith gw = withRegistry opts (serveGateway gw prov opts model)
+          fromEnvGateway build wrap = build >>= either (errExit . tshow) (serveWith . wrap)
+      if cronActive opts
+        then buildCronJobs opts >>= \jobs -> serveWith (cronGateway jobs)
+        else
+          if optServeMatrix opts
+            then fromEnvGateway matrixFromEnv matrixGateway
             else
-              if optAgent opts
-                then withRegistry opts (runAgentMode prov opts model prompt)
-                else runAskMode prov opts model prompt
+              if optServeSlack opts
+                then fromEnvGateway slackFromEnv slackGateway
+                else case (optServeAcp opts, optServeA2a opts, optServe opts) of
+                  (Just port, _, _) -> serveWith (acpGateway port defaultAcpConfig)
+                  (_, Just port, _) -> serveWith (a2aGateway port defaultA2aConfig)
+                  (_, _, Just port) -> serveWith (httpGateway port defaultGatewayConfig)
+                  _ -> do
+                    prompt <- resolvePrompt (optWords opts)
+                    if T.null prompt
+                      then errExit "empty prompt (pass it as arguments or on stdin)"
+                      else
+                        if optAgent opts
+                          then withRegistry opts (runAgentMode prov opts model prompt)
+                          else runAskMode prov opts model prompt
   where
     pinfo =
       info
@@ -184,6 +189,7 @@ applyConfig fc o =
       optServeA2a = optServeA2a o <|> fmap fromIntegral (serveA2a fc),
       optServeAcp = optServeAcp o <|> fmap fromIntegral (serveAcp fc),
       optServeSlack = optServeSlack o || fromMaybe False (serveSlack fc),
+      optServeMatrix = optServeMatrix o || fromMaybe False (serveMatrix fc),
       optSessionDir = optSessionDir o <|> fmap T.unpack (sessionDir fc),
       -- A CLI --mcp-server (non-empty) wins wholesale; otherwise take the file's list.
       optMcpServers = case optMcpServers o of

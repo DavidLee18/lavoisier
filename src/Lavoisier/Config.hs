@@ -30,6 +30,7 @@ data FileConfig = FileConfig
     serveA2a :: Maybe Natural,
     serveAcp :: Maybe Natural,
     serveSlack :: Maybe Bool,
+    serveMatrix :: Maybe Bool,
     sessionDir :: Maybe Text,
     mcpServers :: Maybe [Text],
     tune :: Maybe Bool,
@@ -50,7 +51,7 @@ instance Dhall.FromDhall FileConfig
 
 -- | The all-unset config (one 'Nothing' per 'FileConfig' field).
 defaultConfig :: FileConfig
-defaultConfig = FileConfig n n n n n n n n n n n n n n n n n n n n n n
+defaultConfig = FileConfig n n n n n n n n n n n n n n n n n n n n n n n
   where
     n :: Maybe a
     n = Nothing
@@ -75,6 +76,7 @@ defaultsDhall =
       ", serveA2a = None Natural",
       ", serveAcp = None Natural",
       ", serveSlack = None Bool",
+      ", serveMatrix = None Bool",
       ", sessionDir = None Text",
       ", mcpServers = None (List Text)",
       ", tune = None Bool",
