@@ -7,3 +7,9 @@ packages: . olm/
 package olm
   extra-lib-dirs: /Users/ijaehyeon/.local/lib
   extra-include-dirs: /Users/ijaehyeon/.local/include
+
+-- The lavoisier package links libolm transitively when built with -fe2ee (the Matrix E2EE module
+-- depends on the olm package). Harmless when the flag is off.
+package lavoisier
+  extra-lib-dirs: /Users/ijaehyeon/.local/lib
+  extra-include-dirs: /Users/ijaehyeon/.local/include
