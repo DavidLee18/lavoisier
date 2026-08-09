@@ -1,6 +1,6 @@
 -- | The command-line entry point, ported (core subset) from Rust @lvz-cli@. Two modes over the same
--- plumbing: a one-shot @ask@ (no tools) and the @--agent@ tool loop. Only the Anthropic provider is
--- ported so far; @--provider@ rejects the rest with a clear message.
+-- plumbing: a one-shot @ask@ (no tools) and the @--agent@ tool loop. Providers: Anthropic + Google
+-- (@--provider@); other providers reject with a clear message.
 --
 -- Rendering mirrors the Rust CLI: answer text on stdout; thinking\/tool activity, usage, and the
 -- stop reason on stderr.
@@ -28,6 +28,7 @@ import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider (Provider (..), ProviderError)
 import Lavoisier.Protocol.Stream (Producer (..))
 import Lavoisier.Provider.Anthropic (anthropicFromEnv)
+import Lavoisier.Provider.Google (googleFromEnv)
 import Lavoisier.Tool.Registry (withBuiltins)
 import Options.Applicative
 import System.Exit (exitFailure)
@@ -56,7 +57,7 @@ optionsParser =
           <> value "anthropic"
           <> showDefault
           <> metavar "PROVIDER"
-          <> help "Model provider (only 'anthropic' is ported so far)"
+          <> help "Model provider (anthropic|google)"
       )
     <*> optional (strOption (long "model" <> metavar "MODEL" <> help "Model id"))
     <*> optional (option thinkingReader (long "thinking" <> metavar "LEVEL" <> help "off|low|medium|high"))
@@ -79,34 +80,40 @@ thinkingReader = maybeReader $ \s -> case s of
 runCli :: IO ()
 runCli = do
   opts <- execParser pinfo
-  if optProvider opts /= "anthropic"
-    then errExit ("unsupported provider: " <> T.pack (optProvider opts) <> " (only 'anthropic' is ported so far)")
-    else do
-      eprov <- anthropicFromEnv
-      case eprov of
-        Left e -> errExit (tshow e)
-        Right prov -> do
-          let model = fromMaybe "claude-sonnet-4-5" (optModel opts)
-          case (optServeAcp opts, optServeA2a opts, optServe opts) of
-            (Just port, _, _) -> serveGateway (acpGateway port defaultAcpConfig) prov opts model
-            (_, Just port, _) -> serveGateway (a2aGateway port defaultA2aConfig) prov opts model
-            (_, _, Just port) -> serveGateway (httpGateway port defaultGatewayConfig) prov opts model
-            _ -> do
-              prompt <- resolvePrompt (optWords opts)
-              if T.null prompt
-                then errExit "empty prompt (pass it as arguments or on stdin)"
-                else
-                  if optAgent opts
-                    then runAgentMode prov opts model prompt
-                    else runAskMode prov opts model prompt
+  eprov <- selectProvider (optProvider opts)
+  case eprov of
+    Left e -> errExit e
+    Right (prov, defModel) -> do
+      let model = fromMaybe defModel (optModel opts)
+      case (optServeAcp opts, optServeA2a opts, optServe opts) of
+        (Just port, _, _) -> serveGateway (acpGateway port defaultAcpConfig) prov opts model
+        (_, Just port, _) -> serveGateway (a2aGateway port defaultA2aConfig) prov opts model
+        (_, _, Just port) -> serveGateway (httpGateway port defaultGatewayConfig) prov opts model
+        _ -> do
+          prompt <- resolvePrompt (optWords opts)
+          if T.null prompt
+            then errExit "empty prompt (pass it as arguments or on stdin)"
+            else
+              if optAgent opts
+                then runAgentMode prov opts model prompt
+                else runAskMode prov opts model prompt
   where
     pinfo =
       info
         (optionsParser <**> helper)
         ( fullDesc
-            <> progDesc "Token-efficient CLI coding agent (Haskell port): ask or --agent, Anthropic."
+            <> progDesc "Token-efficient CLI coding agent (Haskell port): ask, --agent, or --serve*; Anthropic + Google."
             <> header "lav - lavoisier"
         )
+
+-- | Build the requested provider and its default model, or an error message.
+selectProvider :: String -> IO (Either Text (Provider, Text))
+selectProvider name = case name of
+  "anthropic" -> tag "claude-sonnet-4-5" <$> anthropicFromEnv
+  "google" -> tag "gemini-2.5-flash" <$> googleFromEnv
+  other -> pure (Left ("unsupported provider: " <> T.pack other <> " (anthropic|google)"))
+  where
+    tag def = either (Left . tshow) (\p -> Right (p, def))
 
 resolvePrompt :: [String] -> IO Text
 resolvePrompt [] = T.strip <$> TIO.getContents

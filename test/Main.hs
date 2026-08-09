@@ -25,6 +25,8 @@ import Lavoisier.Protocol.Stream (drain, fromList)
 import Lavoisier.Protocol.Tool
 import Lavoisier.Provider.Anthropic (buildBody)
 import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
+import Lavoisier.Provider.Google qualified as G
+import Lavoisier.Provider.Google.Sse qualified as GS
 import Lavoisier.Tool.Builtins
 import Lavoisier.Tool.Registry
 import Network.HTTP.Types (hAuthorization, hContentType, status200, status401)
@@ -48,6 +50,7 @@ tests =
       usageProperties,
       sseTests,
       anthropicBodyTests,
+      googleTests,
       toolTests,
       agentTests,
       gatewayTests,
@@ -258,6 +261,71 @@ anthropicBodyTests =
     ]
   where
     bodyText = decodeUtf8Lenient . BL.toStrict . encode . buildBody False
+
+-- --- Phase 11: Google (Gemini) provider (offline; ports lvz-google tests) --------------------------
+
+googleTests :: TestTree
+googleTests =
+  testGroup
+    "Google (Gemini)"
+    [ testCase "decodes text with cache+thinking-aware usage" $ do
+        let evs = gDecode gTextStream
+        take 2 evs @?= [TextDelta "Hi", TextDelta " there"]
+        case evs !! 2 of
+          Usage u -> do
+            inputTokens u @?= 6 -- prompt 10 - cached 4
+            outputTokens u @?= 12 -- candidates 5 + thoughts 7
+            cacheReadTokens u @?= 4
+          o -> assertFailure ("expected usage, got " <> show o)
+        evs !! 3 @?= Done EndTurn,
+      testCase "function call becomes start/delta/end and ToolUse stop" $ do
+        let evs = gDecode gFuncStream
+        evs !! 0 @?= ToolUseStart "call_0" "shell"
+        case evs !! 1 of
+          ToolUseDelta i j -> do
+            i @?= "call_0"
+            assertBool "carries args" ("command" `T.isInfixOf` j)
+          o -> assertFailure ("expected delta, got " <> show o)
+        evs !! 2 @?= ToolUseEnd "call_0"
+        last evs @?= Done ToolUse,
+      testCase "separates thinking parts from answer text" $ do
+        let evs = gDecode "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"reasoning\",\"thought\":true},{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}]}\n\n"
+        take 2 evs @?= [Thinking "reasoning", TextDelta "answer"],
+      testCase "maps finish reasons" $ do
+        GS.mapFinish "STOP" @?= EndTurn
+        GS.mapFinish "MAX_TOKENS" @?= MaxTokens
+        GS.mapFinish "SAFETY" @?= Other "SAFETY",
+      testCase "buildBody maps roles, functionCall/Response, generationConfig" $ do
+        let req =
+              (chatRequest "gemini-2.5-flash")
+                { crSystem = Just (SystemPrompt "sys" False),
+                  crMessages =
+                    [ userMessage "hi",
+                      Message Assistant [ToolUseBlock "c1" "shell" (object ["command" .= ("ls" :: Text)])],
+                      Message User [ToolResultBlock "c1" "files" False]
+                    ]
+                }
+            bt = decodeUtf8Lenient (BL.toStrict (encode (G.buildBody G.defaultReasoningFloor req)))
+        assertBool "assistant -> model" ("\"role\":\"model\"" `T.isInfixOf` bt)
+        assertBool "functionCall" ("functionCall" `T.isInfixOf` bt)
+        assertBool "functionResponse" ("functionResponse" `T.isInfixOf` bt)
+        assertBool "generationConfig" ("maxOutputTokens" `T.isInfixOf` bt)
+        assertBool "systemInstruction" ("systemInstruction" `T.isInfixOf` bt)
+    ]
+
+gDecode :: ByteString -> [Event]
+gDecode input = let (st, e1) = GS.ssePush GS.initSse input in [e | Right e <- e1 <> GS.sseEof st]
+
+gTextStream :: ByteString
+gTextStream =
+  BS.concat
+    [ "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}],\"role\":\"model\"}}],\"usageMetadata\":{\"promptTokenCount\":10,\"cachedContentTokenCount\":4,\"candidatesTokenCount\":1}}\n\n",
+      "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" there\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"cachedContentTokenCount\":4,\"candidatesTokenCount\":5,\"thoughtsTokenCount\":7}}\n\n"
+    ]
+
+gFuncStream :: ByteString
+gFuncStream =
+  "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"shell\",\"args\":{\"command\":\"ls\"}}}]},\"finishReason\":\"STOP\"}]}\n\n"
 
 -- --- Phase 3: built-in tools (offline; real filesystem in a temp dir) ------------------------------
 

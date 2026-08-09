@@ -48,6 +48,8 @@ library
     Lavoisier.Protocol.Tool
     Lavoisier.Provider.Anthropic
     Lavoisier.Provider.Anthropic.Sse
+    Lavoisier.Provider.Google
+    Lavoisier.Provider.Google.Sse
     Lavoisier.Tool.Builtins
     Lavoisier.Tool.Registry
   build-depends:
