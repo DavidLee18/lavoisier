@@ -51,6 +51,7 @@ library
     Lavoisier.Protocol.Tune
     Lavoisier.Provider.Anthropic
     Lavoisier.Provider.Anthropic.Sse
+    Lavoisier.Provider.ClaudeCli
     Lavoisier.Provider.Google
     Lavoisier.Provider.Google.Sse
     Lavoisier.Tool.Builtins

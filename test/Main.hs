@@ -54,6 +54,7 @@ import Lavoisier.Protocol.Tool
 import Lavoisier.Protocol.Tune qualified as Tn
 import Lavoisier.Provider.Anthropic (buildBody)
 import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
+import Lavoisier.Provider.ClaudeCli (eofDecoder, initDecoder, pushLine, renderPrompt)
 import Lavoisier.Provider.Google qualified as G
 import Lavoisier.Provider.Google.Sse qualified as GS
 import Lavoisier.Tool.Builtins
@@ -93,7 +94,8 @@ tests =
       configTests,
       mcpTests,
       tuneTests,
-      bayesTests
+      bayesTests,
+      claudeCliTests
     ]
 
 -- --- Phase 1: protocol wire shapes, as QuickCheck round-trip properties ----------------------------
@@ -946,6 +948,66 @@ bayesTests =
           Right btc -> do
             k <- Tn.tunerSelect (asBayesTuner btc) tnCtx
             assertBool "valid grid vector" (Tn.skeletonRadius k <= 3 && Tn.batchWidth k >= 1 && Tn.batchWidth k <= 8)
+    ]
+
+-- --- Phase 15: claude-cli provider (offline; the stream-json Decoder, ports lvz-claude-cli tests) --
+
+-- Fold lines through the decoder then EOF, keeping the successful events.
+ccDecode :: [Text] -> [Event]
+ccDecode ls =
+  let (d, evs) = foldl stepLine (initDecoder, []) ls
+      (_, eofEvs) = eofDecoder d
+   in [e | Right e <- evs <> eofEvs]
+  where
+    stepLine (dc, acc) l = let (dc', more) = pushLine dc l in (dc', acc <> more)
+
+claudeCliTests :: TestTree
+claudeCliTests =
+  testGroup
+    "claude-cli provider"
+    [ testCase "renders the conversation with role labels" $ do
+        let req =
+              (chatRequest "sonnet")
+                { crMessages = [userMessage "hello", assistantMessage "hi there", userMessage "more"]
+                }
+        renderPrompt req @?= "User: hello\n\nAssistant: hi there\n\nUser: more\n\n",
+      testCase "streams partial deltas, then usage and done" $ do
+        let evs =
+              ccDecode
+                [ "{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"sonnet\"}",
+                  "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}}",
+                  "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}}",
+                  "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Hello\"}]}}",
+                  "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}"
+                ]
+        take 2 evs @?= [TextDelta "Hel", TextDelta "lo"]
+        case evs !! 2 of
+          Usage u -> do
+            inputTokens u @?= 12
+            outputTokens u @?= 3
+          o -> assertFailure ("expected usage, got " <> show o)
+        evs !! 3 @?= Done EndTurn
+        length evs @?= 4, -- the assembled `assistant` message is suppressed (no dup)
+      testCase "falls back to the assistant message when no partials" $ do
+        let evs =
+              ccDecode
+                [ "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"hmm\"},{\"type\":\"text\",\"text\":\"answer\"}]}}",
+                  "{\"type\":\"result\",\"subtype\":\"success\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}"
+                ]
+        take 2 evs @?= [Thinking "hmm", TextDelta "answer"]
+        case evs !! 2 of
+          Usage _ -> pure ()
+          o -> assertFailure ("expected usage, got " <> show o)
+        evs !! 3 @?= Done EndTurn,
+      testCase "an error result maps to Other, and EOF guarantees exactly one Done" $ do
+        let err =
+              ccDecode
+                ["{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}"]
+        last err @?= Done (Other "claude_cli_error")
+        let truncated =
+              ccDecode
+                ["{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}}"]
+        truncated @?= [TextDelta "hi", Done EndTurn]
     ]
 
 -- Run an action in a fresh temp directory, cleaned up afterwards.
