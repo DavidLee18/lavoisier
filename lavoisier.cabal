@@ -29,7 +29,14 @@ library
   import:           lang
   hs-source-dirs:   src
   exposed-modules:
+    Lavoisier.Protocol
+    Lavoisier.Protocol.Agent
     Lavoisier.Protocol.Event
+    Lavoisier.Protocol.Gateway
+    Lavoisier.Protocol.Message
+    Lavoisier.Protocol.Provider
+    Lavoisier.Protocol.Stream
+    Lavoisier.Protocol.Tool
   build-depends:
     , base                  >=4.19 && <5
     , aeson                 >=2.1
