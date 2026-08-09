@@ -59,6 +59,8 @@ library
     Lavoisier.Provider.ClaudeCli
     Lavoisier.Provider.Google
     Lavoisier.Provider.Google.Sse
+    Lavoisier.Provider.Xai
+    Lavoisier.Provider.Xai.Sse
     Lavoisier.Tool.Builtins
     Lavoisier.Tool.Registry
     Lavoisier.Tune
@@ -121,5 +123,6 @@ test-suite lavoisier-test
     , tasty-hunit
     , tasty-quickcheck
     , text
+    , vector
     , wai
     , wai-extra

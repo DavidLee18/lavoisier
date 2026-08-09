@@ -21,6 +21,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient)
 import Data.Text.IO qualified as TIO
+import Data.Vector qualified as V
 import Data.Word (Word64)
 import Lavoisier.Agent
 import Lavoisier.Config (FileConfig (..), defaultConfig, loadConfig)
@@ -62,6 +63,8 @@ import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
 import Lavoisier.Provider.ClaudeCli (eofDecoder, initDecoder, pushLine, renderPrompt)
 import Lavoisier.Provider.Google qualified as G
 import Lavoisier.Provider.Google.Sse qualified as GS
+import Lavoisier.Provider.Xai (buildMessages)
+import Lavoisier.Provider.Xai.Sse qualified as XS
 import Lavoisier.Schedule.Cron (Civil (..), CronError (..), civilFromUnix, nextAfter, parseCron)
 import Lavoisier.Tool.Builtins
 import Lavoisier.Tool.Registry
@@ -104,7 +107,8 @@ tests =
       claudeCliTests,
       legionTests,
       slackTests,
-      cronTests
+      cronTests,
+      xaiTests
     ]
 
 -- --- Phase 1: protocol wire shapes, as QuickCheck round-trip properties ----------------------------
@@ -1289,6 +1293,101 @@ cronTests =
     parseOk e = either (assertFailure . ("bad cron: " <>) . show) pure (parseCron e)
     isLeftE = either (const True) (const False)
     isLeftCfg = either (const True) (const False)
+
+-- --- Phase 19: xAI provider (offline; OpenAI-compat request + SSE decoder, ports lvz-xai http.rs) --
+
+xaiDecode :: ByteString -> [Event]
+xaiDecode input = let (st, e1) = XS.ssePush XS.initSse input in [e | Right e <- e1 <> XS.sseEof st]
+
+xaiTests :: TestTree
+xaiTests =
+  testGroup
+    "xAI (OpenAI-compat)"
+    [ testCase "system prompt leads and tools are function-shaped" $ do
+        let req =
+              (chatRequest "grok-4")
+                { crSystem = Just (SystemPrompt "be terse" False),
+                  crMessages = [userMessage "hi"],
+                  crTools = [ToolDef "list_dir" "list a dir" (object ["type" .= ("object" :: Text)]) False False]
+                }
+            msgs = buildMessages req
+        roleAt msgs 0 @?= Just "system"
+        roleAt msgs 1 @?= Just "user",
+      testCase "tool_use and tool_result map to OpenAI shape" $ do
+        let req =
+              (chatRequest "grok-4")
+                { crMessages =
+                    [ userMessage "go",
+                      Message Assistant [ToolUseBlock "call_1" "shell" (object ["command" .= ("ls" :: Text)])],
+                      Message User [ToolResultBlock "call_1" "files" False]
+                    ]
+                }
+            msgs = buildMessages req
+        -- user, assistant(tool_calls), tool(result)
+        roleAt msgs 1 @?= Just "assistant"
+        strAt msgs 1 ["tool_calls", "0", "id"] @?= Just "call_1"
+        strAt msgs 1 ["tool_calls", "0", "function", "name"] @?= Just "shell"
+        roleAt msgs 2 @?= Just "tool"
+        strAt msgs 2 ["tool_call_id"] @?= Just "call_1"
+        strAt msgs 2 ["content"] @?= Just "files",
+      testCase "decodes text, usage, done in order" $ do
+        let evs =
+              xaiDecode $
+                BS.concat
+                  [ "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
+                    "data: [DONE]\n\n"
+                  ]
+        take 2 evs @?= [TextDelta "Hel", TextDelta "lo"]
+        case evs !! 2 of
+          Usage u -> do
+            inputTokens u @?= 5
+            outputTokens u @?= 2
+          o -> assertFailure ("expected usage, got " <> show o)
+        evs !! 3 @?= Done EndTurn
+        length evs @?= 4,
+      testCase "decodes a streamed tool call" $ do
+        let evs =
+              xaiDecode $
+                BS.concat
+                  [ "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"type\":\"function\",\"function\":{\"name\":\"list_dir\",\"arguments\":\"\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\".\\\"}\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                  ]
+        evs
+          @?= [ ToolUseStart "call_9" "list_dir",
+                ToolUseDelta "call_9" "{\"path\":",
+                ToolUseDelta "call_9" "\".\"}",
+                ToolUseEnd "call_9",
+                Done ToolUse
+              ],
+      testCase "reassembles lines split across chunk boundaries" $ do
+        let sample = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+            byteAtATime = let (st, evs) = BS.foldl' stepB (XS.initSse, []) sample in [e | Right e <- evs <> XS.sseEof st]
+            stepB (s, acc) b = let (s', more) = XS.ssePush s (BS.singleton b) in (s', acc <> more)
+        byteAtATime @?= [TextDelta "hi", Done EndTurn],
+      testCase "maps finish reasons" $ do
+        XS.mapStop "stop" @?= EndTurn
+        XS.mapStop "length" @?= MaxTokens
+        XS.mapStop "tool_calls" @?= ToolUse
+        XS.mapStop "weird" @?= Other "weird"
+    ]
+  where
+    roleAt msgs i = strAt msgs i ["role"]
+    -- Walk a path of object keys / array indices into the i-th message, returning a leaf string.
+    strAt msgs i path = case drop i msgs of
+      (m : _) -> walk path m
+      [] -> Nothing
+    walk [] (String s) = Just s
+    walk (k : ks) (Object o) = KM.lookup (K.fromText k) o >>= walk ks
+    walk (k : ks) (Array a) = case reads (T.unpack k) of
+      [(n, "")] | n >= 0 && n < V.length a -> walk ks (a V.! n)
+      _ -> Nothing
+    walk _ _ = Nothing
 
 -- Run an action in a fresh temp directory, cleaned up afterwards.
 withTmp :: String -> (FilePath -> IO a) -> IO a

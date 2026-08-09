@@ -1,5 +1,5 @@
 -- | The command-line entry point, ported (core subset) from Rust @lvz-cli@. Two modes over the same
--- plumbing: a one-shot @ask@ (no tools) and the @--agent@ tool loop. Providers: Anthropic + Google + claude-cli
+-- plumbing: a one-shot @ask@ (no tools) and the @--agent@ tool loop. Providers: Anthropic + Google + xAI + claude-cli
 -- (@--provider@); other providers reject with a clear message.
 --
 -- Rendering mirrors the Rust CLI: answer text on stdout; thinking\/tool activity, usage, and the
@@ -39,6 +39,7 @@ import Lavoisier.Protocol.Tune (Tuner, noopTuner)
 import Lavoisier.Provider.Anthropic (anthropicFromEnv)
 import Lavoisier.Provider.ClaudeCli (claudeCliFromEnv)
 import Lavoisier.Provider.Google (googleFromEnv)
+import Lavoisier.Provider.Xai (xaiFromEnv)
 import Lavoisier.Tool.Registry (ToolRegistry, registerTools, withBuiltins)
 import Lavoisier.Tune (LearningTuner, asTuner, defaultTuneConfig, learningTuner, loadTuner, saveTuner)
 import Lavoisier.Tune.Bayes (BayesTuner, asBayesTuner, bayesTuner, loadBayes, saveBayes)
@@ -81,7 +82,7 @@ optionsParser :: Parser Options
 optionsParser =
   Options
     <$> switch (long "agent" <> help "Run the plan->act->observe tool loop instead of a single ask")
-    <*> optional (strOption (long "provider" <> metavar "PROVIDER" <> help "Model provider (anthropic|google|claude-cli; default anthropic)"))
+    <*> optional (strOption (long "provider" <> metavar "PROVIDER" <> help "Model provider (anthropic|google|xai|claude-cli; default anthropic)"))
     <*> optional (strOption (long "model" <> metavar "MODEL" <> help "Model id"))
     <*> optional (option thinkingReader (long "thinking" <> metavar "LEVEL" <> help "off|low|medium|high"))
     <*> optional (option auto (long "max-tokens" <> metavar "N" <> help "Generated-token ceiling"))
@@ -149,7 +150,7 @@ runCli = do
       info
         (optionsParser <**> helper)
         ( fullDesc
-            <> progDesc "Token-efficient CLI coding agent (Haskell port): ask, --agent, or --serve*; Anthropic + Google + claude-cli."
+            <> progDesc "Token-efficient CLI coding agent (Haskell port): ask, --agent, or --serve*; Anthropic + Google + xAI + claude-cli."
             <> header "lav - lavoisier"
         )
 
@@ -219,8 +220,9 @@ selectProvider :: String -> IO (Either Text (Provider, Text))
 selectProvider name = case name of
   "anthropic" -> tag "claude-sonnet-4-5" <$> anthropicFromEnv
   "google" -> tag "gemini-2.5-flash" <$> googleFromEnv
+  "xai" -> tag "grok-4" <$> xaiFromEnv
   "claude-cli" -> tag "sonnet" <$> claudeCliFromEnv
-  other -> pure (Left ("unsupported provider: " <> T.pack other <> " (anthropic|google|claude-cli)"))
+  other -> pure (Left ("unsupported provider: " <> T.pack other <> " (anthropic|google|xai|claude-cli)"))
   where
     tag def = either (Left . tshow) (\p -> Right (p, def))
 
