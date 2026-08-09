@@ -30,7 +30,19 @@ module Lavoisier.Protocol.Message
   )
 where
 
-import Data.Aeson (Value)
+import Data.Aeson
+  ( FromJSON (..),
+    ToJSON (..),
+    Value,
+    object,
+    withObject,
+    withText,
+    (.!=),
+    (.:),
+    (.:?),
+    (.=),
+  )
+import Data.Aeson.Types (Parser)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word32)
@@ -210,3 +222,70 @@ chatRequest model =
       crMcpServers = [],
       crBuiltinTools = []
     }
+
+-- --- JSON for the transcript types (Role, MediaSource, ContentBlock, Message) --------------------
+--
+-- Used to persist a session transcript (see "Lavoisier.Memory"). The tags reproduce the Rust
+-- @lvz-protocol@ serde shapes: @Role@ snake_case; @ContentBlock@ tagged @type@; @MediaSource@ tagged
+-- @kind@. The boolean flags are always emitted here (Rust skips them when false, but reads them
+-- either way; our decoder defaults a missing flag to @False@).
+
+instance ToJSON Role where
+  toJSON User = "user"
+  toJSON Assistant = "assistant"
+
+instance FromJSON Role where
+  parseJSON = withText "Role" $ \case
+    "user" -> pure User
+    "assistant" -> pure Assistant
+    t -> fail ("unknown role: " <> show t)
+
+instance ToJSON MediaSource where
+  toJSON = \case
+    SrcBase64 mt d -> object ["kind" .= t "base64", "media_type" .= mt, "data" .= d]
+    SrcUrl u -> object ["kind" .= t "url", "url" .= u]
+    SrcFile f -> object ["kind" .= t "file", "file_id" .= f]
+    SrcPlainText txt -> object ["kind" .= t "plain_text", "text" .= txt]
+    where
+      t = id :: Text -> Text
+
+instance FromJSON MediaSource where
+  parseJSON = withObject "MediaSource" $ \o -> do
+    kind <- o .: "kind" :: Parser Text
+    case kind of
+      "base64" -> SrcBase64 <$> o .: "media_type" <*> o .: "data"
+      "url" -> SrcUrl <$> o .: "url"
+      "file" -> SrcFile <$> o .: "file_id"
+      "plain_text" -> SrcPlainText <$> o .: "text"
+      _ -> fail ("unknown media kind: " <> show kind)
+
+instance ToJSON ContentBlock where
+  toJSON = \case
+    TextBlock txt c -> object ["type" .= t "text", "text" .= txt, "cache" .= c]
+    ThinkingBlock txt -> object ["type" .= t "thinking", "text" .= txt]
+    ImageBlock src -> object ["type" .= t "image", "source" .= src]
+    DocumentBlock src cit -> object ["type" .= t "document", "source" .= src, "citations" .= cit]
+    ToolUseBlock i n inp -> object ["type" .= t "tool_use", "id" .= i, "name" .= n, "input" .= inp]
+    ToolResultBlock tuid c e ->
+      object ["type" .= t "tool_result", "tool_use_id" .= tuid, "content" .= c, "is_error" .= e]
+    where
+      t = id :: Text -> Text
+
+instance FromJSON ContentBlock where
+  parseJSON = withObject "ContentBlock" $ \o -> do
+    ty <- o .: "type" :: Parser Text
+    case ty of
+      "text" -> TextBlock <$> o .: "text" <*> o .:? "cache" .!= False
+      "thinking" -> ThinkingBlock <$> o .: "text"
+      "image" -> ImageBlock <$> o .: "source"
+      "document" -> DocumentBlock <$> o .: "source" <*> o .:? "citations" .!= False
+      "tool_use" -> ToolUseBlock <$> o .: "id" <*> o .: "name" <*> o .: "input"
+      "tool_result" ->
+        ToolResultBlock <$> o .: "tool_use_id" <*> o .: "content" <*> o .:? "is_error" .!= False
+      _ -> fail ("unknown content type: " <> show ty)
+
+instance ToJSON Message where
+  toJSON (Message r c) = object ["role" .= r, "content" .= c]
+
+instance FromJSON Message where
+  parseJSON = withObject "Message" $ \o -> Message <$> o .: "role" <*> o .: "content"

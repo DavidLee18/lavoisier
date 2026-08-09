@@ -3,7 +3,7 @@
 
 module Main (main) where
 
-import Data.Aeson (decode, encode, object, (.=))
+import Data.Aeson (Value (..), decode, encode, object, (.=))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
@@ -18,7 +18,7 @@ import Lavoisier.Protocol.Agent (AgentError (..), AgentHandle (..), turnRequest)
 import Lavoisier.Protocol.Event
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider
-import Lavoisier.Memory (SessionStore (..), newInMemoryStore, sessionAgentHandle, trimTo)
+import Lavoisier.Memory (SessionStore (..), newFileStore, newInMemoryStore, sessionAgentHandle, trimTo)
 import Lavoisier.Protocol.Stream (drain, fromList)
 import Lavoisier.Protocol.Tool
 import Lavoisier.Provider.Anthropic (buildBody)
@@ -30,7 +30,7 @@ import Network.Wai (defaultRequest, pathInfo, requestHeaders, requestMethod)
 import Network.Wai.Test (SRequest (..), runSession, simpleBody, simpleStatus, srequest)
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
 import System.FilePath ((</>))
-import Test.QuickCheck (Arbitrary (..), Gen, choose, oneof)
+import Test.QuickCheck (Arbitrary (..), Gen, choose, elements, listOf, oneof, resize)
 import Test.Tasty
 import Test.Tasty.HUnit
 import Test.Tasty.QuickCheck (Property, testProperty, (===))
@@ -92,14 +92,47 @@ instance Arbitrary Event where
         Done <$> arbitrary
       ]
 
+genValue :: Gen Value
+genValue = oneof [pure Null, String <$> genText]
+
+instance Arbitrary Role where
+  arbitrary = elements [User, Assistant]
+
+instance Arbitrary MediaSource where
+  arbitrary =
+    oneof
+      [ SrcBase64 <$> genText <*> genText,
+        SrcUrl <$> genText,
+        SrcFile <$> genText,
+        SrcPlainText <$> genText
+      ]
+
+instance Arbitrary ContentBlock where
+  arbitrary =
+    oneof
+      [ TextBlock <$> genText <*> arbitrary,
+        ThinkingBlock <$> genText,
+        ImageBlock <$> arbitrary,
+        DocumentBlock <$> arbitrary <*> arbitrary,
+        ToolUseBlock <$> genText <*> genText <*> genValue,
+        ToolResultBlock <$> genText <*> genText <*> arbitrary
+      ]
+
+instance Arbitrary Message where
+  arbitrary = Message <$> arbitrary <*> resize 4 (listOf arbitrary)
+
 jsonProperties :: TestTree
 jsonProperties =
   testGroup
     "JSON round-trips (QuickCheck)"
     [ testProperty "Event encodes/decodes to itself" prop_eventRoundtrip,
       testProperty "StopReason encodes/decodes to itself" prop_stopRoundtrip,
-      testProperty "Usage encodes/decodes to itself" prop_usageRoundtrip
+      testProperty "Usage encodes/decodes to itself" prop_usageRoundtrip,
+      testProperty "Message encodes/decodes to itself" prop_messageRoundtrip
     ]
+
+prop_messageRoundtrip :: Message -> Property
+prop_messageRoundtrip m = decode (encode m) === Just m
 
 prop_eventRoundtrip :: Event -> Property
 prop_eventRoundtrip ev = decode (encode ev) === Just ev
@@ -228,7 +261,7 @@ toolTests :: TestTree
 toolTests =
   testGroup
     "builtin tools"
-    [ testCase "write_file then read_file round-trips" $ withTmp $ \dir -> do
+    [ testCase "write_file then read_file round-trips" $ withTmp "tools" $ \dir -> do
         let f = dir </> "hi.txt"
         wr <- toolInvoke writeFileTool (object ["path" .= T.pack f, "content" .= ("hello hs" :: Text)])
         case wr of
@@ -271,7 +304,7 @@ agentTests :: TestTree
 agentTests =
   testGroup
     "agent loop"
-    [ testCase "runs a tool round-trip then finishes" $ withTmp $ \dir -> do
+    [ testCase "runs a tool round-trip then finishes" $ withTmp "agent" $ \dir -> do
         let f = dir </> "agent.txt"
             args =
               decodeUtf8Lenient . BL.toStrict . encode $
@@ -382,14 +415,22 @@ memoryTests =
         runTurn "again"
         transcript <- loadSession store "s"
         length transcript @?= 4
-        map msgRole transcript @?= [User, Assistant, User, Assistant]
+        map msgRole transcript @?= [User, Assistant, User, Assistant],
+      testCase "file store persists across instances and trims" $ withTmp "filestore" $ \dir -> do
+        s1 <- newFileStore dir (Just 2)
+        saveSession s1 "sess/one" [userMessage "a", assistantMessage "b", userMessage "c"]
+        -- A fresh store instance over the same dir reads what the first persisted.
+        s2 <- newFileStore dir (Just 2)
+        back <- loadSession s2 "sess/one"
+        length back @?= 2
+        map msgRole back @?= [Assistant, User]
     ]
 
 -- Run an action in a fresh temp directory, cleaned up afterwards.
-withTmp :: (FilePath -> IO a) -> IO a
-withTmp k = do
+withTmp :: String -> (FilePath -> IO a) -> IO a
+withTmp name k = do
   base <- getTemporaryDirectory
-  let dir = base </> "lavoisier-hs-test"
+  let dir = base </> ("lavoisier-hs-test-" <> name)
   createDirectoryIfMissing True dir
   r <- k dir
   removeDirectoryRecursive dir

@@ -18,7 +18,7 @@ import Data.Text.IO qualified as TIO
 import Data.Word (Word32)
 import Lavoisier.Agent
 import Lavoisier.Gateway.Http (defaultGatewayConfig, httpGateway)
-import Lavoisier.Memory (newInMemoryStore, sessionAgentHandle)
+import Lavoisier.Memory (newFileStore, newInMemoryStore, sessionAgentHandle)
 import Lavoisier.Protocol.Agent (turnRequest)
 import Lavoisier.Protocol.Event
 import Lavoisier.Protocol.Gateway (Gateway (..))
@@ -39,6 +39,7 @@ data Options = Options
     optThinking :: Maybe ThinkingLevel,
     optMaxTokens :: Maybe Word32,
     optServe :: Maybe Int,
+    optSessionDir :: Maybe FilePath,
     optWords :: [String]
   }
 
@@ -57,6 +58,7 @@ optionsParser =
     <*> optional (option thinkingReader (long "thinking" <> metavar "LEVEL" <> help "off|low|medium|high"))
     <*> optional (option auto (long "max-tokens" <> metavar "N" <> help "Generated-token ceiling"))
     <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
+    <*> optional (strOption (long "session-dir" <> metavar "DIR" <> help "Persist gateway session transcripts under DIR (durable file store; default in-memory)"))
     <*> many (argument str (metavar "PROMPT..."))
 
 thinkingReader :: ReadM ThinkingLevel
@@ -121,7 +123,7 @@ runServe prov opts model port = do
       cfg = base {acThinking = optThinking opts, acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts)}
       agent = Agent prov withBuiltins cfg
       gw = httpGateway port defaultGatewayConfig
-  store <- newInMemoryStore (Just 200)
+  store <- maybe (newInMemoryStore (Just 200)) (`newFileStore` Just 200) (optSessionDir opts)
   herr ("HTTP gateway listening on port " <> tshow port <> " (POST /v1/turns, GET /health)")
   res <- gatewayServe gw (sessionAgentHandle store agent)
   case res of
