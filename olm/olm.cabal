@@ -1,0 +1,52 @@
+cabal-version:      3.0
+name:               olm
+version:            0.1.0
+synopsis:           Thin Haskell FFI bindings to libolm (Olm/Megolm E2EE primitives).
+description:
+  Low-level bindings to the reference Olm/Megolm C library (libolm): accounts, one-time keys,
+  1:1 Olm sessions, and Megolm inbound/outbound group sessions, plus pickling and the Ed25519/
+  SHA-256 utilities. Used by the Lavoisier Matrix gateway's end-to-end encryption. No SDK — a
+  direct `foreign import ccall` binding, matching the workspace's minimal-dependency convention.
+
+license:            MIT
+author:             Jaehyun Lee
+maintainer:         djwodus@gmail.com
+category:           Cryptography
+build-type:         Simple
+
+common lang
+  default-language:   GHC2021
+  default-extensions:
+    OverloadedStrings
+    LambdaCase
+    ImportQualifiedPost
+    DerivingStrategies
+  ghc-options:
+    -Wall -Werror
+    -Wincomplete-patterns -Wincomplete-uni-patterns
+    -Wincomplete-record-updates
+
+library
+  import:           lang
+  hs-source-dirs:   src
+  exposed-modules:
+    Crypto.Olm
+    Crypto.Olm.FFI
+  build-depends:
+    , base        >=4.19 && <5
+    , bytestring
+  extra-libraries:  olm
+
+test-suite olm-test
+  import:           lang
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Main.hs
+  build-depends:
+    , aeson
+    , base
+    , bytestring
+    , olm
+    , tasty
+    , tasty-hunit
+    , text
