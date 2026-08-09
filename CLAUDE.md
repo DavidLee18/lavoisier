@@ -18,9 +18,11 @@ Complete and live-verified against real `XAI_API_KEY`, `ANTHROPIC_API_KEY`, and 
 the original 17 crates, provider streaming (SSE + xAI gRPC), the agent loop, the token engine,
 session memory, the HTTP/Matrix/Slack/cron gateways, AWS packaging (`infra/`), and the ATO learner.
 The three protocol-interop crates added since — `lvz-mcp` (MCP client), `lvz-gw-a2a` (A2A server),
-`lvz-gw-acp` (ACP server) — are unit-tested (offline, against in-process mock servers/pipes) with
-**live verification against real external MCP servers / A2A / ACP clients still pending**, 20 crates
-in all. `cargo test`, `cargo clippy --all-targets`, and `cargo fmt --check` are kept green.
+`lvz-gw-acp` (ACP server) — are unit-tested offline (in-process mock servers/pipes) **and
+live-smoke-verified** end-to-end with real Anthropic turns: MCP against a real stdio MCP server (the
+model called a discovered, namespaced tool), and the A2A/ACP gateways over `curl` (agent card /
+manifest, sync `message/send` / `POST /runs`, SSE streaming, and the error paths). 20 crates in all.
+`cargo test`, `cargo clippy --all-targets`, and `cargo fmt --check` are kept green.
 
 The **cron gateway** (`lvz-gw-cron`, `--cron`/`--cron-file`) is an in-process scheduler shaped as a
 `Gateway`: it fires `TurnRequest`s on a hand-rolled UTC cron schedule (no `chrono`/`cron` dep) into
