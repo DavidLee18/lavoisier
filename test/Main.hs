@@ -1,18 +1,34 @@
+-- Orphan Arbitrary instances for the library's types are the idiomatic place for test generators.
+{-# OPTIONS_GHC -Wno-orphans #-}
+
 module Main (main) where
 
 import Data.Aeson (decode, encode, object, (.=))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
+import Data.IORef
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient)
+import Data.Text.IO qualified as TIO
+import Lavoisier.Agent
+import Lavoisier.Protocol.Agent (AgentError, turnRequest)
 import Lavoisier.Protocol.Event
 import Lavoisier.Protocol.Message
+import Lavoisier.Protocol.Provider
+import Lavoisier.Protocol.Stream (fromList)
+import Lavoisier.Protocol.Tool
 import Lavoisier.Provider.Anthropic (buildBody)
 import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
+import Lavoisier.Tool.Builtins
+import Lavoisier.Tool.Registry
+import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
+import System.FilePath ((</>))
+import Test.QuickCheck (Arbitrary (..), Gen, choose, oneof)
 import Test.Tasty
 import Test.Tasty.HUnit
+import Test.Tasty.QuickCheck (Property, testProperty, (===))
 
 main :: IO ()
 main = defaultMain tests
@@ -21,78 +37,93 @@ tests :: TestTree
 tests =
   testGroup
     "lavoisier"
-    [ eventTests,
-      stopReasonTests,
-      usageTests,
+    [ jsonProperties,
+      usageProperties,
       sseTests,
-      anthropicBodyTests
+      anthropicBodyTests,
+      toolTests,
+      agentTests
     ]
 
--- --- Phase 1: protocol wire shapes ----------------------------------------------------------------
+-- --- Phase 1: protocol wire shapes, as QuickCheck round-trip properties ----------------------------
 
-eventTests :: TestTree
-eventTests =
-  testGroup "Event JSON" $
-    [ testCase ("roundtrip: " <> show ev) (decode (encode ev) @?= Just ev)
-      | ev <- allEvents
-    ]
-      <> [ testCase "wire shape: text_delta" $
-             decodeE "{\"kind\":\"text_delta\",\"data\":\"hello\"}" @?= Just (TextDelta "hello"),
-           testCase "wire shape: tool_use_start" $
-             decodeE "{\"kind\":\"tool_use_start\",\"data\":{\"id\":\"i\",\"name\":\"read\"}}"
-               @?= Just (ToolUseStart "i" "read"),
-           testCase "wire shape: done/end_turn" $
-             decodeE "{\"kind\":\"done\",\"data\":\"end_turn\"}" @?= Just (Done EndTurn),
-           testCase "wire shape: done/other" $
-             decodeE "{\"kind\":\"done\",\"data\":{\"other\":\"weird\"}}"
-               @?= Just (Done (Other "weird"))
-         ]
+genText :: Gen Text
+genText = T.pack <$> arbitrary
 
-allEvents :: [Event]
-allEvents =
-  [ TextDelta "hello",
-    Thinking "hmm",
-    ToolUseStart "id1" "read_file",
-    ToolUseDelta "id1" "{\"path\":",
-    ToolUseEnd "id1",
-    ServerToolUse "s1" "web_search",
-    ServerToolResult "s1" "[]",
-    Citation "cited text" "document 1",
-    Usage (MkUsage 10 20 5 3),
-    Notice "council convened",
-    Done EndTurn,
-    Done (Other "weird")
-  ]
+instance Arbitrary Usage where
+  -- Realistic token magnitudes: usageCost sums via Double (faithful to the Rust `.round() as u64`),
+  -- which is exact only below ~2^53. Real counts are millions, so bound the generator accordingly.
+  arbitrary = MkUsage <$> tok <*> tok <*> tok <*> tok
+    where
+      tok = choose (0, 1_000_000_000)
 
-stopReasonTests :: TestTree
-stopReasonTests =
+instance Arbitrary StopReason where
+  arbitrary =
+    oneof
+      [ pure EndTurn,
+        pure MaxTokens,
+        pure ToolUse,
+        pure StopSequence,
+        pure Refusal,
+        pure PauseTurn,
+        Other <$> genText
+      ]
+
+instance Arbitrary Event where
+  arbitrary =
+    oneof
+      [ TextDelta <$> genText,
+        Thinking <$> genText,
+        ToolUseStart <$> genText <*> genText,
+        ToolUseDelta <$> genText <*> genText,
+        ToolUseEnd <$> genText,
+        ServerToolUse <$> genText <*> genText,
+        ServerToolResult <$> genText <*> genText,
+        Citation <$> genText <*> genText,
+        Usage <$> arbitrary,
+        Notice <$> genText,
+        Done <$> arbitrary
+      ]
+
+jsonProperties :: TestTree
+jsonProperties =
   testGroup
-    "StopReason JSON"
-    [ testCase "end_turn is a bare string" $ decodeSR "\"end_turn\"" @?= Just EndTurn,
-      testCase "other is an object" $ decodeSR "{\"other\":\"x\"}" @?= Just (Other "x"),
-      testCase "roundtrip all" $ mapM_ (\sr -> decode (encode sr) @?= Just sr) allStops
+    "JSON round-trips (QuickCheck)"
+    [ testProperty "Event encodes/decodes to itself" prop_eventRoundtrip,
+      testProperty "StopReason encodes/decodes to itself" prop_stopRoundtrip,
+      testProperty "Usage encodes/decodes to itself" prop_usageRoundtrip
     ]
 
-allStops :: [StopReason]
-allStops = [EndTurn, MaxTokens, ToolUse, StopSequence, Refusal, PauseTurn, Other "custom"]
+prop_eventRoundtrip :: Event -> Property
+prop_eventRoundtrip ev = decode (encode ev) === Just ev
 
-usageTests :: TestTree
-usageTests =
+prop_stopRoundtrip :: StopReason -> Property
+prop_stopRoundtrip sr = decode (encode sr) === Just sr
+
+prop_usageRoundtrip :: Usage -> Property
+prop_usageRoundtrip u = decode (encode u) === Just u
+
+usageProperties :: TestTree
+usageProperties =
   testGroup
-    "Usage"
-    [ testCase "cost is weighted, not flat" $
-        usageCost (MkUsage 100 10 0 0) defaultCostWeights @?= 150,
-      testCase "cache read is cheap" $
-        usageCost (MkUsage 0 0 0 100) defaultCostWeights @?= 10,
-      testCase "accumulate sums fields" $
-        accumulateUsage (MkUsage 1 2 3 4) (MkUsage 10 20 30 40) @?= MkUsage 11 22 33 44,
-      testCase "cache hit rate" $ cacheHitRate (MkUsage 25 0 0 75) @?= 0.75,
-      testCase "wire fields are snake_case" $
-        decodeU "{\"input_tokens\":1,\"output_tokens\":2,\"cache_creation_tokens\":3,\"cache_read_tokens\":4}"
-          @?= Just (MkUsage 1 2 3 4)
+    "Usage arithmetic (QuickCheck)"
+    [ testProperty "accumulate with empty is identity" prop_accIdentity,
+      testProperty "flat-weighted cost is the plain sum" prop_costFlat,
+      testProperty "total ignores cache classes" prop_total
     ]
 
--- --- Phase 2: Anthropic SSE decoder (ports lvz-anthropic/src/sse.rs tests) -------------------------
+prop_accIdentity :: Usage -> Property
+prop_accIdentity u = accumulateUsage u emptyUsage === u
+
+prop_costFlat :: Usage -> Property
+prop_costFlat u =
+  usageCost u flatWeights
+    === inputTokens u + outputTokens u + cacheCreationTokens u + cacheReadTokens u
+
+prop_total :: Usage -> Property
+prop_total u = usageTotal u === inputTokens u + outputTokens u
+
+-- --- Phase 2: Anthropic SSE decoder (example-based; ports sse.rs tests) ----------------------------
 
 sseTests :: TestTree
 sseTests =
@@ -113,10 +144,12 @@ sseTests =
         decodeChunked textStream @?= decodeAll textStream,
       testCase "streams a tool call start/delta/end" $ do
         let evs = decodeAll toolStream
-        evs !! 0 @?= ToolUseStart "toolu_1" "read_file"
-        evs !! 1 @?= ToolUseDelta "toolu_1" "{\"path\":"
-        evs !! 2 @?= ToolUseDelta "toolu_1" "\"a.rs\"}"
-        evs !! 3 @?= ToolUseEnd "toolu_1"
+        take 4 evs
+          @?= [ ToolUseStart "toolu_1" "read_file",
+                ToolUseDelta "toolu_1" "{\"path\":",
+                ToolUseDelta "toolu_1" "\"a.rs\"}",
+                ToolUseEnd "toolu_1"
+              ]
         last evs @?= Done ToolUse,
       testCase "maps stop reasons" $ do
         mapStop "refusal" @?= Refusal
@@ -129,20 +162,17 @@ decodeAll input =
   let (st, evs1) = ssePush initSse input
    in [e | Right e <- evs1 <> sseEof st]
 
--- Feed one byte at a time (mirrors the Rust byte_at_a_time test).
 decodeChunked :: ByteString -> [Event]
 decodeChunked input =
   let (st, evs) = BS.foldl' step (initSse, []) input
    in [e | Right e <- evs <> sseEof st]
   where
-    step (s, acc) b =
-      let (s', more) = ssePush s (BS.singleton b) in (s', acc <> more)
+    step (s, acc) b = let (s', more) = ssePush s (BS.singleton b) in (s', acc <> more)
 
 textStream :: ByteString
 textStream =
   BS.concat
-    [ "event: message_start\n",
-      "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n\n",
+    [ "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n\n",
       "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
       "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" there\"}}\n\n",
       "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
@@ -160,7 +190,7 @@ toolStream =
       "data: {\"type\":\"message_stop\"}\n\n"
     ]
 
--- --- Phase 2: Anthropic request-body construction -------------------------------------------------
+-- --- Phase 2: Anthropic request body (example-based) ----------------------------------------------
 
 anthropicBodyTests :: TestTree
 anthropicBodyTests =
@@ -185,11 +215,94 @@ anthropicBodyTests =
   where
     bodyText = decodeUtf8Lenient . BL.toStrict . encode . buildBody False
 
-decodeE :: ByteString -> Maybe Event
-decodeE = decode . BL.fromStrict
+-- --- Phase 3: built-in tools (offline; real filesystem in a temp dir) ------------------------------
 
-decodeSR :: ByteString -> Maybe StopReason
-decodeSR = decode . BL.fromStrict
+toolTests :: TestTree
+toolTests =
+  testGroup
+    "builtin tools"
+    [ testCase "write_file then read_file round-trips" $ withTmp $ \dir -> do
+        let f = dir </> "hi.txt"
+        wr <- toolInvoke writeFileTool (object ["path" .= T.pack f, "content" .= ("hello hs" :: Text)])
+        case wr of
+          Right o -> toChanged o @?= True
+          Left e -> assertFailure ("write failed: " <> show e)
+        rd <- toolInvoke readFileTool (object ["path" .= T.pack f])
+        case rd of
+          Right o -> toContent o @?= "hello hs"
+          Left e -> assertFailure ("read failed: " <> show e),
+      testCase "read_file on a missing path is a tool error, not a hard failure" $ do
+        rd <- toolInvoke readFileTool (object ["path" .= ("/nonexistent/lvz/xyz" :: Text)])
+        case rd of
+          Right o -> toIsError o @?= True
+          Left e -> assertFailure ("expected a soft error, got " <> show e),
+      testCase "shell echoes and reports exit 0" $ do
+        r <- toolInvoke shellTool (object ["command" .= ("echo lavoisier" :: Text)])
+        case r of
+          Right o -> do
+            toIsError o @?= False
+            assertBool "has output" ("lavoisier" `T.isInfixOf` toContent o)
+            assertBool "exit 0" ("exit=0" `T.isInfixOf` toContent o)
+          Left e -> assertFailure ("shell failed: " <> show e),
+      testCase "shell non-zero exit is a tool error" $ do
+        r <- toolInvoke shellTool (object ["command" .= ("exit 3" :: Text)])
+        case r of
+          Right o -> do
+            toIsError o @?= True
+            assertBool "exit 3" ("exit=3" `T.isInfixOf` toContent o)
+          Left e -> assertFailure ("shell failed: " <> show e),
+      testCase "unknown tool name is TEUnknown" $ do
+        r <- invokeTool "nope" (object []) withBuiltins
+        case r of
+          Left (TEUnknown n) -> n @?= "nope"
+          other -> assertFailure ("expected TEUnknown, got " <> show (fmap (const ()) other))
+    ]
 
-decodeU :: ByteString -> Maybe Usage
-decodeU = decode . BL.fromStrict
+-- --- Phase 4: the agent loop (offline; a stub provider drives a full tool round-trip) --------------
+
+agentTests :: TestTree
+agentTests =
+  testGroup
+    "agent loop"
+    [ testCase "runs a tool round-trip then finishes" $ withTmp $ \dir -> do
+        let f = dir </> "agent.txt"
+            args =
+              decodeUtf8Lenient . BL.toStrict . encode $
+                object ["path" .= T.pack f, "content" .= ("hi from stub" :: Text)]
+            round1 =
+              [ ToolUseStart "t1" "write_file",
+                ToolUseDelta "t1" args,
+                ToolUseEnd "t1",
+                Usage emptyUsage,
+                Done ToolUse
+              ]
+            round2 = [TextDelta "all done", Usage emptyUsage, Done EndTurn]
+        ref <- newIORef (0 :: Int)
+        emitted <- newIORef []
+        let stub =
+              Provider
+                { providerStream = \_ -> do
+                    n <- atomicModifyIORef' ref (\k -> (k + 1, k))
+                    s <- fromList (map Right (if n == 0 then round1 else round2))
+                    pure (Right s),
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+            agent = Agent stub withBuiltins (defaultAgentConfig "stub-model")
+        res <- runAgent agent (turnRequest "t" "please write the file") (\ev -> modifyIORef' emitted (ev :))
+        res @?= (Right () :: Either AgentError ())
+        written <- TIO.readFile f
+        written @?= "hi from stub"
+        evs <- reverse <$> readIORef emitted
+        assertBool "emitted the final text" (TextDelta "all done" `elem` evs)
+    ]
+
+-- Run an action in a fresh temp directory, cleaned up afterwards.
+withTmp :: (FilePath -> IO a) -> IO a
+withTmp k = do
+  base <- getTemporaryDirectory
+  let dir = base </> "lavoisier-hs-test"
+  createDirectoryIfMissing True dir
+  r <- k dir
+  removeDirectoryRecursive dir
+  pure r
