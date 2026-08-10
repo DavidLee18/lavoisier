@@ -15,7 +15,8 @@
 #![warn(missing_docs)]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -152,12 +153,93 @@ impl FileStore {
     }
 }
 
+/// Per-process write counter, so each [`atomic_write`] temp file has a unique name even under
+/// concurrent writers (paired with the pid it is unique across processes on a shared dir too).
+static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Durably replace `path`'s contents with `bytes`: write a sibling temp file, flush it to disk, then
+/// atomically `rename` it over the target.
+///
+/// `rename(2)` is atomic on POSIX and on EFS/NFS (within one filesystem — hence a temp file in the
+/// *same* directory), so a crash mid-write can never leave a torn file, and a concurrent reader sees
+/// either the old contents or the new, never a partial mix. This is what stops a mid-write
+/// SIGKILL/OOM/task-replacement from truncating a transcript into unparseable JSON that [`load`](FileStore::load)
+/// would then read as an empty session.
+async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("session");
+    // Hidden, unique-per-write temp name in the same dir: pid + a monotonic counter.
+    let tmp = dir.join(format!(
+        ".{stem}.{}.{}.tmp",
+        std::process::id(),
+        WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    // Write + flush + fsync the temp file, then swap it in. Clean up the temp file on any failure so
+    // a transient error can't litter the dir.
+    let write = async {
+        let mut f = tokio::fs::File::create(&tmp).await?;
+        f.write_all(bytes).await?;
+        f.sync_all().await?; // durable before the rename makes it visible
+        Ok::<(), std::io::Error>(())
+    };
+    if let Err(e) = write.await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl SessionStore for FileStore {
     async fn load(&self, session: &str) -> Vec<Message> {
-        match tokio::fs::read(self.path_for(session)).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => Vec::new(), // missing/unreadable ⇒ fresh session
+        let path = self.path_for(session);
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            // A missing file is the normal "fresh session" case — silent.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            // Any other read error (permissions, I/O) is worth surfacing, not swallowing silently.
+            Err(e) => {
+                tracing::error!(
+                    session = %path.display(),
+                    error = %e,
+                    "cannot read session file; starting empty",
+                );
+                return Vec::new();
+            }
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(history) => history,
+            // A file that exists but won't parse means corruption — a partial write from before
+            // atomic saves, external tampering, or disk damage. Do NOT silently reset to empty and
+            // let the next save overwrite the evidence: set it aside as `.corrupt` and log loudly, so
+            // the transcript loss is visible and recoverable rather than a silent wipe.
+            Err(e) => {
+                let corrupt = path.with_extension("corrupt");
+                tracing::error!(
+                    session = %path.display(),
+                    error = %e,
+                    preserved_as = %corrupt.display(),
+                    "session file is corrupt; preserving it and starting empty",
+                );
+                if let Err(re) = tokio::fs::rename(&path, &corrupt).await {
+                    tracing::error!(
+                        session = %path.display(),
+                        error = %re,
+                        "could not set aside corrupt session file",
+                    );
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -172,17 +254,15 @@ impl SessionStore for FileStore {
             return;
         }
         let path = self.path_for(session);
-        match serde_json::to_vec_pretty(&history) {
-            Ok(bytes) => {
-                if let Err(e) = tokio::fs::write(&path, bytes).await {
-                    tracing::error!(
-                        session = %path.display(),
-                        error = %e,
-                        "cannot write session",
-                    );
-                }
+        let bytes = match serde_json::to_vec_pretty(&history) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(session = %session, error = %e, "cannot serialize session");
+                return;
             }
-            Err(e) => tracing::error!(session = %session, error = %e, "cannot serialize session"),
+        };
+        if let Err(e) = atomic_write(&path, &bytes).await {
+            tracing::error!(session = %path.display(), error = %e, "cannot write session");
         }
     }
 }
@@ -360,6 +440,58 @@ mod tests {
         assert_eq!(back.len(), 2);
         assert_eq!(back[1].text(), "3");
         assert!(reader.load("never-written").await.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn file_store_corrupt_file_is_preserved_not_silently_wiped() {
+        let dir = std::env::temp_dir().join(format!("lvz-memtest-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = "!room:hs";
+
+        let store = FileStore::new(&dir);
+        let path = store.path_for(session);
+
+        // Simulate a crash mid-write (pre-atomic behaviour): a truncated, unparseable file.
+        std::fs::write(&path, b"[{\"role\":\"user\",\"con").unwrap();
+
+        // load must not panic or return garbage — it starts empty …
+        assert!(store.load(session).await.is_empty());
+        // … and must NOT have silently discarded the evidence: the bad file is set aside, the live
+        // path is freed for a fresh save.
+        let corrupt = path.with_extension("corrupt");
+        assert!(corrupt.exists(), "corrupt file preserved as .corrupt");
+        assert!(!path.exists(), "corrupt file moved off the live path");
+
+        // A subsequent save writes a valid transcript and leaves the preserved evidence intact.
+        store.save(session, vec![Message::user("fresh")]).await;
+        assert_eq!(store.load(session).await.len(), 1);
+        assert!(
+            corrupt.exists(),
+            "preserved evidence survives the next save"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn file_store_atomic_write_leaves_no_temp_files() {
+        let dir = std::env::temp_dir().join(format!("lvz-memtest-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = FileStore::new(&dir);
+
+        store.save("s", vec![Message::user("hi")]).await;
+
+        // The temp file was renamed into place, not left behind.
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "no .tmp litter after an atomic save");
+        assert_eq!(store.load("s").await.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
