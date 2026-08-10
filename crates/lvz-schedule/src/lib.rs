@@ -90,11 +90,13 @@ pub struct ScheduleJob {
     pub room: Option<String>,
     /// Agent session for `Action::Prompt`, so a job accrues memory across fires.
     pub session: String,
-    /// Optional instruction to render a **successful** tool action's raw output as prose before it
-    /// is posted to the room. When set on an [`Action::Tool`] job, the tool still runs
-    /// deterministically; its output is then handed to a **tool-less** turn (empty allowlist) that
-    /// rewrites it under this instruction. `None` ⇒ post the raw output as before. A failure is
-    /// never summarised — its body carries the retry countdown the operator needs verbatim.
+    /// Optional instruction to render a tool action's raw output as prose before it is posted to the
+    /// room — for **both** outcomes (the owner's 2026-08-10 amendment; successes-only originally).
+    /// When set on an [`Action::Tool`] job, the tool still runs deterministically; its output (or the
+    /// error text) is then handed to a **tool-less** turn (empty allowlist) that rewrites it under
+    /// this instruction, prefixed with a `SUCCESS`/`FAILURE` line so the register matches. `None` ⇒
+    /// post the raw output as before. The verdict stays the tool's, and the ❌ marker + retry
+    /// countdown stay structural (composed outside the prose), so a paraphrase can never hide a failure.
     pub summarize: Option<String>,
     /// Retries after a failed fire; 0 = no retry.
     pub retry_max: u32,
@@ -262,8 +264,9 @@ pub struct FireReport {
 struct ActionOutcome {
     result: Result<String, String>,
     usage: Option<Usage>,
-    /// Prose rendering of a successful tool action's output, when the job set `summarize`. This is
-    /// what the room sees; `result` (the raw output) still drives the verdict and the history trail.
+    /// Prose rendering of the tool action's outcome (success or failure), when the job set
+    /// `summarize`. This is what the room sees; `result` (the raw output) still drives the verdict
+    /// and the history trail.
     summary: Option<String>,
     /// Tools the agent called, for a prompt job.
     tools_used: Vec<String>,
@@ -410,9 +413,10 @@ impl ScheduleRegistry {
 
     /// Fold one attempt's result into the job's state and build its report.
     ///
-    /// `summary` is the prose rendering of a successful tool action (present only when the job set
-    /// `summarize` and the render succeeded). The raw `result` still drives the verdict, the stored
-    /// `Outcome.detail`, and the history trail — only the posted body prefers the prose.
+    /// `summary` is the prose rendering of the tool action's outcome — success or failure — present
+    /// only when the job set `summarize` and the render succeeded. The raw `result` still drives the
+    /// verdict, the stored `Outcome.detail`, and the history trail — only the posted body prefers the
+    /// prose.
     fn record(
         &self,
         job: &ScheduleJob,
@@ -473,8 +477,10 @@ impl ScheduleRegistry {
             }
         }
 
-        // Prose when we have it, raw output otherwise. Failures never carry a summary, so the
-        // failure branch of `report_body` keeps receiving `detail` automatically.
+        // Prose when we have it, raw output otherwise. A failure summary (when the render succeeds)
+        // now lands in the detail slot too; `report_body` composes the ❌ marker and the retry
+        // countdown *around* it, so the failure structure survives the paraphrase, and a failed
+        // render still degrades to the raw error here.
         let shown = summary
             .map(|s| truncate(s, DETAIL_CAP))
             .unwrap_or_else(|| detail.clone());
@@ -508,11 +514,20 @@ async fn run_action(
                 Ok(out) if out.is_error => Err(format!("tool `{name}` reported: {}", out.content)),
                 Ok(out) => Ok(out.content),
             };
-            // Summarise a SUCCESSFUL fire only: a failure's body carries the retry countdown and the
-            // operator needs it verbatim, unsoftened by a model. The tool call itself never reaches
-            // a provider (nothing to bill); the summary turn does, so its usage flows in here.
+            // Summarise either outcome, labelling which it is (a leading SUCCESS/FAILURE line) so the
+            // model renders a failure in the register of a failure — the owner's 2026-08-10 amendment;
+            // successes-only originally. The tool call itself never reaches a provider (nothing to
+            // bill); the summary turn does, so its usage flows in here. A summary render that fails
+            // degrades to the raw output (see `record`/`summarise`), and the ❌ marker + retry
+            // countdown stay structural in `report_body`, outside the prose slot — so a paraphrase can
+            // never hide or soften a genuinely refused ATX power call.
             let (summary, usage) = match (&result, job.summarize.as_deref()) {
-                (Ok(raw), Some(instruction)) => summarise(job, agent, instruction, raw).await,
+                (Ok(raw), Some(instruction)) => {
+                    summarise(job, agent, instruction, &format!("SUCCESS\n{raw}")).await
+                }
+                (Err(err), Some(instruction)) => {
+                    summarise(job, agent, instruction, &format!("FAILURE\n{err}")).await
+                }
                 _ => (None, None),
             };
             ActionOutcome {
@@ -662,6 +677,7 @@ fn log_verbose(
                 max_attempts = job.retry_max + 1,
                 duration_ms = ms,
                 error = %error.trim(),
+                summary = outcome.summary.as_deref().unwrap_or("-"),
                 "job FAILED{tools_note}{usage_note}",
             );
         }
@@ -1236,9 +1252,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failing_tool_is_never_summarised() {
-        // A tool failure must reach the room verbatim (retry countdown intact); the summary agent
-        // must not even be consulted, so its softening can never leak in.
+    async fn a_failing_tool_is_summarised_without_losing_the_failure_structure() {
+        // The owner's 2026-08-10 amendment: failures are summarised too. The prose replaces the raw
+        // error in the detail slot, but the verdict stays the tool's and the ❌ marker + attempt
+        // counter + retry countdown stay structural. The payload the model sees is labelled FAILURE
+        // and carries the raw error, and the raw error is still stored for the operator trail.
         struct FailTool;
         #[async_trait::async_trait]
         impl lvz_protocol::Tool for FailTool {
@@ -1255,25 +1273,45 @@ mod tests {
                 Ok(lvz_protocol::ToolOutput::error("ATX call refused"))
             }
         }
-        struct PanicAgent;
-        #[async_trait::async_trait]
-        impl AgentHandle for PanicAgent {
-            async fn submit(
-                &self,
-                _turn: TurnRequest,
-            ) -> Result<
-                futures::stream::BoxStream<'static, Result<Event, lvz_protocol::AgentError>>,
-                lvz_protocol::AgentError,
-            > {
-                panic!("the summary agent must not be consulted for a failed fire");
-            }
-        }
+
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(FailTool));
-        let agent: Arc<dyn AgentHandle> = Arc::new(PanicAgent);
-        let reg = ScheduleRegistry::new(vec![summarising_job("w")]);
+        let seen = Arc::new(Mutex::new(None));
+        let agent: Arc<dyn AgentHandle> = Arc::new(StubAgent {
+            answer: "The wake FAILED: the power call was refused.".into(),
+            seen: seen.clone(),
+        });
+
+        // retry_max > 0 so the countdown line is present to assert it survives the paraphrase.
+        let mut j = summarising_job("w");
+        j.retry_max = 3;
+        j.retry_wait = 60;
+        let reg = ScheduleRegistry::new(vec![j]);
         let report = reg.fire(0, &tools, &agent).await.unwrap();
+
+        // Verdict stays the tool's; the failure structure is intact.
         assert!(!report.ok);
-        assert!(report.body.contains("ATX call refused"));
+        assert!(report.body.contains("❌"));
+        assert!(report.body.contains("attempt 1"));
+        assert!(report.body.contains("↻ retry 1/3 in 60s"));
+
+        // The room sees the prose in the detail slot, not the raw error.
+        assert!(report.body.contains("The wake FAILED"));
+        assert!(!report.body.contains("ATX call refused"));
+
+        // The raw error is still stored for debugging.
+        let state = reg.state_of("w").unwrap();
+        assert!(state
+            .history
+            .back()
+            .unwrap()
+            .detail
+            .contains("ATX call refused"));
+
+        // The summary turn was consulted, tool-less, with a FAILURE-labelled payload carrying the error.
+        let turn = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(turn.allowed_tools, Some(Vec::new()));
+        assert!(turn.input.contains("FAILURE"));
+        assert!(turn.input.contains("ATX call refused"));
     }
 }
