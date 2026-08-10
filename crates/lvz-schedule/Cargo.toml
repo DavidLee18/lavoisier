@@ -1,6 +1,6 @@
 [package]
 name = "lvz-schedule"
-version = "0.3.0"
+version = "0.3.1"
 description = "Scheduled, unconditional actions for the Lavoisier agent — a UTC cron engine plus a job registry that fires direct tool calls or prompt turns and keeps queryable status."
 edition.workspace = true
 rust-version.workspace = true

@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "lavoisier"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "clap",
  "futures",
@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-memory"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1668,7 +1668,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-schedule"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "futures",
