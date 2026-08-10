@@ -26,6 +26,9 @@ import Data.Vector qualified as V
 import Data.Word (Word64)
 import Lavoisier.Agent
 import Lavoisier.Config (FileConfig (..), defaultConfig, loadConfig)
+import Lavoisier.Context.Anchor qualified as Anc
+import Lavoisier.Context.Diff qualified as Dff
+import Lavoisier.Context.Tokens (estimateTokens)
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
 import Lavoisier.Gateway.Acp (defaultAcpConfig, newAcpApp)
 import Lavoisier.Gateway.Cron (CronConfigError (..), CronJob (..), parseCliJob, parseFileJobs)
@@ -99,6 +102,7 @@ tests =
       toolTests,
       agentTests,
       fallbackTests,
+      contextTests,
       gatewayTests,
       a2aTests,
       acpTests,
@@ -520,6 +524,75 @@ fallbackTests =
           providerCapabilities = noCapabilities,
           providerCountTokens = \_ -> pure (Right Nothing)
         }
+
+-- --- context engine, parse-free part: tokens + diff + anchor (ports lvz-context tests) -----------
+
+contextTests :: TestTree
+contextTests =
+  testGroup
+    "context engine (tokens/diff/anchor)"
+    [ testCase "estimateTokens: empty and whitespace are zero" $ do
+        estimateTokens "" @?= 0
+        estimateTokens "   \n\t " @?= 0,
+      testCase "estimateTokens: counts words and punctuation" $
+        -- `fn` `add` `(` `a` `,` `b` `)` => 7
+        estimateTokens "fn add(a, b)" @?= 7,
+      testCase "estimateTokens: an elided body is cheaper than the full body" $
+        assertBool
+          "skeleton cheaper"
+          (estimateTokens "fn f() { … }" < estimateTokens "fn f() {\n    let x = compute(1, 2, 3);\n    x\n}"),
+      testCase "unifiedDiff: identical inputs produce no diff" $ do
+        Dff.unifiedDiff "a\nb\n" "a\nb\n" 1 @?= ""
+        Dff.changedLines "a\nb\n" "a\nb\n" @?= 0,
+      testCase "unifiedDiff: shows only the changed hunk within the context radius" $ do
+        let d = Dff.unifiedDiff "one\ntwo\nthree\nfour\nfive\n" "one\ntwo\nTHREE\nfour\nfive\n" 1
+        assertBool "deletes three" ("-three" `T.isInfixOf` d)
+        assertBool "inserts THREE" ("+THREE" `T.isInfixOf` d)
+        -- With radius 1 the distant unchanged lines are excluded.
+        assertBool "excludes one" (not ("one" `T.isInfixOf` d))
+        assertBool "excludes five" (not ("five" `T.isInfixOf` d)),
+      testCase "changedLines: counts inserts and deletes" $
+        -- one line replaced => one delete + one insert.
+        Dff.changedLines "a\nb\nc\n" "a\nB\nc\n" @?= 2,
+      testCase "anchorOf is indentation-insensitive and stable 8-hex" $ do
+        Anc.anchorOf "    let x = 1;" @?= Anc.anchorOf "let x = 1;"
+        T.length (Anc.anchorOf "let x = 1;") @?= 8,
+      testCase "replace targets the anchored line" $ do
+        out <- expectRight (Anc.applyEdits src [Anc.replaceEdit (Anc.anchorOf "    let x = 1;") "    let x = 42;"])
+        assertBool "new value present" ("let x = 42;" `T.isInfixOf` out)
+        assertBool "old value gone" (not ("let x = 1;" `T.isInfixOf` out))
+        assertBool "trailing newline kept" ("\n" `T.isSuffixOf` out),
+      testCase "insert after and before place lines around the anchor" $ do
+        out <- expectRight (Anc.applyEdits src [Anc.insertAfterEdit (Anc.anchorOf "    let x = 1;") "    let y = 2;"])
+        let ls = T.lines out
+            xi = length (takeWhile (not . T.isInfixOf "let x = 1;") ls)
+        assertBool "y follows x" ("let y = 2;" `T.isInfixOf` (ls !! (xi + 1))),
+      testCase "delete removes the anchored line" $ do
+        out <- expectRight (Anc.applyEdits src [Anc.deleteEdit (Anc.anchorOf "    println!(\"{x}\");")])
+        assertBool "line gone" (not ("println!" `T.isInfixOf` out)),
+      testCase "an unmatched anchor fails the whole batch" $
+        case Anc.applyEdits src [Anc.replaceEdit "deadbeef" "x"] of
+          Left (Anc.NotFound _) -> pure ()
+          other -> assertFailure ("expected NotFound, got " <> show other),
+      testCase "an ambiguous anchor is rejected" $
+        case Anc.applyEdits "dup\ndup\n" [Anc.replaceEdit (Anc.anchorOf "dup") "x"] of
+          Left (Anc.Ambiguous _ 2) -> pure ()
+          other -> assertFailure ("expected Ambiguous _ 2, got " <> show other),
+      testCase "renderAnchored has an anchor gutter" $ do
+        let r = Anc.renderAnchored "hello"
+        assertBool "starts with the anchor" (Anc.anchorOf "hello" `T.isPrefixOf` r)
+        assertBool "has the gutter bar" ("\9474" `T.isInfixOf` r),
+      testCase "end-to-end: anchored edit then minimal diff" $ do
+        let source = "/// Doubles n.\nfn double(n: i32) -> i32 {\n    n * 2\n}\n"
+        edited <- expectRight (Anc.applyEdits source [Anc.replaceEdit (Anc.anchorOf "    n * 2") "    n * 3"])
+        assertBool "body changed" ("n * 3" `T.isInfixOf` edited)
+        let d = Dff.unifiedDiff source edited 0
+        assertBool "diff deletes old body" ("-    n * 2" `T.isInfixOf` d)
+        assertBool "diff inserts new body" ("+    n * 3" `T.isInfixOf` d)
+    ]
+  where
+    src = "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n"
+    expectRight = either (\e -> assertFailure ("expected Right, got " <> show e)) pure
 
 -- --- Phase 6: the HTTP gateway (offline; WAI test harness, no socket or API) ----------------------
 

@@ -40,6 +40,9 @@ library
     Lavoisier.Agent
     Lavoisier.CLI
     Lavoisier.Config
+    Lavoisier.Context.Anchor
+    Lavoisier.Context.Diff
+    Lavoisier.Context.Tokens
     Lavoisier.Gateway.A2A
     Lavoisier.Gateway.Acp
     Lavoisier.Gateway.Cron
@@ -78,6 +81,7 @@ library
     , bytestring
     , containers
     , dhall
+    , Diff
     , directory
     , filepath
     , http-client
