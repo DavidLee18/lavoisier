@@ -77,6 +77,8 @@ data Options = Options
     optCronFile :: Maybe FilePath,
     optCronRetryMax :: Maybe Int,
     optCronRetryWait :: Maybe Int,
+    optFallback :: [String],
+    optFallbackCooldown :: Maybe Int,
     optWords :: [String]
   }
 
@@ -108,6 +110,8 @@ optionsParser =
     <*> optional (strOption (long "cron-file" <> metavar "PATH" <> help "A JSON file of cron jobs [{schedule,session?,prompt,retry_max?,retry_wait?}]"))
     <*> optional (option auto (long "cron-retry-max" <> metavar "N" <> help "Global default retries after a failed cron fire (default 0)"))
     <*> optional (option auto (long "cron-retry-wait" <> metavar "SECS" <> help "Global default seconds between cron retries (default 0)"))
+    <*> many (strOption (long "fallback" <> metavar "PROVIDER:MODEL" <> help "A fallback model (repeatable, ordered): rerouted to when the primary is unresponsive/errors before streaming any output"))
+    <*> optional (option auto (long "fallback-cooldown" <> metavar "SECS" <> help "Seconds a failed fallback-chain model stays demoted before it's re-probed (circuit breaker; default 60)"))
     <*> many (argument str (metavar "PROMPT..."))
 
 thinkingReader :: ReadM ThinkingLevel
@@ -210,7 +214,11 @@ applyConfig fc o =
         given -> given,
       optCronFile = optCronFile o <|> fmap T.unpack (cronFile fc),
       optCronRetryMax = optCronRetryMax o <|> fmap fromIntegral (cronRetryMax fc),
-      optCronRetryWait = optCronRetryWait o <|> fmap fromIntegral (cronRetryWait fc)
+      optCronRetryWait = optCronRetryWait o <|> fmap fromIntegral (cronRetryWait fc),
+      optFallback = case optFallback o of
+        [] -> maybe [] (map T.unpack) (fallback fc)
+        given -> given,
+      optFallbackCooldown = optFallbackCooldown o <|> fmap fromIntegral (fallbackCooldown fc)
     }
 
 parseThinking :: Text -> Maybe ThinkingLevel
@@ -342,14 +350,44 @@ buildDebater spec = case break (== ':') spec of
           Left e -> errExit ("legion: " <> e)
           Right (p, _def) -> pure (mkDebater (T.pack spec) p (T.pack modelPart) Nothing)
 
+-- | Build the ordered @--fallback provider:model@ chain, each provider built fresh from env via
+-- 'selectProvider'; a bad spec or missing key fails fast with the offending spec.
+buildFallbacks :: Options -> IO [(Provider, Text)]
+buildFallbacks opts = mapM one (optFallback opts)
+  where
+    one spec = case break (== ':') spec of
+      (_, "") -> errExit ("fallback: bad spec (want provider:model): " <> T.pack spec)
+      (provName, _ : modelPart)
+        | null modelPart -> errExit ("fallback: empty model in spec: " <> T.pack spec)
+        | otherwise -> do
+            ep <- selectProvider provName
+            case ep of
+              Left e -> errExit ("fallback " <> T.pack spec <> ": " <> e)
+              Right (p, _def) -> pure (p, T.pack modelPart)
+
+-- | Assemble the shared 'Agent': base config + tuner + legion council, then install the fallback
+-- chain (and its cross-turn circuit breaker) if @--fallback@ was given.
+assembleAgent :: Provider -> Options -> Text -> Tuner -> Maybe Deliberator -> ToolRegistry -> IO Agent
+assembleAgent prov opts model tuner delib registry = do
+  let base = defaultAgentConfig model
+      cfg =
+        base
+          { acThinking = optThinking opts,
+            acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts),
+            acMaxSteps = fromMaybe (acMaxSteps base) (optMaxSteps opts)
+          }
+  agent0 <- mkAgent prov registry cfg tuner delib
+  fallbacks <- buildFallbacks opts
+  if null fallbacks
+    then pure agent0
+    else withFallbacks fallbacks (fromIntegral (fromMaybe 60 (optFallbackCooldown opts))) agent0
+
 -- | Serve the agent through any 'Gateway', wrapped with a session store (durable if --session-dir).
 serveGateway :: Gateway -> Provider -> Options -> Text -> ToolRegistry -> IO ()
 serveGateway gw prov opts model registry = do
   (tuner, _persist) <- buildTuner opts
   delib <- buildLegion opts
-  let base = defaultAgentConfig model
-      cfg = base {acThinking = optThinking opts, acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts), acMaxSteps = fromMaybe (acMaxSteps base) (optMaxSteps opts)}
-      agent = Agent prov registry cfg tuner delib
+  agent <- assembleAgent prov opts model tuner delib registry
   store <- maybe (newInMemoryStore (Just 200)) (`newFileStore` Just 200) (optSessionDir opts)
   herr ("gateway '" <> gatewayName gw <> "' starting")
   res <- gatewayServe gw (sessionAgentHandle store agent)
@@ -361,14 +399,7 @@ runAgentMode :: Provider -> Options -> Text -> Text -> ToolRegistry -> IO ()
 runAgentMode prov opts model prompt registry = do
   (tuner, persist) <- buildTuner opts
   delib <- buildLegion opts
-  let base = defaultAgentConfig model
-      cfg =
-        base
-          { acThinking = optThinking opts,
-            acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts),
-            acMaxSteps = fromMaybe (acMaxSteps base) (optMaxSteps opts)
-          }
-      agent = Agent prov registry cfg tuner delib
+  agent <- assembleAgent prov opts model tuner delib registry
   res <- runAgent agent (turnRequest "cli" prompt) renderEvent
   persist -- snapshot learned ATO profiles when --tune-state is set (a no-op otherwise)
   case res of

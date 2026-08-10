@@ -98,6 +98,7 @@ tests =
       googleTests,
       toolTests,
       agentTests,
+      fallbackTests,
       gatewayTests,
       a2aTests,
       acpTests,
@@ -455,7 +456,7 @@ agentTests =
                   providerCapabilities = noCapabilities,
                   providerCountTokens = \_ -> pure (Right Nothing)
                 }
-            agent = Agent stub withBuiltins (defaultAgentConfig "stub-model") Tn.noopTuner Nothing
+        agent <- mkAgent stub withBuiltins (defaultAgentConfig "stub-model") Tn.noopTuner Nothing
         res <- runAgent agent (turnRequest "t" "please write the file") (\ev -> modifyIORef' emitted (ev :))
         res @?= (Right () :: Either AgentError ())
         written <- TIO.readFile f
@@ -463,6 +464,62 @@ agentTests =
         evs <- reverse <$> readIORef emitted
         assertBool "emitted the final text" (TextDelta "all done" `elem` evs)
     ]
+
+-- --- fallback chain (offline; scripted providers + the cross-turn circuit breaker) ---------------
+
+fallbackTests :: TestTree
+fallbackTests =
+  testGroup
+    "fallback chain"
+    [ testCase "reroutes to the next model when the primary errors before any output" $ do
+        emitted <- newIORef []
+        agent0 <- mkAgent (scriptedProv "" emptyUsage True) withBuiltins (defaultAgentConfig "primary") Tn.noopTuner Nothing
+        agent <- withFallbacks [(scriptedProv "from fallback" emptyUsage False, "backup")] 60 agent0
+        res <- runAgent agent (turnRequest "t" "hi") (\ev -> modifyIORef' emitted (ev :))
+        res @?= (Right () :: Either AgentError ())
+        evs <- reverse <$> readIORef emitted
+        assertBool "answered from the fallback" (TextDelta "from fallback" `elem` evs),
+      testCase "with no fallback, a primary open-error surfaces as an error" $ do
+        agent <- mkAgent (scriptedProv "" emptyUsage True) withBuiltins (defaultAgentConfig "primary") Tn.noopTuner Nothing
+        res <- runAgent agent (turnRequest "t" "hi") (const (pure ()))
+        assertBool "left" (isLeftE res),
+      testCase "a failure after output has streamed does NOT reroute" $ do
+        emitted <- newIORef []
+        agent0 <- mkAgent midStreamProv withBuiltins (defaultAgentConfig "primary") Tn.noopTuner Nothing
+        agent <- withFallbacks [(scriptedProv "from fallback" emptyUsage False, "backup")] 60 agent0
+        res <- runAgent agent (turnRequest "t" "hi") (\ev -> modifyIORef' emitted (ev :))
+        assertBool "surfaces the mid-stream error" (isLeftE res)
+        evs <- reverse <$> readIORef emitted
+        assertBool "streamed the partial output" (TextDelta "partial" `elem` evs)
+        assertBool "never used the fallback" (TextDelta "from fallback" `notElem` evs),
+      testCase "the breaker keeps a downed primary demoted across turns" $ do
+        calls <- newIORef (0 :: Int)
+        agent0 <- mkAgent (countingFailProv calls) withBuiltins (defaultAgentConfig "primary") Tn.noopTuner Nothing
+        agent <- withFallbacks [(scriptedProv "backup" emptyUsage False, "backup")] 3600 agent0
+        _ <- runAgent agent (turnRequest "t" "one") (const (pure ()))
+        _ <- runAgent agent (turnRequest "t" "two") (const (pure ()))
+        n <- readIORef calls
+        -- Primary tried once (turn 1, which trips it); turn 2 starts past it while it stays demoted.
+        n @?= 1
+    ]
+  where
+    isLeftE = either (const True) (const False)
+    midStreamProv =
+      Provider
+        { providerStream = \_ -> do
+            s <- fromList [Right (TextDelta "partial"), Left (PTransport "boom")]
+            pure (Right s),
+          providerCapabilities = noCapabilities,
+          providerCountTokens = \_ -> pure (Right Nothing)
+        }
+    countingFailProv ref =
+      Provider
+        { providerStream = \_ -> do
+            modifyIORef' ref (+ 1)
+            pure (Left (PTransport "down")),
+          providerCapabilities = noCapabilities,
+          providerCountTokens = \_ -> pure (Right Nothing)
+        }
 
 -- --- Phase 6: the HTTP gateway (offline; WAI test harness, no socket or API) ----------------------
 
@@ -601,8 +658,8 @@ memoryTests =
                   providerCapabilities = noCapabilities,
                   providerCountTokens = \_ -> pure (Right Nothing)
                 }
-            agent = Agent stub withBuiltins (defaultAgentConfig "stub") Tn.noopTuner Nothing
-            handle = sessionAgentHandle store agent
+        agent <- mkAgent stub withBuiltins (defaultAgentConfig "stub") Tn.noopTuner Nothing
+        let handle = sessionAgentHandle store agent
             runTurn input = do
               e <- submit handle (turnRequest "s" input)
               case e of

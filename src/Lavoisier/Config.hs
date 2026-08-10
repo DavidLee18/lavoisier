@@ -43,7 +43,9 @@ data FileConfig = FileConfig
     cron :: Maybe [Text],
     cronFile :: Maybe Text,
     cronRetryMax :: Maybe Natural,
-    cronRetryWait :: Maybe Natural
+    cronRetryWait :: Maybe Natural,
+    fallback :: Maybe [Text],
+    fallbackCooldown :: Maybe Natural
   }
   deriving stock (Generic, Show, Eq)
 
@@ -51,7 +53,7 @@ instance Dhall.FromDhall FileConfig
 
 -- | The all-unset config (one 'Nothing' per 'FileConfig' field).
 defaultConfig :: FileConfig
-defaultConfig = FileConfig n n n n n n n n n n n n n n n n n n n n n n n
+defaultConfig = FileConfig n n n n n n n n n n n n n n n n n n n n n n n n n
   where
     n :: Maybe a
     n = Nothing
@@ -89,5 +91,7 @@ defaultsDhall =
       ", cron = None (List Text)",
       ", cronFile = None Text",
       ", cronRetryMax = None Natural",
-      ", cronRetryWait = None Natural }"
+      ", cronRetryWait = None Natural",
+      ", fallback = None (List Text)",
+      ", fallbackCooldown = None Natural }"
     ]
