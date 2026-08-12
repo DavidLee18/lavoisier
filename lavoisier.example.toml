@@ -48,6 +48,8 @@
 # serve_slack      = true        # Slack Socket Mode (needs SLACK_APP_TOKEN + SLACK_BOT_TOKEN)
 # serve_a2a        = "127.0.0.1:8081"   # A2A (Agent-to-Agent) server: Agent Card + JSON-RPC/SSE
 # acp              = true        # Zed Agent Client Protocol agent over stdio (for editors; run `lav --acp`)
+# tui              = true        # Interactive inline terminal UI (scrollback-native REPL; run `lav --tui`)
+# tui_auto_approve = false       # Skip TUI tool-approval prompts (default: reads auto, mutations ask)
 # api_keys         = ["key1", "key2"]   # also gate the A2A endpoint
 # rate_limit       = 60          # requests per 60s window
 # Cron gateway (--cron / --cron-file): retry a failed fire (rejected submit or mid-turn stream error)

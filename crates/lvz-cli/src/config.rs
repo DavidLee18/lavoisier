@@ -136,6 +136,10 @@ pub struct GatewaySection {
     pub serve_a2a: Option<String>,
     /// Run as a Zed Agent Client Protocol agent over stdio (see `--acp`). `--acp` takes precedence.
     pub acp: Option<bool>,
+    /// Launch the interactive inline terminal UI (see `--tui`). `--tui` takes precedence.
+    pub tui: Option<bool>,
+    /// Skip TUI tool-approval prompts (see `--tui-auto-approve`). The flag takes precedence.
+    pub tui_auto_approve: Option<bool>,
     pub api_keys: Option<Vec<String>>,
     pub rate_limit: Option<u32>,
     /// Auto-accept Matrix room invites (default `true`).
@@ -249,6 +253,8 @@ impl Config {
         cli.serve_slack |= self.gateway.serve_slack.unwrap_or(false);
         merge(&mut cli.serve_a2a, &self.gateway.serve_a2a);
         cli.acp |= self.gateway.acp.unwrap_or(false);
+        cli.tui |= self.gateway.tui.unwrap_or(false);
+        cli.tui_auto_approve |= self.gateway.tui_auto_approve.unwrap_or(false);
         merge_copy(&mut cli.rate_limit, self.gateway.rate_limit);
         merge_copy(&mut cli.cron_retry_max, self.gateway.cron_retry_max);
         merge_copy(&mut cli.cron_retry_wait, self.gateway.cron_retry_wait);

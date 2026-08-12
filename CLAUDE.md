@@ -25,8 +25,11 @@ model called a discovered, namespaced tool) and the A2A gateway over `curl` (age
 gateway over a `tokio::io::duplex` mock client and the real `lav --acp` binary (initialize /
 session-new / error handshake on stdout). (IBM/BeeAI's *Agent Communication Protocol* server was
 dropped — that project folded into A2A, whose server `lvz-gw-a2a` already covers; `lvz-gw-acp` now
-names the editor-facing Agent **Client** Protocol.) 20 crates in all. `cargo test`, `cargo clippy
---all-targets`, and `cargo fmt --check` are kept green.
+names the editor-facing Agent **Client** Protocol.) An **inline TUI** frontend followed —
+`lvz-gw-tui` (`--tui`), a scrollback-native interactive REPL (ratatui inline viewport) with streaming
+output, tool-call cards, and Claude-Code-style tool-approval prompts on a new `ToolGate` contract —
+unit-tested offline (the render engine needs a real terminal to verify, like Matrix). 21 crates in
+all. `cargo test`, `cargo clippy --all-targets`, and `cargo fmt --check` are kept green.
 
 The **cron gateway** (`lvz-gw-cron`, `--cron`/`--cron-file`) is an in-process scheduler shaped as a
 `Gateway`: it fires `TurnRequest`s on a hand-rolled UTC cron schedule (no `chrono`/`cron` dep) into
@@ -283,7 +286,41 @@ is still read; a shared `Arc<Mutex<writer>>` serialises whole JSON-RPC lines. En
 its own tools, a valid ACP posture; `session/load` is not offered (`loadSession: false`). Leaf crate
 (depends only on `lvz-protocol`), JSON-RPC hand-rolled over `tokio`/`serde_json` — no ACP SDK, no
 protocol/agent change; unit-tested offline over a `tokio::io::duplex` with a mock client, and
-smoke-verified end-to-end through the real `lav --acp` binary. **20 crates in all.**
+smoke-verified end-to-end through the real `lav --acp` binary. **21 crates in all.**
+
+**Inline TUI gateway** (`lvz-gw-tui`, `--tui` / `[gateway] tui`): Lavoisier as an **interactive
+terminal UI** — a scrollback-native REPL modelled on Claude Code / Grok CLI, another `Gateway` driving
+the *same* shared agent. It uses ratatui's **inline viewport** (`Viewport::Inline`), *not* a
+fullscreen alt-screen: finalized output is pushed into the terminal's own scrollback via
+`insert_before` (so native scroll/copy/`Ctrl-L` all work), while a small live region holds the input
+box (`tui-textarea`), a status/spinner line, and a token/cost footer. It renders the normalised
+[`Event`] stream as a chat — `TextDelta`→streamed assistant text (line-buffered to scrollback with
+lightweight markdown line-styling: fenced code, headings), `Thinking`/`Notice`→status, `ToolUse*`→
+tool-call cards, `Usage`→the cost footer. **Slash commands** (`/help`, `/clear`, `/new`, `/session
+<id>`, `/quit`) are handled locally; `/session`/`/new` switch the Lavoisier session so memory forks.
+**Concurrency is the load-bearing bit**: the current turn runs on a **spawned task** feeding the
+render loop over an mpsc channel, so the loop stays responsive — `Ctrl-C` cancels a turn (dropping the
+stream cancels the provider request), and the approval prompt (below) can be answered mid-turn without
+deadlocking the stream that's waiting on it. Depends only on `lvz-protocol` (+ ratatui/crossterm/
+tui-textarea/unicode-width); deps are MSRV-safe. Logs would corrupt the viewport, so under `--tui`
+`init_logging` routes `tracing` to `$LVZ_LOG_FILE` (or a sink) instead of stderr. Unit-tested offline
+(state reducers, wrapping, command parsing, the gate); full interactive behaviour needs a real
+terminal (raw mode fails cleanly on a non-tty), the same live-verification caveat as Matrix/e2ee.
+
+**Tool-approval gate** (a **keystone change**, `lvz-protocol`'s new `ToolGate`): the TUI's
+Claude-Code-style "allow this edit?" prompts rest on a new `ToolGate` contract — `async fn review(name,
+args) -> ToolDecision::{Allow, Deny(reason)}` — held on the `Agent` as `Option<Arc<dyn ToolGate>>` (the
+`Deliberator`/tuner injection pattern, *not* in the `Debug`-derived config) and consulted in `run_loop`
+immediately before each `invoke`, right after the static `allowed_tools` defence-in-depth check. A
+`Deny` is fed back to the model as an `is_error` tool result (the turn continues, never aborts — the
+model adapts). `None` gate ⇒ **byte-identical** to before, so it's additive and backward-compatible
+(every other frontend is unaffected). The TUI's `ChannelGate` implements it by bridging the agent's
+question to the render loop over a channel (a `oneshot` carries the answer back); **policy mirrors
+Claude Code** — read-only tools (`read`/`list`/`find`/`grep`/`search`/`outline`/…) run unattended,
+mutating tools and shells (and any unrecognised/namespaced MCP tool — safe default) prompt, with an
+"always allow this tool" set to suppress repeats. `--tui-auto-approve` / `[gateway] tui_auto_approve`
+waives prompting (no gate installed → the fast path). Contained to `lvz-protocol` (the contract) +
+`lvz-agent` (the seam) + `lvz-gw-tui`/CLI (the policy) — no gateway change.
 
 **Logging** (`--log-level <FILTER>`, env `LVZ_LOG_LEVEL`, or `[log] level`): operator diagnostics are
 structured **`tracing`** events on stderr. The `tracing` *facade* is free — already in every build

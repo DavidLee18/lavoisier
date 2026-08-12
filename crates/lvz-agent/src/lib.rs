@@ -42,7 +42,7 @@ use lvz_protocol::{
     AgentError, AgentHandle, Archetype, Capabilities, ChatRequest, ContentBlock, CostWeights,
     DeliberationContext, Deliberator, Event, Knobs, Message, ModelTier, NoopTuner, Outcome,
     Provider, RepoProfile, Role, StopReason, SystemPrompt, TaskContext, TaskTelemetry,
-    TelemetrySink, ThinkingLevel, ToolDef, Tuner, TurnRequest, Usage,
+    TelemetrySink, ThinkingLevel, ToolDecision, ToolDef, ToolGate, Tuner, TurnRequest, Usage,
 };
 use lvz_tools::ToolRegistry;
 use serde_json::{json, Value};
@@ -500,6 +500,11 @@ pub struct Agent {
     /// token budget) by [`assemble_repo_skeleton`] — cheap string work, stable within a task so the
     /// cached prefix stays byte-identical across that task's round-trips.
     repo_skeleton: Arc<OnceLock<Vec<(String, String)>>>,
+    /// Optional **tool-approval gate** consulted immediately before each tool `invoke`. An
+    /// interactive frontend (the TUI) uses it to ask "allow this edit?"; a `Deny` is fed back to the
+    /// model as an error result (never aborting the turn). Held as an `Arc<dyn ToolGate>` (the
+    /// `legion`/tuner injection pattern). `None` ⇒ every tool runs, byte-identical to before.
+    tool_gate: Option<Arc<dyn ToolGate>>,
 }
 
 impl Agent {
@@ -516,6 +521,7 @@ impl Agent {
             fallbacks: Vec::new(),
             breaker: Arc::new(CircuitBreaker::new(1, Duration::from_secs(60))),
             repo_skeleton: Arc::new(OnceLock::new()),
+            tool_gate: None,
         }
     }
 
@@ -531,6 +537,13 @@ impl Agent {
     /// Without one, no council runs and the advisor (if any) is used instead.
     pub fn with_legion(mut self, legion: Arc<dyn Deliberator>) -> Self {
         self.legion = Some(legion);
+        self
+    }
+
+    /// Install a **tool-approval gate** consulted before each tool call (see [`ToolGate`]). Used by
+    /// the interactive TUI for per-call approval prompts; other frontends leave it unset (no gate).
+    pub fn with_tool_gate(mut self, gate: Arc<dyn ToolGate>) -> Self {
+        self.tool_gate = Some(gate);
         self
     }
 
@@ -594,6 +607,7 @@ impl Agent {
         let fallbacks = self.fallbacks.clone();
         let breaker = self.breaker.clone();
         let skeleton_cell = self.repo_skeleton.clone();
+        let tool_gate = self.tool_gate.clone();
         let allowed_tools = allowed_tools.map(|v| v.into_iter().collect::<HashSet<String>>());
 
         tokio::spawn(async move {
@@ -607,6 +621,7 @@ impl Agent {
                 fallbacks,
                 breaker,
                 skeleton_cell,
+                tool_gate,
                 allowed_tools,
                 history,
                 &tx,
@@ -644,6 +659,7 @@ async fn run_loop(
     fallbacks: Vec<(Arc<dyn Provider>, String)>,
     breaker: Arc<CircuitBreaker>,
     skeleton_cell: Arc<OnceLock<Vec<(String, String)>>>,
+    tool_gate: Option<Arc<dyn ToolGate>>,
     allowed_tools: Option<HashSet<String>>,
     mut history: Vec<Message>,
     tx: &Sink,
@@ -1073,6 +1089,18 @@ async fn run_loop(
                         "tool error: '{}' is not permitted in this context",
                         call.name
                     ),
+                    is_error: true,
+                }
+            } else if let Some(ToolDecision::Deny(reason)) = match &tool_gate {
+                // Interactive approval (e.g. the TUI's "allow this edit?"). A denial is fed back to
+                // the model as a recoverable error result, exactly like a permission block — the turn
+                // continues so the model can choose another path.
+                Some(gate) => Some(gate.review(&call.name, &args).await),
+                None => None,
+            } {
+                ContentBlock::ToolResult {
+                    tool_use_id: call.id.clone(),
+                    content: format!("tool `{}` denied: {reason}", call.name),
                     is_error: true,
                 }
             } else {
@@ -2654,6 +2682,92 @@ mod tests {
             provider.calls.load(Ordering::SeqCst),
             1,
             "stop right after the first edit turn whose verify passes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A gate that returns a fixed decision for every call, for exercising the approval seam.
+    struct FixedGate(ToolDecision);
+    #[async_trait]
+    impl ToolGate for FixedGate {
+        async fn review(&self, _name: &str, _args: &Value) -> ToolDecision {
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_denying_tool_gate_blocks_the_call_and_the_file_is_never_written() {
+        let dir = std::env::temp_dir().join(format!("lvz_gate_deny_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("g.txt").to_string_lossy().to_string();
+        let write = vec![
+            Event::ToolUseStart {
+                id: "e1".into(),
+                name: "write_file".into(),
+            },
+            Event::ToolUseDelta {
+                id: "e1".into(),
+                json: format!("{{\"path\":\"{p}\",\"content\":\"x\"}}"),
+            },
+            Event::ToolUseEnd { id: "e1".into() },
+            Event::Done(StopReason::ToolUse),
+        ];
+        let provider = ScriptedProvider::new(vec![
+            write,
+            vec![
+                Event::TextDelta("done".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+        ]);
+        let agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::with_builtins(),
+            AgentConfig::default(),
+        )
+        .with_tool_gate(Arc::new(FixedGate(ToolDecision::Deny("nope".into()))));
+        let events = collect(agent.run("write it")).await;
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::Done(StopReason::EndTurn))));
+        // The denied write never touched the filesystem…
+        assert!(
+            !std::path::Path::new(&p).exists(),
+            "a denied write must not create the file"
+        );
+        // …and the denial was fed back as a tool result, so the model got a second turn.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_allowing_gate_lets_the_write_through() {
+        let dir = std::env::temp_dir().join(format!("lvz_gate_allow_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("g.txt").to_string_lossy().to_string();
+        let write = vec![
+            Event::ToolUseStart {
+                id: "e1".into(),
+                name: "write_file".into(),
+            },
+            Event::ToolUseDelta {
+                id: "e1".into(),
+                json: format!("{{\"path\":\"{p}\",\"content\":\"hello\"}}"),
+            },
+            Event::ToolUseEnd { id: "e1".into() },
+            Event::Done(StopReason::ToolUse),
+        ];
+        let provider = ScriptedProvider::new(vec![write, vec![Event::Done(StopReason::EndTurn)]]);
+        let agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::with_builtins(),
+            AgentConfig::default(),
+        )
+        .with_tool_gate(Arc::new(FixedGate(ToolDecision::Allow)));
+        let _ = collect(agent.run("write it")).await;
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap_or_default(),
+            "hello",
+            "an allowed write must reach the filesystem"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

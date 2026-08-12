@@ -28,6 +28,7 @@ use lvz_gw_cron::{CronGateway, CronJob};
 use lvz_gw_http::{GatewayConfig, HttpGateway};
 use lvz_gw_matrix::MatrixGateway;
 use lvz_gw_slack::SlackGateway;
+use lvz_gw_tui::{ChannelGate, TuiGateway};
 use lvz_legion::{Debater, Language, Panel};
 use lvz_mcp::McpServerSpec;
 use lvz_memory::SessionAgent;
@@ -291,6 +292,19 @@ struct Cli {
     /// use `--serve-a2a`.)
     #[arg(long = "acp")]
     acp: bool,
+
+    /// Launch the interactive **inline terminal UI** — a scrollback-native REPL that drives the agent
+    /// with streaming output, tool-call cards, and Claude-Code-style tool-approval prompts. Takes over
+    /// the terminal (logs are redirected to `$LVZ_LOG_FILE` or suppressed so they don't corrupt the
+    /// display). Intended standalone. Also `[gateway] tui`.
+    #[arg(long = "tui")]
+    tui: bool,
+
+    /// With `--tui`, skip the tool-approval prompts and run every tool unattended (the default is
+    /// Claude-Code-style: read-only tools run, mutating tools and shells ask first). Also
+    /// `[gateway] tui_auto_approve`.
+    #[arg(long = "tui-auto-approve")]
+    tui_auto_approve: bool,
 
     /// Schedule a recurring agent turn (in-process cron, UTC). The first **five** whitespace
     /// tokens are a standard cron schedule (`min hour dom month dow`); the rest is the prompt.
@@ -561,6 +575,7 @@ const DEFAULT_LOG_FILTER: &str = "warn,\
     lvz_gw_http=info,\
     lvz_gw_matrix=info,\
     lvz_gw_slack=info,\
+    lvz_gw_tui=info,\
     lvz_legion=info,\
     lvz_mcp=info,\
     lvz_memory=info,\
@@ -580,7 +595,7 @@ const DEFAULT_LOG_FILTER: &str = "warn,\
 /// the facade and never decide where events go, so embedding `lavoisier` as a library leaves the
 /// host application's own collector untouched. Returns whether a collector was actually installed
 /// (`false` if one was already set — e.g. by an embedding host).
-fn init_logging(filter: Option<&str>) -> bool {
+fn init_logging(filter: Option<&str>, tui: bool) -> bool {
     let directives = filter.unwrap_or(DEFAULT_LOG_FILTER);
     // A bad filter is reported, then we fall back to the default rather than losing all output —
     // a typo in `--log-level` should not silence a running daemon.
@@ -591,14 +606,38 @@ fn init_logging(filter: Option<&str>) -> bool {
             None => return false,
         },
     };
-    // ANSI only when stderr is a terminal, so redirected logs stay clean.
-    let ansi = std::io::stderr().is_terminal();
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(ansi)
-        .try_init()
-        .is_ok()
+    // The inline TUI owns the terminal: stderr writes would corrupt its viewport, so route logs to
+    // `$LVZ_LOG_FILE` when set, else drop them. Elsewhere, stderr as usual (ANSI only on a tty).
+    if tui {
+        match std::env::var_os("LVZ_LOG_FILE").and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        }) {
+            Some(file) => tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_ansi(false)
+                .with_writer(move || file.try_clone().expect("clone log file handle"))
+                .try_init()
+                .is_ok(),
+            None => tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_ansi(false)
+                .with_writer(std::io::sink)
+                .try_init()
+                .is_ok(),
+        }
+    } else {
+        let ansi = std::io::stderr().is_terminal();
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .with_ansi(ansi)
+            .try_init()
+            .is_ok()
+    }
 }
 
 /// Parse a `RUST_LOG`-style filter, reporting a bad one on stderr. Split out from [`init_logging`]
@@ -657,7 +696,7 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
 
     // Install the logging collector as early as possible — right after precedence is resolved, so
     // `[log] level` counts, and before any work worth logging happens.
-    init_logging(cli.log_level.as_deref());
+    init_logging(cli.log_level.as_deref(), cli.tui);
     // Deferred from `Config::load`: the file carries `[log] level`, so it is necessarily read
     // before the collector exists and an event emitted there would be dropped.
     if let Some(path) = &config.source {
@@ -686,6 +725,7 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
         || cli.serve_slack
         || cli.serve_a2a.is_some()
         || cli.acp
+        || cli.tui
         || !cron_jobs.is_empty();
     let (provider, batch_provider) = provider_kind.build(cli.thinking.as_deref(), serving)?;
     let model = cli
@@ -730,14 +770,19 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             &extra_tools,
             schedule.as_ref(),
         );
-        let inner = Arc::new(build_agent(
-            provider,
-            model,
-            &cli,
-            tools.clone(),
-            legion,
-            fallbacks,
-        ));
+        // Captured before `build_agent` consumes `model` — the TUI footer shows this label.
+        let model_label = model.clone();
+        let agent_core = build_agent(provider, model, &cli, tools.clone(), legion, fallbacks);
+        // Interactive tool-approval gate for the TUI (Claude-Code default: read-only tools run
+        // unattended, mutating tools / shells ask). Built only when the TUI is active and approval
+        // isn't waived; its receiver is handed to the TUI gateway below so prompts reach the user.
+        let (agent_core, mut tui_permits) = if cli.tui && !cli.tui_auto_approve {
+            let (gate, permits) = ChannelGate::new();
+            (agent_core.with_tool_gate(gate), Some(permits))
+        } else {
+            (agent_core, None)
+        };
+        let inner = Arc::new(agent_core);
         let agent: Arc<dyn AgentHandle> = Arc::new(SessionAgent::new(inner, store));
 
         let mut gateways: Vec<Arc<dyn Gateway>> = Vec::new();
@@ -863,6 +908,18 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             // case — answer text and diagnostics never touch stdout in serving mode).
             tracing::info!("Zed ACP agent (stdio)");
             gateways.push(Arc::new(AcpGateway::new()));
+        }
+
+        if cli.tui {
+            // Interactive inline terminal UI. Logs were already routed off stderr in `init_logging`.
+            tracing::info!("inline TUI");
+            let mut tui = TuiGateway::new()
+                .with_session("tui")
+                .with_model(model_label.clone());
+            if let Some(permits) = tui_permits.take() {
+                tui = tui.with_permits(permits);
+            }
+            gateways.push(Arc::new(tui));
         }
 
         if !cron_jobs.is_empty() {
@@ -1449,6 +1506,7 @@ mod tests {
             "lavoisier",
             "lvz_gw_matrix",
             "lvz_gw_slack",
+            "lvz_gw_tui",
             "lvz_gw_a2a",
             "lvz_gw_acp",
             "lvz_gw_cron",

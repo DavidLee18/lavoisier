@@ -18,6 +18,7 @@ mod agent;
 mod batch;
 mod deliberate;
 mod event;
+mod gate;
 mod gateway;
 mod message;
 mod provider;
@@ -30,6 +31,7 @@ pub use agent::{AgentError, AgentHandle, TurnRequest};
 pub use batch::{BatchItem, BatchProvider, BatchTask};
 pub use deliberate::{DeliberateError, Deliberation, DeliberationContext, Deliberator};
 pub use event::{CostWeights, Event, StopReason, Usage};
+pub use gate::{ToolDecision, ToolGate};
 pub use gateway::{Gateway, GatewayError};
 pub use message::{
     BuiltinTool, ChatRequest, ContentBlock, McpServer, MediaSource, Message, OutputFormat, Role,

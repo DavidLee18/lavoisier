@@ -38,6 +38,7 @@ lvz-memory.workspace = true
 lvz-tune.workspace = true
 lvz-gw-a2a.workspace = true
 lvz-gw-acp.workspace = true
+lvz-gw-tui.workspace = true
 lvz-gw-http.workspace = true
 lvz-gw-matrix.workspace = true
 lvz-gw-cron.workspace = true

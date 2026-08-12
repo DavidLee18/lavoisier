@@ -312,6 +312,16 @@ and tool-call updates), and `session/cancel`. Configurable via `[gateway] acp`. 
 interop — the role IBM/BeeAI's *Agent Communication Protocol* played before it folded into A2A — use
 `--serve-a2a`.)
 
+TUI (interactive inline terminal UI): `--tui` launches a scrollback-native REPL — the coding-agent
+shell, modelled on Claude Code / Grok CLI — driving the same shared agent. It uses ratatui's *inline*
+viewport (not fullscreen), so output flows into the terminal's normal scrollback while an input box,
+status line, and token/cost footer stay pinned at the bottom. Streams assistant text, thinking, and
+tool-call cards live; slash commands `/help` `/clear` `/new` `/session <id>` `/quit`; `Ctrl-C` cancels
+a turn, `Ctrl-D` quits. **Tool approval** follows Claude Code's default — read-only tools run
+unattended, mutating tools and shells prompt (`y` allow once · `a` always · `n` deny); waive it with
+`--tui-auto-approve`. Logs are routed to `$LVZ_LOG_FILE` (or suppressed) so they don't corrupt the
+display. Configurable via `[gateway] tui`.
+
 MCP (Model Context Protocol client): `--mcp-server <LABEL:TARGET>` (repeatable) connects to an
 external MCP server and exposes **its** tools as Lavoisier tools, so the agent and every gateway gain
 them. `TARGET` is either a command to spawn (stdio transport) or an `http(s)://` URL (Streamable
