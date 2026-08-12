@@ -21,6 +21,12 @@ pub struct TurnRequest {
     /// the set from its own policy (e.g. the Matrix gateway's room/member tool permissions). An
     /// empty set means "no tools this turn".
     pub allowed_tools: Option<Vec<String>>,
+    /// Optional per-turn **model override**. `None` ⇒ the agent's configured executor model (the
+    /// default). `Some(name)` runs *this turn* on that model instead — an interactive frontend (the
+    /// TUI's `/model`) uses it to switch models mid-session. It replaces the executor model and
+    /// suppresses cheap-model-first for the turn, so the chosen model is used throughout. Within one
+    /// provider (the primary); it does not select a different provider.
+    pub model: Option<String>,
 }
 
 impl TurnRequest {
@@ -30,12 +36,20 @@ impl TurnRequest {
             session: session.into(),
             input: input.into(),
             allowed_tools: None,
+            model: None,
         }
     }
 
     /// Restrict this turn to the given tool names (see [`TurnRequest::allowed_tools`]).
     pub fn with_allowed_tools(mut self, tools: impl IntoIterator<Item = String>) -> Self {
         self.allowed_tools = Some(tools.into_iter().collect());
+        self
+    }
+
+    /// Run this turn on a specific model instead of the agent's configured one (see
+    /// [`TurnRequest::model`]).
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
         self
     }
 }

@@ -315,10 +315,12 @@ interop — the role IBM/BeeAI's *Agent Communication Protocol* played before it
 TUI (interactive inline terminal UI): `--tui` launches a scrollback-native REPL — the coding-agent
 shell, modelled on Claude Code / Grok CLI — driving the same shared agent. It uses ratatui's *inline*
 viewport (not fullscreen), so output flows into the terminal's normal scrollback while an input box,
-status line, and token/cost footer stay pinned at the bottom. Streams assistant text, thinking, and
-tool-call cards live; slash commands `/help` `/clear` `/new` `/session <id>` `/quit`; `Ctrl-C` cancels
-a turn, `Ctrl-D` quits. **Tool approval** follows Claude Code's default — read-only tools run
-unattended, mutating tools and shells prompt (`y` allow once · `a` always · `n` deny); waive it with
+status line, and footer stay pinned at the bottom. Assistant output is **markdown-rendered** (bold,
+italic, code, headings, fenced blocks); the **footer shows a token breakdown and an estimated USD
+cost**. Slash commands `/help` `/model <name|reset>` `/session <id>` `/new` `/clear` `/quit` — `/model`
+switches the model mid-session; `Ctrl-C` cancels a turn, `Ctrl-D` quits. **Tool approval** follows
+Claude Code's default — read-only tools run unattended, mutating tools and shells prompt (the call's
+full arguments are shown, then `y` allow once · `a` always · `n` deny); waive it with
 `--tui-auto-approve`. Logs are routed to `$LVZ_LOG_FILE` (or suppressed) so they don't corrupt the
 display. Configurable via `[gateway] tui`.
 

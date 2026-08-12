@@ -295,9 +295,16 @@ fullscreen alt-screen: finalized output is pushed into the terminal's own scroll
 `insert_before` (so native scroll/copy/`Ctrl-L` all work), while a small live region holds the input
 box (`tui-textarea`), a status/spinner line, and a token/cost footer. It renders the normalised
 [`Event`] stream as a chat — `TextDelta`→streamed assistant text (line-buffered to scrollback with
-lightweight markdown line-styling: fenced code, headings), `Thinking`/`Notice`→status, `ToolUse*`→
-tool-call cards, `Usage`→the cost footer. **Slash commands** (`/help`, `/clear`, `/new`, `/session
-<id>`, `/quit`) are handled locally; `/session`/`/new` switch the Lavoisier session so memory forks.
+**markdown rendering**: inline `**bold**`/`*italic*`/`` `code` ``/`~~strike~~` via a hand-rolled styler
+with width-aware styled-span wrapping, plus block-level headings and fenced code), `Thinking`/`Notice`
+→status, `ToolUse*`→tool-call cards, `Usage`→the footer. The **footer shows real spend** — a token
+breakdown (`↑in ↓out ⚡cache`) and an estimated **USD cost** from a per-model price table (`price.rs`;
+approximate list prices, matched by model-name substring, `~$` = estimate), not an abstract
+token-equivalent. **Slash commands** (`/help`, `/model <name|reset>`, `/session <id>`, `/new`,
+`/clear`, `/quit`) are handled locally; `/session`/`/new` switch the Lavoisier session so memory forks,
+and **`/model` switches the model mid-session** — backed by a new **additive `TurnRequest.model:
+Option<String>`** the agent applies per turn (overriding the executor model + suppressing
+cheap-model-first for that turn; within the primary provider), so the switch needs no rebuild.
 **Concurrency is the load-bearing bit**: the current turn runs on a **spawned task** feeding the
 render loop over an mpsc channel, so the loop stays responsive — `Ctrl-C` cancels a turn (dropping the
 stream cancels the provider request), and the approval prompt (below) can be answered mid-turn without

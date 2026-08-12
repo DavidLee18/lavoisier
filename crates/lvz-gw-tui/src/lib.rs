@@ -24,9 +24,7 @@ use async_trait::async_trait;
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
-use lvz_protocol::{
-    AgentHandle, CostWeights, Event, Gateway, GatewayError, StopReason, TurnRequest, Usage,
-};
+use lvz_protocol::{AgentHandle, Event, Gateway, GatewayError, StopReason, TurnRequest, Usage};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -39,6 +37,8 @@ use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
 mod gate;
+mod md;
+mod price;
 use gate::PermitReply;
 pub use gate::{ChannelGate, PermitRequest};
 
@@ -182,6 +182,9 @@ async fn run(gw: &TuiGateway, agent: Arc<dyn AgentHandle>) -> io::Result<()> {
             // A tool wants approval. `pending()` parks this arm forever when no gate is installed.
             maybe_permit = recv_permit(&mut permits) => {
                 if let Some(req) = maybe_permit {
+                    // Put the full call + arguments in scrollback (unbounded height), so the compact
+                    // viewport prompt only has to carry the question.
+                    scrollback::emit_permit(&mut term, &req.name, &req.args)?;
                     app.pending_permit = Some(req);
                 }
             }
@@ -281,6 +284,9 @@ enum Command<'a> {
     New,
     /// Switch to (or, when empty, report) the named session.
     Session(&'a str),
+    /// Switch to (or, when empty, report) the model this session's turns run on. `reset` clears the
+    /// override back to the configured model.
+    Model(&'a str),
     /// An unrecognised command.
     Unknown(&'a str),
 }
@@ -294,11 +300,12 @@ fn parse_command(cmd: &str) -> Command<'_> {
         "clear" | "cls" => Command::Clear,
         "new" => Command::New,
         "session" | "s" => Command::Session(it.next().unwrap_or("")),
+        "model" | "m" => Command::Model(it.next().unwrap_or("")),
         other => Command::Unknown(other),
     }
 }
 
-const HELP: &str = "commands: /help · /clear (reset counters) · /new (fresh session) · /session <id> · /quit  —  Ctrl-L clears the screen";
+const HELP: &str = "commands: /help · /model <name|reset> · /session <id> · /new · /clear (reset counters) · /quit  —  Ctrl-L clears the screen";
 
 /// Run a slash command against the app. Returns `Ok(true)` to quit.
 fn dispatch_command(term: &mut Term, app: &mut App, cmd: &str) -> io::Result<bool> {
@@ -320,6 +327,17 @@ fn dispatch_command(term: &mut Term, app: &mut App, cmd: &str) -> io::Result<boo
         Command::Session(id) => {
             app.session = id.to_string();
             scrollback::emit_notice(term, &format!("switched to session: {id}"))?;
+        }
+        Command::Model("") => {
+            scrollback::emit_notice(term, &format!("model: {}", app.active_model()))?
+        }
+        Command::Model("reset") | Command::Model("default") => {
+            app.model_override = None;
+            scrollback::emit_notice(term, &format!("model reset to {}", app.model))?;
+        }
+        Command::Model(name) => {
+            app.model_override = Some(name.to_string());
+            scrollback::emit_notice(term, &format!("model set to {name} (next turn)"))?;
         }
         Command::Unknown(c) => {
             scrollback::emit_notice(term, &format!("unknown command: /{c} (try /help)"))?
@@ -345,8 +363,13 @@ fn submit(
     let agent = agent.clone();
     let tx = turn_tx.clone();
     let session = app.session.clone();
+    let model_override = app.model_override.clone();
     let handle = tokio::spawn(async move {
-        match agent.submit(TurnRequest::new(session, prompt)).await {
+        let mut turn = TurnRequest::new(session, prompt);
+        if let Some(model) = model_override {
+            turn = turn.with_model(model);
+        }
+        match agent.submit(turn).await {
             Ok(mut stream) => {
                 while let Some(item) = stream.next().await {
                     let msg = match item {
@@ -468,6 +491,8 @@ struct App {
     in_code_fence: bool,
     /// Monotonic counter backing `/new` fresh-session ids (no clock/rng needed).
     session_seq: u64,
+    /// The `/model` override for this session, if any (else the configured model is used).
+    model_override: Option<String>,
 }
 
 impl App {
@@ -490,6 +515,7 @@ impl App {
             pending_permit: None,
             in_code_fence: false,
             session_seq: 0,
+            model_override: None,
         }
     }
 
@@ -508,9 +534,8 @@ impl App {
         self.pending.push_str(delta);
         while let Some(nl) = self.pending.find('\n') {
             let line: String = self.pending.drain(..=nl).collect();
-            let line = line.trim_end_matches('\n');
-            let style = self.md_line_style(line);
-            scrollback::emit_assistant(term, line, style)?;
+            let segs = self.render_md_line(line.trim_end_matches('\n'));
+            scrollback::emit_rich(term, &segs)?;
         }
         Ok(())
     }
@@ -519,30 +544,39 @@ impl App {
     fn flush_pending(&mut self, term: &mut Term) -> io::Result<()> {
         if !self.pending.is_empty() {
             let line = std::mem::take(&mut self.pending);
-            let style = self.md_line_style(&line);
-            scrollback::emit_assistant(term, &line, style)?;
+            let segs = self.render_md_line(&line);
+            scrollback::emit_rich(term, &segs)?;
         }
         Ok(())
     }
 
-    /// Pick a style for one assistant line from its lightweight markdown context, toggling the fenced
-    /// code state as it goes: a ```` ``` ```` fence line flips the state (and renders dim); lines
-    /// inside a fence render as code; a `#`-heading renders bold cyan; everything else is plain.
-    fn md_line_style(&mut self, line: &str) -> Style {
+    /// Render one assistant line into styled markdown segments, tracking fenced-code state: a
+    /// ```` ``` ```` fence line flips the state (rendered dim); lines inside a fence render as code;
+    /// a `#`-heading renders bold cyan; everything else gets inline styling (bold/italic/code).
+    fn render_md_line(&mut self, line: &str) -> Vec<md::Segment> {
         let t = line.trim_start();
         if t.starts_with("```") {
             self.in_code_fence = !self.in_code_fence;
-            return Style::default().fg(Color::DarkGray);
+            return vec![(line.to_string(), Style::default().fg(Color::DarkGray))];
         }
         if self.in_code_fence {
-            return Style::default().fg(Color::Green);
+            return vec![(line.to_string(), Style::default().fg(Color::Green))];
         }
-        if t.starts_with('#') {
-            return Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD);
+        if let Some(rest) = t.strip_prefix('#') {
+            let heading = rest.trim_start_matches('#').trim_start();
+            return vec![(
+                heading.to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )];
         }
-        Style::default()
+        md::inline(line)
+    }
+
+    /// The model this session's turns run on: the `/model` override if set, else the configured one.
+    fn active_model(&self) -> &str {
+        self.model_override.as_deref().unwrap_or(&self.model)
     }
 
     /// Mark the turn finished and clear transient state.
@@ -580,7 +614,7 @@ impl App {
         if let Some(req) = &self.pending_permit {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    format!("⚠ allow tool `{}`?", req.name),
+                    format!("⚠ allow tool `{}`?  (arguments shown above)", req.name),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -588,17 +622,37 @@ impl App {
                 rows[0],
             );
             f.render_widget(
-                Paragraph::new(req.args.as_str()).block(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        " [y] ",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("allow once   "),
+                    Span::styled(
+                        "[a] ",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("always allow this tool   "),
+                    Span::styled(
+                        "[n] ",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("deny"),
+                ]))
+                .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(" arguments ")
                         .border_style(Style::default().fg(Color::Yellow)),
                 ),
                 rows[1],
             );
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    "y allow once · a always allow this tool · n deny",
+                    "Ctrl-C cancels the turn",
                     Style::default().fg(Color::DarkGray),
                 ))),
                 rows[2],
@@ -627,13 +681,24 @@ impl App {
 
         f.render_widget(&self.input, rows[1]);
 
+        let model = self.active_model();
+        let spend = match price::estimate_usd(model, &self.usage) {
+            Some(usd) => format!("~${usd:.4}"),
+            None => format!("{} tok", price::fmt_tokens(self.usage.total())),
+        };
+        let cache = self.usage.cache_read_tokens + self.usage.cache_creation_tokens;
         let footer = format!(
-            "{} · {} · {} tok-eq · {} in / {} out",
+            "{} · {} · ↑{} ↓{}{} · {}",
             self.session,
-            self.model,
-            self.usage.cost(&CostWeights::default()),
-            self.usage.input_tokens,
-            self.usage.output_tokens,
+            model,
+            price::fmt_tokens(self.usage.input_tokens),
+            price::fmt_tokens(self.usage.output_tokens),
+            if cache > 0 {
+                format!(" ⚡{}", price::fmt_tokens(cache))
+            } else {
+                String::new()
+            },
+            spend,
         );
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -702,6 +767,44 @@ mod scrollback {
         })
     }
 
+    /// Insert one line of pre-styled markdown segments into scrollback, wrapping the styled runs to
+    /// the current width so nothing is clipped and styles survive the wrap.
+    pub(super) fn emit_rich(term: &mut Term, segments: &[md::Segment]) -> io::Result<()> {
+        let full_w = width(term);
+        let rows = md::wrap(segments, full_w as usize);
+        let lines: Vec<Line<'static>> = rows
+            .into_iter()
+            .map(|row| {
+                Line::from(
+                    row.into_iter()
+                        .map(|(t, s)| Span::styled(t, s))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let height = lines.len().max(1) as u16;
+        let text = Text::from(lines);
+        term.insert_before(height, |buf| {
+            Paragraph::new(text).render(Rect::new(0, 0, full_w, height), buf);
+        })
+    }
+
+    /// Announce a pending tool-approval request in scrollback: a yellow header plus the call's full
+    /// arguments (so the small viewport prompt can stay compact).
+    pub(super) fn emit_permit(term: &mut Term, name: &str, args: &str) -> io::Result<()> {
+        emit(
+            term,
+            Span::styled(
+                "🔒 approve ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            &format!("{name}\n{args}"),
+            Style::default().fg(Color::Yellow),
+        )
+    }
+
     pub(super) fn emit_welcome(term: &mut Term) -> io::Result<()> {
         emit(
             term,
@@ -728,10 +831,6 @@ mod scrollback {
             text,
             Style::default().fg(Color::Cyan),
         )
-    }
-
-    pub(super) fn emit_assistant(term: &mut Term, text: &str, style: Style) -> io::Result<()> {
-        emit(term, Span::raw(""), text, style)
     }
 
     pub(super) fn emit_tool(term: &mut Term, name: &str, hint: &str) -> io::Result<()> {
@@ -822,21 +921,32 @@ mod tests {
         assert_eq!(parse_command("new"), Command::New);
         assert_eq!(parse_command("session work"), Command::Session("work"));
         assert_eq!(parse_command("session"), Command::Session(""));
+        assert_eq!(parse_command("model opus"), Command::Model("opus"));
+        assert_eq!(parse_command("m"), Command::Model(""));
         assert_eq!(parse_command("frob"), Command::Unknown("frob"));
     }
 
     #[test]
-    fn markdown_line_style_tracks_fences_and_headings() {
+    fn markdown_line_rendering_tracks_fences_and_headings() {
         let mut app = App::new("s".into(), "m".into());
-        // A heading outside a fence is styled; the plain line is not.
-        assert_eq!(app.md_line_style("# Title").add_modifier, Modifier::BOLD);
-        assert_eq!(app.md_line_style("plain"), Style::default());
-        // Entering a fence styles subsequent lines as code until the closing fence.
-        let _ = app.md_line_style("```rust");
+        // A heading strips its marker and renders bold; a fenced block renders as code.
+        let h = app.render_md_line("# Title");
+        assert_eq!(h[0].0, "Title");
+        assert!(h[0].1.add_modifier.contains(Modifier::BOLD));
+        let _ = app.render_md_line("```rust");
         assert!(app.in_code_fence);
-        assert_eq!(app.md_line_style("let x = 1;").fg, Some(Color::Green));
-        let _ = app.md_line_style("```");
+        let code = app.render_md_line("let x = 1;");
+        assert_eq!(code[0].1.fg, Some(Color::Green));
+        let _ = app.render_md_line("```");
         assert!(!app.in_code_fence);
+    }
+
+    #[test]
+    fn model_override_selects_the_active_model() {
+        let mut app = App::new("s".into(), "base".into());
+        assert_eq!(app.active_model(), "base");
+        app.model_override = Some("opus".into());
+        assert_eq!(app.active_model(), "opus");
     }
 
     #[test]

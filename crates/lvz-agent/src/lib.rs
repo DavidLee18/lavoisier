@@ -597,10 +597,26 @@ impl Agent {
         history: Vec<Message>,
         allowed_tools: Option<Vec<String>>,
     ) -> BoxStream<'static, Result<Event, AgentError>> {
+        self.run_inner(history, allowed_tools, None)
+    }
+
+    /// The shared implementation, additionally taking a per-turn model override
+    /// ([`TurnRequest::model`]): when set it replaces the executor model and suppresses
+    /// cheap-model-first for this turn, so the chosen model is used throughout.
+    fn run_inner(
+        &self,
+        history: Vec<Message>,
+        allowed_tools: Option<Vec<String>>,
+        model_override: Option<String>,
+    ) -> BoxStream<'static, Result<Event, AgentError>> {
         let (tx, rx) = mpsc::unbounded();
         let provider = self.provider.clone();
         let tools = self.tools.clone();
-        let config = self.config.clone();
+        let mut config = self.config.clone();
+        if let Some(model) = model_override {
+            config.model = model;
+            config.cheap_model = None;
+        }
         let tuner = self.tuner.clone();
         let telemetry = self.telemetry.clone();
         let legion = self.legion.clone();
@@ -640,7 +656,11 @@ impl AgentHandle for Agent {
         &self,
         turn: TurnRequest,
     ) -> Result<BoxStream<'static, Result<Event, AgentError>>, AgentError> {
-        Ok(self.run_seeded_with_tools(vec![Message::user(turn.input)], turn.allowed_tools))
+        Ok(self.run_inner(
+            vec![Message::user(turn.input)],
+            turn.allowed_tools,
+            turn.model,
+        ))
     }
 }
 
@@ -2684,6 +2704,46 @@ mod tests {
             "stop right after the first edit turn whose verify passes"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A provider that records the model of each request it receives, then ends the turn.
+    struct ModelRecordingProvider {
+        models: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Provider for ModelRecordingProvider {
+        async fn stream(
+            &self,
+            req: ChatRequest,
+        ) -> Result<
+            BoxStream<'static, Result<Event, lvz_protocol::ProviderError>>,
+            lvz_protocol::ProviderError,
+        > {
+            self.models.lock().unwrap().push(req.model.clone());
+            Ok(stream::iter(vec![Ok(Event::Done(StopReason::EndTurn))]).boxed())
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_per_turn_model_override_reaches_the_provider_request() {
+        let models = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(ModelRecordingProvider {
+            models: models.clone(),
+        });
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig::default().with_model("base-model"),
+        );
+        let turn = TurnRequest::new("s", "hi").with_model("picked-model");
+        let _ = collect(agent.submit(turn).await.unwrap()).await;
+        assert_eq!(
+            models.lock().unwrap().as_slice(),
+            &["picked-model".to_string()]
+        );
     }
 
     /// A gate that returns a fixed decision for every call, for exercising the approval seam.

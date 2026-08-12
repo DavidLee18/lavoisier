@@ -105,13 +105,13 @@ pub(crate) fn is_read_only(name: &str) -> bool {
     PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
-/// A compact, single-block preview of a call's arguments for the prompt (pretty JSON, capped).
+/// A readable, pretty-printed preview of a call's arguments for the prompt (shown in scrollback, so
+/// generously capped rather than one-lined).
 fn preview(args: &Value) -> String {
     let s = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
-    if s.len() > 400 {
-        format!("{}…", &s[..400])
-    } else {
-        s
+    match s.char_indices().nth(2000) {
+        Some((idx, _)) => format!("{}…", &s[..idx]),
+        None => s,
     }
 }
 
