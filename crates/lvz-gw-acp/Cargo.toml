@@ -1,7 +1,7 @@
 [package]
 name = "lvz-gw-acp"
-version = "0.1.0"
-description = "ACP (Agent Communication Protocol, BeeAI/IBM) server gateway for Lavoisier: exposes the shared agent over the REST agents/runs API with sync and SSE-streaming runs."
+version = "0.2.0"
+description = "Zed Agent Client Protocol (ACP) agent gateway for Lavoisier: drives the shared agent over JSON-RPC 2.0 on stdio so any ACP-capable editor (Zed, Neovim, …) can run it as a subprocess."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,13 +11,10 @@ authors.workspace = true
 [dependencies]
 lvz-protocol.workspace = true
 async-trait.workspace = true
-axum.workspace = true
 futures.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-reqwest.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

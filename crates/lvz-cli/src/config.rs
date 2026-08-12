@@ -134,8 +134,8 @@ pub struct GatewaySection {
     pub serve_slack: Option<bool>,
     /// A2A server bind address (`host:port`). `--serve-a2a` / `LVZ_SERVE_A2A` take precedence.
     pub serve_a2a: Option<String>,
-    /// ACP server bind address (`host:port`). `--serve-acp` / `LVZ_SERVE_ACP` take precedence.
-    pub serve_acp: Option<String>,
+    /// Run as a Zed Agent Client Protocol agent over stdio (see `--acp`). `--acp` takes precedence.
+    pub acp: Option<bool>,
     pub api_keys: Option<Vec<String>>,
     pub rate_limit: Option<u32>,
     /// Auto-accept Matrix room invites (default `true`).
@@ -248,7 +248,7 @@ impl Config {
         cli.serve_matrix |= self.gateway.serve_matrix.unwrap_or(false);
         cli.serve_slack |= self.gateway.serve_slack.unwrap_or(false);
         merge(&mut cli.serve_a2a, &self.gateway.serve_a2a);
-        merge(&mut cli.serve_acp, &self.gateway.serve_acp);
+        cli.acp |= self.gateway.acp.unwrap_or(false);
         merge_copy(&mut cli.rate_limit, self.gateway.rate_limit);
         merge_copy(&mut cli.cron_retry_max, self.gateway.cron_retry_max);
         merge_copy(&mut cli.cron_retry_wait, self.gateway.cron_retry_wait);

@@ -17,12 +17,16 @@ Companion docs — read the relevant one before working in that area:
 Complete and live-verified against real `XAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY`:
 the original 17 crates, provider streaming (SSE + xAI gRPC), the agent loop, the token engine,
 session memory, the HTTP/Matrix/Slack/cron gateways, AWS packaging (`infra/`), and the ATO learner.
-The three protocol-interop crates added since — `lvz-mcp` (MCP client), `lvz-gw-a2a` (A2A server),
-`lvz-gw-acp` (ACP server) — are unit-tested offline (in-process mock servers/pipes) **and
-live-smoke-verified** end-to-end with real Anthropic turns: MCP against a real stdio MCP server (the
-model called a discovered, namespaced tool), and the A2A/ACP gateways over `curl` (agent card /
-manifest, sync `message/send` / `POST /runs`, SSE streaming, and the error paths). 20 crates in all.
-`cargo test`, `cargo clippy --all-targets`, and `cargo fmt --check` are kept green.
+The protocol-interop crates added since — `lvz-mcp` (MCP client), `lvz-gw-a2a` (A2A server), and
+`lvz-gw-acp` (**Zed Agent Client Protocol** agent over stdio, `--acp`) — are unit-tested offline
+(in-process mock servers/pipes) **and live-smoke-verified**: MCP against a real stdio MCP server (the
+model called a discovered, namespaced tool) and the A2A gateway over `curl` (agent card, sync
+`message/send`, SSE streaming, error paths), both end-to-end with real Anthropic turns; the ACP
+gateway over a `tokio::io::duplex` mock client and the real `lav --acp` binary (initialize /
+session-new / error handshake on stdout). (IBM/BeeAI's *Agent Communication Protocol* server was
+dropped — that project folded into A2A, whose server `lvz-gw-a2a` already covers; `lvz-gw-acp` now
+names the editor-facing Agent **Client** Protocol.) 20 crates in all. `cargo test`, `cargo clippy
+--all-targets`, and `cargo fmt --check` are kept green.
 
 The **cron gateway** (`lvz-gw-cron`, `--cron`/`--cron-file`) is an in-process scheduler shaped as a
 `Gateway`: it fires `TurnRequest`s on a hand-rolled UTC cron schedule (no `chrono`/`cron` dep) into
@@ -254,18 +258,32 @@ optional `Authorization: Bearer` gate on the endpoint (the card stays public). O
 + `axum::serve(..).with_graceful_shutdown(..)` so SIGTERM exits cleanly under the CLI's `select_all`
 join. JSON-RPC is hand-rolled over `axum`/`serde_json` — no A2A SDK; no protocol/agent change.
 
-**ACP server gateway** (`lvz-gw-acp`, `--serve-acp <ADDR>` / `[gateway] serve_acp`): Lavoisier as an
-**Agent Communication Protocol** server (BeeAI/IBM — the REST agent-interop protocol, **not** Zed's
-Agent Client Protocol). Another `Gateway` (axum) driving the same shared agent, exposing the REST
-**agents/runs** surface: `GET /agents` + `GET /agents/{name}` (the agent **manifest**), `POST /runs`
-with a `mode` — **`sync`** (fold the turn to a completed `Run`), **`stream`** (SSE: `run.in-progress`
-→ `message.part` per delta → `run.completed`), or **`async`** (return an in-progress `Run`, finish it
-on a spawned task) — `GET /runs/{run_id}` (from a bounded in-memory store, so `async` results are
-pollable), `POST /runs/{run_id}/cancel` (best-effort), `GET /ping`. The ACP **`session_id` maps to a
-Lavoisier session**. Input text is pulled from each message's `text/*` `parts`; the reply is one
-`agent/lavoisier` message. Same optional `--api-key` bearer gate (manifest stays public), same
-`shutdown_signal()` + graceful shutdown. Hand-rolled REST over `axum`/`serde_json` — no ACP SDK; no
-protocol/agent change.
+**ACP agent gateway** (`lvz-gw-acp`, `--acp` / `[gateway] acp`): Lavoisier as a **Zed Agent Client
+Protocol** agent — the editor-facing protocol (<https://agentclientprotocol.com>), **JSON-RPC 2.0 over
+stdio**, where the editor is the *client* that launches `lav --acp` as a subprocess and drives the
+tool loop from its agent panel. (This ACP is the *Agent Client Protocol*. IBM/BeeAI's *Agent
+Communication Protocol* shared the acronym but folded into A2A, so `--serve-a2a` is the agent-to-agent
+interop surface now — Lavoisier ships no BeeAI-ACP server.) A `Gateway` (like every other) driving the
+same shared agent, but over stdio rather than a socket: the serve loop reads newline-framed JSON-RPC
+from **stdin** and writes responses +
+`session/update` notifications to **stdout** (so nothing else may touch stdout — product/log output
+already lives on stderr, which the protocol relies on). Surface (client→agent): `initialize`
+(advertises protocol version `1`, text prompts, **no** auth methods — Lavoisier authenticates to model
+providers itself via env keys), `session/new` (allocates `acp-<n>`, mapped straight onto a **Lavoisier
+session** so a multi-turn conversation accrues memory), `session/prompt` (runs one turn — `TextDelta`→
+`agent_message_chunk`, `Thinking`/`Notice`→`agent_thought_chunk`, `ToolUse*`→`tool_call`/
+`tool_call_update` with a best-effort `kind` + accumulated `rawInput`, resolving with a `stopReason`
+mapped from `StopReason`), and `session/cancel` (a notification; a per-session `Notify` armed
+*before* submit — `notify_one` so the cancel is race-proof — is `select!`ed against the event stream,
+and cancelling **drops the stream** to cancel the provider request, resolving `stopReason:
+"cancelled"`). `session/prompt` is **spawned** off the reader loop so a concurrent `session/cancel`
+is still read; a shared `Arc<Mutex<writer>>` serialises whole JSON-RPC lines. Ends cleanly on stdin
+**EOF** (the editor closing the pipe). **Deferred** (documented): editor-delegated fs
+(`fs/read_text_file`/`fs/write_text_file`) and `session/request_permission` — for now the agent runs
+its own tools, a valid ACP posture; `session/load` is not offered (`loadSession: false`). Leaf crate
+(depends only on `lvz-protocol`), JSON-RPC hand-rolled over `tokio`/`serde_json` — no ACP SDK, no
+protocol/agent change; unit-tested offline over a `tokio::io::duplex` with a mock client, and
+smoke-verified end-to-end through the real `lav --acp` binary. **20 crates in all.**
 
 **Logging** (`--log-level <FILTER>`, env `LVZ_LOG_LEVEL`, or `[log] level`): operator diagnostics are
 structured **`tracing`** events on stderr. The `tracing` *facade* is free — already in every build

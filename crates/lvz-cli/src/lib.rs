@@ -284,12 +284,13 @@ struct Cli {
     #[arg(long = "serve-a2a", value_name = "ADDR", env = "LVZ_SERVE_A2A")]
     serve_a2a: Option<String>,
 
-    /// Serve as an **ACP (Agent Communication Protocol) server** on this `host:port` — the REST
-    /// agents/runs API (`GET /agents`, `POST /runs` with sync/stream/async modes, `GET /runs/{id}`)
-    /// so ACP clients can run Lavoisier. Reuses `--api-key` for auth. Runs alongside the other
-    /// gateways. Also `[gateway] serve_acp`.
-    #[arg(long = "serve-acp", value_name = "ADDR", env = "LVZ_SERVE_ACP")]
-    serve_acp: Option<String>,
+    /// Run as a **Zed Agent Client Protocol (ACP) agent** over **stdio** (JSON-RPC 2.0), so an
+    /// ACP-capable editor (Zed, or Neovim via a bridge) can launch Lavoisier as a subprocess and
+    /// drive the full tool loop from its agent panel. This takes over stdin/stdout (no bind address).
+    /// Configure your editor to run `lav --acp`. Also `[gateway] acp`. (For agent-to-agent interop,
+    /// use `--serve-a2a`.)
+    #[arg(long = "acp")]
+    acp: bool,
 
     /// Schedule a recurring agent turn (in-process cron, UTC). The first **five** whitespace
     /// tokens are a standard cron schedule (`min hour dom month dow`); the rest is the prompt.
@@ -684,7 +685,7 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
         || cli.serve_matrix
         || cli.serve_slack
         || cli.serve_a2a.is_some()
-        || cli.serve_acp.is_some()
+        || cli.acp
         || !cron_jobs.is_empty();
     let (provider, batch_provider) = provider_kind.build(cli.thinking.as_deref(), serving)?;
     let model = cli
@@ -856,18 +857,12 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             gateways.push(Arc::new(a2a));
         }
 
-        if let Some(addr) = cli.serve_acp.clone() {
-            let mut acp = AcpGateway::bind(&addr)?;
-            if !cli.api_key.is_empty() {
-                acp = acp.with_api_keys(cli.api_key.clone());
-            }
-            let auth = if cli.api_key.is_empty() {
-                "open"
-            } else {
-                "API-key required"
-            };
-            tracing::info!(%addr, %auth, "ACP gateway listening on http://{addr}");
-            gateways.push(Arc::new(acp));
+        if cli.acp {
+            // Zed Agent Client Protocol over stdio: the editor spawns us and speaks JSON-RPC on
+            // stdin/stdout. It owns those streams, so keep product/log output on stderr (already the
+            // case — answer text and diagnostics never touch stdout in serving mode).
+            tracing::info!("Zed ACP agent (stdio)");
+            gateways.push(Arc::new(AcpGateway::new()));
         }
 
         if !cron_jobs.is_empty() {

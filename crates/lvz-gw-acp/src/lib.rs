@@ -1,134 +1,69 @@
-//! `lvz-gw-acp` — an **ACP (Agent Communication Protocol) server** gateway.
+//! `lvz-gw-acp` — a **Zed Agent Client Protocol (ACP)** agent gateway.
 //!
-//! The **Agent Communication Protocol** (BeeAI/IBM) is a REST protocol for agent interoperability:
-//! an agent publishes a manifest and accepts *runs*. This is a concrete [`Gateway`] that exposes the
-//! shared agent over that surface, depending only on `lvz-protocol` (the [`Gateway`]/[`AgentHandle`]
-//! contracts + the normalised [`Event`] stream) — never on a provider or on `lvz-agent`'s internals.
+//! The **Agent Client Protocol** (from Zed; <https://agentclientprotocol.com>) lets a code editor
+//! drive an AI coding agent that it launches **as a subprocess**, speaking **JSON-RPC 2.0 over
+//! stdio**. The editor is the *client*; Lavoisier is the *agent*. Wire an ACP-capable editor (Zed,
+//! or Neovim via a bridge) to run `lav --acp` and it gains the full Lavoisier tool loop inside the
+//! editor's agent panel — with **zero core change**, like every other gateway.
 //!
-//! Surface:
-//! - `GET  /agents` and `GET /agents/{name}` — the agent **manifest(s)** (discovery).
-//! - `POST /runs` — create a run: `{ agent_name, input: [Message], mode, session_id? }`.
-//!   - `mode: "sync"` (default) — run to completion, return the finished `Run`.
-//!   - `mode: "stream"` — stream ACP run events over SSE.
-//!   - `mode: "async"` — return a created run immediately; poll `GET /runs/{run_id}`.
-//! - `GET  /runs/{run_id}` — a run's current state; `POST /runs/{run_id}/cancel` — best-effort.
-//! - `GET  /ping` — liveness.
+//! (Not to be confused with IBM/BeeAI's *Agent Communication Protocol*, which shared the acronym —
+//! that project folded into A2A, so `--serve-a2a` is the interop server surface now. This `acp` is
+//! the editor-facing stdio protocol.)
 //!
-//! The ACP `session_id` maps to a Lavoisier session, so multi-run conversations accrue memory. The
-//! REST surface is hand-rolled over `axum`/`serde_json` — no ACP SDK.
+//! It is a **leaf crate**: it depends only on `lvz-protocol` (the [`Gateway`]/[`AgentHandle`]
+//! contracts + the normalised [`Event`] stream), never on a provider or on `lvz-agent`'s internals,
+//! so the same shared agent drives the CLI and this gateway unchanged.
+//!
+//! Surface (client → agent):
+//! - `initialize` — capability negotiation. We advertise protocol version `1`, text prompts, and no
+//!   auth methods (Lavoisier authenticates to model providers itself, via env keys).
+//! - `session/new` — allocate a session id (mapped straight onto a Lavoisier session, so a
+//!   multi-turn ACP conversation accrues memory through the shared `SessionAgent`).
+//! - `session/prompt` — run one turn. Text/thinking deltas stream out as `session/update`
+//!   notifications (`agent_message_chunk` / `agent_thought_chunk`); tool calls surface as
+//!   `tool_call` + `tool_call_update` updates; the request resolves with a `stopReason`.
+//! - `session/cancel` — a notification that cancels the session's in-flight prompt (dropping the
+//!   provider stream cancels the request), which then resolves with `stopReason: "cancelled"`.
+//!
+//! Deferred (documented, not yet wired): delegating file reads/writes to the editor
+//! (`fs/read_text_file` / `fs/write_text_file`) and `session/request_permission` — for now Lavoisier
+//! runs its own tools directly, which is a valid ACP posture. `session/load` is likewise not offered
+//! (`loadSession: false`). JSON-RPC is **hand-rolled** over `tokio`/`serde_json` — no ACP SDK.
 
 #![warn(missing_docs)]
 
-use std::collections::{HashSet, VecDeque};
-use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
-use axum::{
-    extract::{Path, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
-    response::{
-        sse::{Event as SseEvent, Sse},
-        IntoResponse, Response,
-    },
-    routing::{get, post},
-    Json, Router,
-};
-use futures::stream::{self, BoxStream, StreamExt};
-use lvz_protocol::{AgentHandle, Event, Gateway, GatewayError, TurnRequest};
+use futures::stream::StreamExt;
+use lvz_protocol::{AgentHandle, Event, Gateway, GatewayError, StopReason, TurnRequest};
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
-/// The single agent this gateway advertises.
-const AGENT_NAME: &str = "lavoisier";
-
-/// How many runs the in-memory store keeps for `GET /runs/{id}` before evicting the oldest.
-const RUN_STORE_CAP: usize = 256;
+/// The ACP protocol version this agent implements.
+const PROTOCOL_VERSION: u64 = 1;
 
 /// The shared agent, as every handler sees it.
 type SharedAgent = Arc<dyn AgentHandle>;
 
-/// Customisable manifest fields.
-#[derive(Clone)]
-struct ManifestConfig {
-    description: String,
-}
+/// A writer shared by the reader loop and every spawned prompt task; the mutex serialises whole
+/// JSON-RPC lines so interleaved notifications and responses never corrupt each other.
+type SharedWriter = Arc<AsyncMutex<Box<dyn AsyncWrite + Unpin + Send>>>;
 
-impl Default for ManifestConfig {
-    fn default() -> Self {
-        Self {
-            description: "Token-efficient CLI coding agent, exposed over ACP.".into(),
-        }
-    }
-}
-
-/// The ACP server gateway. Construct with a bind address, then [`Gateway::serve`] it with an
-/// [`AgentHandle`].
+/// The Zed ACP agent gateway. Construct with [`AcpGateway::new`], then [`Gateway::serve`] it with
+/// an [`AgentHandle`] — it takes over the process's stdin/stdout for the protocol.
+#[derive(Default)]
 pub struct AcpGateway {
-    addr: SocketAddr,
-    api_keys: HashSet<String>,
-    manifest: ManifestConfig,
+    _private: (),
 }
 
 impl AcpGateway {
-    /// Bind-address constructor with an open (no-auth) policy and the default manifest.
-    pub fn new(addr: SocketAddr) -> Self {
-        Self {
-            addr,
-            api_keys: HashSet::new(),
-            manifest: ManifestConfig::default(),
-        }
-    }
-
-    /// Parse a `host:port` string into a gateway, surfacing a [`GatewayError::Bind`] on a malformed
-    /// address.
-    pub fn bind(addr: &str) -> Result<Self, GatewayError> {
-        let addr = addr
-            .parse()
-            .map_err(|e: std::net::AddrParseError| GatewayError::Bind(e.to_string()))?;
-        Ok(Self::new(addr))
-    }
-
-    /// Require one of these API keys (sent as `Authorization: Bearer <key>`) on the `/runs` routes.
-    /// An empty set (the default) leaves the gateway open.
-    pub fn with_api_keys<I: IntoIterator<Item = String>>(mut self, keys: I) -> Self {
-        self.api_keys = keys.into_iter().collect();
-        self
-    }
-
-    /// Override the manifest description.
-    pub fn with_description(mut self, description: impl Into<String>) -> Self {
-        self.manifest.description = description.into();
-        self
-    }
-
-    fn manifest_json(&self) -> Value {
-        json!({
-            "name": AGENT_NAME,
-            "description": self.manifest.description,
-            "metadata": { "programming_language": "Rust" },
-            "input_content_types": ["text/plain"],
-            "output_content_types": ["text/plain"],
-        })
-    }
-
-    fn router(&self, agent: SharedAgent) -> Router {
-        let state = Arc::new(AppState {
-            agent,
-            manifest: self.manifest_json(),
-            api_keys: self.api_keys.clone(),
-            runs: Mutex::new(VecDeque::new()),
-            ids: AtomicU64::new(1),
-        });
-        Router::new()
-            .route("/ping", get(ping))
-            .route("/agents", get(list_agents))
-            .route("/agents/{name}", get(get_agent))
-            .route("/runs", post(create_run))
-            .route("/runs/{run_id}", get(get_run))
-            .route("/runs/{run_id}/cancel", post(cancel_run))
-            .with_state(state)
+    /// A new gateway with default configuration.
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -139,461 +74,594 @@ impl Gateway for AcpGateway {
     }
 
     async fn serve(self: Arc<Self>, agent: SharedAgent) -> Result<(), GatewayError> {
-        let app = self.router(agent);
-        let listener = tokio::net::TcpListener::bind(self.addr)
-            .await
-            .map_err(|e| GatewayError::Bind(e.to_string()))?;
-        tracing::info!(addr = %self.addr, "ACP gateway listening (GET /agents, POST /runs)");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .map_err(|e| GatewayError::Io(e.to_string()))
+        tracing::info!("Zed ACP agent on stdio (JSON-RPC 2.0)");
+        serve_over(
+            agent,
+            Box::new(tokio::io::stdin()),
+            Box::new(tokio::io::stdout()),
+        )
+        .await
     }
 }
 
-/// Shared handler state.
-struct AppState {
+/// The transport-agnostic serve loop: read newline-framed JSON-RPC from `reader`, dispatch, and
+/// write responses + `session/update` notifications to `writer`. Generic over the pipe so it can be
+/// unit-tested over an in-memory duplex instead of real stdio.
+///
+/// The loop stays responsive while a prompt runs: `session/prompt` is spawned as a task (so a
+/// concurrent `session/cancel` can still be read and acted on), and the shared `writer` serialises
+/// their output. Ends cleanly on EOF (the editor closing the pipe).
+async fn serve_over(
     agent: SharedAgent,
-    manifest: Value,
-    api_keys: HashSet<String>,
-    /// Runs, newest last, for `GET /runs/{id}`. Bounded by [`RUN_STORE_CAP`].
-    runs: Mutex<VecDeque<(String, Value)>>,
-    ids: AtomicU64,
-}
-
-impl AppState {
-    fn next(&self, prefix: &str) -> String {
-        format!("{prefix}-{}", self.ids.fetch_add(1, Ordering::Relaxed))
-    }
-
-    fn put_run(&self, id: &str, run: Value) {
-        let mut store = self.runs.lock().expect("acp run store poisoned");
-        if let Some(slot) = store.iter_mut().find(|(rid, _)| rid == id) {
-            slot.1 = run;
-            return;
+    reader: Box<dyn AsyncRead + Unpin + Send>,
+    writer: Box<dyn AsyncWrite + Unpin + Send>,
+) -> Result<(), GatewayError> {
+    let writer: SharedWriter = Arc::new(AsyncMutex::new(writer));
+    let state = Arc::new(ServerState::new(agent));
+    let mut lines = BufReader::new(reader).lines();
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|e| GatewayError::Io(e.to_string()))?
+    {
+        if line.trim().is_empty() {
+            continue;
         }
-        store.push_back((id.to_string(), run));
-        while store.len() > RUN_STORE_CAP {
-            store.pop_front();
+        let msg: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                // A malformed line has no reliable id to answer; log and keep serving.
+                tracing::debug!(error = %e, "acp: unparseable line");
+                continue;
+            }
+        };
+        dispatch(&state, &writer, msg).await;
+    }
+    Ok(())
+}
+
+/// Route one inbound JSON-RPC message. Requests carry a non-null `id` and get a response;
+/// notifications (no id) do not. Only `session/prompt` is long-running, so only it is spawned.
+async fn dispatch(state: &Arc<ServerState>, writer: &SharedWriter, msg: Value) {
+    let id = msg.get("id").cloned().filter(|v| !v.is_null());
+    let method = msg
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+    match method {
+        "initialize" => respond(writer, id, initialize_result()).await,
+        // No ACP auth methods are advertised, so `authenticate` is a no-op acknowledgement.
+        "authenticate" => respond(writer, id, json!({})).await,
+        "session/new" => {
+            let session_id = state.new_session();
+            tracing::info!(session = %session_id, "acp session/new");
+            respond(writer, id, json!({ "sessionId": session_id })).await;
+        }
+        "session/prompt" => {
+            let state = state.clone();
+            let writer = writer.clone();
+            tokio::spawn(async move { run_prompt(state, writer, id, params).await });
+        }
+        "session/cancel" => {
+            // A notification: no response. Signal the session's in-flight prompt to stop.
+            if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
+                tracing::info!(session = %session_id, "acp session/cancel");
+                state.cancel(session_id);
+            }
+        }
+        other => {
+            if id.is_some() {
+                respond_err(writer, id, -32601, &format!("method not found: {other}")).await;
+            }
         }
     }
-
-    fn get_run(&self, id: &str) -> Option<Value> {
-        let store = self.runs.lock().expect("acp run store poisoned");
-        store
-            .iter()
-            .rev()
-            .find(|(rid, _)| rid == id)
-            .map(|(_, r)| r.clone())
-    }
-
-    fn authorized(&self, headers: &HeaderMap) -> bool {
-        if self.api_keys.is_empty() {
-            return true;
-        }
-        headers
-            .get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .is_some_and(|key| self.api_keys.contains(key))
-    }
 }
 
-async fn ping() -> &'static str {
-    "pong"
+/// The `initialize` result: protocol version, agent capabilities, and (no) auth methods.
+fn initialize_result() -> Value {
+    json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "agentCapabilities": {
+            "loadSession": false,
+            "promptCapabilities": {
+                "image": false,
+                "audio": false,
+                "embeddedContext": false,
+            },
+        },
+        "authMethods": [],
+    })
 }
 
-/// `GET /agents` — the manifest list (one agent).
-async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({ "agents": [state.manifest.clone()] }))
-}
-
-/// `GET /agents/{name}` — one agent's manifest.
-async fn get_agent(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
-    if name == AGENT_NAME {
-        Json(state.manifest.clone()).into_response()
-    } else {
-        error_response(StatusCode::NOT_FOUND, &format!("no such agent: {name}"))
-    }
-}
-
-/// `POST /runs` — create a run in sync / stream / async mode.
-async fn create_run(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> Response {
-    if !state.authorized(&headers) {
-        return error_response(StatusCode::UNAUTHORIZED, "missing or invalid API key");
-    }
-    let text = extract_input(&body);
-    if text.is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "run input has no text content");
-    }
-    let session_id = body
-        .get("session_id")
+/// Run one `session/prompt` to completion: submit the turn, stream its events as `session/update`
+/// notifications, and answer the original request with a `stopReason` (or a JSON-RPC error).
+async fn run_prompt(
+    state: Arc<ServerState>,
+    writer: SharedWriter,
+    id: Option<Value>,
+    params: Value,
+) {
+    let Some(session_id) = params
+        .get("sessionId")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .unwrap_or_else(|| state.next("session"));
-    let mode = body.get("mode").and_then(Value::as_str).unwrap_or("sync");
-    let run_id = state.next("run");
+    else {
+        respond_err(&writer, id, -32602, "missing `sessionId`").await;
+        return;
+    };
+    let text = extract_prompt_text(params.get("prompt"));
+    if text.is_empty() {
+        respond_err(&writer, id, -32602, "prompt has no text content").await;
+        return;
+    }
 
-    match mode {
-        "stream" => stream_run(&state, run_id, session_id, text),
-        "async" => {
-            // Return an in-progress run immediately; a background task finishes it into the store.
-            let run = build_run(&run_id, &session_id, "in-progress", None);
-            state.put_run(&run_id, run.clone());
-            let bg = state.clone();
-            tokio::spawn(async move {
-                let final_run = match run_turn(&bg, &session_id, &text).await {
-                    Ok(answer) => build_run(
-                        &run_id,
-                        &session_id,
-                        "completed",
-                        Some(answer_output(&answer)),
-                    ),
-                    Err(e) => {
-                        let mut r = build_run(&run_id, &session_id, "failed", None);
-                        r["error"] = json!({ "message": e });
-                        r
-                    }
-                };
-                bg.put_run(&run_id, final_run);
-            });
-            Json(run).into_response()
+    // Arm cancellation *before* submitting so a race between the turn starting and a cancel arriving
+    // is caught (`Notify::notify_one` stores a permit even if we are not yet awaiting it).
+    let cancel = state.arm(&session_id);
+
+    let events = match state
+        .agent
+        .submit(TurnRequest::new(session_id.clone(), text))
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            state.disarm(&session_id);
+            respond_err(&writer, id, -32603, &e.to_string()).await;
+            return;
         }
-        _ => {
-            // sync
-            match run_turn(&state, &session_id, &text).await {
-                Ok(answer) => {
-                    let run = build_run(
-                        &run_id,
-                        &session_id,
-                        "completed",
-                        Some(answer_output(&answer)),
-                    );
-                    state.put_run(&run_id, run.clone());
-                    Json(run).into_response()
-                }
-                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
-            }
-        }
-    }
-}
-
-/// `GET /runs/{run_id}` — a run's current state.
-async fn get_run(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(run_id): Path<String>,
-) -> Response {
-    if !state.authorized(&headers) {
-        return error_response(StatusCode::UNAUTHORIZED, "missing or invalid API key");
-    }
-    match state.get_run(&run_id) {
-        Some(run) => Json(run).into_response(),
-        None => error_response(StatusCode::NOT_FOUND, &format!("no such run: {run_id}")),
-    }
-}
-
-/// `POST /runs/{run_id}/cancel` — best-effort cancellation.
-async fn cancel_run(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(run_id): Path<String>,
-) -> Response {
-    if !state.authorized(&headers) {
-        return error_response(StatusCode::UNAUTHORIZED, "missing or invalid API key");
-    }
-    match state.get_run(&run_id) {
-        Some(mut run) => {
-            // Only an unfinished run can move to cancelled; a completed one is returned as-is.
-            if run.get("status").and_then(Value::as_str) == Some("in-progress") {
-                run["status"] = json!("cancelled");
-                state.put_run(&run_id, run.clone());
-            }
-            Json(run).into_response()
-        }
-        None => error_response(StatusCode::NOT_FOUND, &format!("no such run: {run_id}")),
-    }
-}
-
-/// `mode: "stream"` — run the turn and stream ACP run events over SSE: a `run.in-progress` head,
-/// one `message.part` per text delta (accumulating the full answer), then a terminal `run.completed`
-/// (or `run.failed`) carrying the assembled output.
-fn stream_run(state: &Arc<AppState>, run_id: String, session_id: String, text: String) -> Response {
-    let in_progress = build_run(&run_id, &session_id, "in-progress", None);
-    state.put_run(&run_id, in_progress.clone());
-    let head = stream::once(async move {
-        Ok::<_, Infallible>(sse_json(
-            &json!({ "type": "run.in-progress", "run": in_progress }),
-        ))
-    });
-
-    // The turn is submitted lazily inside the stream, so the SSE response starts flushing at once.
-    let submit_state = state.clone();
-    let submit = async move {
-        let events = submit_state
-            .agent
-            .submit(TurnRequest::new(session_id.clone(), text))
-            .await;
-        (submit_state, run_id, session_id, events)
     };
 
-    let body = stream::once(submit).flat_map(|(state, run_id, session_id, events)| match events {
-        Ok(ev) => {
-            // Accumulate deltas so the terminal `run.completed` can carry the full output.
-            let acc = Arc::new(Mutex::new(String::new()));
-            let acc_body = acc.clone();
-            let parts = ev.filter_map(move |item| {
-                let acc = acc_body.clone();
-                async move {
-                    match item {
-                        Ok(Event::TextDelta(t)) => {
-                            acc.lock().expect("acp acc poisoned").push_str(&t);
-                            Some(Ok::<_, Infallible>(sse_json(&json!({
-                                "type": "message.part",
-                                "part": { "content_type": "text/plain", "content": t },
-                            }))))
-                        }
-                        _ => None,
+    let result = stream_updates(&writer, &session_id, events, cancel).await;
+    state.disarm(&session_id);
+    match result {
+        Ok(stop_reason) => respond(&writer, id, json!({ "stopReason": stop_reason })).await,
+        Err(e) => respond_err(&writer, id, -32603, &e).await,
+    }
+}
+
+/// Consume the agent's event stream, emitting one `session/update` per relevant [`Event`], until the
+/// turn ends, is cancelled, or errors. Returns the ACP `stopReason` on a clean finish.
+async fn stream_updates(
+    writer: &SharedWriter,
+    session_id: &str,
+    mut events: futures::stream::BoxStream<'static, Result<Event, lvz_protocol::AgentError>>,
+    cancel: Arc<Notify>,
+) -> Result<&'static str, String> {
+    // Accumulated tool-argument JSON per call id, so `tool_call_update` can carry the whole input.
+    let mut tool_args: HashMap<String, String> = HashMap::new();
+    let mut stop_reason = "end_turn";
+    loop {
+        tokio::select! {
+            biased;
+            // Cancellation wins the race: drop the stream (cancelling the provider request) and stop.
+            _ = cancel.notified() => {
+                return Ok("cancelled");
+            }
+            item = events.next() => match item {
+                None => break,
+                Some(Ok(event)) => {
+                    if let Some(update) = event_to_update(&event, &mut tool_args) {
+                        notify(writer, "session/update", json!({
+                            "sessionId": session_id,
+                            "update": update,
+                        }))
+                        .await;
+                    }
+                    if let Event::Done(reason) = event {
+                        stop_reason = map_stop_reason(&reason);
                     }
                 }
-            });
-            let tail = stream::once(async move {
-                let answer = acc.lock().expect("acp acc poisoned").trim().to_string();
-                let run = build_run(
-                    &run_id,
-                    &session_id,
-                    "completed",
-                    Some(answer_output(&answer)),
-                );
-                state.put_run(&run_id, run.clone());
-                Ok::<_, Infallible>(sse_json(&json!({ "type": "run.completed", "run": run })))
-            });
-            parts.chain(tail).boxed()
-        }
-        Err(e) => {
-            let run = build_run(&run_id, &session_id, "failed", None);
-            state.put_run(&run_id, run.clone());
-            stream::once(async move {
-                Ok::<_, Infallible>(sse_json(&json!({
-                    "type": "run.failed",
-                    "run": run,
-                    "error": { "message": e.to_string() },
-                })))
-            })
-            .boxed()
-        }
-    });
-
-    let full: BoxStream<'static, Result<SseEvent, Infallible>> = head.chain(body).boxed();
-    Sse::new(full).into_response()
-}
-
-// --- helpers ---
-
-/// Submit a turn and fold its text deltas into the final answer.
-async fn run_turn(state: &Arc<AppState>, session: &str, input: &str) -> Result<String, String> {
-    let mut stream = state
-        .agent
-        .submit(TurnRequest::new(session.to_string(), input.to_string()))
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut answer = String::new();
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(Event::TextDelta(t)) => answer.push_str(&t),
-            Ok(_) => {}
-            Err(e) => return Err(e.to_string()),
+                Some(Err(e)) => return Err(e.to_string()),
+            }
         }
     }
-    Ok(answer.trim().to_string())
+    Ok(stop_reason)
 }
 
-/// Pull all text-part content out of a run's `input` messages.
-fn extract_input(body: &Value) -> String {
-    let Some(messages) = body.get("input").and_then(Value::as_array) else {
+/// Translate one [`Event`] into an ACP `session/update` payload, or `None` for events ACP has no
+/// slot for (usage, citations — informational, folded away for now).
+fn event_to_update(event: &Event, tool_args: &mut HashMap<String, String>) -> Option<Value> {
+    match event {
+        Event::TextDelta(t) => Some(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": t },
+        })),
+        Event::Thinking(t) | Event::Notice(t) => Some(json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": { "type": "text", "text": t },
+        })),
+        Event::ToolUseStart { id, name } | Event::ServerToolUse { id, name } => Some(json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": id,
+            "title": name,
+            "kind": tool_kind(name),
+            "status": "in_progress",
+        })),
+        Event::ToolUseDelta { id, json } => {
+            tool_args.entry(id.clone()).or_default().push_str(json);
+            None
+        }
+        Event::ToolUseEnd { id } => {
+            // The call's arguments are now whole. Surface the parsed input if it parses.
+            let raw_input = tool_args
+                .remove(id)
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+            let mut update = json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": id,
+                "status": "completed",
+            });
+            if let Some(input) = raw_input {
+                update["rawInput"] = input;
+            }
+            Some(update)
+        }
+        Event::ServerToolResult { id, content } => Some(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": id,
+            "status": "completed",
+            "content": [{ "type": "content", "content": { "type": "text", "text": content } }],
+        })),
+        // Usage/Citation/Done carry no user-visible update chunk of their own.
+        _ => None,
+    }
+}
+
+/// Best-effort mapping of a Lavoisier tool name onto an ACP tool-call `kind` (drives the editor's
+/// icon/label). Unknown tools fall to `other`.
+fn tool_kind(name: &str) -> &'static str {
+    match name {
+        n if n.starts_with("read") || n.starts_with("outline") || n.starts_with("list") => "read",
+        n if n.starts_with("write")
+            || n.starts_with("edit")
+            || n.starts_with("batch_edit")
+            || n.starts_with("apply") =>
+        {
+            "edit"
+        }
+        n if n.starts_with("find") || n.starts_with("grep") || n.starts_with("search") => "search",
+        "shell" | "bash" => "execute",
+        _ => "other",
+    }
+}
+
+/// Map a Lavoisier [`StopReason`] onto an ACP `stopReason`. ACP has a narrower set — the extras all
+/// fold to the natural end of a turn.
+fn map_stop_reason(reason: &StopReason) -> &'static str {
+    match reason {
+        StopReason::MaxTokens => "max_tokens",
+        StopReason::Refusal => "refusal",
+        // EndTurn / ToolUse / StopSequence / PauseTurn / Other all present as a completed turn.
+        _ => "end_turn",
+    }
+}
+
+/// Pull the text out of an ACP prompt (an array of content blocks): concatenate every `text` block.
+fn extract_prompt_text(prompt: Option<&Value>) -> String {
+    let Some(blocks) = prompt.and_then(Value::as_array) else {
         return String::new();
     };
     let mut text = String::new();
-    for msg in messages {
-        let Some(parts) = msg.get("parts").and_then(Value::as_array) else {
-            continue;
-        };
-        for part in parts {
-            let ctype = part
-                .get("content_type")
+    for block in blocks {
+        let kind = block.get("type").and_then(Value::as_str);
+        // A plain text block, or a `resource` block whose embedded resource is text.
+        if kind == Some("text") || kind.is_none() {
+            if let Some(t) = block.get("text").and_then(Value::as_str) {
+                text.push_str(t);
+            }
+        } else if kind == Some("resource") {
+            if let Some(t) = block
+                .get("resource")
+                .and_then(|r| r.get("text"))
                 .and_then(Value::as_str)
-                .unwrap_or("text/plain");
-            if ctype.starts_with("text") {
-                if let Some(content) = part.get("content").and_then(Value::as_str) {
-                    text.push_str(content);
-                }
+            {
+                text.push_str(t);
             }
         }
     }
     text
 }
 
-/// The ACP output messages for a completed run.
-fn answer_output(answer: &str) -> Value {
-    json!([{
-        "role": "agent/lavoisier",
-        "parts": [{ "content_type": "text/plain", "content": answer }],
-    }])
+// --- JSON-RPC write helpers ---
+
+/// Write a JSON-RPC success response.
+async fn respond(writer: &SharedWriter, id: Option<Value>, result: Value) {
+    write_line(
+        writer,
+        &json!({ "jsonrpc": "2.0", "id": id.unwrap_or(Value::Null), "result": result }),
+    )
+    .await;
 }
 
-/// Build a `Run` object.
-fn build_run(run_id: &str, session_id: &str, status: &str, output: Option<Value>) -> Value {
-    json!({
-        "run_id": run_id,
-        "agent_name": AGENT_NAME,
-        "session_id": session_id,
-        "status": status,
-        "output": output.unwrap_or_else(|| json!([])),
-    })
+/// Write a JSON-RPC error response.
+async fn respond_err(writer: &SharedWriter, id: Option<Value>, code: i64, message: &str) {
+    write_line(
+        writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": id.unwrap_or(Value::Null),
+            "error": { "code": code, "message": message },
+        }),
+    )
+    .await;
 }
 
-fn sse_json(value: &Value) -> SseEvent {
-    SseEvent::default().data(value.to_string())
+/// Write a JSON-RPC notification (no id).
+async fn notify(writer: &SharedWriter, method: &str, params: Value) {
+    write_line(
+        writer,
+        &json!({ "jsonrpc": "2.0", "method": method, "params": params }),
+    )
+    .await;
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response {
-    (status, Json(json!({ "error": message }))).into_response()
+/// Serialise one message and write it as a newline-framed line, flushing so the editor sees it at
+/// once. A write failure (the editor closed the pipe) is logged, not fatal — the reader loop's EOF
+/// is the authoritative end-of-serve.
+async fn write_line(writer: &SharedWriter, msg: &Value) {
+    let mut line = serde_json::to_string(msg).expect("json-rpc message serialises");
+    line.push('\n');
+    let mut w = writer.lock().await;
+    if let Err(e) = w.write_all(line.as_bytes()).await {
+        tracing::debug!(error = %e, "acp: write failed");
+        return;
+    }
+    let _ = w.flush().await;
 }
 
-/// Resolve when the process is asked to terminate (SIGTERM/Ctrl-C), so the serve loop can shut down
-/// gracefully under the CLI's `select_all` join.
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = term.recv() => {}
-                    _ = tokio::signal::ctrl_c() => {}
-                }
-            }
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-            }
+/// Per-connection server state: the shared agent, a session-id counter, and the set of in-flight
+/// prompts (so a `session/cancel` can find and stop one).
+struct ServerState {
+    agent: SharedAgent,
+    next_session: AtomicU64,
+    /// sessionId → its in-flight prompt's cancellation handle. Present only while a prompt runs.
+    prompts: StdMutex<HashMap<String, Arc<Notify>>>,
+}
+
+impl ServerState {
+    fn new(agent: SharedAgent) -> Self {
+        Self {
+            agent,
+            next_session: AtomicU64::new(1),
+            prompts: StdMutex::new(HashMap::new()),
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+
+    fn new_session(&self) -> String {
+        format!("acp-{}", self.next_session.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Register a cancellation handle for `session`'s prompt, returning it for the stream loop to
+    /// await. Replaces any prior handle for the same session (a new prompt supersedes the old).
+    fn arm(&self, session: &str) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        self.prompts
+            .lock()
+            .expect("acp prompts poisoned")
+            .insert(session.to_string(), notify.clone());
+        notify
+    }
+
+    fn disarm(&self, session: &str) {
+        self.prompts
+            .lock()
+            .expect("acp prompts poisoned")
+            .remove(session);
+    }
+
+    /// Signal `session`'s in-flight prompt to cancel. `notify_one` stores a permit if the stream is
+    /// momentarily between awaits, so the cancel is never lost to a race.
+    fn cancel(&self, session: &str) {
+        if let Some(notify) = self
+            .prompts
+            .lock()
+            .expect("acp prompts poisoned")
+            .get(session)
+        {
+            notify.notify_one();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lvz_protocol::{AgentError, StopReason};
+    use futures::stream::{self, BoxStream};
+    use lvz_protocol::AgentError;
+    use tokio::io::{split, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    struct StubAgent(&'static str);
+    /// A stub agent streaming a scripted event list, so the gateway is testable without a provider.
+    struct StubAgent(Vec<Event>);
     #[async_trait]
     impl AgentHandle for StubAgent {
         async fn submit(
             &self,
             _turn: TurnRequest,
         ) -> Result<BoxStream<'static, Result<Event, AgentError>>, AgentError> {
-            let answer = self.0.to_string();
-            Ok(stream::iter(vec![
-                Ok(Event::TextDelta(answer)),
-                Ok(Event::Done(StopReason::EndTurn)),
-            ])
-            .boxed())
+            let events: Vec<_> = self.0.iter().cloned().map(Ok).collect();
+            Ok(stream::iter(events).boxed())
         }
     }
 
-    async fn spawn(agent: SharedAgent) -> String {
-        let gw = AcpGateway::bind("127.0.0.1:0").unwrap();
-        let app = gw.router(agent);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        format!("http://{addr}")
+    /// Drive the gateway over a duplex: return a client that can write requests and read reply lines.
+    fn spawn(agent: SharedAgent) -> Client {
+        let (server_end, client_end) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = split(server_end);
+        tokio::spawn(async move { serve_over(agent, Box::new(sr), Box::new(sw)).await });
+        let (cr, cw) = split(client_end);
+        Client {
+            reader: BufReader::new(Box::new(cr)),
+            writer: Box::new(cw),
+        }
+    }
+
+    struct Client {
+        reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+        writer: Box<dyn AsyncWrite + Unpin + Send>,
+    }
+    impl Client {
+        async fn send(&mut self, msg: Value) {
+            let mut line = msg.to_string();
+            line.push('\n');
+            self.writer.write_all(line.as_bytes()).await.unwrap();
+            self.writer.flush().await.unwrap();
+        }
+        /// Read one reply line as JSON.
+        async fn recv(&mut self) -> Value {
+            let mut line = String::new();
+            self.reader.read_line(&mut line).await.unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+        /// Read reply lines until one carries a `result` (a response), collecting notifications seen.
+        async fn recv_until_result(&mut self) -> (Vec<Value>, Value) {
+            let mut notes = Vec::new();
+            loop {
+                let v = self.recv().await;
+                if v.get("result").is_some() || v.get("error").is_some() {
+                    return (notes, v);
+                }
+                notes.push(v);
+            }
+        }
     }
 
     #[tokio::test]
-    async fn lists_the_agent_manifest() {
-        let base = spawn(Arc::new(StubAgent("hi"))).await;
-        let v: Value = reqwest::get(format!("{base}/agents"))
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(v["agents"][0]["name"], "lavoisier");
-        assert_eq!(v["agents"][0]["input_content_types"][0], "text/plain");
+    async fn initialize_advertises_protocol_and_no_auth() {
+        let mut c = spawn(Arc::new(StubAgent(vec![])));
+        c.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }))
+            .await;
+        let resp = c.recv().await;
+        assert_eq!(resp["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(resp["result"]["authMethods"], json!([]));
+        assert_eq!(resp["result"]["agentCapabilities"]["loadSession"], false);
     }
 
     #[tokio::test]
-    async fn sync_run_returns_completed_with_output() {
-        let base = spawn(Arc::new(StubAgent("42 is the answer"))).await;
-        let body = json!({
-            "agent_name": "lavoisier",
-            "input": [{ "parts": [{ "content_type": "text/plain", "content": "hi" }] }],
-        });
-        let run: Value = reqwest::Client::new()
-            .post(format!("{base}/runs"))
-            .json(&body)
-            .send()
-            .await
+    async fn new_session_then_prompt_streams_message_chunks_and_ends() {
+        let mut c = spawn(Arc::new(StubAgent(vec![
+            Event::TextDelta("the answer ".into()),
+            Event::TextDelta("is 42".into()),
+            Event::Done(StopReason::EndTurn),
+        ])));
+        c.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {} }))
+            .await;
+        let sid = c.recv().await["result"]["sessionId"]
+            .as_str()
             .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(run["status"], "completed");
-        assert_eq!(run["output"][0]["parts"][0]["content"], "42 is the answer");
-        // Retrievable by run_id.
-        let run_id = run["run_id"].as_str().unwrap().to_string();
-        let got: Value = reqwest::get(format!("{base}/runs/{run_id}"))
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(got["status"], "completed");
+            .to_string();
+        assert!(sid.starts_with("acp-"));
+
+        c.send(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+            "params": { "sessionId": sid, "prompt": [{ "type": "text", "text": "hi" }] }
+        }))
+        .await;
+        let (notes, resp) = c.recv_until_result().await;
+        // The two deltas arrive as agent_message_chunk updates on this session.
+        let text: String = notes
+            .iter()
+            .filter(|n| n["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+            .filter_map(|n| n["params"]["update"]["content"]["text"].as_str())
+            .collect();
+        assert_eq!(text, "the answer is 42");
+        assert!(notes
+            .iter()
+            .all(|n| n["params"]["sessionId"].as_str() == Some(sid.as_str())));
+        assert_eq!(resp["result"]["stopReason"], "end_turn");
     }
 
     #[tokio::test]
-    async fn stream_run_emits_sse_events() {
-        let base = spawn(Arc::new(StubAgent("streamed answer"))).await;
-        let body = json!({
-            "agent_name": "lavoisier",
-            "mode": "stream",
-            "input": [{ "parts": [{ "content_type": "text/plain", "content": "go" }] }],
-        });
-        let text = reqwest::Client::new()
-            .post(format!("{base}/runs"))
-            .json(&body)
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
-        assert!(text.contains("run.in-progress"));
-        assert!(text.contains("streamed answer"));
-        assert!(text.contains("run.completed"));
+    async fn tool_calls_surface_as_tool_call_updates() {
+        let mut c = spawn(Arc::new(StubAgent(vec![
+            Event::ToolUseStart {
+                id: "call_1".into(),
+                name: "read_file".into(),
+            },
+            Event::ToolUseDelta {
+                id: "call_1".into(),
+                json: "{\"path\":\"a.rs\"}".into(),
+            },
+            Event::ToolUseEnd {
+                id: "call_1".into(),
+            },
+            Event::TextDelta("done".into()),
+            Event::Done(StopReason::EndTurn),
+        ])));
+        c.send(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/prompt",
+            "params": { "sessionId": "acp-1", "prompt": [{ "type": "text", "text": "read it" }] }
+        }))
+        .await;
+        let (notes, resp) = c.recv_until_result().await;
+        let start = notes
+            .iter()
+            .find(|n| n["params"]["update"]["sessionUpdate"] == "tool_call")
+            .expect("a tool_call update");
+        assert_eq!(start["params"]["update"]["toolCallId"], "call_1");
+        assert_eq!(start["params"]["update"]["kind"], "read");
+        let end = notes
+            .iter()
+            .find(|n| n["params"]["update"]["sessionUpdate"] == "tool_call_update")
+            .expect("a tool_call_update");
+        assert_eq!(end["params"]["update"]["status"], "completed");
+        // The accumulated argument JSON is surfaced as rawInput.
+        assert_eq!(end["params"]["update"]["rawInput"]["path"], "a.rs");
+        assert_eq!(resp["result"]["stopReason"], "end_turn");
     }
 
     #[tokio::test]
-    async fn empty_input_is_a_bad_request() {
-        let base = spawn(Arc::new(StubAgent("x"))).await;
-        let body = json!({ "agent_name": "lavoisier", "input": [] });
-        let resp = reqwest::Client::new()
-            .post(format!("{base}/runs"))
-            .json(&body)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
+    async fn refusal_maps_to_the_refusal_stop_reason() {
+        let mut c = spawn(Arc::new(StubAgent(vec![Event::Done(StopReason::Refusal)])));
+        c.send(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/prompt",
+            "params": { "sessionId": "acp-1", "prompt": [{ "type": "text", "text": "x" }] }
+        }))
+        .await;
+        let (_notes, resp) = c.recv_until_result().await;
+        assert_eq!(resp["result"]["stopReason"], "refusal");
+    }
+
+    #[tokio::test]
+    async fn empty_prompt_is_an_invalid_params_error() {
+        let mut c = spawn(Arc::new(StubAgent(vec![])));
+        c.send(json!({
+            "jsonrpc": "2.0", "id": 5, "method": "session/prompt",
+            "params": { "sessionId": "acp-1", "prompt": [] }
+        }))
+        .await;
+        let resp = c.recv().await;
+        assert_eq!(resp["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn unknown_method_is_a_minus_32601() {
+        let mut c = spawn(Arc::new(StubAgent(vec![])));
+        c.send(json!({ "jsonrpc": "2.0", "id": 9, "method": "frobnicate", "params": {} }))
+            .await;
+        let resp = c.recv().await;
+        assert_eq!(resp["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn tool_kinds_map_sensibly() {
+        assert_eq!(tool_kind("read_files"), "read");
+        assert_eq!(tool_kind("edit_files"), "edit");
+        assert_eq!(tool_kind("find_references"), "search");
+        assert_eq!(tool_kind("shell"), "execute");
+        assert_eq!(tool_kind("whatever"), "other");
+    }
+
+    #[test]
+    fn prompt_text_extraction_reads_text_blocks() {
+        let prompt = json!([
+            { "type": "text", "text": "hello " },
+            { "type": "resource_link", "uri": "file:///x" },
+            { "type": "text", "text": "world" },
+        ]);
+        assert_eq!(extract_prompt_text(Some(&prompt)), "hello world");
+        assert_eq!(extract_prompt_text(None), "");
     }
 }

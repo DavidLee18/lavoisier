@@ -303,10 +303,14 @@ Agent Card at `/.well-known/agent-card.json` plus a JSON-RPC endpoint (`message/
 `message/stream` over SSE, `tasks/get`) so other agents can delegate tasks to it. Reuses `--api-key`
 for auth; runs alongside the other gateways. Configurable via `[gateway] serve_a2a`.
 
-ACP (Agent Communication Protocol server, BeeAI/IBM): `--serve-acp <ADDR>` exposes Lavoisier over the
-**ACP** REST agents/runs API — `GET /agents`, `POST /runs` (sync / SSE-stream / async modes),
-`GET /runs/{id}` — so ACP clients can run it. Reuses `--api-key` for auth. Configurable via
-`[gateway] serve_acp`.
+ACP (Zed **Agent Client Protocol** agent — the *editor* protocol): `--acp` runs Lavoisier as an ACP
+agent over **stdio** (JSON-RPC 2.0), so an ACP-capable editor (Zed, or Neovim via a bridge) launches
+it as a subprocess and drives the full tool loop from its agent panel. It owns stdin/stdout for the
+protocol (diagnostics stay on stderr); point your editor's agent command at `lav --acp`. Implements
+`initialize`, `session/new`, `session/prompt` (streaming `session/update`s — message/thought chunks
+and tool-call updates), and `session/cancel`. Configurable via `[gateway] acp`. (For agent-to-agent
+interop — the role IBM/BeeAI's *Agent Communication Protocol* played before it folded into A2A — use
+`--serve-a2a`.)
 
 MCP (Model Context Protocol client): `--mcp-server <LABEL:TARGET>` (repeatable) connects to an
 external MCP server and exposes **its** tools as Lavoisier tools, so the agent and every gateway gain
