@@ -296,7 +296,10 @@ fullscreen alt-screen: finalized output is pushed into the terminal's own scroll
 box (`tui-textarea`), a status/spinner line, and a token/cost footer. It renders the normalised
 [`Event`] stream as a chat — `TextDelta`→streamed assistant text (line-buffered to scrollback with
 **markdown rendering**: inline `**bold**`/`*italic*`/`` `code` ``/`~~strike~~` via a hand-rolled styler
-with width-aware styled-span wrapping, plus block-level headings and fenced code), `Thinking`/`Notice`
+with width-aware styled-span wrapping, plus **block constructs** — headings, **fenced code blocks**
+(dim top/bottom border + `│ ` gutter, no inline interpretation), and **aligned markdown tables**
+(the one buffered block: rows accumulate until the table ends, then columns are width-fitted — with
+per-column alignment from the separator row and cell truncation when too wide)), `Thinking`/`Notice`
 →status, `ToolUse*`→tool-call cards, `Usage`→the footer. The **footer shows real spend** — a token
 breakdown (`↑in ↓out ⚡cache`) and an estimated **USD cost** from a per-model price table (`price.rs`;
 approximate list prices, matched by model-name substring, `~$` = estimate), not an abstract

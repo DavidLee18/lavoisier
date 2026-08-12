@@ -316,7 +316,7 @@ TUI (interactive inline terminal UI): `--tui` launches a scrollback-native REPL 
 shell, modelled on Claude Code / Grok CLI — driving the same shared agent. It uses ratatui's *inline*
 viewport (not fullscreen), so output flows into the terminal's normal scrollback while an input box,
 status line, and footer stay pinned at the bottom. Assistant output is **markdown-rendered** (bold,
-italic, code, headings, fenced blocks); the **footer shows a token breakdown and an estimated USD
+italic, code, headings, bordered fenced code blocks, and column-aligned tables); the **footer shows a token breakdown and an estimated USD
 cost**. Slash commands `/help` `/model <name|reset>` `/session <id>` `/new` `/clear` `/quit` — `/model`
 switches the model mid-session; `Ctrl-C` cancels a turn, `Ctrl-D` quits. **Tool approval** follows
 Claude Code's default — read-only tools run unattended, mutating tools and shells prompt (the call's
