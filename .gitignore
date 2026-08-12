@@ -11,3 +11,6 @@
 # Benchmark run artifacts (transient: per-run results dirs + captured stdout logs)
 bench/results/
 bench/*.out
+
+# Unrelated project directory that lives alongside this repo (never track it)
+/42_webserv/
