@@ -111,6 +111,7 @@ tests =
       compactionTests,
       section8Tests,
       convergenceTests,
+      minorLeverTests,
       fallbackTests,
       contextTests,
       treeSitterTests,
@@ -853,6 +854,68 @@ convergenceTests =
         evs <- readIORef emitted
         n @?= 1 -- stopped after one edit turn
         assertBool "emitted EndTurn" (Done EndTurn `elem` evs)
+    ]
+
+-- --- minor levers: archetype classification, budget-awareness, summary-model routing --------------
+
+minorLeverTests :: TestTree
+minorLeverTests =
+  testGroup
+    "minor levers"
+    [ testCase "classifyArchetype keys off task keywords" $ do
+        classifyArchetype "please rename foo" @?= Tn.Rename
+        classifyArchetype "refactor the module" @?= Tn.Refactor
+        classifyArchetype "implement a new endpoint" @?= Tn.Feature
+        classifyArchetype "fix the bug" @?= Tn.SingleFileEdit
+        classifyArchetype "what does this function do?" @?= Tn.Other,
+      testCase "budget-awareness appends a progress note to a turn's results" $ do
+        ref <- newIORef (0 :: Int)
+        let arg = decodeUtf8Lenient . BL.toStrict . encode $ object ["path" .= ("/no" :: Text)]
+            stub =
+              Provider
+                { providerStream = \_ -> do
+                    n <- atomicModifyIORef' ref (\k -> (k + 1, k))
+                    fmap Right (fromList (map Right (if n == 0 then [ToolUseStart "t" "read_file", ToolUseDelta "t" arg, ToolUseEnd "t", Usage emptyUsage, Done ToolUse] else [TextDelta "done", Usage emptyUsage, Done EndTurn]))),
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+            cfg = (defaultAgentConfig "m") {acBudgetAwareness = True}
+        agent <- mkAgent stub withBuiltins cfg Tn.noopTuner Nothing
+        r <- runLoopSeeded agent Nothing [userMessage "go"] (const (pure ()))
+        case r of
+          Right msgs -> assertBool "progress note present" (any ("[progress: turn 1/" `T.isInfixOf`) [c | Message _ bs <- msgs, TextBlock c _ <- bs])
+          Left e -> assertFailure (show e),
+      testCase "require-edit does not nudge a question (Other archetype)" $ do
+        ref <- newIORef (0 :: Int)
+        let stub =
+              Provider
+                { providerStream = \_ -> modifyIORef' ref (+ 1) >> fmap Right (fromList (map Right [TextDelta "it does X", Usage emptyUsage, Done EndTurn])),
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+            cfg = (defaultAgentConfig "m") {acRequireEdit = True}
+        agent <- mkAgent stub withBuiltins cfg Tn.noopTuner Nothing
+        _ <- runLoopSeeded agent Nothing [userMessage "what does this do?"] (const (pure ()))
+        readIORef ref >>= (@?= 1), -- Other ⇒ no nudge ⇒ single round-trip
+      testCase "compaction routes to the summary model when set" $ do
+        models <- newIORef []
+        let big = T.replicate 400 "z"
+            mkPair i = [Message Assistant [ToolUseBlock (T.pack (show i)) "read_file" (object [])], Message User [ToolResultBlock (T.pack (show i)) (big <> T.pack (show i)) False]]
+            seed = userMessage "task" : concatMap mkPair [1 .. 3 :: Int]
+            stub =
+              Provider
+                { providerStream = \req -> do
+                    modifyIORef' models (<> [(null (crTools req), crModel req)])
+                    fmap Right (fromList (map Right (if null (crTools req) then [TextDelta "SUM", Usage emptyUsage, Done EndTurn] else [TextDelta "final", Usage emptyUsage, Done EndTurn]))),
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+            tuner = Tn.Tuner {Tn.tunerSelect = \_ -> pure Tn.defaultKnobs {Tn.compactAfter = 1}, Tn.tunerObserve = \_ _ _ -> pure ()}
+            cfg = (defaultAgentConfig "exec") {acSummaryModel = Just "cheap-sum"}
+        agent <- mkAgent stub withBuiltins cfg tuner Nothing
+        _ <- runLoopSeeded agent Nothing seed (const (pure ()))
+        ms <- readIORef models
+        assertBool "the tool-less summary call used the summary model" ((True, "cheap-sum") `elem` ms)
     ]
 
 -- --- fallback chain (offline; scripted providers + the cross-turn circuit breaker) ---------------

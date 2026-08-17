@@ -68,6 +68,8 @@ data Options = Options
     optRequireEdit :: Bool,
     optVerifyAndFix :: Bool,
     optInLoopVerify :: Bool,
+    optSummaryModel :: Maybe Text,
+    optBudgetAwareness :: Bool,
     optServe :: Maybe Int,
     optServeA2a :: Maybe Int,
     optServeAcp :: Maybe Int,
@@ -111,6 +113,8 @@ optionsParser =
     <*> switch (long "require-edit" <> help "Nudge a finish that edited nothing to actually edit (bounded)")
     <*> switch (long "verify-and-fix" <> help "On a would-be finish, if --verify-cmd fails, feed the output back and keep working (bounded)")
     <*> switch (long "in-loop-verify" <> help "Stop as soon as an edit turn makes --verify-cmd pass")
+    <*> optional (strOption (long "summary-model" <> metavar "MODEL" <> help "Cheaper model for history-compaction summaries (defaults to --model)"))
+    <*> switch (long "budget-awareness" <> help "Append a progress/token note to each turn so the model sees the ceilings")
     <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
     <*> optional (option auto (long "serve-a2a" <> metavar "PORT" <> help "Serve the agent as an A2A (Agent-to-Agent) gateway on this port"))
     <*> optional (option auto (long "serve-acp" <> metavar "PORT" <> help "Serve the agent as an ACP (Agent Communication Protocol) gateway on this port"))
@@ -219,6 +223,8 @@ applyConfig fc o =
       optRequireEdit = optRequireEdit o || fromMaybe False (requireEdit fc),
       optVerifyAndFix = optVerifyAndFix o || fromMaybe False (verifyAndFix fc),
       optInLoopVerify = optInLoopVerify o || fromMaybe False (inLoopVerify fc),
+      optSummaryModel = optSummaryModel o <|> summaryModel fc,
+      optBudgetAwareness = optBudgetAwareness o || fromMaybe False (budgetAwareness fc),
       optServe = optServe o <|> fmap fromIntegral (serve fc),
       optServeA2a = optServeA2a o <|> fmap fromIntegral (serveA2a fc),
       optServeAcp = optServeAcp o <|> fmap fromIntegral (serveAcp fc),
@@ -414,7 +420,9 @@ assembleAgent prov opts model tuner delib registry = do
             acVerifyCommand = optVerifyCmd opts,
             acRequireEdit = optRequireEdit opts,
             acVerifyAndFix = optVerifyAndFix opts,
-            acInLoopVerify = optInLoopVerify opts
+            acInLoopVerify = optInLoopVerify opts,
+            acSummaryModel = optSummaryModel opts,
+            acBudgetAwareness = optBudgetAwareness opts
           }
   agent0 <- mkAgent prov registry cfg tuner delib
   fallbacks <- buildFallbacks opts

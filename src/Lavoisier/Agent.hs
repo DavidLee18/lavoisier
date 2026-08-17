@@ -25,6 +25,7 @@ module Lavoisier.Agent
     markStaleReads,
     evictToFit,
     historyTokens,
+    classifyArchetype,
   )
 where
 
@@ -108,14 +109,19 @@ data AgentConfig = AgentConfig
     -- (bounded by 'maxFixAttempts')..
     acVerifyAndFix :: Bool,
     -- | Stop as soon as an edit turn makes 'acVerifyCommand' pass (don't wait for the model).
-    acInLoopVerify :: Bool
+    acInLoopVerify :: Bool,
+    -- | Cheaper model for history-compaction summaries (§6.3 model tiering). 'Nothing' ⇒ 'acModel'.
+    acSummaryModel :: Maybe Text,
+    -- | Append a "[progress: turn X\/Y, ~Nk tokens]" note to each turn's tool results, so the model
+    -- can see how close it is to the step\/budget ceilings.
+    acBudgetAwareness :: Bool
   }
 
 -- | Sensible defaults: 12 steps, 4096 max tokens, no forced thinking, the default system prompt, no
 -- context-eviction ceiling, no cheap\/advisor model (escalate-after 2), unbounded budget, no
 -- no-progress breaker.
 defaultAgentConfig :: Text -> AgentConfig
-defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing Nothing Nothing 2 Nothing Nothing Nothing Nothing False False False
+defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing Nothing Nothing 2 Nothing Nothing Nothing Nothing False False False Nothing False
 
 -- | A per-position __circuit breaker__ for the fallback chain, shared across turns so a dead model
 -- isn't re-probed every turn. Position @0@ is the primary; position @i>0@ is @fallbacks !! (i-1)@.
@@ -266,7 +272,7 @@ runLoopSeeded agent allowed initial emit = do
   -- ATO: pick knobs for this task, honour the tuned thinking dial (the one knob the loop can act on
   -- today — the skeleton/truncate/compact/batch dials await the context engine), then observe the
   -- realised cost-weighted outcome so the learner improves. With 'noopTuner' this is inert.
-  let ctx = taskContextFor agent
+  let ctx = taskContextFor agent (lastUserText initial)
   knobs <- tunerSelect (agTuner agent) ctx
   usageRef <- newIORef emptyUsage
   stepRef <- newIORef (0 :: Int)
@@ -315,6 +321,8 @@ runLoopSeeded agent allowed initial emit = do
   pure result
   where
     cfg = agConfig agent
+    -- The task archetype gates require-edit (skip a likely-Q&A `Other` task).
+    notOther = classifyArchetype (lastUserText initial) /= Other
     defs = filterDefs allowed (registryDefs (agTools agent))
     systemText = fromMaybe defaultSystemPrompt (acSystem cfg)
     system = SystemPrompt systemText True
@@ -376,10 +384,14 @@ runLoopSeeded agent allowed initial emit = do
         -- now passes (done) or the no-progress streak hit the hard limit.
         act msgs' txt calls cursor' = do
           results <- mapM (runCall knobs maxRef) calls
+          spentNow <- readIORef usageRef
           let madeEdit = or (zipWith edited calls results)
               conv' = conv {cvEdited = cvEdited conv || madeEdit, cvStreak = if madeEdit then 0 else cvStreak conv + 1}
               assistantMsg = Message Assistant (textPart txt <> map callBlock calls)
-              userMsg = Message User (map resultBlock results <> [TextBlock noProgressNudge False | nudgeAt (cvStreak conv')])
+              extras =
+                [TextBlock noProgressNudge False | nudgeAt (cvStreak conv')]
+                  <> [budgetNote (step + 1) (acMaxSteps cfg) (usageCost spentNow defaultCostWeights) (acTokenBudget cfg) | acBudgetAwareness cfg]
+              userMsg = Message User (map resultBlock results <> extras)
               transcript = msgs' <> [assistantMsg, userMsg]
           done <- if acInLoopVerify cfg && madeEdit then runVerify cfg else pure False
           if done
@@ -392,7 +404,7 @@ runLoopSeeded agent allowed initial emit = do
         finish msgs' txt = do
           let base = msgs' <> [Message Assistant b | let b = textPart txt, not (null b)]
               continueWith extra c = go effThinking usageRef stepRef knobs maxRef cursor (base <> [Message User [TextBlock extra False]]) (step + 1) c
-          if acRequireEdit cfg && not (cvEdited conv) && cvNudges conv < maxEditNudges
+          if acRequireEdit cfg && not (cvEdited conv) && notOther && cvNudges conv < maxEditNudges
             then continueWith requireEditNudge conv {cvNudges = cvNudges conv + 1}
             else do
               vf <- if acVerifyAndFix cfg && cvFixes conv < maxFixAttempts then runVerifyOutput cfg else pure Nothing
@@ -509,10 +521,10 @@ agentHandle agent = AgentHandle $ \turn -> do
 -- | The ATO 'TaskContext' for this turn. Archetype classification and repo profiling are deferred
 -- (no context engine yet), so it reports 'Other' over an empty repo; the model tier is a coarse
 -- name heuristic, and the concrete model id keys the learner's profiles apart across upgrades.
-taskContextFor :: Agent -> TaskContext
-taskContextFor agent =
+taskContextFor :: Agent -> Text -> TaskContext
+taskContextFor agent task =
   TaskContext
-    { tcArchetype = Other,
+    { tcArchetype = classifyArchetype task,
       tcRepo = defaultRepoProfile,
       tcCaps = providerCapabilities (agProvider agent),
       tcModel = tierOf (acModel (agConfig agent)),
@@ -777,7 +789,7 @@ compactHistory prov cfg history = case history of
         let cutEnd = length history - keep
             prefix = take (cutEnd - 1) (drop 1 history)
             req =
-              (chatRequest (acModel cfg))
+              (chatRequest (fromMaybe (acModel cfg) (acSummaryModel cfg)))
                 { crSystem = Just (SystemPrompt compactionSystem True),
                   crMessages = [userMessage (renderTranscript prefix)],
                   crMaxTokens = summaryMaxTokens
@@ -862,6 +874,26 @@ verifyFailPrompt out =
   "Verification failed — the task is not complete. Fix the issues below, then finish only once it "
     <> "passes.\n\n"
     <> out
+
+-- | Keyword heuristic classifying a task into an 'Archetype' (the default, model-free classifier).
+classifyArchetype :: Text -> Archetype
+classifyArchetype prompt
+  | any has ["rename"] = Rename
+  | any has ["refactor", "extract ", "restructure", "split ", "move "] = Refactor
+  | any has ["implement", "add ", "create ", "new feature", "support for", "build "] = Feature
+  | any has ["fix", "edit", "change", "update", "modify", "rewrite"] = SingleFileEdit
+  | otherwise = Other
+  where
+    has kw = kw `T.isInfixOf` T.toLower prompt
+
+-- | A "[progress: …]" note telling the model how close it is to the step\/budget ceilings.
+budgetNote :: Int -> Int -> Word64 -> Maybe Word64 -> ContentBlock
+budgetNote roundTrips maxSteps used budget =
+  TextBlock ("[progress: turn " <> tshow roundTrips <> "/" <> tshow maxSteps <> tokens <> " — finish before the limit]") False
+  where
+    tokens = case budget of
+      Just b | b > 0 -> ", ~" <> tshow (used `div` 1000) <> "k/" <> tshow (b `div` 1000) <> "k tokens"
+      _ -> ""
 
 -- | Apply the knobs the agent enforces directly on a tool call's arguments (§6.6\/§6.1): inject the
 -- tuned skeleton radius into an @outline_*@ call that focuses a symbol but left @radius@ unset, and

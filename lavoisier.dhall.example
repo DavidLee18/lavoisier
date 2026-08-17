@@ -20,6 +20,8 @@
 , requireEdit = None Bool -- nudge a finish that edited nothing
 , verifyAndFix = None Bool -- on a would-be finish, if verifyCmd fails, feed it back and keep working
 , inLoopVerify = None Bool -- stop as soon as an edit turn makes verifyCmd pass
+, summaryModel = None Text -- cheaper model for history-compaction summaries
+, budgetAwareness = None Bool -- append a progress/token note to each turn
 , serve = None Natural -- HTTP gateway port (POST /v1/turns, GET /health)
 , serveA2a = None Natural -- A2A gateway port
 , serveAcp = None Natural -- ACP gateway port
