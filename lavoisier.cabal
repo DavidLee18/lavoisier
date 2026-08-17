@@ -41,6 +41,7 @@ library
     Lavoisier.CLI
     Lavoisier.Config
     Lavoisier.Context.Anchor
+    Lavoisier.Context.Budget
     Lavoisier.Context.Diff
     Lavoisier.Context.Lang
     Lavoisier.Context.Skeleton

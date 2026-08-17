@@ -27,6 +27,7 @@ import Data.Word (Word64)
 import Lavoisier.Agent
 import Lavoisier.Config (FileConfig (..), defaultConfig, loadConfig)
 import Lavoisier.Context.Anchor qualified as Anc
+import Lavoisier.Context.Budget qualified as Bud
 import Lavoisier.Context.Diff qualified as Dff
 import Lavoisier.Context.Lang (Lang (..), LangSpec (..), langFromPath, langSpec)
 import Lavoisier.Context.Skeleton qualified as Skel
@@ -110,6 +111,7 @@ tests =
       treeSitterTests,
       skeletonTests,
       symbolTests,
+      budgetTests,
       gatewayTests,
       a2aTests,
       acpTests,
@@ -780,6 +782,50 @@ symbolTests =
     ]
   where
     src = "fn helper(x: i32) -> i32 {\n    x + 1\n}\n\nfn target() -> i32 {\n    helper(41)\n}\n\nfn unrelated() -> i32 {\n    7\n}\n"
+
+-- Budget-fixture loop (Phase 23b): the deterministic skeleton-radius token lever.
+budgetTests :: TestTree
+budgetTests =
+  testGroup
+    "context engine (budget)"
+    [ testCase "kept set never shrinks with radius" $ do
+        reports <- Bud.sweep demo 3
+        let kepts = map Bud.brKeptSymbols reports
+        assertBool ("monotonic kept set: " <> show kepts) (and (zipWith (<=) kepts (drop 1 kepts))),
+      testCase "radius is a real lever for substantial bodies" $ do
+        let bigDep =
+              Bud.Fixture
+                { Bud.fxName = "big_dep",
+                  Bud.fxArchetype = Bud.SingleFileEdit,
+                  Bud.fxFiles =
+                    [ ( Rust,
+                        BS8.pack "fn target() -> i32 { big() }\nfn big() -> i32 {\n    let mut total = 0;\n    for i in 0..100 { total += i * i - 3 * i + 7; }\n    total\n}\n"
+                      )
+                    ],
+                  Bud.fxTarget = "target"
+                }
+        r0 <- Bud.measure bigDep 0
+        r1 <- Bud.measure bigDep 1
+        assertBool "radius 1 costs more tokens" (Bud.brEstTokens r1 > Bud.brEstTokens r0),
+      testCase "radius expands the kept set along the dependency chain" $ do
+        k0 <- Bud.brKeptSymbols <$> Bud.measure demo 0
+        k1 <- Bud.brKeptSymbols <$> Bud.measure demo 1
+        k2 <- Bud.brKeptSymbols <$> Bud.measure demo 2
+        k3 <- Bud.brKeptSymbols <$> Bud.measure demo 3
+        (k0, k1, k2, k3) @?= (1, 2, 3, 3)
+    ]
+  where
+    demo =
+      Bud.Fixture
+        { Bud.fxName = "demo",
+          Bud.fxArchetype = Bud.SingleFileEdit,
+          Bud.fxFiles =
+            [ ( Rust,
+                BS8.pack "fn a() -> i32 { b() + 1 }\nfn b() -> i32 { c() + 1 }\nfn c() -> i32 { 1 }\nfn unrelated() -> i32 { 99 }\n"
+              )
+            ],
+          Bud.fxTarget = "a"
+        }
 
 -- --- Phase 6: the HTTP gateway (offline; WAI test harness, no socket or API) ----------------------
 
