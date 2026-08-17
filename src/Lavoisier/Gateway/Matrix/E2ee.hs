@@ -38,6 +38,16 @@ module Lavoisier.Gateway.Matrix.E2ee
     olmEncryptTo,
     roomKeyEvent,
     encryptMegolm,
+
+    -- * Homeserver REST wiring (decoupled via a 'Rest' hook, so it is offline-testable)
+    Rest,
+    publishKeys,
+    queryDevice,
+    claimOtk,
+    shareRoomKeyWith,
+    olmEncryptedContent,
+    parseDeviceKeys,
+    parseClaimedOtk,
   )
 where
 
@@ -288,6 +298,81 @@ encryptMegolm c room event = do
           "ciphertext" .= ct
         ]
     )
+
+-- --- homeserver REST wiring ------------------------------------------------------------------------
+
+-- | The gateway supplies this: @method → path → body → response@ (or an error). Keeping it abstract
+-- lets the E2EE key exchange be driven against a real homeserver by the gateway, and against a mock
+-- in tests, without this module depending on the HTTP client.
+type Rest = Text -> Text -> Value -> IO (Either Text Value)
+
+-- | Publish the bot's device keys + a batch of one-time keys (@POST \/keys\/upload@).
+publishKeys :: Crypto -> Rest -> IO (Either Text ())
+publishKeys c rest = do
+  dk <- deviceKeysPayload c
+  otk <- oneTimeKeysPayload c
+  fmap (const ()) <$> rest "POST" "/_matrix/client/v3/keys/upload" (object ["device_keys" .= dk, "one_time_keys" .= otk])
+
+-- | Query a peer device's @(curve25519, ed25519)@ identity keys (@POST \/keys\/query@).
+queryDevice :: Rest -> Text -> Text -> IO (Either Text (Text, Text))
+queryDevice rest userId deviceId = do
+  r <- rest "POST" "/_matrix/client/v3/keys/query" (object ["device_keys" .= object [K.fromText userId .= ([] :: [Text])]])
+  pure (r >>= parseDeviceKeys userId deviceId)
+
+-- | Claim a one-time key for a peer device (@POST \/keys\/claim@), returning its base64 value.
+claimOtk :: Rest -> Text -> Text -> IO (Either Text Text)
+claimOtk rest userId deviceId = do
+  let body = object ["one_time_keys" .= object [K.fromText userId .= object [K.fromText deviceId .= ("signed_curve25519" :: Text)]]]
+  r <- rest "POST" "/_matrix/client/v3/keys/claim" body
+  pure (r >>= parseClaimedOtk userId deviceId)
+
+-- | Share @room@'s current Megolm session with a peer device: look up its keys, claim a one-time key,
+-- Olm-encrypt the @m.room_key@ to it, and send it to-device (@PUT \/sendToDevice@, @txn@ supplied by
+-- the caller). The room key must be shared before 'encryptMegolm' output is sent.
+shareRoomKeyWith :: Crypto -> Rest -> Text -> Text -> Text -> Text -> IO (Either Text ())
+shareRoomKeyWith c rest txn room userId deviceId = do
+  ek <- queryDevice rest userId deviceId
+  case ek of
+    Left e -> pure (Left e)
+    Right (curve, _ed) -> do
+      mo <- claimOtk rest userId deviceId
+      case mo of
+        Left e -> pure (Left e)
+        Right otk -> do
+          rk <- roomKeyEvent c room
+          (mtype, ctBody) <- olmEncryptTo c curve otk rk
+          let msg = object ["messages" .= object [K.fromText userId .= object [K.fromText deviceId .= olmEncryptedContent c curve mtype ctBody]]]
+          fmap (const ()) <$> rest "PUT" ("/_matrix/client/v3/sendToDevice/m.room.encrypted/" <> txn) msg
+
+-- | The to-device @m.room.encrypted@ (Olm) content wrapping a ciphertext for a peer's curve25519 key.
+olmEncryptedContent :: Crypto -> Text -> Int -> Text -> Value
+olmEncryptedContent c theirCurve mtype ctBody =
+  object
+    [ "algorithm" .= olmAlgorithm,
+      "sender_key" .= crCurve c,
+      "ciphertext" .= object [K.fromText theirCurve .= object ["type" .= mtype, "body" .= ctBody]]
+    ]
+
+-- | Parse a peer device's @(curve25519, ed25519)@ identity keys from a @\/keys\/query@ response.
+parseDeviceKeys :: Text -> Text -> Value -> Either Text (Text, Text)
+parseDeviceKeys userId deviceId resp = do
+  keys <- note "no device_keys.<user>.<device>.keys" (lookKey "device_keys" resp >>= lookKey userId >>= lookKey deviceId >>= lookKey "keys")
+  curve <- note "no curve25519 key" (lookStr ("curve25519:" <> deviceId) keys)
+  ed <- note "no ed25519 key" (lookStr ("ed25519:" <> deviceId) keys)
+  pure (curve, ed)
+
+-- | Parse the claimed one-time key's base64 value from a @\/keys\/claim@ response.
+parseClaimedOtk :: Text -> Text -> Value -> Either Text Text
+parseClaimedOtk userId deviceId resp = do
+  dev <- note "no one_time_keys.<user>.<device>" (lookKey "one_time_keys" resp >>= lookKey userId >>= lookKey deviceId)
+  case dev of
+    Object o -> case [v | (k, v) <- KM.toList o, "signed_curve25519:" `T.isPrefixOf` K.toText k] of
+      (keyObj : _) -> note "claimed key has no `key`" (lookStr "key" keyObj)
+      [] -> Left "no signed_curve25519 key in claim response"
+    _ -> Left "claim response device entry was not an object"
+
+note :: Text -> Maybe a -> Either Text a
+note e = maybe (Left e) Right
 
 -- --- JSON helpers ----------------------------------------------------------------------------------
 

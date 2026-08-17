@@ -4,7 +4,9 @@ import Crypto.Olm (ed25519Verify, newUtility)
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Lavoisier.Gateway.Matrix.E2ee
 import Test.Tasty
@@ -67,11 +69,56 @@ tests =
         enc <- encryptMegolm alice "!room:hs" (object ["type" .= t "m.room.message"])
         -- bob never received the room key → a Left, not a crash.
         r <- decryptMegolm bob enc
-        assertBool "left" (isLeft r)
+        assertBool "left" (isLeft r),
+      testCase "parseDeviceKeys / parseClaimedOtk read homeserver responses" $ do
+        let devResp = object ["device_keys" .= object ["@u:hs" .= object ["D" .= object ["keys" .= object ["curve25519:D" .= t "CURVE", "ed25519:D" .= t "ED"]]]]]
+            claimResp = object ["one_time_keys" .= object ["@u:hs" .= object ["D" .= object ["signed_curve25519:AAAA" .= object ["key" .= t "OTKVAL"]]]]]
+        parseDeviceKeys "@u:hs" "D" devResp @?= Right ("CURVE", "ED")
+        parseClaimedOtk "@u:hs" "D" claimResp @?= Right "OTKVAL",
+      testCase "publishKeys posts device + one-time keys to /keys/upload" $ do
+        c <- newCrypto "@bot:hs" "BOTDEV"
+        cap <- newIORef Nothing
+        let rest _ path body = writeIORef cap (Just (path, body)) >> pure (Right (object []))
+        r <- publishKeys c rest
+        r @?= Right ()
+        Just (path, body) <- readIORef cap
+        assertBool "upload path" ("keys/upload" `T.isInfixOf` path)
+        assertBool "has device_keys" (has "device_keys" body)
+        assertBool "has one_time_keys" (has "one_time_keys" body),
+      testCase "shareRoomKeyWith drives query+claim+to-device; the peer decrypts the room key" $ do
+        alice <- newCrypto "@alice:hs" "ALICEDEV"
+        bob <- newCrypto "@bob:hs" "BOTDEV"
+        (bobCurve, bobEd) <- cryptoIdentityKeys bob
+        (aliceCurve, _) <- cryptoIdentityKeys alice
+        Just bobOtk <- takeOneTimeKey bob
+        let devResp = object ["device_keys" .= object ["@bob:hs" .= object ["BOTDEV" .= object ["keys" .= object ["curve25519:BOTDEV" .= bobCurve, "ed25519:BOTDEV" .= bobEd]]]]]
+            claimResp = object ["one_time_keys" .= object ["@bob:hs" .= object ["BOTDEV" .= object ["signed_curve25519:AAAA" .= object ["key" .= bobOtk]]]]]
+        cap <- newIORef Nothing
+        let rest _ path body
+              | "keys/query" `T.isInfixOf` path = pure (Right devResp)
+              | "keys/claim" `T.isInfixOf` path = pure (Right claimResp)
+              | "sendToDevice" `T.isInfixOf` path = writeIORef cap (Just body) >> pure (Right (object []))
+              | otherwise = pure (Left ("unexpected: " <> path))
+        r <- shareRoomKeyWith alice rest "txn1" "!room:hs" "@bob:hs" "BOTDEV"
+        r @?= Right ()
+        Just sent <- readIORef cap
+        let ctObj = lookK "messages" sent >>= lookK "@bob:hs" >>= lookK "BOTDEV" >>= lookK "ciphertext" >>= lookK bobCurve
+            mtype = maybe 0 id (ctObj >>= lookK "type" >>= asInt)
+            body' = maybe "" id (ctObj >>= lookK "body" >>= asStr)
+        Right roomKey <- decryptOlm bob aliceCurve mtype body'
+        Right () <- storeRoomKey bob aliceCurve roomKey
+        enc2 <- encryptMegolm alice "!room:hs" (object ["type" .= t "m.room.message", "content" .= object ["body" .= t "hi bob"]])
+        edec <- decryptMegolm bob enc2
+        case edec of
+          Right inner -> (lookK "content" inner >>= lookK "body") @?= Just (String "hi bob")
+          Left e -> assertFailure (T.unpack e)
     ]
   where
     t = id :: Text -> Text
     isLeft = either (const True) (const False)
+    has key = maybe False (const True) . lookK key
+    asInt v = case v of Number n -> Just (round n :: Int); _ -> Nothing
+    asStr v = case v of String s -> Just s; _ -> Nothing
 
 -- Pull a signature string out of a signed object's `signatures.<user>.<keyid>`.
 sigOf :: Text -> Text -> Value -> Text
