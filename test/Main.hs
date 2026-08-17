@@ -883,6 +883,30 @@ minorLeverTests =
         classifyArchetype "implement a new endpoint" @?= Tn.Feature
         classifyArchetype "fix the bug" @?= Tn.SingleFileEdit
         classifyArchetype "what does this function do?" @?= Tn.Other,
+      testCase "parseArchetype leniently reads a model's label" $ do
+        parseArchetype "refactor" @?= Just Tn.Refactor
+        parseArchetype "  Single_File_Edit.\n" @?= Just Tn.SingleFileEdit
+        parseArchetype "feature — adds a thing" @?= Just Tn.Feature
+        parseArchetype "rename" @?= Just Tn.Rename
+        parseArchetype "i think it is a bugfix" @?= Nothing
+        parseArchetype "" @?= Nothing,
+      testCase "classify-with-model routes the archetype through a model call" $ do
+        archRef <- newIORef Tn.Other
+        let stub =
+              Provider
+                { providerStream = \req ->
+                    fmap Right . fromList . map Right $
+                      if null (crTools req)
+                        then [TextDelta "refactor", Usage emptyUsage, Done EndTurn] -- the classify call
+                        else [TextDelta "done", Usage emptyUsage, Done EndTurn],
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+            tuner = Tn.Tuner {Tn.tunerSelect = \c -> writeIORef archRef (Tn.tcArchetype c) >> pure Tn.defaultKnobs, Tn.tunerObserve = \_ _ _ -> pure ()}
+            cfg = (defaultAgentConfig "m") {acClassifyWithModel = True}
+        agent <- mkAgent stub withBuiltins cfg tuner Nothing
+        _ <- runLoopSeeded agent Nothing [userMessage "please restructure this"] (const (pure ()))
+        readIORef archRef >>= (@?= Tn.Refactor),
       testCase "budget-awareness appends a progress note to a turn's results" $ do
         ref <- newIORef (0 :: Int)
         let arg = decodeUtf8Lenient . BL.toStrict . encode $ object ["path" .= ("/no" :: Text)]

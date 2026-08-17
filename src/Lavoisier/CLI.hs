@@ -71,6 +71,7 @@ data Options = Options
     optInLoopVerify :: Bool,
     optSummaryModel :: Maybe Text,
     optBudgetAwareness :: Bool,
+    optClassifyWithModel :: Bool,
     optApiKey :: [Text],
     optRateLimit :: Maybe Int,
     optServe :: Maybe Int,
@@ -118,6 +119,7 @@ optionsParser =
     <*> switch (long "in-loop-verify" <> help "Stop as soon as an edit turn makes --verify-cmd pass")
     <*> optional (strOption (long "summary-model" <> metavar "MODEL" <> help "Cheaper model for history-compaction summaries (defaults to --model)"))
     <*> switch (long "budget-awareness" <> help "Append a progress/token note to each turn so the model sees the ceilings")
+    <*> switch (long "classify-with-model" <> help "Classify the task archetype with a model call instead of the keyword heuristic")
     <*> many (strOption (long "api-key" <> metavar "KEY" <> help "Bearer API key gating the HTTP gateway's /v1/turns (repeatable); empty = open"))
     <*> optional (option auto (long "rate-limit" <> metavar "N" <> help "HTTP gateway per-key request cap over a 60s window"))
     <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
@@ -432,7 +434,8 @@ assembleAgent prov opts model tuner delib registry = do
             acVerifyAndFix = optVerifyAndFix opts,
             acInLoopVerify = optInLoopVerify opts,
             acSummaryModel = optSummaryModel opts,
-            acBudgetAwareness = optBudgetAwareness opts
+            acBudgetAwareness = optBudgetAwareness opts,
+            acClassifyWithModel = optClassifyWithModel opts
           }
   agent0 <- mkAgent prov registry cfg tuner delib
   fallbacks <- buildFallbacks opts

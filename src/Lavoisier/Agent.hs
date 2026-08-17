@@ -26,6 +26,7 @@ module Lavoisier.Agent
     evictToFit,
     historyTokens,
     classifyArchetype,
+    parseArchetype,
   )
 where
 
@@ -37,6 +38,7 @@ import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
+import Data.Char (isAlphaNum)
 import Data.IORef
 import Data.List (mapAccumL)
 import Data.Map.Strict qualified as Map
@@ -114,14 +116,17 @@ data AgentConfig = AgentConfig
     acSummaryModel :: Maybe Text,
     -- | Append a "[progress: turn X\/Y, ~Nk tokens]" note to each turn's tool results, so the model
     -- can see how close it is to the step\/budget ceilings.
-    acBudgetAwareness :: Bool
+    acBudgetAwareness :: Bool,
+    -- | Classify the task archetype with a model call (routed to 'acSummaryModel') rather than the
+    -- keyword heuristic — sharpens the ATO context key. Off by default.
+    acClassifyWithModel :: Bool
   }
 
 -- | Sensible defaults: 12 steps, 4096 max tokens, no forced thinking, the default system prompt, no
 -- context-eviction ceiling, no cheap\/advisor model (escalate-after 2), unbounded budget, no
 -- no-progress breaker.
 defaultAgentConfig :: Text -> AgentConfig
-defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing Nothing Nothing 2 Nothing Nothing Nothing Nothing False False False Nothing False
+defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing Nothing Nothing 2 Nothing Nothing Nothing Nothing False False False Nothing False False
 
 -- | A per-position __circuit breaker__ for the fallback chain, shared across turns so a dead model
 -- isn't re-probed every turn. Position @0@ is the primary; position @i>0@ is @fallbacks !! (i-1)@.
@@ -272,10 +277,19 @@ runLoopSeeded agent allowed initial emit = do
   -- ATO: pick knobs for this task, honour the tuned thinking dial (the one knob the loop can act on
   -- today — the skeleton/truncate/compact/batch dials await the context engine), then observe the
   -- realised cost-weighted outcome so the learner improves. With 'noopTuner' this is inert.
-  let ctx = taskContextFor agent (lastUserText initial)
-  knobs <- tunerSelect (agTuner agent) ctx
   usageRef <- newIORef emptyUsage
   stepRef <- newIORef (0 :: Int)
+  -- Task archetype: an opt-in model classification (--classify-with-model) when set, else the keyword
+  -- heuristic; either sharpens the ATO context key. The classify call's tokens fold into the turn.
+  arch <-
+    if acClassifyWithModel cfg
+      then
+        classifyArchetypeViaModel cfg (agProvider agent) (lastUserText initial) >>= \case
+          Just (a, u) -> modifyIORef' usageRef (accumulateUsage u) >> pure a
+          Nothing -> pure (classifyArchetype (lastUserText initial))
+      else pure (classifyArchetype (lastUserText initial))
+  let ctx = (taskContextFor agent (lastUserText initial)) {tcArchetype = arch}
+  knobs <- tunerSelect (agTuner agent) ctx
   -- Pre-pass (best-effort, deliberate/advise-then-act): a legion council (if installed) argues the
   -- task out grounded in the executor's system + tools, streaming Event.Notice progress; otherwise an
   -- advisor model (if set) drafts a plan in one tool-less call. Either seeds the transcript with an
@@ -885,6 +899,42 @@ classifyArchetype prompt
   | otherwise = Other
   where
     has kw = kw `T.isInfixOf` T.toLower prompt
+
+-- | System prompt + token ceiling for the opt-in model archetype classifier.
+classifySystem :: Text
+classifySystem =
+  "Classify the coding task into exactly one label from this set: single_file_edit, refactor, "
+    <> "rename, feature, other. Reply with only the single label — no punctuation, no explanation."
+
+classifyMaxTokens :: Word32
+classifyMaxTokens = 16
+
+-- | Leniently parse a model's archetype label (leading identifier chars of the trimmed, lowercased
+-- reply); 'Nothing' when unrecognised so the caller falls back to the heuristic.
+parseArchetype :: Text -> Maybe Archetype
+parseArchetype label = case T.takeWhile (\c -> isAlphaNum c || c == '_') (T.toLower (T.strip label)) of
+  "single_file_edit" -> Just SingleFileEdit
+  "singlefileedit" -> Just SingleFileEdit
+  "edit" -> Just SingleFileEdit
+  "refactor" -> Just Refactor
+  "rename" -> Just Rename
+  "feature" -> Just Feature
+  "other" -> Just Other
+  _ -> Nothing
+
+-- | Classify the task archetype via one tool-less model call (routed to the summary model); 'Nothing'
+-- on a failed call or an unrecognised label.
+classifyArchetypeViaModel :: AgentConfig -> Provider -> Text -> IO (Maybe (Archetype, Usage))
+classifyArchetypeViaModel cfg prov task = do
+  r <- toollessCall prov req
+  pure (r >>= \(t, u) -> (,u) <$> parseArchetype t)
+  where
+    req =
+      (chatRequest (fromMaybe (acModel cfg) (acSummaryModel cfg)))
+        { crSystem = Just (SystemPrompt classifySystem True),
+          crMessages = [userMessage task],
+          crMaxTokens = classifyMaxTokens
+        }
 
 -- | A "[progress: …]" note telling the model how close it is to the step\/budget ceilings.
 budgetNote :: Int -> Int -> Word64 -> Maybe Word64 -> ContentBlock
