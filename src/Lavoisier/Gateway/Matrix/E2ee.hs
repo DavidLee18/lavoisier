@@ -42,6 +42,7 @@ module Lavoisier.Gateway.Matrix.E2ee
     -- * Homeserver REST wiring (decoupled via a 'Rest' hook, so it is offline-testable)
     Rest,
     publishKeys,
+    replenishOtks,
     queryDevice,
     claimOtk,
     shareRoomKeyWith,
@@ -51,6 +52,7 @@ module Lavoisier.Gateway.Matrix.E2ee
   )
 where
 
+import Control.Exception (SomeException, try)
 import Crypto.Olm
 import Data.Aeson (Value (..), decodeStrict, encode, object, (.=))
 import Data.Aeson.Key qualified as K
@@ -62,7 +64,7 @@ import Data.IORef
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (listToMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
@@ -179,12 +181,22 @@ canonicalJson (Object o) =
 canonicalJson (Array a) = "[" <> BS.intercalate "," (map canonicalJson (V.toList a)) <> "]"
 canonicalJson v = BL.toStrict (encode v)
 
+-- | Run a libolm-backed decrypt, turning a thrown libolm C error (e.g. @BAD_MESSAGE_KEY_ID@ from a
+-- pre-key message that references a one-time key the account no longer holds) into a clean 'Left' so
+-- a malformed\/stale inbound message can never crash the serve loop.
+catchOlm :: IO (Either Text a) -> IO (Either Text a)
+catchOlm act = do
+  r <- try act
+  pure $ case r of
+    Left e -> Left (T.pack (show (e :: SomeException)))
+    Right x -> x
+
 -- --- inbound (receiving) ---------------------------------------------------------------------------
 
 -- | Decrypt a 1:1 Olm message from a peer (its curve25519 @senderKey@): reuse an existing session, or
 -- (a PRE_KEY message, type 0) establish an inbound one. Returns the decrypted plaintext JSON.
 decryptOlm :: Crypto -> Text -> Int -> Text -> IO (Either Text Value)
-decryptOlm c senderKey msgType body = do
+decryptOlm c senderKey msgType body = catchOlm $ do
   sessions <- readIORef (crOlm c)
   msess <- case Map.lookup senderKey sessions of
     Just s -> pure (Just s)
@@ -218,7 +230,7 @@ storeRoomKey c senderKey roomKey =
 -- @(sender_key, session_id)@, Megolm-decrypt the ciphertext, and parse the inner event JSON.
 decryptMegolm :: Crypto -> Value -> IO (Either Text Value)
 decryptMegolm c content =
-  case (lookStr "sender_key" content, lookStr "session_id" content, lookStr "ciphertext" content) of
+  catchOlm $ case (lookStr "sender_key" content, lookStr "session_id" content, lookStr "ciphertext" content) of
     (Just sk, Just sid, Just ct) -> do
       inbound <- readIORef (crInbound c)
       case Map.lookup (sk, sid) inbound of
@@ -313,6 +325,20 @@ publishKeys c rest = do
   otk <- oneTimeKeysPayload c
   fmap (const ()) <$> rest "POST" "/_matrix/client/v3/keys/upload" (object ["device_keys" .= dk, "one_time_keys" .= otk])
 
+-- | Top up published one-time keys when the homeserver's current count (@serverCount@, from
+-- @/sync@'s @device_one_time_keys_count@) has fallen below half the account maximum. Generates the
+-- shortfall and uploads a signed @one_time_keys@ batch. A no-op when the count is already healthy.
+replenishOtks :: Crypto -> Rest -> Int -> IO (Either Text ())
+replenishOtks c rest serverCount = do
+  maxOtk <- maxOneTimeKeys (crAccount c)
+  let target = max 1 (maxOtk `div` 2)
+  if serverCount >= target
+    then pure (Right ())
+    else do
+      generateOneTimeKeys (crAccount c) (target - serverCount)
+      otk <- oneTimeKeysPayload c
+      fmap (const ()) <$> rest "POST" "/_matrix/client/v3/keys/upload" (object ["one_time_keys" .= otk])
+
 -- | Query a peer device's @(curve25519, ed25519)@ identity keys (@POST \/keys\/query@).
 queryDevice :: Rest -> Text -> Text -> IO (Either Text (Text, Text))
 queryDevice rest userId deviceId = do
@@ -334,15 +360,32 @@ shareRoomKeyWith c rest txn room userId deviceId = do
   ek <- queryDevice rest userId deviceId
   case ek of
     Left e -> pure (Left e)
-    Right (curve, _ed) -> do
+    Right (curve, ed) -> do
       mo <- claimOtk rest userId deviceId
       case mo of
         Left e -> pure (Left e)
         Right otk -> do
           rk <- roomKeyEvent c room
-          (mtype, ctBody) <- olmEncryptTo c curve otk rk
+          (mtype, ctBody) <- olmEncryptTo c curve otk (olmPlaintext c userId ed rk)
           let msg = object ["messages" .= object [K.fromText userId .= object [K.fromText deviceId .= olmEncryptedContent c curve mtype ctBody]]]
           fmap (const ()) <$> rest "PUT" ("/_matrix/client/v3/sendToDevice/m.room.encrypted/" <> txn) msg
+
+-- | Wrap an inner to-device event (@{type, content}@) in the Matrix Olm plaintext envelope the spec
+-- requires: @sender@\/@sender_device@\/@keys@ (ours) and @recipient@\/@recipient_keys@ (the peer's).
+-- A receiver (e.g. matrix-nio) rejects a room key that lacks these, so the peer could not decrypt.
+olmPlaintext :: Crypto -> Text -> Text -> Value -> Value
+olmPlaintext c recipient recipientEd inner =
+  object
+    [ "type" .= lk "type",
+      "content" .= lk "content",
+      "sender" .= crUserId c,
+      "sender_device" .= crDeviceId c,
+      "keys" .= object ["ed25519" .= crEd c],
+      "recipient" .= recipient,
+      "recipient_keys" .= object ["ed25519" .= recipientEd]
+    ]
+  where
+    lk k = fromMaybe Null (lookKey k inner)
 
 -- | The to-device @m.room.encrypted@ (Olm) content wrapping a ciphertext for a peer's curve25519 key.
 olmEncryptedContent :: Crypto -> Text -> Int -> Text -> Value

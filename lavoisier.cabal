@@ -145,7 +145,10 @@ library
 
   if flag(e2ee)
     exposed-modules: Lavoisier.Gateway.Matrix.E2ee
-    build-depends:   olm
+    build-depends:   olm, scientific
+    -- -DE2EE turns on the CPP-gated E2EE serve-loop wiring in Lavoisier.Gateway.Matrix
+    -- (to-device room-key receive, inbound Megolm decrypt, outbound Megolm encrypt).
+    cpp-options:     -DE2EE
 
 -- Generated proto-lens bindings for the xAI gRPC chat service, committed under gen/ (like the
 -- Rust side commits its tonic bindings — no protoc at build time). Isolated in its own library

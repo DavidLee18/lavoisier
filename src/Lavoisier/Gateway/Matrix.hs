@@ -1,5 +1,10 @@
+{-# LANGUAGE CPP #-}
+
 -- | @Lavoisier.Gateway.Matrix@ — a Matrix gateway driving the shared agent. Ports the plaintext core
--- of Rust @lvz-gw-matrix@ (E2EE is layered on separately, over the @olm@ package).
+-- of Rust @lvz-gw-matrix@; under the @e2ee@ cabal flag (@-DE2EE@) the serve loop also drives Matrix
+-- end-to-end encryption over "Lavoisier.Gateway.Matrix.E2ee" (the @olm@ package): it publishes signed
+-- device\/one-time keys, receives Megolm room keys via to-device Olm messages, decrypts inbound
+-- @m.room.encrypted@ timeline events, and Megolm-encrypts replies in encrypted rooms.
 --
 -- A hand-rolled REST client (no matrix SDK): authenticate (access token or password), @\/sync@ in a
 -- loop, and for each answerable message decide whether to __engage__ — always in a 1:1 DM, in a group
@@ -61,6 +66,11 @@ import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (QueryItem, urlEncode)
 import Network.HTTP.Types.Status (statusCode, statusIsSuccessful)
 import System.Environment (lookupEnv)
+#ifdef E2EE
+import Control.Monad (forM_, unless, void)
+import Data.Scientific (toBoundedInteger)
+import Lavoisier.Gateway.Matrix.E2ee qualified as E2
+#endif
 
 syncTimeoutMs :: Int
 syncTimeoutMs = 30000
@@ -134,6 +144,30 @@ matrixGateway cfg =
 
 -- --- runtime environment ---------------------------------------------------------------------------
 
+#ifdef E2EE
+
+-- | The resolved session + shared HTTP state used across the serve loop (with E2EE state under
+-- @-DE2EE@: the crypto identity + per-room key-sharing\/encryption caches).
+data MatrixEnv = MatrixEnv
+  { meConfig :: MatrixConfig,
+    meManager :: Manager,
+    meToken :: Text,
+    meUserId :: Text,
+    meTxn :: IORef Int,
+    meE2 :: E2State
+  }
+
+-- | The serve loop's E2EE state: the bot 'E2.Crypto', the set of @(room, user, device)@ triples the
+-- current Megolm session was already shared with (so a room key is only sent once), and a per-room
+-- encrypted-or-not cache (from @m.room.encryption@ state).
+data E2State = E2State
+  { esCrypto :: E2.Crypto,
+    esShared :: IORef (Set (Text, Text, Text)),
+    esEnc :: IORef (Map Text Bool)
+  }
+
+#else
+
 -- | The resolved session + shared HTTP state used across the serve loop.
 data MatrixEnv = MatrixEnv
   { meConfig :: MatrixConfig,
@@ -143,6 +177,8 @@ data MatrixEnv = MatrixEnv
     meTxn :: IORef Int
   }
 
+#endif
+
 -- --- the serve loop (live-only) --------------------------------------------------------------------
 
 serveLoop :: MatrixConfig -> AgentHandle -> IO (Either GatewayError ())
@@ -151,9 +187,9 @@ serveLoop cfg agent = do
   esess <- resolveSession cfg mgr
   case esess of
     Left e -> pure (Left e)
-    Right (token, userId) -> do
+    Right (token, userId, deviceId) -> do
       txn <- newIORef (0 :: Int)
-      let env = MatrixEnv cfg mgr token userId txn
+      env <- mkEnv cfg mgr token userId deviceId txn
       recent <- newRecentIds 256
       dmCache <- newIORef Map.empty
       -- Baseline sync: take a `since` and discard the backlog so we only act on new messages
@@ -173,7 +209,8 @@ serveLoop cfg agent = do
         Left _ -> threadDelay 3000000 >> loop env recent dmCache since -- transient: back off
         Right sync -> do
           autoJoinInvites env sync
-          let msgs = extractMessages sync (meUserId env) (mcAllowedUsers cfg) (mcAllowedRooms cfg)
+          syncD <- decryptedSync env sync
+          let msgs = extractMessages syncD (meUserId env) (mcAllowedUsers cfg) (mcAllowedRooms cfg)
           mapM_ (dispatch env recent dmCache) msgs
           case parseNextBatch sync of
             Right next -> loop env recent dmCache next
@@ -212,14 +249,14 @@ handleMessage env agent recent msg = do
           ToolUseStart _ name -> notice ("🔧 `" <> name <> "`") >> drain stream acc
           _ -> drain stream acc
     notice t = do
-      e <- sendMessage env room t
+      e <- sendText env room t
       either (const (pure ())) (insertRecent recent) e
       _ <- setTyping env room True
       pure ()
     sendAnswer answer
       | T.null answer = pure ()
       | otherwise = do
-          e <- sendMessage env room answer
+          e <- sendText env room answer
           either (const (pure ())) (insertRecent recent) e
 
 -- | Retract the transient 👀 ack and react ✅\/❌ with the outcome (best-effort).
@@ -229,25 +266,223 @@ finishReaction env room eventId ack ok = do
   _ <- react env room eventId (if ok then "✅" else "❌")
   pure ()
 
+-- --- E2EE serve-loop wiring (only under -DE2EE) ----------------------------------------------------
+
+#ifdef E2EE
+
+-- | Build the serve env and, under E2EE, initialise the crypto identity and publish its keys.
+mkEnv :: MatrixConfig -> Manager -> Text -> Text -> Text -> IORef Int -> IO MatrixEnv
+mkEnv cfg mgr token userId deviceId txn = do
+  c <- E2.newCrypto userId deviceId
+  _ <- E2.publishKeys c (restAdapter cfg mgr token) -- best-effort
+  shared <- newIORef Set.empty
+  encc <- newIORef Map.empty
+  pure (MatrixEnv cfg mgr token userId txn (E2State c shared encc))
+
+-- | Adapt the gateway's HTTP client to the E2ee module's abstract 'E2.Rest' hook.
+restAdapter :: MatrixConfig -> Manager -> Text -> E2.Rest
+restAdapter cfg mgr token httpMethod path body =
+  either (Left . geText) Right <$> httpSend cfg mgr (Just token) (BL.fromStrict (encodeUtf8 httpMethod)) path (Just body)
+
+geText :: GatewayError -> Text
+geText (GEIo m) = m
+geText (GEBind m) = m
+geText (GEProtocol m) = m
+
+-- | Under E2EE: consume to-device room keys, top up one-time keys, then decrypt the timeline in place
+-- so the existing plaintext extraction\/engagement logic runs post-decrypt.
+decryptedSync :: MatrixEnv -> Value -> IO Value
+decryptedSync env sync = do
+  processToDevice env sync
+  replenishFromSync env sync
+  decryptTimeline env sync
+
+-- | Receive Megolm room keys: for each @m.room.encrypted@ to-device event addressed to our
+-- curve25519 key, Olm-decrypt it and, when it is an @m.room_key@, store the inbound session.
+processToDevice :: MatrixEnv -> Value -> IO ()
+processToDevice env sync = do
+  let c = esCrypto (meE2 env)
+  (ourCurve, _ed) <- E2.cryptoIdentityKeys c
+  forM_ (arrGet "events" (fromMaybe Null (lookKey "to_device" sync))) (handleTd c ourCurve)
+  where
+    handleTd c ourCurve ev
+      | lookStr "type" ev == Just "m.room.encrypted" =
+          let content = fromMaybe Null (lookKey "content" ev)
+           in case (lookStr "sender_key" content, olmCipherFor ourCurve content) of
+                (Just senderKey, Just (mtype, body)) -> do
+                  r <- E2.decryptOlm c senderKey mtype body
+                  case r of
+                    Right pt | lookStr "type" pt == Just "m.room_key" -> void (E2.storeRoomKey c senderKey pt)
+                    _ -> pure ()
+                _ -> pure ()
+      | otherwise = pure ()
+
+-- | The @(message_type, body)@ of an Olm ciphertext addressed to our curve25519 key, if present.
+olmCipherFor :: Text -> Value -> Maybe (Int, Text)
+olmCipherFor ourCurve content = do
+  ct <- lookKey "ciphertext" content
+  entry <- lookKey ourCurve ct
+  mtype <- lookInt "type" entry
+  body <- lookStr "body" entry
+  pure (mtype, body)
+
+-- | Top up published one-time keys when the homeserver reports the count has fallen below half the
+-- account maximum (best-effort; the server count rides on each @/sync@).
+replenishFromSync :: MatrixEnv -> Value -> IO ()
+replenishFromSync env sync = do
+  let count = fromMaybe 0 (lookKey "device_one_time_keys_count" sync >>= lookInt "signed_curve25519")
+  _ <- E2.replenishOtks (esCrypto (meE2 env)) (restAdapter (meConfig env) (meManager env) (meToken env)) count
+  pure ()
+
+-- | Rewrite a sync response so each encrypted joined-room timeline event is replaced by its decrypted
+-- inner event (@type@\/@content@ spliced onto the outer envelope). Undecryptable events are left as-is.
+decryptTimeline :: MatrixEnv -> Value -> IO Value
+decryptTimeline env sync = case lookKey "rooms" sync of
+  Just (Object roomsObj) -> case KM.lookup "join" roomsObj of
+    Just (Object joinObj) -> do
+      joinObj' <- KM.traverseWithKey (\_ room -> decryptRoom room) joinObj
+      let roomsObj' = KM.insert "join" (Object joinObj') roomsObj
+      pure (setKey "rooms" (Object roomsObj') sync)
+    _ -> pure sync
+  _ -> pure sync
+  where
+    c = esCrypto (meE2 env)
+    decryptRoom (Object ro) = case KM.lookup "timeline" ro of
+      Just (Object tl) -> case KM.lookup "events" tl of
+        Just (Array evs) -> do
+          evs' <- V.mapM decryptEvent evs
+          pure (Object (KM.insert "timeline" (Object (KM.insert "events" (Array evs') tl)) ro))
+        _ -> pure (Object ro)
+      _ -> pure (Object ro)
+    decryptRoom v = pure v
+    decryptEvent ev
+      | lookStr "type" ev == Just "m.room.encrypted" = do
+          r <- E2.decryptMegolm c (fromMaybe Null (lookKey "content" ev))
+          pure $ case r of
+            Right inner -> case (lookKey "type" inner, lookKey "content" inner) of
+              (Just ty, Just ct) -> setKey "type" ty (setKey "content" ct ev)
+              _ -> ev
+            Left _ -> ev
+      | otherwise = pure ev
+
+-- | Send a message body, Megolm-encrypting it when the room is encrypted (else plaintext).
+sendText :: MatrixEnv -> Text -> Text -> IO (Either GatewayError Text)
+sendText env room body = do
+  enc' <- roomEncrypted env room
+  if enc' then sendEncrypted env room body else sendMessage env room body
+
+-- | Whether @room@ has @m.room.encryption@ state (cached per room).
+roomEncrypted :: MatrixEnv -> Text -> IO Bool
+roomEncrypted env room = do
+  let ref = esEnc (meE2 env)
+  cache <- readIORef ref
+  case Map.lookup room cache of
+    Just b -> pure b
+    Nothing -> do
+      r <- httpGet (meConfig env) (meManager env) (meToken env) ("/_matrix/client/v3/rooms/" <> enc room <> "/state/m.room.encryption/")
+      let b = case r of Right v -> lookKey "algorithm" v /= Nothing; _ -> False
+      modifyIORef' ref (Map.insert room b)
+      pure b
+
+-- | Share the room key with every peer device (once per Megolm session), then Megolm-encrypt @body@
+-- and PUT it as an @m.room.encrypted@ timeline event.
+sendEncrypted :: MatrixEnv -> Text -> Text -> IO (Either GatewayError Text)
+sendEncrypted env room body = do
+  ensureRoomKeyShared env room
+  let c = esCrypto (meE2 env)
+      inner =
+        object
+          [ "type" .= ("m.room.message" :: Text),
+            "room_id" .= room,
+            "content" .= object ["msgtype" .= ("m.text" :: Text), "body" .= body]
+          ]
+  content <- E2.encryptMegolm c room inner
+  n <- nextTxn env
+  let path = "/_matrix/client/v3/rooms/" <> enc room <> "/send/m.room.encrypted/lvz" <> tshow n
+  r <- httpSend (meConfig env) (meManager env) (Just (meToken env)) "PUT" path (Just content)
+  pure (r >>= \v -> maybe (Left (GEProtocol "send missing event_id")) Right (lookStr "event_id" v))
+
+-- | Ensure the current room key has been Olm-shared to every joined peer device (deduped in 'esShared').
+ensureRoomKeyShared :: MatrixEnv -> Text -> IO ()
+ensureRoomKeyShared env room = do
+  members <- joinedMembers env room
+  forM_ [m | m <- members, m /= meUserId env] $ \userId -> do
+    devices <- userDevices env userId
+    forM_ devices (shareToDevice env room userId)
+
+shareToDevice :: MatrixEnv -> Text -> Text -> Text -> IO ()
+shareToDevice env room userId deviceId = do
+  let ref = esShared (meE2 env)
+  s <- readIORef ref
+  unless (Set.member (room, userId, deviceId) s) $ do
+    n <- nextTxn env
+    r <- E2.shareRoomKeyWith (esCrypto (meE2 env)) (restAdapter (meConfig env) (meManager env) (meToken env)) ("lvz" <> tshow n) room userId deviceId
+    case r of
+      Right () -> modifyIORef' ref (Set.insert (room, userId, deviceId))
+      Left _ -> pure () -- best-effort; retried on the next send
+
+-- | The joined members of a room (their user ids).
+joinedMembers :: MatrixEnv -> Text -> IO [Text]
+joinedMembers env room = do
+  r <- httpGet (meConfig env) (meManager env) (meToken env) ("/_matrix/client/v3/rooms/" <> enc room <> "/joined_members")
+  pure $ case r of
+    Right v -> map fst (objToList (lookKey "joined" v))
+    Left _ -> []
+
+-- | A user's device ids (from a @/keys/query@ over that user).
+userDevices :: MatrixEnv -> Text -> IO [Text]
+userDevices env userId = do
+  r <- restAdapter (meConfig env) (meManager env) (meToken env) "POST" "/_matrix/client/v3/keys/query" (object ["device_keys" .= object [K.fromText userId .= ([] :: [Text])]])
+  pure $ case r of
+    Right v -> case lookKey "device_keys" v >>= lookKey userId of
+      Just (Object o) -> map K.toText (KM.keys o)
+      _ -> []
+    Left _ -> []
+
+lookInt :: Text -> Value -> Maybe Int
+lookInt k v = case lookKey k v of
+  Just (Number n) -> toBoundedInteger n
+  _ -> Nothing
+
+setKey :: Text -> Value -> Value -> Value
+setKey k val (Object o) = Object (KM.insert (K.fromText k) val o)
+setKey _ _ v = v
+
+#else
+
+-- | Without E2EE: the plaintext env, an identity sync transform, and a plaintext sender.
+mkEnv :: MatrixConfig -> Manager -> Text -> Text -> Text -> IORef Int -> IO MatrixEnv
+mkEnv cfg mgr token userId _deviceId txn = pure (MatrixEnv cfg mgr token userId txn)
+
+decryptedSync :: MatrixEnv -> Value -> IO Value
+decryptedSync _ sync = pure sync
+
+sendText :: MatrixEnv -> Text -> Text -> IO (Either GatewayError Text)
+sendText = sendMessage
+
+#endif
+
 -- --- auth ------------------------------------------------------------------------------------------
 
 -- | Resolve the session (token > password login). Persisted-session reuse is deferred (no state dir
 -- persistence yet); a configured token is validated via @whoami@.
-resolveSession :: MatrixConfig -> Manager -> IO (Either GatewayError (Text, Text))
+resolveSession :: MatrixConfig -> Manager -> IO (Either GatewayError (Text, Text, Text))
 resolveSession cfg mgr = case mcAccessToken cfg of
   Just token -> do
     ewho <- whoami cfg mgr token
-    pure (fmap (\uid -> (token, uid)) ewho)
+    pure (fmap (\(uid, dev) -> (token, uid, dev)) ewho)
   Nothing -> login cfg mgr
 
-whoami :: MatrixConfig -> Manager -> Text -> IO (Either GatewayError Text)
+whoami :: MatrixConfig -> Manager -> Text -> IO (Either GatewayError (Text, Text))
 whoami cfg mgr token = do
   r <- httpGet cfg mgr token "/_matrix/client/v3/account/whoami"
   pure $ case r of
     Left e -> Left e
-    Right v -> maybe (Left (GEProtocol "whoami missing user_id")) Right (lookStr "user_id" v)
+    Right v -> case lookStr "user_id" v of
+      Just uid -> Right (uid, deviceIdFrom cfg v)
+      Nothing -> Left (GEProtocol "whoami missing user_id")
 
-login :: MatrixConfig -> Manager -> IO (Either GatewayError (Text, Text))
+login :: MatrixConfig -> Manager -> IO (Either GatewayError (Text, Text, Text))
 login cfg mgr = case mcPassword cfg of
   Nothing -> pure (Left (GEBind "no MATRIX_PASSWORD set and no usable access token"))
   Just pw -> do
@@ -262,8 +497,13 @@ login cfg mgr = case mcPassword cfg of
     pure $ case r of
       Left e -> Left e
       Right v -> case (lookStr "access_token" v, lookStr "user_id" v) of
-        (Just tok, Just uid) -> Right (tok, uid)
+        (Just tok, Just uid) -> Right (tok, uid, deviceIdFrom cfg v)
         _ -> Left (GEProtocol "login response missing access_token/user_id")
+
+-- | The device id from a login\/whoami response, else the configured @MATRIX_DEVICE_ID@, else empty.
+-- (Only E2EE actually needs a stable device id; the plaintext path ignores it.)
+deviceIdFrom :: MatrixConfig -> Value -> Text
+deviceIdFrom cfg v = fromMaybe (fromMaybe "" (mcDeviceId cfg)) (lookStr "device_id" v)
 
 -- --- REST helpers ----------------------------------------------------------------------------------
 
