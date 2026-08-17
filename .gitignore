@@ -18,3 +18,6 @@ dist-newstyle/
 # Benchmark run artifacts (transient: per-run results dirs + captured stdout logs)
 bench/results/
 bench/*.out
+
+# proto-lens-protoc plugin (installed into ~/.cabal/store; regenerate gen/ with it)
+.protoc-plugins/

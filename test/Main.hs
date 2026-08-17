@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedLabels #-}
 -- Orphan Arbitrary instances for the library's types are the idiomatic place for test generators.
 {-# OPTIONS_GHC -Wno-orphans #-}
 
@@ -16,6 +17,8 @@ import Data.ByteString.Lazy qualified as BL
 import Data.IORef
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, isNothing)
+import Data.ProtoLens (defMessage)
+import Data.ProtoLens.Labels ()
 import Data.Scientific (toBoundedInteger)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -74,6 +77,7 @@ import Lavoisier.Provider.ClaudeCli (eofDecoder, initDecoder, pushLine, renderPr
 import Lavoisier.Provider.Google qualified as G
 import Lavoisier.Provider.Google.Sse qualified as GS
 import Lavoisier.Provider.Xai (buildMessages)
+import Lavoisier.Provider.Xai.Grpc qualified as XG
 import Lavoisier.Provider.Xai.Sse qualified as XS
 import Lavoisier.Schedule.Cron (Civil (..), CronError (..), civilFromUnix, nextAfter, parseCron)
 import Lavoisier.Tool.Builtins
@@ -81,9 +85,12 @@ import Lavoisier.Tool.Edit
 import Lavoisier.Tool.Registry
 import Lavoisier.Tune
 import Lavoisier.Tune.Bayes (asBayesTuner, bayesTuner, loadBayes, newBayesTuner, sampleBeta, saveBayes)
+import Lens.Family2 ((&), (.~), (^.))
 import Network.HTTP.Types (hAuthorization, hContentType, status200, status401)
 import Network.Wai (defaultRequest, pathInfo, requestHeaders, requestMethod)
 import Network.Wai.Test (SRequest (..), runSession, simpleBody, simpleStatus, srequest)
+import Proto.Xai.Api.V1.Chat qualified as PX
+import Proto.Xai.Api.V1.Sample qualified as SX
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
 import System.FilePath ((</>))
 import System.IO (Handle, hClose, hFlush, hSetBinaryMode)
@@ -131,6 +138,7 @@ tests =
       slackTests,
       cronTests,
       xaiTests,
+      xaiGrpcTests,
       matrixTests
     ]
 
@@ -2104,6 +2112,36 @@ cronTests =
 
 xaiDecode :: ByteString -> [Event]
 xaiDecode input = let (st, e1) = XS.ssePush XS.initSse input in [e | Right e <- e1 <> XS.sseEof st]
+
+-- The xAI native gRPC transport: pure request-build + chunk-decode (no network / grapesy call).
+xaiGrpcTests :: TestTree
+xaiGrpcTests =
+  testGroup
+    "xAI (gRPC)"
+    [ testCase "mapFinish maps proto finish reasons" $ do
+        XG.mapFinish SX.REASON_STOP @?= EndTurn
+        XG.mapFinish SX.REASON_MAX_LEN @?= MaxTokens
+        XG.mapFinish SX.REASON_TOOL_CALLS @?= ToolUse,
+      testCase "decodeChunk emits a TextDelta from a delta chunk" $ do
+        let chunk :: PX.GetChatCompletionChunk
+            chunk = defMessage & #outputs .~ [defMessage & #maybe'delta .~ Just (defMessage & #content .~ "hi") & #finishReason .~ SX.REASON_STOP]
+        fst (XG.decodeChunk XG.emptyDecoder chunk) @?= [TextDelta "hi"],
+      testCase "decodeChunk opens and streams a tool call" $ do
+        let call = defMessage & #id .~ "t1" & #function .~ (defMessage & #name .~ "read_file" & #arguments .~ "{}")
+            chunk :: PX.GetChatCompletionChunk
+            chunk = defMessage & #outputs .~ [defMessage & #maybe'delta .~ Just (defMessage & #toolCalls .~ [call])]
+        fst (XG.decodeChunk XG.emptyDecoder chunk) @?= [ToolUseStart "t1" "read_file", ToolUseDelta "t1" "{}"],
+      testCase "buildMessages maps roles (system, tool-result, assistant)" $ do
+        let req =
+              (chatRequest "grok-4")
+                { crSystem = Just (SystemPrompt "sys" False),
+                  crMessages =
+                    [ Message User [ToolResultBlock "t1" "the result" False],
+                      Message Assistant [TextBlock "hi" False, ToolUseBlock "t2" "f" (object [])]
+                    ]
+                }
+        map (^. #role) (XG.buildMessages req) @?= [PX.ROLE_SYSTEM, PX.ROLE_TOOL, PX.ROLE_ASSISTANT]
+    ]
 
 xaiTests :: TestTree
 xaiTests =

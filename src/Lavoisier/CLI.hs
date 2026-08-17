@@ -41,6 +41,7 @@ import Lavoisier.Provider.Anthropic (anthropicFromEnv)
 import Lavoisier.Provider.ClaudeCli (claudeCliFromEnv)
 import Lavoisier.Provider.Google (googleFromEnv)
 import Lavoisier.Provider.Xai (xaiFromEnv)
+import Lavoisier.Provider.Xai.Grpc (defaultXaiGrpcEndpoint, xaiGrpcProvider)
 import Lavoisier.Tool.Registry (ToolRegistry, registerTools, withBuiltins)
 import Lavoisier.Tune (LearningTuner, asTuner, defaultTuneConfig, learningTuner, loadTuner, saveTuner)
 import Lavoisier.Tune.Bayes (BayesTuner, asBayesTuner, bayesTuner, loadBayes, saveBayes)
@@ -98,7 +99,7 @@ optionsParser :: Parser Options
 optionsParser =
   Options
     <$> switch (long "agent" <> help "Run the plan->act->observe tool loop instead of a single ask")
-    <*> optional (strOption (long "provider" <> metavar "PROVIDER" <> help "Model provider (anthropic|google|xai|claude-cli; default anthropic)"))
+    <*> optional (strOption (long "provider" <> metavar "PROVIDER" <> help "Model provider (anthropic|google|xai|xai-grpc|claude-cli; default anthropic)"))
     <*> optional (strOption (long "model" <> metavar "MODEL" <> help "Model id"))
     <*> optional (option thinkingReader (long "thinking" <> metavar "LEVEL" <> help "off|low|medium|high"))
     <*> optional (option auto (long "max-tokens" <> metavar "N" <> help "Generated-token ceiling"))
@@ -271,8 +272,13 @@ selectProvider name = case name of
   "anthropic" -> tag "claude-sonnet-4-5" <$> anthropicFromEnv
   "google" -> tag "gemini-2.5-flash" <$> googleFromEnv
   "xai" -> tag "grok-4" <$> xaiFromEnv
+  "xai-grpc" -> do
+    mkey <- lookupEnv "XAI_API_KEY"
+    pure $ case mkey of
+      Just k | not (null k) -> Right (xaiGrpcProvider (T.pack k) defaultXaiGrpcEndpoint, "grok-4")
+      _ -> Left "XAI_API_KEY is not set"
   "claude-cli" -> tag "sonnet" <$> claudeCliFromEnv
-  other -> pure (Left ("unsupported provider: " <> T.pack other <> " (anthropic|google|xai|claude-cli)"))
+  other -> pure (Left ("unsupported provider: " <> T.pack other <> " (anthropic|google|xai|xai-grpc|claude-cli)"))
   where
     tag def = either (Left . tshow) (\p -> Right (p, def))
 

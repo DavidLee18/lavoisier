@@ -13,3 +13,9 @@ package olm
 package lavoisier
   extra-lib-dirs: /Users/ijaehyeon/.local/lib
   extra-include-dirs: /Users/ijaehyeon/.local/include
+
+-- snappy-c (pulled in transitively by grapesy → grpc-spec, for gRPC snappy compression) links
+-- against the libsnappy C library (Homebrew: `brew install snappy`). Machine-specific paths.
+package snappy-c
+  extra-lib-dirs: /opt/homebrew/lib
+  extra-include-dirs: /opt/homebrew/include
