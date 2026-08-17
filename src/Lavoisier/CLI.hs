@@ -23,7 +23,7 @@ import Lavoisier.Config (FileConfig (..), loadConfig)
 import Lavoisier.Gateway.A2A (a2aGateway, defaultA2aConfig)
 import Lavoisier.Gateway.Acp (acpGateway, defaultAcpConfig)
 import Lavoisier.Gateway.Cron (CronJob, cronGateway, parseCliJob, parseFileJobs)
-import Lavoisier.Gateway.Http (defaultGatewayConfig, httpGateway)
+import Lavoisier.Gateway.Http (GatewayConfig (..), httpGateway)
 import Lavoisier.Gateway.Matrix (matrixFromEnv, matrixGateway)
 import Lavoisier.Gateway.Slack (slackFromEnv, slackGateway)
 import Lavoisier.Legion (Debater, languageFromLocale, mkDebater, newPanel, panelDeliberator, renderLegionError, withLanguage)
@@ -71,6 +71,8 @@ data Options = Options
     optInLoopVerify :: Bool,
     optSummaryModel :: Maybe Text,
     optBudgetAwareness :: Bool,
+    optApiKey :: [Text],
+    optRateLimit :: Maybe Int,
     optServe :: Maybe Int,
     optServeA2a :: Maybe Int,
     optServeAcp :: Maybe Int,
@@ -116,6 +118,8 @@ optionsParser =
     <*> switch (long "in-loop-verify" <> help "Stop as soon as an edit turn makes --verify-cmd pass")
     <*> optional (strOption (long "summary-model" <> metavar "MODEL" <> help "Cheaper model for history-compaction summaries (defaults to --model)"))
     <*> switch (long "budget-awareness" <> help "Append a progress/token note to each turn so the model sees the ceilings")
+    <*> many (strOption (long "api-key" <> metavar "KEY" <> help "Bearer API key gating the HTTP gateway's /v1/turns (repeatable); empty = open"))
+    <*> optional (option auto (long "rate-limit" <> metavar "N" <> help "HTTP gateway per-key request cap over a 60s window"))
     <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
     <*> optional (option auto (long "serve-a2a" <> metavar "PORT" <> help "Serve the agent as an A2A (Agent-to-Agent) gateway on this port"))
     <*> optional (option auto (long "serve-acp" <> metavar "PORT" <> help "Serve the agent as an ACP (Agent Communication Protocol) gateway on this port"))
@@ -170,7 +174,7 @@ runCli = do
                 else case (optServeAcp opts, optServeA2a opts, optServe opts) of
                   (Just port, _, _) -> serveWith (acpGateway port defaultAcpConfig)
                   (_, Just port, _) -> serveWith (a2aGateway port defaultA2aConfig)
-                  (_, _, Just port) -> serveWith (httpGateway port defaultGatewayConfig)
+                  (_, _, Just port) -> serveWith (httpGateway port (GatewayConfig (optApiKey opts) (fmap (\n -> (fromIntegral n, 60)) (optRateLimit opts))))
                   _ -> do
                     prompt <- resolvePrompt (optWords opts)
                     if T.null prompt

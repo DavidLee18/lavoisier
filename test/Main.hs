@@ -40,7 +40,7 @@ import Lavoisier.Context.TreeSitter qualified as TS
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
 import Lavoisier.Gateway.Acp (defaultAcpConfig, newAcpApp)
 import Lavoisier.Gateway.Cron (CronConfigError (..), CronJob (..), parseCliJob, parseFileJobs)
-import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp)
+import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp, newHttpApp, stepWindow)
 import Lavoisier.Gateway.Matrix qualified as MX
 import Lavoisier.Gateway.Slack (SlackMessage (..), parseEvent, senderAllowed, slackSession)
 import Lavoisier.Legion (Debater, Language (..), LegionError (..), languageFromLocale, mkDebater, newPanel, panelDeliberator, withLanguage)
@@ -87,7 +87,7 @@ import Lavoisier.Tool.Registry
 import Lavoisier.Tune
 import Lavoisier.Tune.Bayes (asBayesTuner, bayesTuner, loadBayes, newBayesTuner, sampleBeta, saveBayes)
 import Lens.Family2 ((&), (.~), (^.))
-import Network.HTTP.Types (hAuthorization, hContentType, status200, status401)
+import Network.HTTP.Types (hAuthorization, hContentType, status200, status401, status429)
 import Network.Wai (defaultRequest, pathInfo, requestHeaders, requestMethod)
 import Network.Wai.Test (SRequest (..), runSession, simpleBody, simpleStatus, srequest)
 import Proto.Xai.Api.V1.Chat qualified as PX
@@ -1296,14 +1296,32 @@ gatewayTests =
         assertBool "carries the answer text" ("hi there" `T.isInfixOf` body)
         assertBool "ends with a done event" ("\"kind\":\"done\"" `T.isInfixOf` body),
       testCase "protected route rejects a missing key" $ do
-        let app = httpApp (GatewayConfig ["secret"]) (stubAgent [])
+        let app = httpApp (GatewayConfig ["secret"] Nothing) (stubAgent [])
         r <- runSession (srequest (SRequest (post ["v1", "turns"] []) "{\"input\":\"x\"}")) app
         simpleStatus r @?= status401,
       testCase "protected route accepts a valid bearer key" $ do
-        let app = httpApp (GatewayConfig ["secret"]) (stubAgent [Done EndTurn])
+        let app = httpApp (GatewayConfig ["secret"] Nothing) (stubAgent [Done EndTurn])
             auth = [(hAuthorization, "Bearer secret")]
         r <- runSession (srequest (SRequest (post ["v1", "turns"] auth) "{\"input\":\"x\"}")) app
-        simpleStatus r @?= status200
+        simpleStatus r @?= status200,
+      testCase "GET /metrics counts turns and tokens" $ do
+        app <- newHttpApp defaultGatewayConfig (stubAgent [TextDelta "hi", Usage (MkUsage 3 5 0 7), Done EndTurn])
+        _ <- runSession (srequest (SRequest (post ["v1", "turns"] []) "{\"input\":\"x\"}")) app
+        mr <- runSession (srequest (SRequest (get ["metrics"]) "")) app
+        let body = decodeUtf8Lenient (BL.toStrict (simpleBody mr))
+        assertBool "turns counted" ("lavoisier_turns_total 1" `T.isInfixOf` body)
+        assertBool "input tokens" ("lavoisier_input_tokens_total 3" `T.isInfixOf` body)
+        assertBool "output tokens" ("lavoisier_output_tokens_total 5" `T.isInfixOf` body),
+      testCase "rate limit returns 429 once the window cap is hit" $ do
+        app <- newHttpApp (GatewayConfig [] (Just (1, 60))) (stubAgent [Done EndTurn])
+        r1 <- runSession (srequest (SRequest (post ["v1", "turns"] []) "{\"input\":\"x\"}")) app
+        simpleStatus r1 @?= status200
+        r2 <- runSession (srequest (SRequest (post ["v1", "turns"] []) "{\"input\":\"x\"}")) app
+        simpleStatus r2 @?= status429,
+      testCase "stepWindow admits within cap and resets after the window" $ do
+        stepWindow 2 60 100 Nothing @?= (True, (100, 1))
+        stepWindow 2 60 100 (Just (100, 2)) @?= (False, (100, 2))
+        stepWindow 2 60 200 (Just (100, 2)) @?= (True, (200, 1))
     ]
   where
     get p = defaultRequest {requestMethod = "GET", pathInfo = p}
