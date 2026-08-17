@@ -42,7 +42,9 @@ library
     Lavoisier.Config
     Lavoisier.Context.Anchor
     Lavoisier.Context.Diff
+    Lavoisier.Context.Lang
     Lavoisier.Context.Tokens
+    Lavoisier.Context.TreeSitter
     Lavoisier.Gateway.A2A
     Lavoisier.Gateway.Acp
     Lavoisier.Gateway.Cron
@@ -100,6 +102,21 @@ library
     , warp
     , websockets
     , wuss
+  -- The tree-sitter context engine (Lavoisier.Context.{Lang,TreeSitter,…}). We link
+  -- against the system libtree-sitter runtime (pkg-config) and compile the vendored
+  -- grammar C sources (cbits/ts-*/) plus a small pointer-based shim (cbits/lvz_ts_shim.c)
+  -- that wraps tree-sitter's by-value TSNode API — the Haskell FFI cannot pass structs
+  -- by value. `include-dirs` carries lvz_ts_shim.h (cbits) and each grammar's bundled
+  -- tree_sitter/*.h headers (cbits/ts-<lang>).
+  pkgconfig-depends: tree-sitter
+  include-dirs:
+    cbits
+    cbits/ts-rust
+  c-sources:
+    cbits/lvz_ts_shim.c
+    cbits/ts-rust/parser.c
+    cbits/ts-rust/scanner.c
+
   if flag(e2ee)
     exposed-modules: Lavoisier.Gateway.Matrix.E2ee
     build-depends:   olm

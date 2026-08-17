@@ -28,7 +28,9 @@ import Lavoisier.Agent
 import Lavoisier.Config (FileConfig (..), defaultConfig, loadConfig)
 import Lavoisier.Context.Anchor qualified as Anc
 import Lavoisier.Context.Diff qualified as Dff
+import Lavoisier.Context.Lang (Lang (..), LangSpec (..), langFromPath, langSpec)
 import Lavoisier.Context.Tokens (estimateTokens)
+import Lavoisier.Context.TreeSitter qualified as TS
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
 import Lavoisier.Gateway.Acp (defaultAcpConfig, newAcpApp)
 import Lavoisier.Gateway.Cron (CronConfigError (..), CronJob (..), parseCliJob, parseFileJobs)
@@ -103,6 +105,7 @@ tests =
       agentTests,
       fallbackTests,
       contextTests,
+      treeSitterTests,
       gatewayTests,
       a2aTests,
       acpTests,
@@ -593,6 +596,47 @@ contextTests =
   where
     src = "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n"
     expectRight = either (\e -> assertFailure ("expected Right, got " <> show e)) pure
+
+-- The tree-sitter substrate (Phase 23b): language config + a real parse over the vendored Rust
+-- grammar via the C-FFI shim. Proves the fragile C build actually parses end-to-end.
+treeSitterTests :: TestTree
+treeSitterTests =
+  testGroup
+    "context engine (tree-sitter)"
+    [ testCase "langFromPath detects by extension" $ do
+        langFromPath "src/main.rs" @?= Just Rust
+        langFromPath "a/b/c.py" @?= Just Python
+        langFromPath "x.JSX" @?= Just JavaScript
+        langFromPath "x.tsx" @?= Just TypeScript
+        langFromPath "README.md" @?= Nothing
+        langFromPath "noext" @?= Nothing,
+      testCase "langSpec: Rust elides bodies, Python keeps docstrings" $ do
+        elision (langSpec Rust) @?= "{ … }"
+        keepsDocstring (langSpec Python) @?= True
+        keepsDocstring (langSpec Rust) @?= False,
+      testCase "supported: Rust is wired, other grammars pending" $ do
+        TS.supported Rust @?= True
+        TS.supported Python @?= False,
+      testCase "parse: a Rust fn yields a named function_item with name + body fields" $ do
+        let code = BS8.pack "fn add(a: i32, b: i32) -> i32 { a + b }\n"
+        mroot <- TS.parse Rust code
+        case mroot of
+          Nothing -> assertFailure "expected a parse tree"
+          Just root -> do
+            TS.synType root @?= "source_file"
+            case [n | n <- TS.descendants root, TS.synType n == "function_item"] of
+              [fn] -> do
+                case TS.childByField "name" fn of
+                  Just nameNode -> TS.nodeText code nameNode @?= BS8.pack "add"
+                  Nothing -> assertFailure "function_item has no name field"
+                case TS.childByField "body" fn of
+                  Just body -> TS.synType body @?= "block"
+                  Nothing -> assertFailure "function_item has no body field"
+              other -> assertFailure ("expected exactly one function_item, got " <> show (length other)),
+      testCase "parse: an unsupported language returns Nothing" $ do
+        r <- TS.parse Python (BS8.pack "def f(): pass\n")
+        r @?= Nothing
+    ]
 
 -- --- Phase 6: the HTTP gateway (offline; WAI test harness, no socket or API) ----------------------
 
