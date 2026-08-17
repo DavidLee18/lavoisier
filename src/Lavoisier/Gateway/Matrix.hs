@@ -65,9 +65,11 @@ import Network.HTTP.Client
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (QueryItem, urlEncode)
 import Network.HTTP.Types.Status (statusCode, statusIsSuccessful)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (lookupEnv)
+import System.FilePath ((</>))
 #ifdef E2EE
-import Control.Monad (forM_, unless, void)
+import Control.Monad (forM_, unless)
 import Data.Scientific (toBoundedInteger)
 import Lavoisier.Gateway.Matrix.E2ee qualified as E2
 #endif
@@ -91,13 +93,22 @@ data MatrixConfig = MatrixConfig
     -- | Per-member tool permission map (intersected with the room's when both apply).
     mcUserTools :: Map Text [Text],
     -- | Auto-accept room invites (@\/join@ each invited room).
-    mcAutoJoin :: Bool
+    mcAutoJoin :: Bool,
+    -- | Directory persisting @session.json@ (token + device id, so the device id is stable across
+    -- restarts) and, under @e2ee@, the pickled crypto store. Unset ⇒ in-memory only.
+    mcStateDir :: Maybe FilePath,
+    -- | Optional at-rest passphrase for the pickled crypto store (@MATRIX_CRYPTO_STORE_KEY@).
+    mcCryptoStoreKey :: Maybe Text,
+    -- | Room to greet with a friendly "going offline" notice on shutdown (@MATRIX_HOME_ROOM@).
+    mcHomeRoom :: Maybe Text,
+    -- | If set, download inbound image\/file attachments here and hand the local path to the turn.
+    mcMediaDir :: Maybe FilePath
   }
 
 -- | A config with only the required fields; everything else off.
 defaultMatrixConfig :: Text -> Text -> MatrixConfig
 defaultMatrixConfig homeserver user =
-  MatrixConfig homeserver user Nothing Nothing Nothing Nothing Nothing Map.empty Map.empty True
+  MatrixConfig homeserver user Nothing Nothing Nothing Nothing Nothing Map.empty Map.empty True Nothing Nothing Nothing Nothing
 
 -- | Build the config from the @MATRIX_*@ environment (homeserver + user required; token or password
 -- for auth; optional device id, allowlists, auto-join).
@@ -111,6 +122,10 @@ matrixFromEnv = do
   allowedU <- lookupEnv "MATRIX_ALLOWED_USERS"
   allowedR <- lookupEnv "MATRIX_ALLOWED_ROOMS"
   autoJoin <- lookupEnv "MATRIX_NO_AUTO_JOIN"
+  stateDir <- lookupEnv "MATRIX_STATE_DIR"
+  cryptoKey <- lookupEnv "MATRIX_CRYPTO_STORE_KEY"
+  homeRoom <- lookupEnv "MATRIX_HOME_ROOM"
+  mediaDir <- lookupEnv "MATRIX_MEDIA_DIR"
   pure $ case (mhs, muser) of
     (Nothing, _) -> Left (GEBind "MATRIX_HOMESERVER is not set")
     (_, Nothing) -> Left (GEBind "MATRIX_USER is not set")
@@ -125,7 +140,11 @@ matrixFromEnv = do
                 mcDeviceId = T.pack <$> dev,
                 mcAllowedUsers = parseSet allowedU,
                 mcAllowedRooms = parseSet allowedR,
-                mcAutoJoin = autoJoin == Nothing
+                mcAutoJoin = autoJoin == Nothing,
+                mcStateDir = stateDir,
+                mcCryptoStoreKey = T.pack <$> cryptoKey,
+                mcHomeRoom = T.pack <$> homeRoom,
+                mcMediaDir = mediaDir
               }
   where
     dropTrailingSlash = reverse . dropWhile (== '/') . reverse
@@ -163,7 +182,10 @@ data MatrixEnv = MatrixEnv
 data E2State = E2State
   { esCrypto :: E2.Crypto,
     esShared :: IORef (Set (Text, Text, Text)),
-    esEnc :: IORef (Map Text Bool)
+    esEnc :: IORef (Map Text Bool),
+    -- | Set when the crypto state changed (a room key received, a session created), so the loop
+    -- re-persists the pickled store; cleared after a successful write.
+    esDirty :: IORef Bool
   }
 
 #else
@@ -212,6 +234,7 @@ serveLoop cfg agent = do
           syncD <- decryptedSync env sync
           let msgs = extractMessages syncD (meUserId env) (mcAllowedUsers cfg) (mcAllowedRooms cfg)
           mapM_ (dispatch env recent dmCache) msgs
+          persistIfDirty env
           case parseNextBatch sync of
             Right next -> loop env recent dmCache next
             Left _ -> loop env recent dmCache since
@@ -270,14 +293,63 @@ finishReaction env room eventId ack ok = do
 
 #ifdef E2EE
 
--- | Build the serve env and, under E2EE, initialise the crypto identity and publish its keys.
+-- | Build the serve env and, under E2EE, restore the crypto identity from the durable store (else
+-- create a fresh one, publish its keys, and seed the store).
 mkEnv :: MatrixConfig -> Manager -> Text -> Text -> Text -> IORef Int -> IO MatrixEnv
 mkEnv cfg mgr token userId deviceId txn = do
-  c <- E2.newCrypto userId deviceId
-  _ <- E2.publishKeys c (restAdapter cfg mgr token) -- best-effort
+  loaded <- loadCrypto cfg userId deviceId
+  (c, fresh) <- case loaded of
+    Just c -> pure (c, False)
+    Nothing -> (,True) <$> E2.newCrypto userId deviceId
   shared <- newIORef Set.empty
   encc <- newIORef Map.empty
-  pure (MatrixEnv cfg mgr token userId txn (E2State c shared encc))
+  dirty <- newIORef False
+  let e2 = E2State c shared encc dirty
+      env = MatrixEnv cfg mgr token userId txn e2
+  -- A fresh identity publishes its keys and seeds the store; a restored one is already published.
+  if fresh
+    then do
+      _ <- E2.publishKeys c (restAdapter cfg mgr token) -- best-effort
+      persistCrypto env
+    else pure ()
+  pure env
+
+-- | Restore the pickled 'E2.Crypto' from @\<stateDir\>/crypto.json@ (under the configured passphrase),
+-- if a state dir is set and the file is present and readable.
+loadCrypto :: MatrixConfig -> Text -> Text -> IO (Maybe E2.Crypto)
+loadCrypto cfg userId deviceId = case mcStateDir cfg of
+  Nothing -> pure Nothing
+  Just dir -> do
+    let path = dir </> "crypto.json"
+    ok <- doesFileExist path
+    if not ok
+      then pure Nothing
+      else do
+        r <- try (BL.readFile path) :: IO (Either SomeException BL.ByteString)
+        case r of
+          Left _ -> pure Nothing
+          Right bytes -> case decode bytes of
+            Nothing -> pure Nothing
+            Just v -> E2.unpickleStore userId deviceId (cryptoPassphrase cfg) v
+
+-- | Persist the crypto store to @\<stateDir\>/crypto.json@ (best-effort) and clear the dirty flag.
+persistCrypto :: MatrixEnv -> IO ()
+persistCrypto env = case mcStateDir (meConfig env) of
+  Nothing -> pure ()
+  Just dir -> do
+    v <- E2.pickleStore (esCrypto (meE2 env)) (cryptoPassphrase (meConfig env))
+    _ <- try (createDirectoryIfMissing True dir) :: IO (Either SomeException ())
+    _ <- try (BL.writeFile (dir </> "crypto.json") (encode v)) :: IO (Either SomeException ())
+    writeIORef (esDirty (meE2 env)) False
+
+-- | Re-persist the crypto store only if it changed since the last write.
+persistIfDirty :: MatrixEnv -> IO ()
+persistIfDirty env = do
+  dirty <- readIORef (esDirty (meE2 env))
+  if dirty then persistCrypto env else pure ()
+
+cryptoPassphrase :: MatrixConfig -> Text
+cryptoPassphrase = fromMaybe "" . mcCryptoStoreKey
 
 -- | Adapt the gateway's HTTP client to the E2ee module's abstract 'E2.Rest' hook.
 restAdapter :: MatrixConfig -> Manager -> Text -> E2.Rest
@@ -312,7 +384,9 @@ processToDevice env sync = do
                 (Just senderKey, Just (mtype, body)) -> do
                   r <- E2.decryptOlm c senderKey mtype body
                   case r of
-                    Right pt | lookStr "type" pt == Just "m.room_key" -> void (E2.storeRoomKey c senderKey pt)
+                    Right pt | lookStr "type" pt == Just "m.room_key" -> do
+                      _ <- E2.storeRoomKey c senderKey pt
+                      writeIORef (esDirty (meE2 env)) True
                     _ -> pure ()
                 _ -> pure ()
       | otherwise = pure ()
@@ -397,6 +471,7 @@ sendEncrypted env room body = do
             "content" .= object ["msgtype" .= ("m.text" :: Text), "body" .= body]
           ]
   content <- E2.encryptMegolm c room inner
+  writeIORef (esDirty (meE2 env)) True -- the outbound Megolm ratchet advanced
   n <- nextTxn env
   let path = "/_matrix/client/v3/rooms/" <> enc room <> "/send/m.room.encrypted/lvz" <> tshow n
   r <- httpSend (meConfig env) (meManager env) (Just (meToken env)) "PUT" path (Just content)
@@ -418,7 +493,7 @@ shareToDevice env room userId deviceId = do
     n <- nextTxn env
     r <- E2.shareRoomKeyWith (esCrypto (meE2 env)) (restAdapter (meConfig env) (meManager env) (meToken env)) ("lvz" <> tshow n) room userId deviceId
     case r of
-      Right () -> modifyIORef' ref (Set.insert (room, userId, deviceId))
+      Right () -> modifyIORef' ref (Set.insert (room, userId, deviceId)) >> writeIORef (esDirty (meE2 env)) True
       Left _ -> pure () -- best-effort; retried on the next send
 
 -- | The joined members of a room (their user ids).
@@ -457,6 +532,9 @@ mkEnv cfg mgr token userId _deviceId txn = pure (MatrixEnv cfg mgr token userId 
 decryptedSync :: MatrixEnv -> Value -> IO Value
 decryptedSync _ sync = pure sync
 
+persistIfDirty :: MatrixEnv -> IO ()
+persistIfDirty _ = pure ()
+
 sendText :: MatrixEnv -> Text -> Text -> IO (Either GatewayError Text)
 sendText = sendMessage
 
@@ -468,10 +546,55 @@ sendText = sendMessage
 -- persistence yet); a configured token is validated via @whoami@.
 resolveSession :: MatrixConfig -> Manager -> IO (Either GatewayError (Text, Text, Text))
 resolveSession cfg mgr = case mcAccessToken cfg of
+  -- Explicit token wins (validated via whoami).
   Just token -> do
     ewho <- whoami cfg mgr token
     pure (fmap (\(uid, dev) -> (token, uid, dev)) ewho)
-  Nothing -> login cfg mgr
+  Nothing -> do
+    -- A persisted session (token + device id) is reused when valid, keeping the device id stable.
+    persisted <- maybe (pure Nothing) loadSession (mcStateDir cfg)
+    case persisted of
+      Just (ptoken, pdev) -> do
+        ewho <- whoami cfg mgr ptoken
+        case ewho of
+          Right (uid, _) -> pure (Right (ptoken, uid, pdev))
+          Left _ -> loginAndSave cfg mgr (Just pdev)
+      Nothing -> loginAndSave cfg mgr Nothing
+
+-- | Password-login, reusing a persisted\/configured device id so the device stays stable, then
+-- persist the issued @{access_token, device_id}@ to @session.json@ when a state dir is configured.
+loginAndSave :: MatrixConfig -> Manager -> Maybe Text -> IO (Either GatewayError (Text, Text, Text))
+loginAndSave cfg mgr persistedDev = do
+  let cfg' = cfg {mcDeviceId = mcDeviceId cfg `orElse` persistedDev}
+  r <- login cfg' mgr
+  case r of
+    Right (token, uid, dev) -> do
+      maybe (pure ()) (\d -> saveSession d token dev) (mcStateDir cfg)
+      pure (Right (token, uid, dev))
+    Left e -> pure (Left e)
+  where
+    orElse (Just x) _ = Just x
+    orElse Nothing y = y
+
+-- | Load @{access_token, device_id}@ from @\<dir\>/session.json@, if present and well-formed.
+loadSession :: FilePath -> IO (Maybe (Text, Text))
+loadSession dir = do
+  let path = dir </> "session.json"
+  ok <- doesFileExist path
+  if not ok
+    then pure Nothing
+    else do
+      bytes <- BL.readFile path
+      pure $ do
+        v <- decode bytes
+        (,) <$> lookStr "access_token" v <*> lookStr "device_id" v
+
+-- | Persist @{access_token, device_id}@ to @\<dir\>/session.json@ (creating the dir; best-effort).
+saveSession :: FilePath -> Text -> Text -> IO ()
+saveSession dir token dev = do
+  _ <- try (createDirectoryIfMissing True dir) :: IO (Either SomeException ())
+  _ <- try (BL.writeFile (dir </> "session.json") (encode (object ["access_token" .= token, "device_id" .= dev]))) :: IO (Either SomeException ())
+  pure ()
 
 whoami :: MatrixConfig -> Manager -> Text -> IO (Either GatewayError (Text, Text))
 whoami cfg mgr token = do

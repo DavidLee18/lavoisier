@@ -11,11 +11,12 @@
 --   * establish an Olm session to a peer device and share the room key ('olmEncryptTo'), then
 --     Megolm-encrypt outbound messages ('encryptMegolm').
 --
--- Matrix signs device keys over __canonical JSON__ ('canonicalJson'), implemented here. The full
--- crypto path — Olm room-key share → Megolm decrypt, and device-key signing — is exercised offline
--- with two in-process 'Crypto' instances (see the @lavoisier-e2ee-test@ suite). The live REST wiring
--- (@\/keys\/upload@, @\/keys\/query@, @\/keys\/claim@, to-device send, and the serve-loop
--- decrypt\/encrypt hooks) is the remaining homeserver-only integration.
+-- Matrix signs device keys over __canonical JSON__ ('canonicalJson'), implemented here, and a peer's
+-- device keys are __verified__ against their Ed25519 self-signature before use ('verifyDeviceKeys').
+-- The identity is __durable__: 'pickleStore' \/ 'unpickleStore' round-trip the account + all sessions
+-- to disk so the bot survives a restart. The crypto path is exercised offline with two in-process
+-- 'Crypto' instances (see @lavoisier-e2ee-test@) and the whole serve loop is live-verified end to end
+-- against a real homeserver.
 module Lavoisier.Gateway.Matrix.E2ee
   ( Crypto,
     newCrypto,
@@ -38,6 +39,11 @@ module Lavoisier.Gateway.Matrix.E2ee
     olmEncryptTo,
     roomKeyEvent,
     encryptMegolm,
+
+    -- * Durable crypto store (pickle the account + all sessions)
+    pickleStore,
+    unpickleStore,
+    verifyDeviceKeys,
 
     -- * Homeserver REST wiring (decoupled via a 'Rest' hook, so it is offline-testable)
     Rest,
@@ -111,6 +117,69 @@ identityKeysRaw acc = do
 -- | The bot's @(curve25519, ed25519)@ identity keys.
 cryptoIdentityKeys :: Crypto -> IO (Text, Text)
 cryptoIdentityKeys c = pure (crCurve c, crEd c)
+
+-- --- durable crypto store --------------------------------------------------------------------------
+
+-- | Pickle the whole crypto identity (the Olm account, the 1:1 Olm sessions, and the inbound\/outbound
+-- Megolm sessions) to a JSON value, each blob encrypted at rest under @passphrase@ (libolm pickling).
+-- Round-trips with 'unpickleStore' so the E2EE identity survives a restart — no re-verification, no
+-- lost inbound room keys.
+pickleStore :: Crypto -> Text -> IO Value
+pickleStore c passphrase = do
+  let key = encodeUtf8 passphrase
+  acc <- decodeUtf8Lenient <$> pickleAccount (crAccount c) key
+  olm <- readIORef (crOlm c) >>= traverse (\s -> decodeUtf8Lenient <$> pickleSession s key)
+  inb <- readIORef (crInbound c)
+  inbTriples <- mapM (\((curve, sid), s) -> (\p -> [curve, sid, decodeUtf8Lenient p]) <$> pickleInbound s key) (Map.toList inb)
+  out <- readIORef (crOutbound c) >>= traverse (\s -> decodeUtf8Lenient <$> pickleOutbound s key)
+  pure $
+    object
+      [ "account" .= acc,
+        "olm" .= object [K.fromText k .= v | (k, v) <- Map.toList olm],
+        "inbound" .= inbTriples,
+        "outbound" .= object [K.fromText k .= v | (k, v) <- Map.toList out]
+      ]
+
+-- | Restore a 'Crypto' pickled by 'pickleStore' for @userId@\/@deviceId@ under @passphrase@. A bad
+-- passphrase or a corrupt store yields 'Nothing' (the caller falls back to a fresh identity).
+unpickleStore :: Text -> Text -> Text -> Value -> IO (Maybe Crypto)
+unpickleStore userId deviceId passphrase v =
+  either (const Nothing) Just <$> (try restore :: IO (Either SomeException Crypto))
+  where
+    key = encodeUtf8 passphrase
+    restore = do
+      accB64 <- maybe (fail "no account") pure (lookStr "account" v)
+      acc <- unpickleAccount key (encodeUtf8 accB64)
+      (curve, ed) <- identityKeysRaw acc
+      olmMap <- restoreMap (lookKey "olm" v) (unpickleSession key)
+      outMap <- restoreMap (lookKey "outbound" v) (unpickleOutbound key)
+      inbMap <- restoreInbound (lookKey "inbound" v)
+      Crypto acc userId deviceId curve ed <$> newIORef inbMap <*> newIORef outMap <*> newIORef olmMap
+    restoreMap (Just (Object o)) un =
+      Map.fromList <$> mapM (\(k, val) -> case val of String p -> (,) (K.toText k) <$> un (encodeUtf8 p); _ -> fail "non-string pickle") (KM.toList o)
+    restoreMap _ _ = pure Map.empty
+    restoreInbound (Just (Array a)) =
+      Map.fromList
+        <$> sequence
+          [ (\s -> ((curve, sid), s)) <$> unpickleInbound key (encodeUtf8 p)
+          | Array e <- V.toList a,
+            [String curve, String sid, String p] <- [V.toList e]
+          ]
+    restoreInbound _ = pure Map.empty
+
+-- | Verify a peer @device_keys@ object's Ed25519 __self-signature__ over Matrix canonical JSON: the
+-- device advertises its ed25519 key and signs its own key object with it. Returns 'False' when the
+-- signature is absent or does not verify, so the caller can refuse to trust unsigned\/forged keys.
+verifyDeviceKeys :: Text -> Text -> Value -> IO Bool
+verifyDeviceKeys userId deviceId dev = case (edKey, sig) of
+  (Just ed, Just s) -> do
+    u <- newUtility
+    r <- try (ed25519Verify u (encodeUtf8 ed) (canonicalJson (stripSigning dev)) (encodeUtf8 s)) :: IO (Either SomeException Bool)
+    pure (either (const False) id r)
+  _ -> pure False
+  where
+    edKey = lookKey "keys" dev >>= lookStr ("ed25519:" <> deviceId)
+    sig = lookKey "signatures" dev >>= lookKey userId >>= lookStr ("ed25519:" <> deviceId)
 
 -- | One of the account's current unpublished one-time keys (its base64 value), if any. (Test helper
 -- standing in for a server @\/keys\/claim@.)
@@ -339,11 +408,22 @@ replenishOtks c rest serverCount = do
       otk <- oneTimeKeysPayload c
       fmap (const ()) <$> rest "POST" "/_matrix/client/v3/keys/upload" (object ["one_time_keys" .= otk])
 
--- | Query a peer device's @(curve25519, ed25519)@ identity keys (@POST \/keys\/query@).
+-- | Query a peer device's @(curve25519, ed25519)@ identity keys (@POST \/keys\/query@), __verifying__
+-- the device object's Ed25519 self-signature before trusting it — an unsigned or forged key set is
+-- rejected with a clear error rather than used to establish a session.
 queryDevice :: Rest -> Text -> Text -> IO (Either Text (Text, Text))
 queryDevice rest userId deviceId = do
   r <- rest "POST" "/_matrix/client/v3/keys/query" (object ["device_keys" .= object [K.fromText userId .= ([] :: [Text])]])
-  pure (r >>= parseDeviceKeys userId deviceId)
+  case r of
+    Left e -> pure (Left e)
+    Right resp -> case lookKey "device_keys" resp >>= lookKey userId >>= lookKey deviceId of
+      Nothing -> pure (Left ("no device_keys." <> userId <> "." <> deviceId))
+      Just dev -> do
+        okSig <- verifyDeviceKeys userId deviceId dev
+        pure $
+          if okSig
+            then parseDeviceKeys userId deviceId resp
+            else Left ("device key signature verification failed for " <> deviceId)
 
 -- | Claim a one-time key for a peer device (@POST \/keys\/claim@), returning its base64 value.
 claimOtk :: Rest -> Text -> Text -> IO (Either Text Text)

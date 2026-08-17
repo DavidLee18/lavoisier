@@ -88,10 +88,12 @@ tests =
       testCase "shareRoomKeyWith drives query+claim+to-device; the peer decrypts the room key" $ do
         alice <- newCrypto "@alice:hs" "ALICEDEV"
         bob <- newCrypto "@bob:hs" "BOTDEV"
-        (bobCurve, bobEd) <- cryptoIdentityKeys bob
+        (bobCurve, _bobEd) <- cryptoIdentityKeys bob
         (aliceCurve, _) <- cryptoIdentityKeys alice
         Just bobOtk <- takeOneTimeKey bob
-        let devResp = object ["device_keys" .= object ["@bob:hs" .= object ["BOTDEV" .= object ["keys" .= object ["curve25519:BOTDEV" .= bobCurve, "ed25519:BOTDEV" .= bobEd]]]]]
+        -- The device object must carry bob's real Ed25519 self-signature: queryDevice now verifies it.
+        bobDev <- deviceKeysPayload bob
+        let devResp = object ["device_keys" .= object ["@bob:hs" .= object ["BOTDEV" .= bobDev]]]
             claimResp = object ["one_time_keys" .= object ["@bob:hs" .= object ["BOTDEV" .= object ["signed_curve25519:AAAA" .= object ["key" .= bobOtk]]]]]
         cap <- newIORef Nothing
         let rest _ path body
@@ -111,7 +113,53 @@ tests =
         edec <- decryptMegolm bob enc2
         case edec of
           Right inner -> (lookK "content" inner >>= lookK "body") @?= Just (String "hi bob")
-          Left e -> assertFailure (T.unpack e)
+          Left e -> assertFailure (T.unpack e),
+      testCase "pickleStore/unpickleStore round-trips the crypto identity and inbound sessions" $ do
+        -- alice shares a room key to bob; bob's restored store must still decrypt alice's message.
+        alice <- newCrypto "@alice:hs" "ALICEDEV"
+        bob <- newCrypto "@bob:hs" "BOTDEV"
+        (aliceCurve, _) <- cryptoIdentityKeys alice
+        bobDev <- deviceKeysPayload bob
+        Just bobOtk <- takeOneTimeKey bob
+        let devResp = object ["device_keys" .= object ["@bob:hs" .= object ["BOTDEV" .= bobDev]]]
+            claimResp = object ["one_time_keys" .= object ["@bob:hs" .= object ["BOTDEV" .= object ["signed_curve25519:AAAA" .= object ["key" .= bobOtk]]]]]
+        cap <- newIORef Nothing
+        let rest _ path body
+              | "keys/query" `T.isInfixOf` path = pure (Right devResp)
+              | "keys/claim" `T.isInfixOf` path = pure (Right claimResp)
+              | "sendToDevice" `T.isInfixOf` path = writeIORef cap (Just body) >> pure (Right (object []))
+              | otherwise = pure (Left ("unexpected: " <> path))
+        _ <- shareRoomKeyWith alice rest "txn1" "!room:hs" "@bob:hs" "BOTDEV"
+        Just sent <- readIORef cap
+        -- deliver the room key to bob, then persist + restore bob, then decrypt an alice message
+        (bobCurve, _) <- cryptoIdentityKeys bob
+        let ct = lookK "messages" sent >>= lookK "@bob:hs" >>= lookK "BOTDEV" >>= lookK "ciphertext" >>= lookK bobCurve
+            mtype = maybe 0 id (ct >>= lookK "type" >>= asInt)
+            body' = maybe "" id (ct >>= lookK "body" >>= asStr)
+        Right roomKey <- decryptOlm bob aliceCurve mtype body'
+        Right () <- storeRoomKey bob aliceCurve roomKey
+        pickled <- pickleStore bob "pass"
+        Just bob2 <- unpickleStore "@bob:hs" "BOTDEV" "pass" pickled
+        enc2 <- encryptMegolm alice "!room:hs" (object ["type" .= t "m.room.message", "content" .= object ["body" .= t "after restart"]])
+        edec <- decryptMegolm bob2 enc2
+        case edec of
+          Right inner -> (lookK "content" inner >>= lookK "body") @?= Just (String "after restart")
+          Left e -> assertFailure ("restored store failed to decrypt: " <> T.unpack e),
+      testCase "unpickleStore rejects a wrong passphrase" $ do
+        c <- newCrypto "@x:hs" "XDEV"
+        pickled <- pickleStore c "right"
+        bad <- unpickleStore "@x:hs" "XDEV" "wrong" pickled
+        assertBool "wrong passphrase yields Nothing" (maybe True (const False) bad),
+      testCase "verifyDeviceKeys accepts a self-signed device and rejects a tampered one" $ do
+        c <- newCrypto "@bot:hs" "BOTDEV"
+        dev <- deviceKeysPayload c
+        okGood <- verifyDeviceKeys "@bot:hs" "BOTDEV" dev
+        assertBool "genuine self-signature verifies" okGood
+        let tampered = case dev of
+              Object o -> Object (KM.insert "keys" (object ["curve25519:BOTDEV" .= t "FORGED", "ed25519:BOTDEV" .= t "FORGED"]) o)
+              v -> v
+        okBad <- verifyDeviceKeys "@bot:hs" "BOTDEV" tampered
+        assertBool "a tampered key object is rejected" (not okBad)
     ]
   where
     t = id :: Text -> Text
