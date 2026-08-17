@@ -475,7 +475,43 @@ agentTests =
         written <- TIO.readFile f
         written @?= "hi from stub"
         evs <- reverse <$> readIORef emitted
-        assertBool "emitted the final text" (TextDelta "all done" `elem` evs)
+        assertBool "emitted the final text" (TextDelta "all done" `elem` evs),
+      testCase "the truncate knob caps a large tool result and records the counterfactual" $ withTmp "trunc" $ \dir -> do
+        let f = dir </> "big.txt"
+            big = T.replicate 100 "x" -- 100 bytes, well over the 16-byte budget below
+            args = decodeUtf8Lenient . BL.toStrict . encode $ object ["path" .= T.pack f]
+            round1 = [ToolUseStart "t1" "read_file", ToolUseDelta "t1" args, ToolUseEnd "t1", Usage emptyUsage, Done ToolUse]
+            round2 = [TextDelta "done", Usage emptyUsage, Done EndTurn]
+        TIO.writeFile f big
+        ref <- newIORef (0 :: Int)
+        obsRef <- newIORef Nothing
+        let stub =
+              Provider
+                { providerStream = \_ -> do
+                    n <- atomicModifyIORef' ref (\k -> (k + 1, k))
+                    s <- fromList (map Right (if n == 0 then round1 else round2))
+                    pure (Right s),
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+            -- A tuner that forces a tiny truncate budget and captures the observed Outcome.
+            tuner =
+              Tn.Tuner
+                { Tn.tunerSelect = \_ -> pure Tn.defaultKnobs {Tn.truncateBytes = 16},
+                  Tn.tunerObserve = \_ _ o -> writeIORef obsRef (Just o)
+                }
+        agent <- mkAgent stub withBuiltins (defaultAgentConfig "stub-model") tuner Nothing
+        r <- runLoopSeeded agent Nothing [userMessage "read it"] (const (pure ()))
+        case r of
+          Left e -> assertFailure ("loop failed: " <> show e)
+          Right msgs -> do
+            let results = [content | Message _ blocks <- msgs, ToolResultBlock _ content _ <- blocks]
+            assertBool "a tool result is present" (not (null results))
+            assertBool "the result was truncated" (any ("truncated" `T.isInfixOf`) results)
+        obs <- readIORef obsRef
+        case obs >>= Tn.otMaxToolResultBytes of
+          Just m -> assertBool ("recorded pre-truncation size " <> show m) (m >= 100)
+          Nothing -> assertFailure "no max-tool-result-bytes recorded in the outcome"
     ]
 
 -- --- fallback chain (offline; scripted providers + the cross-turn circuit breaker) ---------------

@@ -27,11 +27,12 @@ import Control.Concurrent (forkIO)
 import Control.Concurrent.Chan
 import Control.Monad (replicateM)
 import Data.Aeson (Value (..), decodeStrict, object)
+import Data.ByteString qualified as BS
 import Data.IORef
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding (encodeUtf8)
+import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Data.Word (Word32)
 import GHC.Clock (getMonotonicTime)
 import Lavoisier.Protocol.Agent
@@ -240,18 +241,26 @@ runLoopSeeded agent allowed initial emit = do
           modifyIORef' usageRef (accumulateUsage (delUsage del))
           pure (initial <> [Message Assistant [TextBlock (delPlan del) False]])
   let effThinking = maybe (acThinking cfg) Just (knobThinking knobs)
+  -- ATO truncate dial: cap each tool result at the tuned byte budget before it re-enters the
+  -- transcript (a large result billed every subsequent round-trip is a pure token sink). We also
+  -- record the largest *pre-truncation* result so the tuner's Outcome carries the counterfactual
+  -- (`otMaxToolResultBytes`) — "how big was the thing we clipped", the signal it uses to decide
+  -- whether a wider budget would have helped.
+  maxToolBytesRef <- newIORef (0 :: Int)
   -- Fallback cursor start: the first chain position the cross-turn breaker isn't currently demoting,
   -- so a persistently-down primary isn't re-timed every turn. Sticky within the turn (only advances).
   startCursor <- cbFirstAvailable (agBreaker agent) (length (agFallbacks agent))
-  result <- go effThinking usageRef stepRef startCursor seeded 0
+  result <- go effThinking usageRef stepRef (truncateBytes knobs) maxToolBytesRef startCursor seeded 0
   finalUsage <- readIORef usageRef
   steps <- readIORef stepRef
+  maxToolBytes <- readIORef maxToolBytesRef
   let out =
         defaultOutcome
           { otTotalTokens = usageCost finalUsage defaultCostWeights,
             otRoundTrips = fromIntegral steps,
             otCacheHitRate = cacheHitRate finalUsage,
-            otSuccess = either (const False) (const True) result
+            otSuccess = either (const False) (const True) result,
+            otMaxToolResultBytes = if maxToolBytes > 0 then Just maxToolBytes else Nothing
           }
   tunerObserve (agTuner agent) ctx knobs out
   pure result
@@ -267,8 +276,8 @@ runLoopSeeded agent allowed initial emit = do
     fallbacksLen :: Int
     fallbacksLen = length (agFallbacks agent)
 
-    go :: Maybe ThinkingLevel -> IORef Usage -> IORef Int -> Int -> [Message] -> Int -> IO (Either AgentError [Message])
-    go effThinking usageRef stepRef cursor msgs step
+    go :: Maybe ThinkingLevel -> IORef Usage -> IORef Int -> Int -> IORef Int -> Int -> [Message] -> Int -> IO (Either AgentError [Message])
+    go effThinking usageRef stepRef tlimit maxRef cursor msgs step
       | step >= acMaxSteps cfg = pure (Right msgs)
       | otherwise = do
           let buildReq model =
@@ -287,10 +296,10 @@ runLoopSeeded agent allowed initial emit = do
               writeIORef stepRef (step + 1)
               if stop == ToolUse && not (null calls)
                 then do
-                  results <- mapM runCall calls
+                  results <- mapM (runCall tlimit maxRef) calls
                   let assistantMsg = Message Assistant (textPart txt <> map callBlock calls)
                       userMsg = Message User (map resultBlock results)
-                  go effThinking usageRef stepRef cursor' (msgs <> [assistantMsg, userMsg]) (step + 1)
+                  go effThinking usageRef stepRef tlimit maxRef cursor' (msgs <> [assistantMsg, userMsg]) (step + 1)
                 else pure (Right (msgs <> [Message Assistant blocks | let blocks = textPart txt, not (null blocks)]))
 
     -- Fallback-aware send: try the model at `cursor`, then each remaining fallback in order. We only
@@ -348,15 +357,18 @@ runLoopSeeded agent allowed initial emit = do
                 Done sr -> loop txt calls (Just sr) usg fwd'
                 _ -> loop txt calls stop usg fwd'
 
-    runCall :: PendingCall -> IO (Text, Text, Bool)
-    runCall (i, name, jsonT)
+    runCall :: Int -> IORef Int -> PendingCall -> IO (Text, Text, Bool)
+    runCall tlimit maxRef (i, name, jsonT)
       | not (isAllowed allowed name) =
           pure (i, "tool `" <> name <> "` is not permitted this turn", True)
       | otherwise = do
           r <- invokeTool name (parseArgs jsonT) (agTools agent)
-          pure $ case r of
-            Right out -> (i, toContent out, toIsError out)
-            Left err -> (i, "tool error: " <> tshow err, True)
+          case r of
+            Left err -> pure (i, "tool error: " <> tshow err, True)
+            Right out -> do
+              let (content, origBytes) = truncateToBytes tlimit (toContent out)
+              modifyIORef' maxRef (max origBytes)
+              pure (i, content, toIsError out)
 
     callBlock (i, name, jsonT) = ToolUseBlock i name (parseArgs jsonT)
     resultBlock (i, content, err) = ToolResultBlock i content err
@@ -419,6 +431,18 @@ parseArgs :: Text -> Value
 parseArgs s =
   let s' = if T.null (T.strip s) then "{}" else s
    in fromMaybe (object []) (decodeStrict (encodeUtf8 s'))
+
+-- | Truncate @content@ to at most @limit@ UTF-8 bytes, appending a marker, and return it together
+-- with the ORIGINAL byte size (so the caller can record the pre-truncation counterfactual). A
+-- non-positive limit disables truncation. A split codepoint at the boundary decodes leniently.
+truncateToBytes :: Int -> Text -> (Text, Int)
+truncateToBytes limit content
+  | limit <= 0 || origBytes <= limit = (content, origBytes)
+  | otherwise = (decodeUtf8Lenient (BS.take limit bytes) <> marker, origBytes)
+  where
+    bytes = encodeUtf8 content
+    origBytes = BS.length bytes
+    marker = "\n… [truncated " <> tshow (origBytes - limit) <> " of " <> tshow origBytes <> " bytes]"
 
 tshow :: (Show a) => a -> Text
 tshow = T.pack . show
