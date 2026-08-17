@@ -800,7 +800,59 @@ convergenceTests =
         agent <- mkAgent stub withBuiltins cfg Tn.noopTuner Nothing
         _ <- runLoopSeeded agent Nothing [userMessage "go"] (\e -> modifyIORef' emitted (e :))
         evs <- readIORef emitted
-        assertBool "emitted a no_progress stop" (Done (Other "no_progress") `elem` evs)
+        assertBool "emitted a no_progress stop" (Done (Other "no_progress") `elem` evs),
+      testCase "require-edit nudges a no-edit finish then accepts (bounded)" $ do
+        ref <- newIORef (0 :: Int)
+        let stub =
+              Provider
+                { providerStream = \_ -> modifyIORef' ref (+ 1) >> fmap Right (fromList (map Right [TextDelta "you should edit X", Usage emptyUsage, Done EndTurn])),
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+            cfg = (defaultAgentConfig "m") {acRequireEdit = True}
+        agent <- mkAgent stub withBuiltins cfg Tn.noopTuner Nothing
+        r <- runLoopSeeded agent Nothing [userMessage "edit the thing"] (const (pure ()))
+        n <- readIORef ref
+        case r of
+          Right msgs -> do
+            assertBool "nudged" (any ("haven't changed any files" `T.isInfixOf`) [c | Message _ bs <- msgs, TextBlock c _ <- bs])
+            n @?= 3 -- finish + 2 nudges
+          Left e -> assertFailure (show e),
+      testCase "verify-and-fix bounces a failing verify then accepts (bounded)" $ do
+        ref <- newIORef (0 :: Int)
+        let stub =
+              Provider
+                { providerStream = \_ -> modifyIORef' ref (+ 1) >> fmap Right (fromList (map Right [TextDelta "done", Usage emptyUsage, Done EndTurn])),
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+            cfg = (defaultAgentConfig "m") {acVerifyCommand = Just "false", acVerifyAndFix = True}
+        agent <- mkAgent stub withBuiltins cfg Tn.noopTuner Nothing
+        r <- runLoopSeeded agent Nothing [userMessage "go"] (const (pure ()))
+        n <- readIORef ref
+        case r of
+          Right msgs -> do
+            assertBool "fed the failure back" (any ("Verification failed" `T.isInfixOf`) [c | Message _ bs <- msgs, TextBlock c _ <- bs])
+            n @?= 4 -- finish + 3 fix attempts
+          Left e -> assertFailure (show e),
+      testCase "in-loop-verify stops as soon as an edit makes verify pass" $ withTmp "ilv" $ \dir -> do
+        ref <- newIORef (0 :: Int)
+        emitted <- newIORef []
+        let f = dir </> "out.txt"
+            wargs = decodeUtf8Lenient . BL.toStrict . encode $ object ["path" .= T.pack f, "content" .= ("hi" :: Text)]
+            stub =
+              Provider
+                { providerStream = \_ -> modifyIORef' ref (+ 1) >> fmap Right (fromList (map Right [ToolUseStart "w" "write_file", ToolUseDelta "w" wargs, ToolUseEnd "w", Usage emptyUsage, Done ToolUse])),
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+            cfg = (defaultAgentConfig "m") {acVerifyCommand = Just "true", acInLoopVerify = True}
+        agent <- mkAgent stub withBuiltins cfg Tn.noopTuner Nothing
+        _ <- runLoopSeeded agent Nothing [userMessage "write it"] (\e -> modifyIORef' emitted (e :))
+        n <- readIORef ref
+        evs <- readIORef emitted
+        n @?= 1 -- stopped after one edit turn
+        assertBool "emitted EndTurn" (Done EndTurn `elem` evs)
     ]
 
 -- --- fallback chain (offline; scripted providers + the cross-turn circuit breaker) ---------------

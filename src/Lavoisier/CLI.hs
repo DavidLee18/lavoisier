@@ -64,6 +64,10 @@ data Options = Options
     optAdvisorModel :: Maybe Text,
     optBudget :: Maybe Word64,
     optNoProgressLimit :: Maybe Int,
+    optVerifyCmd :: Maybe Text,
+    optRequireEdit :: Bool,
+    optVerifyAndFix :: Bool,
+    optInLoopVerify :: Bool,
     optServe :: Maybe Int,
     optServeA2a :: Maybe Int,
     optServeAcp :: Maybe Int,
@@ -103,6 +107,10 @@ optionsParser =
     <*> optional (strOption (long "advisor-model" <> metavar "MODEL" <> help "Smarter model for a one-shot planning pre-pass that seeds the executor"))
     <*> optional (option auto (long "budget" <> metavar "N" <> help "Whole-task cost-weighted token budget; the turn stops when exceeded"))
     <*> optional (option auto (long "no-progress-limit" <> metavar "N" <> help "Hard-stop after 2N edit-free round-trips (nudge at N)"))
+    <*> optional (strOption (long "verify-cmd" <> metavar "CMD" <> help "Shell command that verifies the task (exit 0 = pass); drives the ATO success signal and verify levers"))
+    <*> switch (long "require-edit" <> help "Nudge a finish that edited nothing to actually edit (bounded)")
+    <*> switch (long "verify-and-fix" <> help "On a would-be finish, if --verify-cmd fails, feed the output back and keep working (bounded)")
+    <*> switch (long "in-loop-verify" <> help "Stop as soon as an edit turn makes --verify-cmd pass")
     <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
     <*> optional (option auto (long "serve-a2a" <> metavar "PORT" <> help "Serve the agent as an A2A (Agent-to-Agent) gateway on this port"))
     <*> optional (option auto (long "serve-acp" <> metavar "PORT" <> help "Serve the agent as an ACP (Agent Communication Protocol) gateway on this port"))
@@ -207,6 +215,10 @@ applyConfig fc o =
       optAdvisorModel = optAdvisorModel o <|> advisorModel fc,
       optBudget = optBudget o <|> fmap fromIntegral (budget fc),
       optNoProgressLimit = optNoProgressLimit o <|> fmap fromIntegral (noProgressLimit fc),
+      optVerifyCmd = optVerifyCmd o <|> verifyCmd fc,
+      optRequireEdit = optRequireEdit o || fromMaybe False (requireEdit fc),
+      optVerifyAndFix = optVerifyAndFix o || fromMaybe False (verifyAndFix fc),
+      optInLoopVerify = optInLoopVerify o || fromMaybe False (inLoopVerify fc),
       optServe = optServe o <|> fmap fromIntegral (serve fc),
       optServeA2a = optServeA2a o <|> fmap fromIntegral (serveA2a fc),
       optServeAcp = optServeAcp o <|> fmap fromIntegral (serveAcp fc),
@@ -398,7 +410,11 @@ assembleAgent prov opts model tuner delib registry = do
             acEscalateAfter = fromMaybe (acEscalateAfter base) (optEscalateAfter opts),
             acAdvisorModel = optAdvisorModel opts,
             acTokenBudget = optBudget opts,
-            acNoProgressLimit = optNoProgressLimit opts
+            acNoProgressLimit = optNoProgressLimit opts,
+            acVerifyCommand = optVerifyCmd opts,
+            acRequireEdit = optRequireEdit opts,
+            acVerifyAndFix = optVerifyAndFix opts,
+            acInLoopVerify = optInLoopVerify opts
           }
   agent0 <- mkAgent prov registry cfg tuner delib
   fallbacks <- buildFallbacks opts

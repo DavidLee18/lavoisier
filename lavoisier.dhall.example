@@ -16,6 +16,10 @@
 , advisorModel = None Text -- smarter model for a one-shot planning pre-pass
 , budget = None Natural -- whole-task cost-weighted token budget; stop when exceeded
 , noProgressLimit = None Natural -- hard-stop after 2N edit-free round-trips (nudge at N)
+, verifyCmd = None Text -- shell command that verifies the task (exit 0 = pass)
+, requireEdit = None Bool -- nudge a finish that edited nothing
+, verifyAndFix = None Bool -- on a would-be finish, if verifyCmd fails, feed it back and keep working
+, inLoopVerify = None Bool -- stop as soon as an edit turn makes verifyCmd pass
 , serve = None Natural -- HTTP gateway port (POST /v1/turns, GET /health)
 , serveA2a = None Natural -- A2A gateway port
 , serveAcp = None Natural -- ACP gateway port

@@ -32,6 +32,10 @@ data FileConfig = FileConfig
     advisorModel :: Maybe Text,
     budget :: Maybe Natural,
     noProgressLimit :: Maybe Natural,
+    verifyCmd :: Maybe Text,
+    requireEdit :: Maybe Bool,
+    verifyAndFix :: Maybe Bool,
+    inLoopVerify :: Maybe Bool,
     serve :: Maybe Natural,
     serveA2a :: Maybe Natural,
     serveAcp :: Maybe Natural,
@@ -59,7 +63,7 @@ instance Dhall.FromDhall FileConfig
 
 -- | The all-unset config (one 'Nothing' per 'FileConfig' field).
 defaultConfig :: FileConfig
-defaultConfig = FileConfig n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n
+defaultConfig = FileConfig n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n
   where
     n :: Maybe a
     n = Nothing
@@ -86,6 +90,10 @@ defaultsDhall =
       ", advisorModel = None Text",
       ", budget = None Natural",
       ", noProgressLimit = None Natural",
+      ", verifyCmd = None Text",
+      ", requireEdit = None Bool",
+      ", verifyAndFix = None Bool",
+      ", inLoopVerify = None Bool",
       ", serve = None Natural",
       ", serveA2a = None Natural",
       ", serveAcp = None Natural",

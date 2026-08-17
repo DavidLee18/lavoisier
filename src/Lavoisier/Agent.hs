@@ -71,6 +71,8 @@ import Lavoisier.Protocol.Stream (Producer (..))
 import Lavoisier.Protocol.Tool (ToolOutput (..))
 import Lavoisier.Protocol.Tune
 import Lavoisier.Tool.Registry
+import System.Exit (ExitCode (ExitSuccess))
+import System.Process.Typed (nullStream, proc, readProcess, runProcess, setStderr, setStdout)
 
 -- | The tool-loop configuration.
 data AgentConfig = AgentConfig
@@ -96,14 +98,24 @@ data AgentConfig = AgentConfig
     acTokenBudget :: Maybe Word64,
     -- | No-progress circuit-breaker: after @2*limit@ edit-free round-trips the turn hard-stops with
     -- @Done (Other "no_progress")@; a nudge is injected at @limit@. 'Nothing' disables it.
-    acNoProgressLimit :: Maybe Int
+    acNoProgressLimit :: Maybe Int,
+    -- | Shell command that verifies the task (exit 0 = pass). Drives the real ATO success signal and
+    -- the verify convergence levers. 'Nothing' ⇒ success falls back to "completed without erroring".
+    acVerifyCommand :: Maybe Text,
+    -- | Nudge a finish that edited nothing to actually edit (bounded by 'maxEditNudges').
+    acRequireEdit :: Bool,
+    -- | On a would-be finish, if 'acVerifyCommand' fails, feed its output back and keep working
+    -- (bounded by 'maxFixAttempts')..
+    acVerifyAndFix :: Bool,
+    -- | Stop as soon as an edit turn makes 'acVerifyCommand' pass (don't wait for the model).
+    acInLoopVerify :: Bool
   }
 
 -- | Sensible defaults: 12 steps, 4096 max tokens, no forced thinking, the default system prompt, no
 -- context-eviction ceiling, no cheap\/advisor model (escalate-after 2), unbounded budget, no
 -- no-progress breaker.
 defaultAgentConfig :: Text -> AgentConfig
-defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing Nothing Nothing 2 Nothing Nothing Nothing
+defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing Nothing Nothing 2 Nothing Nothing Nothing Nothing False False False
 
 -- | A per-position __circuit breaker__ for the fallback chain, shared across turns so a dead model
 -- isn't re-probed every turn. Position @0@ is the primary; position @i>0@ is @fallbacks !! (i-1)@.
@@ -284,16 +296,19 @@ runLoopSeeded agent allowed initial emit = do
   -- Fallback cursor start: the first chain position the cross-turn breaker isn't currently demoting,
   -- so a persistently-down primary isn't re-timed every turn. Sticky within the turn (only advances).
   startCursor <- cbFirstAvailable (agBreaker agent) (length (agFallbacks agent))
-  result <- go effThinking usageRef stepRef knobs maxToolBytesRef startCursor seeded 0 0
+  result <- go effThinking usageRef stepRef knobs maxToolBytesRef startCursor seeded 0 conv0
   finalUsage <- readIORef usageRef
   steps <- readIORef stepRef
   maxToolBytes <- readIORef maxToolBytesRef
+  -- Real ATO success signal (§6.6): a clean completion counts as success only if the verify command
+  -- also passes (no command ⇒ the coarse "completed without erroring" fallback).
+  success <- either (const (pure False)) (const (runVerify cfg)) result
   let out =
         defaultOutcome
           { otTotalTokens = usageCost finalUsage defaultCostWeights,
             otRoundTrips = fromIntegral steps,
             otCacheHitRate = cacheHitRate finalUsage,
-            otSuccess = either (const False) (const True) result,
+            otSuccess = success,
             otMaxToolResultBytes = if maxToolBytes > 0 then Just maxToolBytes else Nothing
           }
   tunerObserve (agTuner agent) ctx knobs out
@@ -316,16 +331,17 @@ runLoopSeeded agent allowed initial emit = do
     fallbacksLen :: Int
     fallbacksLen = length (agFallbacks agent)
 
-    -- Whether an edit tool ran successfully this round (resets the no-progress streak).
-    edited :: PendingCall -> (Text, Text, Bool) -> Bool
-    edited (_, name, _) (_, _, isErr) = name `elem` editTools && not isErr
+    -- A real edit landed this call: an edit tool whose result reported `changed` (§6.6 — a no-op
+    -- edit is not progress).
+    edited :: PendingCall -> (Text, Text, Bool, Bool) -> Bool
+    edited (_, name, _) (_, _, _, changed) = changed && name `elem` editTools
 
     nudgeAt, hardStop :: Int -> Bool
     nudgeAt s = maybe False (\l -> l > 0 && s == l) (acNoProgressLimit cfg)
     hardStop s = maybe False (\l -> l > 0 && s >= 2 * l) (acNoProgressLimit cfg)
 
-    go :: Maybe ThinkingLevel -> IORef Usage -> IORef Int -> Knobs -> IORef Int -> Int -> [Message] -> Int -> Int -> IO (Either AgentError [Message])
-    go effThinking usageRef stepRef knobs maxRef cursor msgs step streak
+    go :: Maybe ThinkingLevel -> IORef Usage -> IORef Int -> Knobs -> IORef Int -> Int -> [Message] -> Int -> Conv -> IO (Either AgentError [Message])
+    go effThinking usageRef stepRef knobs maxRef cursor msgs step conv
       | step >= acMaxSteps cfg = pure (Right msgs)
       | otherwise = do
           -- History shaping before the send (§6.3), in the Rust pipeline order: mark stale reads →
@@ -353,18 +369,36 @@ runLoopSeeded agent allowed initial emit = do
                 then pure (Left AEBudgetExceeded)
                 else
                   if stop == ToolUse && not (null calls)
-                    then do
-                      results <- mapM (runCall knobs maxRef) calls
-                      -- No-progress breaker: an edit resets the streak; a nudge is injected once at
-                      -- the limit; the turn hard-stops (Done no_progress) at twice the limit.
-                      let streak' = if or (zipWith edited calls results) then 0 else streak + 1
-                          assistantMsg = Message Assistant (textPart txt <> map callBlock calls)
-                          userMsg = Message User (map resultBlock results <> [TextBlock noProgressNudge False | nudgeAt streak'])
-                          transcript = msgs' <> [assistantMsg, userMsg]
-                      if hardStop streak'
-                        then emit (Done (Ev.Other "no_progress")) >> pure (Right transcript)
-                        else go effThinking usageRef stepRef knobs maxRef cursor' transcript (step + 1) streak'
-                    else pure (Right (msgs' <> [Message Assistant blocks | let blocks = textPart txt, not (null blocks)]))
+                    then act msgs' txt calls cursor'
+                    else finish msgs' txt
+      where
+        -- An edit turn: run the tools, update convergence state, then continue — unless in-loop-verify
+        -- now passes (done) or the no-progress streak hit the hard limit.
+        act msgs' txt calls cursor' = do
+          results <- mapM (runCall knobs maxRef) calls
+          let madeEdit = or (zipWith edited calls results)
+              conv' = conv {cvEdited = cvEdited conv || madeEdit, cvStreak = if madeEdit then 0 else cvStreak conv + 1}
+              assistantMsg = Message Assistant (textPart txt <> map callBlock calls)
+              userMsg = Message User (map resultBlock results <> [TextBlock noProgressNudge False | nudgeAt (cvStreak conv')])
+              transcript = msgs' <> [assistantMsg, userMsg]
+          done <- if acInLoopVerify cfg && madeEdit then runVerify cfg else pure False
+          if done
+            then emit (Done EndTurn) >> pure (Right transcript)
+            else
+              if hardStop (cvStreak conv')
+                then emit (Done (Ev.Other "no_progress")) >> pure (Right transcript)
+                else go effThinking usageRef stepRef knobs maxRef cursor' transcript (step + 1) conv'
+        -- The model tried to finish: apply the require-edit and verify-and-fix guards, else accept it.
+        finish msgs' txt = do
+          let base = msgs' <> [Message Assistant b | let b = textPart txt, not (null b)]
+              continueWith extra c = go effThinking usageRef stepRef knobs maxRef cursor (base <> [Message User [TextBlock extra False]]) (step + 1) c
+          if acRequireEdit cfg && not (cvEdited conv) && cvNudges conv < maxEditNudges
+            then continueWith requireEditNudge conv {cvNudges = cvNudges conv + 1}
+            else do
+              vf <- if acVerifyAndFix cfg && cvFixes conv < maxFixAttempts then runVerifyOutput cfg else pure Nothing
+              case vf of
+                Just (False, out) -> continueWith (verifyFailPrompt out) conv {cvFixes = cvFixes conv + 1}
+                _ -> pure (Right base)
 
     -- The §6.3 pipeline: stale-reads → dedup (both lossless) → compact (best-effort) → evict-to-fit
     -- (only when a context limit is configured).
@@ -437,24 +471,24 @@ runLoopSeeded agent allowed initial emit = do
                 Done sr -> loop txt calls (Just sr) usg fwd'
                 _ -> loop txt calls stop usg fwd'
 
-    runCall :: Knobs -> IORef Int -> PendingCall -> IO (Text, Text, Bool)
+    runCall :: Knobs -> IORef Int -> PendingCall -> IO (Text, Text, Bool, Bool)
     runCall knobs maxRef (i, name, jsonT)
       | not (isAllowed allowed name) =
-          pure (i, "tool `" <> name <> "` is not permitted this turn", True)
+          pure (i, "tool `" <> name <> "` is not permitted this turn", True, False)
       | otherwise = do
           -- Apply the agent-enforced knobs to the call's args (skeleton-radius injection, batch-width
           -- cap), then truncate the result to the tuned byte budget and record the counterfactual.
           let args = applyKnobsToArgs knobs name (parseArgs jsonT)
           r <- invokeTool name args (agTools agent)
           case r of
-            Left err -> pure (i, "tool error: " <> tshow err, True)
+            Left err -> pure (i, "tool error: " <> tshow err, True, False)
             Right out -> do
               let (content, origBytes) = truncateToBytes (truncateBytes knobs) (toContent out)
               modifyIORef' maxRef (max origBytes)
-              pure (i, content, toIsError out)
+              pure (i, content, toIsError out, toChanged out)
 
     callBlock (i, name, jsonT) = ToolUseBlock i name (parseArgs jsonT)
-    resultBlock (i, content, err) = ToolResultBlock i content err
+    resultBlock (i, content, err, _) = ToolResultBlock i content err
     textPart txt = [TextBlock txt False | not (T.null txt)]
 
 -- | Adapt 'runAgent' to the 'AgentHandle' record: spawn the loop, streaming its events (and any
@@ -779,6 +813,55 @@ toollessCall prov req = do
 -- | A JSON value rendered to compact text (for token-proxy\/transcript rendering).
 renderJson :: Value -> Text
 renderJson = decodeUtf8Lenient . BL.toStrict . encode
+
+-- --- convergence: verify command + mutable per-turn counters ---------------------------------------
+
+-- | Bounds for the nudge\/fix guards, and the verify-output cap.
+maxEditNudges, maxFixAttempts, verifyOutputCap :: Int
+maxEditNudges = 2
+maxFixAttempts = 3
+verifyOutputCap = 4096
+
+-- | Per-turn convergence state threaded through the loop: edit-free streak (no-progress), whether
+-- any real edit landed (require-edit\/in-loop-verify), and the nudge\/fix attempt counters.
+data Conv = Conv
+  { cvStreak :: !Int,
+    cvEdited :: !Bool,
+    cvNudges :: !Int,
+    cvFixes :: !Int
+  }
+
+conv0 :: Conv
+conv0 = Conv 0 False 0 0
+
+-- | Run the verify command for its exit status (pass\/fail); no command ⇒ trivially passes. Output
+-- is silenced.
+runVerify :: AgentConfig -> IO Bool
+runVerify cfg = case acVerifyCommand cfg of
+  Nothing -> pure True
+  Just cmd -> (== ExitSuccess) <$> runProcess (setStderr nullStream (setStdout nullStream (proc "sh" ["-c", T.unpack cmd])))
+
+-- | Run the verify command capturing (pass?, combined stdout+stderr, capped); 'Nothing' if unset.
+runVerifyOutput :: AgentConfig -> IO (Maybe (Bool, Text))
+runVerifyOutput cfg = case acVerifyCommand cfg of
+  Nothing -> pure Nothing
+  Just cmd -> do
+    (code, out, err) <- readProcess (proc "sh" ["-c", T.unpack cmd])
+    let text = decodeUtf8Lenient (BL.toStrict out) <> decodeUtf8Lenient (BL.toStrict err)
+    pure (Just (code == ExitSuccess, fst (truncateToBytes verifyOutputCap text)))
+
+-- | Nudge injected when a require-edit task finishes having changed nothing.
+requireEditNudge :: Text
+requireEditNudge =
+  "You haven't changed any files yet, but this task requires edits. Make the necessary change(s) now "
+    <> "with str_replace — or, if no change is genuinely needed, say so explicitly and why."
+
+-- | Prompt fed back when a would-be finish fails the verify command.
+verifyFailPrompt :: Text -> Text
+verifyFailPrompt out =
+  "Verification failed — the task is not complete. Fix the issues below, then finish only once it "
+    <> "passes.\n\n"
+    <> out
 
 -- | Apply the knobs the agent enforces directly on a tool call's arguments (§6.6\/§6.1): inject the
 -- tuned skeleton radius into an @outline_*@ call that focuses a symbol but left @radius@ unset, and
