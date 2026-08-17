@@ -29,6 +29,7 @@ import Lavoisier.Config (FileConfig (..), defaultConfig, loadConfig)
 import Lavoisier.Context.Anchor qualified as Anc
 import Lavoisier.Context.Diff qualified as Dff
 import Lavoisier.Context.Lang (Lang (..), LangSpec (..), langFromPath, langSpec)
+import Lavoisier.Context.Skeleton qualified as Skel
 import Lavoisier.Context.Tokens (estimateTokens)
 import Lavoisier.Context.TreeSitter qualified as TS
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
@@ -106,6 +107,7 @@ tests =
       fallbackTests,
       contextTests,
       treeSitterTests,
+      skeletonTests,
       gatewayTests,
       a2aTests,
       acpTests,
@@ -655,6 +657,62 @@ treeSitterTests =
           Just r -> assertBool "ts interface_declaration" (any ((== "interface_declaration") . TS.synType) (TS.descendants r))
           Nothing -> assertFailure "expected a TS parse tree"
     ]
+
+-- Skeletonisation (Phase 23b): keep signatures + docs, elide bodies (the §6.1 token lever).
+skeletonTests :: TestTree
+skeletonTests =
+  testGroup
+    "context engine (skeleton)"
+    [ testCase "Rust bodies are elided; signatures and docs kept" $ do
+        out <-
+          skel Rust $
+            "/// Adds two numbers.\npub fn add(a: i32, b: i32) -> i32 {\n    let sum = a + b;\n    sum\n}\n\nstruct Point { x: i32, y: i32 }\n"
+        assertBool "doc kept" ("/// Adds two numbers." `T.isInfixOf` out)
+        assertBool "signature kept" ("pub fn add(a: i32, b: i32) -> i32" `T.isInfixOf` out)
+        assertBool "placeholder present" ("{ … }" `T.isInfixOf` out)
+        assertBool "body elided" (not ("let sum = a + b;" `T.isInfixOf` out))
+        assertBool "struct fields kept" ("struct Point { x: i32, y: i32 }" `T.isInfixOf` out),
+      testCase "keepBodies preserves the named function only" $ do
+        out <-
+          Skel.skeletonize Rust (Set.fromList ["keep_me"]) $
+            BS8.pack "fn keep_me() { let a = 1; }\nfn drop_me() { let b = 2; }\n"
+        let t = decodeUtf8Lenient out
+        assertBool "kept body remains" ("let a = 1;" `T.isInfixOf` t)
+        assertBool "other body elided" (not ("let b = 2;" `T.isInfixOf` t)),
+      testCase "methods inside impl blocks are skeletonised" $ do
+        out <- skel Rust "impl Foo {\n    fn method(&self) -> u8 {\n        let secret = 42;\n        secret\n    }\n}\n"
+        assertBool "method sig kept" ("fn method(&self) -> u8" `T.isInfixOf` out)
+        assertBool "method body elided" (not ("let secret = 42;" `T.isInfixOf` out)),
+      testCase "Python bodies are elided" $ do
+        out <- skel Python "def greet(name):\n    msg = 'hi ' + name\n    return msg\n"
+        assertBool "def kept" ("def greet(name):" `T.isInfixOf` out)
+        assertBool "placeholder" ("..." `T.isInfixOf` out)
+        assertBool "body elided" (not ("msg = 'hi ' + name" `T.isInfixOf` out)),
+      testCase "Python docstring kept when body elided, re-indented placeholder" $ do
+        out <- skel Python "def greet(name):\n    \"\"\"Return a friendly greeting for name.\"\"\"\n    msg = 'hi ' + name\n    return msg\n"
+        assertBool "docstring kept" ("\"\"\"Return a friendly greeting for name.\"\"\"" `T.isInfixOf` out)
+        assertBool "body elided" (not ("msg = 'hi ' + name" `T.isInfixOf` out))
+        assertBool "re-indented placeholder" ("\"\"\"\n    ..." `T.isInfixOf` out),
+      testCase "Python docstring-only body is kept whole (no stray placeholder)" $ do
+        out <- skel Python "def stub():\n    \"\"\"Not implemented yet.\"\"\"\n"
+        assertBool "docstring kept" ("\"\"\"Not implemented yet.\"\"\"" `T.isInfixOf` out)
+        assertBool "no placeholder" (not ("..." `T.isInfixOf` out)),
+      testCase "Python method docstring kept with class-level indent" $ do
+        out <- skel Python "class C:\n    def m(self):\n        \"\"\"Do the thing.\"\"\"\n        x = 1\n        return x\n"
+        assertBool "method docstring kept" ("\"\"\"Do the thing.\"\"\"" `T.isInfixOf` out)
+        assertBool "method body elided" (not ("x = 1" `T.isInfixOf` out))
+        assertBool "deep indent preserved" ("\"\"\"\n        ..." `T.isInfixOf` out),
+      testCase "TypeScript bodies are elided" $ do
+        out <- skel TypeScript "function add(a: number, b: number): number {\n    const s = a + b;\n    return s;\n}\n"
+        assertBool "signature kept" ("function add(a: number, b: number): number" `T.isInfixOf` out)
+        assertBool "body elided" (not ("const s = a + b;" `T.isInfixOf` out)),
+      testCase "an unknown extension yields Nothing" $ do
+        r <- Skel.skeletonizePath "notes.md" (BS8.pack "# hi")
+        assertBool "unknown → Nothing" (isNothing r)
+    ]
+  where
+    skel :: Lang -> ByteString -> IO Text
+    skel lang src = decodeUtf8Lenient <$> Skel.skeleton lang src
 
 -- --- Phase 6: the HTTP gateway (offline; WAI test harness, no socket or API) ----------------------
 

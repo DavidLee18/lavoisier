@@ -43,6 +43,7 @@ library
     Lavoisier.Context.Anchor
     Lavoisier.Context.Diff
     Lavoisier.Context.Lang
+    Lavoisier.Context.Skeleton
     Lavoisier.Context.Tokens
     Lavoisier.Context.TreeSitter
     Lavoisier.Gateway.A2A
