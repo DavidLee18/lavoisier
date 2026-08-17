@@ -9,6 +9,9 @@ module Lavoisier.Tool.Builtins
     writeFileTool,
     listDirTool,
     shellTool,
+    outlineFileTool,
+    outlineFilesTool,
+    findReferencesTool,
   )
 where
 
@@ -19,10 +22,14 @@ import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.List (sort)
+import Data.Scientific (toBoundedInteger)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Data.Text.IO qualified as TIO
+import Lavoisier.Context.Lang (langFromPath)
+import Lavoisier.Context.Skeleton qualified as Skel
+import Lavoisier.Context.Symbols qualified as Sym
 import Lavoisier.Protocol.Tool
 import System.Directory
   ( createDirectoryIfMissing,
@@ -35,7 +42,16 @@ import System.Process.Typed (proc, readProcess)
 
 -- | The default built-in tool set, in registration order.
 builtinTools :: [Tool]
-builtinTools = [readFileTool, readFilesTool, writeFileTool, listDirTool, shellTool]
+builtinTools =
+  [ readFileTool,
+    readFilesTool,
+    writeFileTool,
+    listDirTool,
+    shellTool,
+    outlineFileTool,
+    outlineFilesTool,
+    findReferencesTool
+  ]
 
 readFileTool :: Tool
 readFileTool =
@@ -169,6 +185,118 @@ shellTool =
              in (if code == ExitSuccess then toolOk else toolErr) rendered
     }
 
+-- --- context-engine tools (skeleton + symbol references over tree-sitter) -------------------------
+
+-- | Skeletonise one source file (signatures kept, bodies elided), with an optional symbol focus.
+outlineFileTool :: Tool
+outlineFileTool =
+  Tool
+    { toolName = "outline_file",
+      toolDescription =
+        "Return a token-efficient skeleton of a source file: signatures, type definitions and doc "
+          <> "comments kept, function/method bodies elided. Optionally focus on a symbol — pass "
+          <> "`target` (and `radius`, default 1) to keep full bodies for it and everything within "
+          <> "`radius` dependency hops. Supported: Rust, Python, JavaScript, TypeScript; other files "
+          <> "are returned unchanged. Prefer this over read_file when you only need a file's shape.",
+      toolSchema =
+        object
+          [ "type" .= sv "object",
+            "properties"
+              .= object
+                [ "path" .= prop "Path to the source file",
+                  "target" .= prop "Optional symbol to keep full bodies around (focus mode)",
+                  "radius"
+                    .= object
+                      [ "type" .= sv "integer",
+                        "description" .= sv "Dependency hops to keep around target (default 1)"
+                      ]
+                ],
+            "required" .= [sv "path"]
+          ],
+      toolInvoke = \args -> withArg (argStr "path" args) $ \path -> do
+        r <- tryIO (BS.readFile (T.unpack path))
+        case r of
+          Left e -> pure (Right (toolErr ("outline_file " <> path <> ": " <> tshow e)))
+          Right bytes -> case langFromPath (T.unpack path) of
+            Nothing -> pure (Right (toolOk (decodeUtf8Lenient bytes)))
+            Just lang -> do
+              out <- case argStr "target" args of
+                Right target -> Sym.skeletonWithRadius lang target (max 0 (argIntOr "radius" 1 args)) bytes
+                Left _ -> Skel.skeleton lang bytes
+              pure (Right (toolOk (decodeUtf8Lenient out)))
+    }
+
+-- | Skeletonise several source files at once, concatenated under per-file headers.
+outlineFilesTool :: Tool
+outlineFilesTool =
+  Tool
+    { toolName = "outline_files",
+      toolDescription =
+        "Skeletonise several source files at once (signatures kept, bodies elided), concatenated "
+          <> "under per-file headers. Prefer this over multiple outline_file calls. Unsupported file "
+          <> "types are returned unchanged.",
+      toolSchema =
+        object
+          [ "type" .= sv "object",
+            "properties"
+              .= object
+                [ "paths"
+                    .= object
+                      [ "type" .= sv "array",
+                        "items" .= object ["type" .= sv "string"],
+                        "description" .= sv "Paths to outline, relative to the working directory"
+                      ]
+                ],
+            "required" .= [sv "paths"]
+          ],
+      toolInvoke = \args -> withArg (argStrList "paths" args) $ \paths -> do
+        sections <- mapM outlineOne paths
+        pure (Right (toolOk (T.intercalate "\n\n" sections)))
+    }
+  where
+    outlineOne path = do
+      r <- tryIO (BS.readFile (T.unpack path))
+      body <- case r of
+        Left e -> pure ("[error: " <> tshow e <> "]")
+        Right bytes -> case langFromPath (T.unpack path) of
+          Nothing -> pure (decodeUtf8Lenient bytes)
+          Just lang -> decodeUtf8Lenient <$> Skel.skeleton lang bytes
+      pure ("===== " <> path <> " =====\n" <> body)
+
+-- | Find every line where a name is used as a real code identifier (not in a string or comment).
+findReferencesTool :: Tool
+findReferencesTool =
+  Tool
+    { toolName = "find_references",
+      toolDescription =
+        "Find every line in a source file where a name is used as a real code identifier — not in a "
+          <> "string or comment. AST-accurate, unlike a substring grep. Returns `Lnn: <line>` rows in "
+          <> "source order. Supported: Rust, Python, JavaScript, TypeScript.",
+      toolSchema =
+        object
+          [ "type" .= sv "object",
+            "properties"
+              .= object
+                [ "path" .= prop "Path to the source file",
+                  "name" .= prop "Identifier to find"
+                ],
+            "required" .= [sv "path", sv "name"]
+          ],
+      toolInvoke = \args -> withArg (both (argStr "path" args) (argStr "name" args)) $ \(path, name) ->
+        case langFromPath (T.unpack path) of
+          Nothing -> pure (Right (toolErr ("find_references: unsupported file type: " <> path)))
+          Just lang -> do
+            r <- tryIO (BS.readFile (T.unpack path))
+            case r of
+              Left e -> pure (Right (toolErr ("find_references " <> path <> ": " <> tshow e)))
+              Right bytes -> do
+                hits <- Sym.findIdentifierLines lang name bytes
+                pure . Right $ case hits of
+                  Nothing -> toolErr ("find_references: could not parse " <> path)
+                  Just [] -> toolOk ("no code references to `" <> name <> "` in " <> path)
+                  Just rows -> toolOk (T.intercalate "\n" ["L" <> tshow ln <> ": " <> t | (ln, t) <- rows])
+    }
+
 -- --- argument parsing + small helpers -------------------------------------------------------------
 
 -- | Run an IO effect only when the arguments parsed; a parse failure short-circuits to 'ToolError'.
@@ -185,6 +313,13 @@ argStr _ _ = Left (TEInvalidArgs "expected a JSON object")
 
 argStrOr :: Text -> Text -> Value -> Text
 argStrOr key def v = either (const def) id (argStr key v)
+
+-- | An integer argument with a default (a non-integer or absent value falls back to @def@).
+argIntOr :: Text -> Int -> Value -> Int
+argIntOr key def (Object o) = case KM.lookup (K.fromText key) o of
+  Just (Number n) -> maybe def id (toBoundedInteger n)
+  _ -> def
+argIntOr _ def _ = def
 
 argStrList :: Text -> Value -> Either ToolError [Text]
 argStrList key (Object o) = case KM.lookup (K.fromText key) o of

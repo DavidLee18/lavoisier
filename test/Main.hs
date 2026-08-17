@@ -436,7 +436,51 @@ toolTests =
         r <- invokeTool "nope" (object []) withBuiltins
         case r of
           Left (TEUnknown n) -> n @?= "nope"
-          other -> assertFailure ("expected TEUnknown, got " <> show (fmap (const ()) other))
+          other -> assertFailure ("expected TEUnknown, got " <> show (fmap (const ()) other)),
+      testCase "outline_file elides bodies, keeps signatures" $ withTmp "outline" $ \dir -> do
+        let f = dir </> "m.rs"
+        TIO.writeFile f "/// doc\nfn add(a: i32) -> i32 {\n    let s = a + 1;\n    s\n}\n"
+        r <- toolInvoke outlineFileTool (object ["path" .= T.pack f])
+        case r of
+          Right o -> do
+            assertBool "signature kept" ("fn add(a: i32) -> i32" `T.isInfixOf` toContent o)
+            assertBool "placeholder" ("{ … }" `T.isInfixOf` toContent o)
+            assertBool "body elided" (not ("let s = a + 1;" `T.isInfixOf` toContent o))
+          Left e -> assertFailure ("outline failed: " <> show e),
+      testCase "outline_file focus keeps the target's dependency bodies" $ withTmp "focus" $ \dir -> do
+        let f = dir </> "f.rs"
+        TIO.writeFile f "fn helper() -> i32 { 41 }\nfn target() -> i32 { helper() }\n"
+        r1 <- toolInvoke outlineFileTool (object ["path" .= T.pack f, "target" .= ("target" :: Text), "radius" .= (1 :: Int)])
+        case r1 of
+          Right o -> assertBool "helper body kept at radius 1" ("41" `T.isInfixOf` toContent o)
+          Left e -> assertFailure ("outline failed: " <> show e)
+        r0 <- toolInvoke outlineFileTool (object ["path" .= T.pack f, "target" .= ("target" :: Text), "radius" .= (0 :: Int)])
+        case r0 of
+          Right o -> assertBool "helper body elided at radius 0" (not ("41" `T.isInfixOf` toContent o))
+          Left e -> assertFailure ("outline failed: " <> show e),
+      testCase "find_references matches code, not comments" $ withTmp "refs" $ \dir -> do
+        let f = dir </> "r.rs"
+        TIO.writeFile f "fn helper() -> i32 { 1 }\nfn target() -> i32 {\n    // helper mention\n    helper()\n}\n"
+        r <- toolInvoke findReferencesTool (object ["path" .= T.pack f, "name" .= ("helper" :: Text)])
+        case r of
+          Right o -> do
+            toIsError o @?= False
+            assertBool "line 1 (def)" ("L1:" `T.isInfixOf` toContent o)
+            assertBool "line 4 (call)" ("L4:" `T.isInfixOf` toContent o)
+            assertBool "comment line 3 excluded" (not ("L3:" `T.isInfixOf` toContent o))
+          Left e -> assertFailure ("find_references failed: " <> show e),
+      testCase "outline_files batches under per-file headers" $ withTmp "outlines" $ \dir -> do
+        let a = dir </> "a.rs"
+            b = dir </> "b.rs"
+        TIO.writeFile a "fn one() -> i32 { 1 }\n"
+        TIO.writeFile b "fn two() -> i32 { 2 }\n"
+        r <- toolInvoke outlineFilesTool (object ["paths" .= [T.pack a, T.pack b]])
+        case r of
+          Right o -> do
+            assertBool "header a" (T.pack a `T.isInfixOf` toContent o)
+            assertBool "header b" (T.pack b `T.isInfixOf` toContent o)
+            assertBool "both signatures" ("fn one() -> i32" `T.isInfixOf` toContent o && "fn two() -> i32" `T.isInfixOf` toContent o)
+          Left e -> assertFailure ("outline_files failed: " <> show e)
     ]
 
 -- --- Phase 4: the agent loop (offline; a stub provider drives a full tool round-trip) --------------
