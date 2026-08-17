@@ -41,7 +41,8 @@ import Lavoisier.Protocol.Tune (Tuner, noopTuner)
 import Lavoisier.Provider.Anthropic (anthropicFromEnv, newAnthropicConfig)
 import Lavoisier.Provider.Anthropic.Batch (anthropicBatch)
 import Lavoisier.Provider.ClaudeCli (claudeCliFromEnv)
-import Lavoisier.Provider.Google (googleFromEnv)
+import Lavoisier.Provider.Google (googleFromEnv, newGoogleConfig)
+import Lavoisier.Provider.Google.Batch (googleBatch)
 import Lavoisier.Provider.Xai (xaiFromEnv)
 import Lavoisier.Provider.Xai.Grpc (defaultXaiGrpcEndpoint, xaiGrpcProvider)
 import Lavoisier.Tool.Batch (batchEditTool)
@@ -325,7 +326,7 @@ withRegistry opts model k = do
 batchEditTools :: Options -> Text -> IO [Tool]
 batchEditTools opts model
   | optNoBatchEdit opts = pure []
-  | fromMaybe "anthropic" (optProvider opts) == "anthropic" = do
+  | provider == "anthropic" = do
       mkey <- lookupEnv "ANTHROPIC_API_KEY"
       case mkey of
         Just key -> do
@@ -333,7 +334,17 @@ batchEditTools opts model
           cfg <- newAnthropicConfig (T.pack key) base
           pure [batchEditTool model (anthropicBatch cfg)]
         Nothing -> pure []
+  | provider == "google" = do
+      mkey <- lookupEnv "GOOGLE_API_KEY"
+      case mkey of
+        Just key -> do
+          base <- maybe "https://generativelanguage.googleapis.com" T.pack <$> lookupEnv "GOOGLE_BASE_URL"
+          cfg <- newGoogleConfig (T.pack key) base
+          pure [batchEditTool model (googleBatch cfg)]
+        Nothing -> pure []
   | otherwise = pure []
+  where
+    provider = fromMaybe "anthropic" (optProvider opts)
 
 -- | Connect one @label:target@ MCP server, failing fast with the offending label.
 connectOne :: String -> IO [Tool]

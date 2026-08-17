@@ -77,6 +77,7 @@ import Lavoisier.Provider.Anthropic.Batch (batchRequestsBody, parseResultLine)
 import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
 import Lavoisier.Provider.ClaudeCli (eofDecoder, initDecoder, pushLine, renderPrompt)
 import Lavoisier.Provider.Google qualified as G
+import Lavoisier.Provider.Google.Batch qualified as GB
 import Lavoisier.Provider.Google.Sse qualified as GS
 import Lavoisier.Provider.Xai (buildMessages)
 import Lavoisier.Provider.Xai.Grpc qualified as XG
@@ -562,7 +563,46 @@ batchEditTests =
             i1 = parseResultLine bad
         (biId i0, biText i0, biError i0) @?= ("0", "hello", Nothing)
         inputTokens (biUsage i0) @?= 10
-        (biId i1, biError i1) @?= ("1", Just "overloaded")
+        (biId i1, biError i1) @?= ("1", Just "overloaded"),
+      testCase "Google batchBody inlines request + metadata key" $ do
+        let cfg = G.GoogleConfig "k" "https://x" undefined G.defaultReasoningFloor
+            task = BatchTask "task-0" ((chatRequest "gemini") {crMessages = [userMessage "hi"], crMaxTokens = 64})
+            body = GB.batchBody cfg [task]
+            inl = jix (jkey "requests" (maybe Null id (jkey "requests" (maybe Null id (jkey "input_config" (maybe Null id (jkey "batch" body))))))) 0
+        jkey "key" (maybe Null id (jkey "metadata" inl)) @?= Just (String "task-0")
+        assertBool "carries a request" (jkey "request" inl /= Nothing),
+      testCase "Google parseBatchOp reads name/state/done" $ do
+        let op = object ["name" .= t "batches/abc", "metadata" .= object ["state" .= t "BATCH_STATE_SUCCEEDED"], "done" .= True]
+            (nm, st, dn) = GB.parseBatchOp op
+        (nm, st, dn) @?= ("batches/abc", "BATCH_STATE_SUCCEEDED", True),
+      testCase "Google parseResults reads text/error/usage" $ do
+        let op =
+              object
+                [ "response"
+                    .= object
+                      [ "inlinedResponses"
+                          .= object
+                            [ "inlinedResponses"
+                                .= [ object
+                                       [ "metadata" .= object ["key" .= t "task-1"],
+                                         "response"
+                                           .= object
+                                             [ "candidates" .= [object ["content" .= object ["parts" .= [object ["text" .= t "hello"]]]]],
+                                               "usageMetadata" .= object ["promptTokenCount" .= (10 :: Int), "cachedContentTokenCount" .= (4 :: Int), "candidatesTokenCount" .= (3 :: Int)]
+                                             ]
+                                       ],
+                                     object ["metadata" .= object ["key" .= t "task-2"], "error" .= object ["message" .= t "boom"]]
+                                   ]
+                            ]
+                      ]
+                ]
+            items = GB.parseResults op
+        length items @?= 2
+        let g0 = items !! 0
+            g1 = items !! 1
+        (biId g0, biText g0, biError g0) @?= ("task-1", "hello", Nothing)
+        (inputTokens (biUsage g0), cacheReadTokens (biUsage g0), outputTokens (biUsage g0)) @?= (6, 4, 3)
+        (biId g1, biError g1) @?= ("task-2", Just "boom")
     ]
   where
     t = id :: Text -> Text
