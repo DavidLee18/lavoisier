@@ -32,7 +32,7 @@ import Data.IORef
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
+import Data.Text.Encoding (encodeUtf8)
 import Data.Word (Word32)
 import GHC.Clock (getMonotonicTime)
 import Lavoisier.Protocol.Agent
@@ -432,17 +432,19 @@ parseArgs s =
   let s' = if T.null (T.strip s) then "{}" else s
    in fromMaybe (object []) (decodeStrict (encodeUtf8 s'))
 
--- | Truncate @content@ to at most @limit@ UTF-8 bytes, appending a marker, and return it together
--- with the ORIGINAL byte size (so the caller can record the pre-truncation counterfactual). A
--- non-positive limit disables truncation. A split codepoint at the boundary decodes leniently.
+-- | Truncate @content@ to about @maxBytes@, keeping the head (⅔) and tail (⅓) around an elision
+-- marker, and return it with the ORIGINAL byte size (so the caller records the pre-truncation
+-- counterfactual). Preserving the tail keeps trailing errors\/summaries visible. Ports the Rust
+-- @truncate@ (byte-length threshold, char-count head\/tail). A non-positive limit disables it.
 truncateToBytes :: Int -> Text -> (Text, Int)
-truncateToBytes limit content
-  | limit <= 0 || origBytes <= limit = (content, origBytes)
-  | otherwise = (decodeUtf8Lenient (BS.take limit bytes) <> marker, origBytes)
+truncateToBytes maxBytes content
+  | maxBytes <= 0 || origBytes <= maxBytes = (content, origBytes)
+  | otherwise = (headT <> "\n... [" <> tshow omitted <> " bytes truncated] ...\n" <> tailT, origBytes)
   where
-    bytes = encodeUtf8 content
-    origBytes = BS.length bytes
-    marker = "\n… [truncated " <> tshow (origBytes - limit) <> " of " <> tshow origBytes <> " bytes]"
+    origBytes = BS.length (encodeUtf8 content)
+    headT = T.take (maxBytes * 2 `div` 3) content
+    tailT = T.takeEnd (maxBytes `div` 3) content
+    omitted = origBytes - (BS.length (encodeUtf8 headT) + BS.length (encodeUtf8 tailT))
 
 tshow :: (Show a) => a -> Text
 tshow = T.pack . show
