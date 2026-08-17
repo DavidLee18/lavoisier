@@ -64,6 +64,7 @@ import Lavoisier.Mcp
   )
 import Lavoisier.Memory (SessionStore (..), newFileStore, newInMemoryStore, sessionAgentHandle, trimTo)
 import Lavoisier.Protocol.Agent (AgentError (..), AgentHandle (..), turnRequest)
+import Lavoisier.Protocol.Batch (Batch (..), BatchItem (..), BatchTask (..))
 import Lavoisier.Protocol.Deliberate (DeliberateError (..), Deliberation (..), DeliberationContext (..), deliberate, runDeliberation)
 import Lavoisier.Protocol.Event
 import Lavoisier.Protocol.Message
@@ -81,6 +82,7 @@ import Lavoisier.Provider.Xai.Grpc qualified as XG
 import Lavoisier.Provider.Xai.Sse qualified as XS
 import Lavoisier.Schedule qualified as Sch
 import Lavoisier.Schedule.Cron (Civil (..), CronError (..), civilFromUnix, nextAfter, parseCron)
+import Lavoisier.Tool.Batch (applyResponse, batchEditTool, stripCodeFence)
 import Lavoisier.Tool.Builtins
 import Lavoisier.Tool.Edit
 import Lavoisier.Tool.Registry
@@ -116,6 +118,7 @@ tests =
       googleTests,
       toolTests,
       editToolTests,
+      batchEditTests,
       agentTests,
       compactionTests,
       section8Tests,
@@ -505,6 +508,45 @@ toolTests =
     ]
 
 -- --- Phase 4: the agent loop (offline; a stub provider drives a full tool round-trip) --------------
+
+batchEditTests :: TestTree
+batchEditTests =
+  testGroup
+    "batch_edit"
+    [ testCase "applyResponse applies a SEARCH/REPLACE block" $ do
+        let orig = "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n"
+            resp = "<<<<<<< SEARCH\n    let x = 1;\n=======\n    let x = 2;\n>>>>>>> REPLACE"
+        case applyResponse orig resp of
+          Right out -> do
+            assertBool "new value" ("let x = 2;" `T.isInfixOf` out)
+            assertBool "old gone" (not ("let x = 1;" `T.isInfixOf` out))
+            assertBool "rest kept" ("fn main()" `T.isInfixOf` out && "println!" `T.isInfixOf` out)
+          Left e -> assertFailure (T.unpack e),
+      testCase "applyResponse supports multiple blocks" $
+        applyResponse "a\nb\nc\n" "<<<<<<< SEARCH\na\n=======\nA\n>>>>>>> REPLACE\n<<<<<<< SEARCH\nc\n=======\nC\n>>>>>>> REPLACE" @?= Right "A\nb\nC\n",
+      testCase "applyResponse errors when SEARCH does not match" $
+        case applyResponse "hello world\n" "<<<<<<< SEARCH\nnot present\n=======\nx\n>>>>>>> REPLACE" of
+          Left e -> assertBool "did not match" ("did not match" `T.isInfixOf` e)
+          Right _ -> assertFailure "expected a Left",
+      testCase "applyResponse falls back to the full file when no markers" $
+        applyResponse "old\n" "brand new\ncontents\n" @?= Right "brand new\ncontents\n",
+      testCase "stripCodeFence unwraps only whole fenced blocks" $ do
+        stripCodeFence "```rust\nlet x = 1;\n```" @?= "let x = 1;\n"
+        stripCodeFence "```\nplain\n```\n" @?= "plain\n"
+        stripCodeFence "no fences here" @?= "no fences here",
+      testCase "batch_edit runs the batch and applies each result" $ withTmp "batch" $ \dir -> do
+        let f = dir </> "m.rs"
+        TIO.writeFile f "fn main() {\n    let x = 1;\n}\n"
+        let mockBatch = Batch $ \tasks -> pure (Right [BatchItem (btId t) "<<<<<<< SEARCH\n    let x = 1;\n=======\n    let x = 42;\n>>>>>>> REPLACE" emptyUsage Nothing | t <- tasks])
+        r <- toolInvoke (batchEditTool "m" mockBatch) (object ["edits" .= [object ["path" .= T.pack f, "instruction" .= ("bump x" :: Text)]]])
+        case r of
+          Right o -> do
+            toChanged o @?= True
+            assertBool "applied 1/1" ("applied 1/1" `T.isInfixOf` toContent o)
+            c <- TIO.readFile f
+            assertBool "file edited" ("let x = 42;" `T.isInfixOf` c)
+          Left e -> assertFailure (show e)
+    ]
 
 editToolTests :: TestTree
 editToolTests =

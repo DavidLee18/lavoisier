@@ -59,6 +59,7 @@ library
     Lavoisier.Memory
     Lavoisier.Protocol
     Lavoisier.Protocol.Agent
+    Lavoisier.Protocol.Batch
     Lavoisier.Protocol.Deliberate
     Lavoisier.Protocol.Event
     Lavoisier.Protocol.Gateway
@@ -77,6 +78,7 @@ library
     Lavoisier.Provider.Xai
     Lavoisier.Provider.Xai.Grpc
     Lavoisier.Provider.Xai.Sse
+    Lavoisier.Tool.Batch
     Lavoisier.Tool.Builtins
     Lavoisier.Tool.Edit
     Lavoisier.Tool.Registry
