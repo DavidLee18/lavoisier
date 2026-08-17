@@ -73,6 +73,7 @@ import Lavoisier.Protocol.Stream (drain, fromList)
 import Lavoisier.Protocol.Tool
 import Lavoisier.Protocol.Tune qualified as Tn
 import Lavoisier.Provider.Anthropic (buildBody)
+import Lavoisier.Provider.Anthropic.Batch (batchRequestsBody, parseResultLine)
 import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
 import Lavoisier.Provider.ClaudeCli (eofDecoder, initDecoder, pushLine, renderPrompt)
 import Lavoisier.Provider.Google qualified as G
@@ -537,7 +538,7 @@ batchEditTests =
       testCase "batch_edit runs the batch and applies each result" $ withTmp "batch" $ \dir -> do
         let f = dir </> "m.rs"
         TIO.writeFile f "fn main() {\n    let x = 1;\n}\n"
-        let mockBatch = Batch $ \tasks -> pure (Right [BatchItem (btId t) "<<<<<<< SEARCH\n    let x = 1;\n=======\n    let x = 42;\n>>>>>>> REPLACE" emptyUsage Nothing | t <- tasks])
+        let mockBatch = Batch $ \tasks -> pure (Right [BatchItem (btId task) "<<<<<<< SEARCH\n    let x = 1;\n=======\n    let x = 42;\n>>>>>>> REPLACE" emptyUsage Nothing | task <- tasks])
         r <- toolInvoke (batchEditTool "m" mockBatch) (object ["edits" .= [object ["path" .= T.pack f, "instruction" .= ("bump x" :: Text)]]])
         case r of
           Right o -> do
@@ -545,8 +546,30 @@ batchEditTests =
             assertBool "applied 1/1" ("applied 1/1" `T.isInfixOf` toContent o)
             c <- TIO.readFile f
             assertBool "file edited" ("let x = 42;" `T.isInfixOf` c)
-          Left e -> assertFailure (show e)
+          Left e -> assertFailure (show e),
+      testCase "Anthropic batchRequestsBody wraps custom_id + strips stream" $ do
+        let task = BatchTask "0" ((chatRequest "claude") {crMessages = [userMessage "hi"], crMaxTokens = 64})
+            body = batchRequestsBody False [task]
+            req0 = jix (jkey "requests" body) 0
+        jkey "custom_id" req0 @?= Just (String "0")
+        assertBool "params carries the model" (jkey "model" (maybe Null id (jkey "params" req0)) == Just (String "claude"))
+        assertBool "params has no stream" (jkey "stream" (maybe Null id (jkey "params" req0)) == Nothing),
+      testCase "Anthropic parseResultLine reads a succeeded + an errored line" $ do
+        let okMsg = object ["content" .= [object ["type" .= t "text", "text" .= t "hello"]], "usage" .= object ["input_tokens" .= (10 :: Int), "output_tokens" .= (3 :: Int)]]
+            ok = object ["custom_id" .= t "0", "result" .= object ["type" .= t "succeeded", "message" .= okMsg]]
+            bad = object ["custom_id" .= t "1", "result" .= object ["type" .= t "errored", "error" .= object ["type" .= t "overloaded"]]]
+            i0 = parseResultLine ok
+            i1 = parseResultLine bad
+        (biId i0, biText i0, biError i0) @?= ("0", "hello", Nothing)
+        inputTokens (biUsage i0) @?= 10
+        (biId i1, biError i1) @?= ("1", Just "overloaded")
     ]
+  where
+    t = id :: Text -> Text
+    jkey k (Object o) = KM.lookup (K.fromText k) o
+    jkey _ _ = Nothing
+    jix (Just (Array a)) i = a V.! i
+    jix _ _ = Null
 
 editToolTests :: TestTree
 editToolTests =

@@ -36,12 +36,15 @@ import Lavoisier.Protocol.Gateway (Gateway (..))
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider (Provider (..), ProviderError)
 import Lavoisier.Protocol.Stream (Producer (..))
+import Lavoisier.Protocol.Tool (Tool)
 import Lavoisier.Protocol.Tune (Tuner, noopTuner)
-import Lavoisier.Provider.Anthropic (anthropicFromEnv)
+import Lavoisier.Provider.Anthropic (anthropicFromEnv, newAnthropicConfig)
+import Lavoisier.Provider.Anthropic.Batch (anthropicBatch)
 import Lavoisier.Provider.ClaudeCli (claudeCliFromEnv)
 import Lavoisier.Provider.Google (googleFromEnv)
 import Lavoisier.Provider.Xai (xaiFromEnv)
 import Lavoisier.Provider.Xai.Grpc (defaultXaiGrpcEndpoint, xaiGrpcProvider)
+import Lavoisier.Tool.Batch (batchEditTool)
 import Lavoisier.Tool.Registry (ToolRegistry, registerTools, withBuiltins)
 import Lavoisier.Tune (LearningTuner, asTuner, defaultTuneConfig, learningTuner, loadTuner, saveTuner)
 import Lavoisier.Tune.Bayes (BayesTuner, asBayesTuner, bayesTuner, loadBayes, saveBayes)
@@ -72,6 +75,7 @@ data Options = Options
     optSummaryModel :: Maybe Text,
     optBudgetAwareness :: Bool,
     optClassifyWithModel :: Bool,
+    optNoBatchEdit :: Bool,
     optApiKey :: [Text],
     optRateLimit :: Maybe Int,
     optServe :: Maybe Int,
@@ -120,6 +124,7 @@ optionsParser =
     <*> optional (strOption (long "summary-model" <> metavar "MODEL" <> help "Cheaper model for history-compaction summaries (defaults to --model)"))
     <*> switch (long "budget-awareness" <> help "Append a progress/token note to each turn so the model sees the ceilings")
     <*> switch (long "classify-with-model" <> help "Classify the task archetype with a model call instead of the keyword heuristic")
+    <*> switch (long "no-batch-edit" <> help "Don't offer the batch_edit fan-out tool (only offered with a batch-capable provider)")
     <*> many (strOption (long "api-key" <> metavar "KEY" <> help "Bearer API key gating the HTTP gateway's /v1/turns (repeatable); empty = open"))
     <*> optional (option auto (long "rate-limit" <> metavar "N" <> help "HTTP gateway per-key request cap over a 60s window"))
     <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
@@ -163,7 +168,7 @@ runCli = do
     Left e -> errExit e
     Right (prov, defModel) -> do
       let model = fromMaybe defModel (optModel opts)
-          serveWith gw = withRegistry opts (serveGateway gw prov opts model)
+          serveWith gw = withRegistry opts model (serveGateway gw prov opts model)
           fromEnvGateway build wrap = build >>= either (errExit . tshow) (serveWith . wrap)
       if cronActive opts
         then buildCronJobs opts >>= \jobs -> serveWith (cronGateway jobs)
@@ -183,7 +188,7 @@ runCli = do
                       then errExit "empty prompt (pass it as arguments or on stdin)"
                       else
                         if optAgent opts
-                          then withRegistry opts (runAgentMode prov opts model prompt)
+                          then withRegistry opts model (runAgentMode prov opts model prompt)
                           else runAskMode prov opts model prompt
   where
     pinfo =
@@ -309,18 +314,36 @@ runAskMode prov opts model prompt = do
 -- (namespaced @\<label\>_\<tool\>@), then hand it to the continuation. Connecting only happens for
 -- tool-using modes (@--agent@ or a gateway) — a plain @ask@ spawns nothing. A bad spec or a dead
 -- server fails fast with the offending label.
-withRegistry :: Options -> (ToolRegistry -> IO ()) -> IO ()
-withRegistry opts k = do
+withRegistry :: Options -> Text -> (ToolRegistry -> IO ()) -> IO ()
+withRegistry opts model k = do
   toolss <- mapM connectOne (optMcpServers opts)
-  k (registerTools (concat toolss) withBuiltins)
-  where
-    connectOne raw = case parseServerSpec (T.pack raw) of
-      Left e -> errExit ("mcp: " <> renderMcpError e)
-      Right spec -> do
-        r <- connectTools spec
-        case r of
-          Left e -> errExit ("mcp '" <> mssLabel spec <> "': " <> renderMcpError e)
-          Right ts -> pure ts
+  batch <- batchEditTools opts model
+  k (registerTools (concat toolss <> batch) withBuiltins)
+
+-- | Offer @batch_edit@ when the provider has a discounted batch API (Anthropic today) and it wasn't
+-- disabled. A missing key just omits the tool.
+batchEditTools :: Options -> Text -> IO [Tool]
+batchEditTools opts model
+  | optNoBatchEdit opts = pure []
+  | fromMaybe "anthropic" (optProvider opts) == "anthropic" = do
+      mkey <- lookupEnv "ANTHROPIC_API_KEY"
+      case mkey of
+        Just key -> do
+          base <- maybe "https://api.anthropic.com" T.pack <$> lookupEnv "ANTHROPIC_BASE_URL"
+          cfg <- newAnthropicConfig (T.pack key) base
+          pure [batchEditTool model (anthropicBatch cfg)]
+        Nothing -> pure []
+  | otherwise = pure []
+
+-- | Connect one @label:target@ MCP server, failing fast with the offending label.
+connectOne :: String -> IO [Tool]
+connectOne raw = case parseServerSpec (T.pack raw) of
+  Left e -> errExit ("mcp: " <> renderMcpError e)
+  Right spec -> do
+    r <- connectTools spec
+    case r of
+      Left e -> errExit ("mcp '" <> mssLabel spec <> "': " <> renderMcpError e)
+      Right ts -> pure ts
 
 -- | Build the ATO tuner: 'noopTuner' unless @--tune@\/@--tune-bayes@, else a learner — Bayesian
 -- (Thompson) when @--tune-bayes@, else ε-greedy — loaded from @--tune-state@ when present (a missing
