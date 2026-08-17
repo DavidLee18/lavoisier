@@ -80,6 +80,7 @@ library
     Lavoisier.Tool.Builtins
     Lavoisier.Tool.Edit
     Lavoisier.Tool.Registry
+    Lavoisier.Tool.Search
     Lavoisier.Tune
     Lavoisier.Tune.Bayes
   build-depends:

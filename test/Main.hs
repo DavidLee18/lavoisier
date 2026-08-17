@@ -84,6 +84,7 @@ import Lavoisier.Schedule.Cron (Civil (..), CronError (..), civilFromUnix, nextA
 import Lavoisier.Tool.Builtins
 import Lavoisier.Tool.Edit
 import Lavoisier.Tool.Registry
+import Lavoisier.Tool.Search (findReferencesTool)
 import Lavoisier.Tune
 import Lavoisier.Tune.Bayes (asBayesTuner, bayesTuner, loadBayes, newBayesTuner, sampleBeta, saveBayes)
 import Lens.Family2 ((&), (.~), (^.))
@@ -474,16 +475,20 @@ toolTests =
         case r0 of
           Right o -> assertBool "helper body elided at radius 0" (not ("41" `T.isInfixOf` toContent o))
           Left e -> assertFailure ("outline failed: " <> show e),
-      testCase "find_references matches code, not comments" $ withTmp "refs" $ \dir -> do
-        let f = dir </> "r.rs"
-        TIO.writeFile f "fn helper() -> i32 { 1 }\nfn target() -> i32 {\n    // helper mention\n    helper()\n}\n"
-        r <- toolInvoke findReferencesTool (object ["path" .= T.pack f, "name" .= ("helper" :: Text)])
+      testCase "find_references scans a directory, AST-precise, skipping ignore dirs" $ withTmp "refs" $ \dir -> do
+        TIO.writeFile (dir </> "r.rs") "fn helper() -> i32 { 1 }\nfn target() -> i32 {\n    // helper mention\n    helper()\n}\n"
+        createDirectoryIfMissing True (dir </> "node_modules")
+        TIO.writeFile (dir </> "node_modules" </> "junk.rs") "fn helper() {}\n"
+        r <- toolInvoke findReferencesTool (object ["name" .= ("helper" :: Text), "path" .= T.pack dir])
         case r of
           Right o -> do
             toIsError o @?= False
-            assertBool "line 1 (def)" ("L1:" `T.isInfixOf` toContent o)
-            assertBool "line 4 (call)" ("L4:" `T.isInfixOf` toContent o)
-            assertBool "comment line 3 excluded" (not ("L3:" `T.isInfixOf` toContent o))
+            let c = toContent o
+            assertBool "count header" ("reference(s) to `helper`" `T.isInfixOf` c)
+            assertBool "def line 1" ("1: fn helper" `T.isInfixOf` c)
+            assertBool "call line 4" ("4: helper()" `T.isInfixOf` c)
+            assertBool "comment line 3 excluded" (not ("3:" `T.isInfixOf` c))
+            assertBool "node_modules skipped" (not ("node_modules" `T.isInfixOf` c))
           Left e -> assertFailure ("find_references failed: " <> show e),
       testCase "outline_files batches under per-file headers" $ withTmp "outlines" $ \dir -> do
         let a = dir </> "a.rs"

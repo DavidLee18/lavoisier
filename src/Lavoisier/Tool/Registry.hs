@@ -20,6 +20,7 @@ import Lavoisier.Protocol.Message (ToolDef (..))
 import Lavoisier.Protocol.Tool
 import Lavoisier.Tool.Builtins (builtinTools)
 import Lavoisier.Tool.Edit (editToolset)
+import Lavoisier.Tool.Search (searchTools)
 
 -- | An ordered collection of tools.
 newtype ToolRegistry = ToolRegistry [Tool]
@@ -30,7 +31,7 @@ emptyRegistry = ToolRegistry []
 
 -- | A registry pre-loaded with the built-in tools (filesystem\/shell\/context + the edit suite).
 withBuiltins :: ToolRegistry
-withBuiltins = ToolRegistry (builtinTools <> editToolset)
+withBuiltins = ToolRegistry (builtinTools <> editToolset <> searchTools)
 
 -- | Append a tool (last registration wins on dispatch).
 registerTool :: Tool -> ToolRegistry -> ToolRegistry

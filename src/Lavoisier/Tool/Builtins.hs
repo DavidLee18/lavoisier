@@ -11,7 +11,6 @@ module Lavoisier.Tool.Builtins
     shellTool,
     outlineFileTool,
     outlineFilesTool,
-    findReferencesTool,
   )
 where
 
@@ -49,8 +48,7 @@ builtinTools =
     listDirTool,
     shellTool,
     outlineFileTool,
-    outlineFilesTool,
-    findReferencesTool
+    outlineFilesTool
   ]
 
 readFileTool :: Tool
@@ -275,40 +273,6 @@ outlineFilesTool =
               Just focus -> Sym.skeletonWithRadius lang focus radius bytes
               Nothing -> Skel.skeleton lang bytes
       pure ("===== " <> path <> " =====\n" <> body)
-
--- | Find every line where a name is used as a real code identifier (not in a string or comment).
-findReferencesTool :: Tool
-findReferencesTool =
-  Tool
-    { toolName = "find_references",
-      toolDescription =
-        "Find every line in a source file where a name is used as a real code identifier — not in a "
-          <> "string or comment. AST-accurate, unlike a substring grep. Returns `Lnn: <line>` rows in "
-          <> "source order. Supported: Rust, Python, JavaScript, TypeScript.",
-      toolSchema =
-        object
-          [ "type" .= sv "object",
-            "properties"
-              .= object
-                [ "path" .= prop "Path to the source file",
-                  "name" .= prop "Identifier to find"
-                ],
-            "required" .= [sv "path", sv "name"]
-          ],
-      toolInvoke = \args -> withArg (both (argStr "path" args) (argStr "name" args)) $ \(path, name) ->
-        case langFromPath (T.unpack path) of
-          Nothing -> pure (Right (toolErr ("find_references: unsupported file type: " <> path)))
-          Just lang -> do
-            r <- tryIO (BS.readFile (T.unpack path))
-            case r of
-              Left e -> pure (Right (toolErr ("find_references " <> path <> ": " <> tshow e)))
-              Right bytes -> do
-                hits <- Sym.findIdentifierLines lang name bytes
-                pure . Right $ case hits of
-                  Nothing -> toolErr ("find_references: could not parse " <> path)
-                  Just [] -> toolOk ("no code references to `" <> name <> "` in " <> path)
-                  Just rows -> toolOk (T.intercalate "\n" ["L" <> tshow ln <> ": " <> t | (ln, t) <- rows])
-    }
 
 -- --- argument parsing + small helpers -------------------------------------------------------------
 
