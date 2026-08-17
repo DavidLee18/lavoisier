@@ -30,6 +30,7 @@ import Lavoisier.Context.Anchor qualified as Anc
 import Lavoisier.Context.Diff qualified as Dff
 import Lavoisier.Context.Lang (Lang (..), LangSpec (..), langFromPath, langSpec)
 import Lavoisier.Context.Skeleton qualified as Skel
+import Lavoisier.Context.Symbols qualified as Sym
 import Lavoisier.Context.Tokens (estimateTokens)
 import Lavoisier.Context.TreeSitter qualified as TS
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
@@ -108,6 +109,7 @@ tests =
       contextTests,
       treeSitterTests,
       skeletonTests,
+      symbolTests,
       gatewayTests,
       a2aTests,
       acpTests,
@@ -713,6 +715,71 @@ skeletonTests =
   where
     skel :: Lang -> ByteString -> IO Text
     skel lang src = decodeUtf8Lenient <$> Skel.skeleton lang src
+
+-- Symbol-dependency graph (Phase 23b): AST-resolved, scope-aware edges → the radius knob.
+symbolTests :: TestTree
+symbolTests =
+  testGroup
+    "context engine (symbols)"
+    [ testCase "references in strings and comments do not link" $ do
+        g <- Sym.fromSource Rust "fn helper() -> i32 { 1 }\nfn target() -> i32 {\n    // call helper here later\n    let s = \"remember to call helper\";\n    2\n}\n"
+        assertBool "no string/comment edge" (not (Set.member "helper" (Sym.neighborsWithin "target" 1 g))),
+      testCase "a local shadowing a symbol name does not link" $ do
+        g <- Sym.fromSource Rust "fn helper() -> i32 { 1 }\nfn target() -> i32 {\n    let helper = 5;\n    helper + 1\n}\n"
+        assertBool "shadowing local excluded" (not (Set.member "helper" (Sym.neighborsWithin "target" 1 g))),
+      testCase "graph links caller to callee, excludes unrelated" $ do
+        g <- Sym.fromSource Rust src
+        let within1 = Sym.neighborsWithin "target" 1 g
+        assertBool "target" (Set.member "target" within1)
+        assertBool "helper" (Set.member "helper" within1)
+        assertBool "not unrelated" (not (Set.member "unrelated" within1)),
+      testCase "radius 0 is just the target" $ do
+        g <- Sym.fromSource Rust src
+        Sym.neighborsWithin "target" 0 g @?= Set.singleton "target",
+      testCase "skeleton_with_radius keeps only dependencies" $ do
+        out <- decodeUtf8Lenient <$> Sym.skeletonWithRadius Rust "target" 1 src
+        assertBool "target body kept" ("helper(41)" `T.isInfixOf` out)
+        assertBool "helper body kept" ("x + 1" `T.isInfixOf` out)
+        assertBool "unrelated body elided" (not ("    7\n" `T.isInfixOf` out)),
+      testCase "radius 0 elides dependencies too" $ do
+        out <- decodeUtf8Lenient <$> Sym.skeletonWithRadius Rust "target" 0 src
+        assertBool "target body kept" ("helper(41)" `T.isInfixOf` out)
+        assertBool "helper body elided at radius 0" (not ("x + 1" `T.isInfixOf` out)),
+      testCase "findIdentifierLines matches code, not strings or comments" $ do
+        r <- Sym.findIdentifierLines Rust "helper" "fn helper() -> i32 { 1 }\nfn target() -> i32 {\n    // helper is mentioned in this comment\n    let s = \"call helper here\";\n    helper()\n}\n"
+        case r of
+          Just hits -> do
+            map fst hits @?= [1, 5]
+            assertBool "call line has helper()" (any (\(ln, t) -> ln == 5 && "helper()" `T.isInfixOf` t) hits)
+          Nothing -> assertFailure "expected a parse",
+      testCase "findIdentifierLines dedups a line with two uses" $ do
+        r <- Sym.findIdentifierLines Rust "g" "fn f() -> i32 { g() + g() }\nfn g() -> i32 { 1 }\n"
+        fmap (map fst) r @?= Just [1, 2],
+      testCase "multi-file graph links across sources" $ do
+        g <- Sym.fromSources [(Rust, "fn caller() -> i32 { shared() }"), (Rust, "fn shared() -> i32 { 5 }")]
+        assertBool "caller → shared" (Set.member "shared" (Sym.neighborsWithin "caller" 1 g)),
+      testCase "same name across files resolves to the local definition" $ do
+        g <-
+          Sym.fromSources
+            [ (Rust, "fn helper() -> i32 { 0 }\nfn target() -> i32 { helper() }\n"),
+              (Rust, "fn helper() -> i32 { dep() }\nfn dep() -> i32 { 9 }\n")
+            ]
+        let within2 = Sym.neighborsWithin "target" 2 g
+        assertBool "local helper linked" (Set.member "helper" within2)
+        assertBool "does not reach the other file's dep" (not (Set.member "dep" within2)),
+      testCase "neighbors-by-file keeps a body only in its owning file" $ do
+        g <-
+          Sym.fromSources
+            [ (Rust, "fn target() -> i32 { repo() }\nfn noise_a() -> i32 { 0 }"),
+              (Rust, "fn repo() -> i32 { 5 }\nfn noise_b() -> i32 { 1 }")
+            ]
+        let perFile = Sym.neighborsWithinByFile "target" 1 g
+        length perFile @?= 2
+        assertBool "file 0 has target not repo" (Set.member "target" (perFile !! 0) && not (Set.member "repo" (perFile !! 0)))
+        assertBool "file 1 has repo not target" (Set.member "repo" (perFile !! 1) && not (Set.member "target" (perFile !! 1)))
+    ]
+  where
+    src = "fn helper(x: i32) -> i32 {\n    x + 1\n}\n\nfn target() -> i32 {\n    helper(41)\n}\n\nfn unrelated() -> i32 {\n    7\n}\n"
 
 -- --- Phase 6: the HTTP gateway (offline; WAI test harness, no socket or API) ----------------------
 
