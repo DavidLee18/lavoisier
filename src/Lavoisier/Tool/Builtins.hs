@@ -195,7 +195,7 @@ outlineFileTool =
       toolDescription =
         "Return a token-efficient skeleton of a source file: signatures, type definitions and doc "
           <> "comments kept, function/method bodies elided. Optionally focus on a symbol — pass "
-          <> "`target` (and `radius`, default 1) to keep full bodies for it and everything within "
+          <> "`focus` (and `radius`, default 1) to keep full bodies for it and everything within "
           <> "`radius` dependency hops. Supported: Rust, Python, JavaScript, TypeScript; other files "
           <> "are returned unchanged. Prefer this over read_file when you only need a file's shape.",
       toolSchema =
@@ -204,11 +204,12 @@ outlineFileTool =
             "properties"
               .= object
                 [ "path" .= prop "Path to the source file",
-                  "target" .= prop "Optional symbol to keep full bodies around (focus mode)",
+                  "focus" .= prop "Optional symbol to expand around (keep its body + dependencies)",
                   "radius"
                     .= object
                       [ "type" .= sv "integer",
-                        "description" .= sv "Dependency hops to keep around target (default 1)"
+                        "minimum" .= (0 :: Int),
+                        "description" .= sv "Dependency-hop radius for focus (default 1)"
                       ]
                 ],
             "required" .= [sv "path"]
@@ -220,8 +221,8 @@ outlineFileTool =
           Right bytes -> case langFromPath (T.unpack path) of
             Nothing -> pure (Right (toolOk (decodeUtf8Lenient bytes)))
             Just lang -> do
-              out <- case argStr "target" args of
-                Right target -> Sym.skeletonWithRadius lang target (max 0 (argIntOr "radius" 1 args)) bytes
+              out <- case argStr "focus" args of
+                Right focus -> Sym.skeletonWithRadius lang focus (max 0 (argIntOr "radius" 1 args)) bytes
                 Left _ -> Skel.skeleton lang bytes
               pure (Right (toolOk (decodeUtf8Lenient out)))
     }
@@ -233,8 +234,8 @@ outlineFilesTool =
     { toolName = "outline_files",
       toolDescription =
         "Skeletonise several source files at once (signatures kept, bodies elided), concatenated "
-          <> "under per-file headers. Prefer this over multiple outline_file calls. Unsupported file "
-          <> "types are returned unchanged.",
+          <> "under per-file headers. Prefer this over multiple outline_file calls. Optional "
+          <> "`focus`/`radius` apply to each file. Unsupported file types are returned unchanged.",
       toolSchema =
         object
           [ "type" .= sv "object",
@@ -245,22 +246,34 @@ outlineFilesTool =
                       [ "type" .= sv "array",
                         "items" .= object ["type" .= sv "string"],
                         "description" .= sv "Paths to outline, relative to the working directory"
+                      ],
+                  "focus" .= prop "Optional symbol to expand around in each file",
+                  "radius"
+                    .= object
+                      [ "type" .= sv "integer",
+                        "minimum" .= (0 :: Int),
+                        "description" .= sv "Dependency-hop radius for focus (default 1)"
                       ]
                 ],
             "required" .= [sv "paths"]
           ],
       toolInvoke = \args -> withArg (argStrList "paths" args) $ \paths -> do
-        sections <- mapM outlineOne paths
+        let mfocus = either (const Nothing) Just (argStr "focus" args)
+            radius = max 0 (argIntOr "radius" 1 args)
+        sections <- mapM (outlineOne mfocus radius) paths
         pure (Right (toolOk (T.intercalate "\n\n" sections)))
     }
   where
-    outlineOne path = do
+    outlineOne mfocus radius path = do
       r <- tryIO (BS.readFile (T.unpack path))
       body <- case r of
         Left e -> pure ("[error: " <> tshow e <> "]")
         Right bytes -> case langFromPath (T.unpack path) of
           Nothing -> pure (decodeUtf8Lenient bytes)
-          Just lang -> decodeUtf8Lenient <$> Skel.skeleton lang bytes
+          Just lang ->
+            decodeUtf8Lenient <$> case mfocus of
+              Just focus -> Sym.skeletonWithRadius lang focus radius bytes
+              Nothing -> Skel.skeleton lang bytes
       pure ("===== " <> path <> " =====\n" <> body)
 
 -- | Find every line where a name is used as a real code identifier (not in a string or comment).

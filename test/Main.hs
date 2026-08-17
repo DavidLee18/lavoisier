@@ -450,11 +450,11 @@ toolTests =
       testCase "outline_file focus keeps the target's dependency bodies" $ withTmp "focus" $ \dir -> do
         let f = dir </> "f.rs"
         TIO.writeFile f "fn helper() -> i32 { 41 }\nfn target() -> i32 { helper() }\n"
-        r1 <- toolInvoke outlineFileTool (object ["path" .= T.pack f, "target" .= ("target" :: Text), "radius" .= (1 :: Int)])
+        r1 <- toolInvoke outlineFileTool (object ["path" .= T.pack f, "focus" .= ("target" :: Text), "radius" .= (1 :: Int)])
         case r1 of
           Right o -> assertBool "helper body kept at radius 1" ("41" `T.isInfixOf` toContent o)
           Left e -> assertFailure ("outline failed: " <> show e)
-        r0 <- toolInvoke outlineFileTool (object ["path" .= T.pack f, "target" .= ("target" :: Text), "radius" .= (0 :: Int)])
+        r0 <- toolInvoke outlineFileTool (object ["path" .= T.pack f, "focus" .= ("target" :: Text), "radius" .= (0 :: Int)])
         case r0 of
           Right o -> assertBool "helper body elided at radius 0" (not ("41" `T.isInfixOf` toContent o))
           Left e -> assertFailure ("outline failed: " <> show e),
@@ -555,7 +555,28 @@ agentTests =
         obs <- readIORef obsRef
         case obs >>= Tn.otMaxToolResultBytes of
           Just m -> assertBool ("recorded pre-truncation size " <> show m) (m >= 100)
-          Nothing -> assertFailure "no max-tool-result-bytes recorded in the outcome"
+          Nothing -> assertFailure "no max-tool-result-bytes recorded in the outcome",
+      testCase "applyKnobsToArgs caps a batch tool's paths to batch_width" $ do
+        let knobs = Tn.defaultKnobs {Tn.batchWidth = 2}
+            out = applyKnobsToArgs knobs "read_files" (object ["paths" .= (["a", "b", "c", "d"] :: [Text])])
+        case out of
+          Object o -> case KM.lookup "paths" o of
+            Just (Array a) -> V.length a @?= 2
+            _ -> assertFailure "paths missing/!array"
+          _ -> assertFailure "not an object",
+      testCase "applyKnobsToArgs injects the tuned radius when focus is set but radius unset" $ do
+        let knobs = Tn.defaultKnobs {Tn.skeletonRadius = 3}
+            out = applyKnobsToArgs knobs "outline_file" (object ["path" .= ("x.rs" :: Text), "focus" .= ("f" :: Text)])
+        case out of
+          Object o -> KM.lookup "radius" o @?= Just (Number 3)
+          _ -> assertFailure "not an object",
+      testCase "applyKnobsToArgs leaves a pinned radius and non-batch tools untouched" $ do
+        let knobs = Tn.defaultKnobs {Tn.skeletonRadius = 3, Tn.batchWidth = 1}
+        case applyKnobsToArgs knobs "outline_file" (object ["path" .= ("x.rs" :: Text), "focus" .= ("f" :: Text), "radius" .= (0 :: Int)]) of
+          Object o -> KM.lookup "radius" o @?= Just (Number 0)
+          _ -> assertFailure "not an object"
+        let a = object ["path" .= ("x" :: Text)]
+        applyKnobsToArgs knobs "read_file" a @?= a
     ]
 
 -- --- fallback chain (offline; scripted providers + the cross-turn circuit breaker) ---------------

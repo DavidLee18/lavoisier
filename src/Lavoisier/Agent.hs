@@ -20,19 +20,22 @@ module Lavoisier.Agent
     runLoopSeeded,
     agentHandle,
     defaultSystemPrompt,
+    applyKnobsToArgs,
   )
 where
 
 import Control.Concurrent (forkIO)
 import Control.Concurrent.Chan
 import Control.Monad (replicateM)
-import Data.Aeson (Value (..), decodeStrict, object)
+import Data.Aeson (Value (..), decodeStrict, object, toJSON)
+import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as BS
 import Data.IORef
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
+import Data.Vector qualified as V
 import Data.Word (Word32)
 import GHC.Clock (getMonotonicTime)
 import Lavoisier.Protocol.Agent
@@ -250,7 +253,7 @@ runLoopSeeded agent allowed initial emit = do
   -- Fallback cursor start: the first chain position the cross-turn breaker isn't currently demoting,
   -- so a persistently-down primary isn't re-timed every turn. Sticky within the turn (only advances).
   startCursor <- cbFirstAvailable (agBreaker agent) (length (agFallbacks agent))
-  result <- go effThinking usageRef stepRef (truncateBytes knobs) maxToolBytesRef startCursor seeded 0
+  result <- go effThinking usageRef stepRef knobs maxToolBytesRef startCursor seeded 0
   finalUsage <- readIORef usageRef
   steps <- readIORef stepRef
   maxToolBytes <- readIORef maxToolBytesRef
@@ -276,8 +279,8 @@ runLoopSeeded agent allowed initial emit = do
     fallbacksLen :: Int
     fallbacksLen = length (agFallbacks agent)
 
-    go :: Maybe ThinkingLevel -> IORef Usage -> IORef Int -> Int -> IORef Int -> Int -> [Message] -> Int -> IO (Either AgentError [Message])
-    go effThinking usageRef stepRef tlimit maxRef cursor msgs step
+    go :: Maybe ThinkingLevel -> IORef Usage -> IORef Int -> Knobs -> IORef Int -> Int -> [Message] -> Int -> IO (Either AgentError [Message])
+    go effThinking usageRef stepRef knobs maxRef cursor msgs step
       | step >= acMaxSteps cfg = pure (Right msgs)
       | otherwise = do
           let buildReq model =
@@ -296,10 +299,10 @@ runLoopSeeded agent allowed initial emit = do
               writeIORef stepRef (step + 1)
               if stop == ToolUse && not (null calls)
                 then do
-                  results <- mapM (runCall tlimit maxRef) calls
+                  results <- mapM (runCall knobs maxRef) calls
                   let assistantMsg = Message Assistant (textPart txt <> map callBlock calls)
                       userMsg = Message User (map resultBlock results)
-                  go effThinking usageRef stepRef tlimit maxRef cursor' (msgs <> [assistantMsg, userMsg]) (step + 1)
+                  go effThinking usageRef stepRef knobs maxRef cursor' (msgs <> [assistantMsg, userMsg]) (step + 1)
                 else pure (Right (msgs <> [Message Assistant blocks | let blocks = textPart txt, not (null blocks)]))
 
     -- Fallback-aware send: try the model at `cursor`, then each remaining fallback in order. We only
@@ -357,16 +360,19 @@ runLoopSeeded agent allowed initial emit = do
                 Done sr -> loop txt calls (Just sr) usg fwd'
                 _ -> loop txt calls stop usg fwd'
 
-    runCall :: Int -> IORef Int -> PendingCall -> IO (Text, Text, Bool)
-    runCall tlimit maxRef (i, name, jsonT)
+    runCall :: Knobs -> IORef Int -> PendingCall -> IO (Text, Text, Bool)
+    runCall knobs maxRef (i, name, jsonT)
       | not (isAllowed allowed name) =
           pure (i, "tool `" <> name <> "` is not permitted this turn", True)
       | otherwise = do
-          r <- invokeTool name (parseArgs jsonT) (agTools agent)
+          -- Apply the agent-enforced knobs to the call's args (skeleton-radius injection, batch-width
+          -- cap), then truncate the result to the tuned byte budget and record the counterfactual.
+          let args = applyKnobsToArgs knobs name (parseArgs jsonT)
+          r <- invokeTool name args (agTools agent)
           case r of
             Left err -> pure (i, "tool error: " <> tshow err, True)
             Right out -> do
-              let (content, origBytes) = truncateToBytes tlimit (toContent out)
+              let (content, origBytes) = truncateToBytes (truncateBytes knobs) (toContent out)
               modifyIORef' maxRef (max origBytes)
               pure (i, content, toIsError out)
 
@@ -431,6 +437,27 @@ parseArgs :: Text -> Value
 parseArgs s =
   let s' = if T.null (T.strip s) then "{}" else s
    in fromMaybe (object []) (decodeStrict (encodeUtf8 s'))
+
+-- | Apply the knobs the agent enforces directly on a tool call's arguments (§6.6\/§6.1): inject the
+-- tuned skeleton radius into an @outline_*@ call that focuses a symbol but left @radius@ unset, and
+-- cap a batch tool's @paths@ array to the batch-width knob. Other tools\/already-pinned args pass
+-- through untouched. Ports the Rust @apply_knobs_to_args@.
+applyKnobsToArgs :: Knobs -> Text -> Value -> Value
+applyKnobsToArgs knobs tool (Object o) = Object (capPaths (injectRadius o))
+  where
+    injectRadius m
+      | tool `elem` ["outline_file", "outline_files"],
+        KM.member "focus" m,
+        not (KM.member "radius" m) =
+          KM.insert "radius" (toJSON (fromIntegral (skeletonRadius knobs) :: Int)) m
+      | otherwise = m
+    capPaths m
+      | tool `elem` ["read_files", "outline_files"] =
+          case KM.lookup "paths" m of
+            Just (Array a) -> KM.insert "paths" (Array (V.take (fromIntegral (batchWidth knobs)) a)) m
+            _ -> m
+      | otherwise = m
+applyKnobsToArgs _ _ v = v
 
 -- | Truncate @content@ to about @maxBytes@, keeping the head (⅔) and tail (⅓) around an elision
 -- marker, and return it with the ORIGINAL byte size (so the caller records the pre-truncation
