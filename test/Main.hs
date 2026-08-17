@@ -40,7 +40,7 @@ import Lavoisier.Context.TreeSitter qualified as TS
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
 import Lavoisier.Gateway.Acp (defaultAcpConfig, newAcpApp)
 import Lavoisier.Gateway.Cron (CronConfigError (..), CronJob (..), parseCliJob, parseFileJobs)
-import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp, newHttpApp, stepWindow)
+import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp, newHttpApp, stepWindow, wsAuthorized, wsPrincipal)
 import Lavoisier.Gateway.Matrix qualified as MX
 import Lavoisier.Gateway.Slack (SlackMessage (..), parseEvent, senderAllowed, slackSession)
 import Lavoisier.Legion (Debater, Language (..), LegionError (..), languageFromLocale, mkDebater, newPanel, panelDeliberator, withLanguage)
@@ -95,6 +95,7 @@ import Lens.Family2 ((&), (.~), (^.))
 import Network.HTTP.Types (hAuthorization, hContentType, status200, status401, status429)
 import Network.Wai (defaultRequest, pathInfo, requestHeaders, requestMethod)
 import Network.Wai.Test (SRequest (..), runSession, simpleBody, simpleStatus, srequest)
+import Network.WebSockets qualified as WS
 import Proto.Xai.Api.V1.Chat qualified as PX
 import Proto.Xai.Api.V1.Sample qualified as SX
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
@@ -1455,7 +1456,21 @@ gatewayTests =
       testCase "stepWindow admits within cap and resets after the window" $ do
         stepWindow 2 60 100 Nothing @?= (True, (100, 1))
         stepWindow 2 60 100 (Just (100, 2)) @?= (False, (100, 2))
-        stepWindow 2 60 200 (Just (100, 2)) @?= (True, (200, 1))
+        stepWindow 2 60 200 (Just (100, 2)) @?= (True, (200, 1)),
+      testCase "wsAuthorized gates the /v1/ws upgrade like the SSE route" $ do
+        let open = defaultGatewayConfig
+            keyed = GatewayConfig ["secret"] Nothing
+            head' hdrs = WS.RequestHead "/v1/ws" hdrs False
+        wsAuthorized open (head' []) @?= True
+        wsAuthorized keyed (head' []) @?= False
+        wsAuthorized keyed (head' [(hAuthorization, "Bearer secret")]) @?= True
+        wsAuthorized keyed (head' [(hAuthorization, "Bearer wrong")]) @?= False,
+      testCase "wsPrincipal is the bearer key when keyed, else anon" $ do
+        let keyed = GatewayConfig ["secret"] Nothing
+            head' hdrs = WS.RequestHead "/v1/ws" hdrs False
+        wsPrincipal defaultGatewayConfig (head' [(hAuthorization, "Bearer secret")]) @?= "anon"
+        wsPrincipal keyed (head' [(hAuthorization, "Bearer secret")]) @?= "secret"
+        wsPrincipal keyed (head' []) @?= "anon"
     ]
   where
     get p = defaultRequest {requestMethod = "GET", pathInfo = p}

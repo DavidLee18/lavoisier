@@ -8,9 +8,12 @@
 --   * @POST \/v1\/turns@ — submit one turn (@{ "session"?, "input" }@) and stream the resulting
 --     'Event's back as **Server-Sent Events** (one JSON-encoded 'Event' per @data:@ frame), matching
 --     the Rust gateway's wire shape.
+--   * @GET  \/v1\/ws@    — a **WebSocket**: each inbound text frame is a turn JSON @{ "session"?,
+--     "input" }@; the agent's 'Event's for that turn stream back as JSON text frames (one per frame,
+--     same encoding as the SSE payload) before the next inbound frame is read.
 --
--- Optional bearer-key auth gates @\/v1\/turns@. The WebSocket endpoint, Prometheus @\/metrics@, and
--- rate limiting are deferred to a follow-up.
+-- Optional bearer-key auth + the per-principal rate limit gate both @\/v1\/turns@ and @\/v1\/ws@;
+-- @\/health@ and @\/metrics@ stay open.
 module Lavoisier.Gateway.Http
   ( GatewayConfig (..),
     defaultGatewayConfig,
@@ -18,12 +21,15 @@ module Lavoisier.Gateway.Http
     httpGateway,
     newHttpApp,
     stepWindow,
+    wsAuthorized,
+    wsPrincipal,
   )
 where
 
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, handle, try)
 import Data.Aeson (FromJSON (..), decode, encode, object, withObject, (.:), (.:?), (.=))
 import Data.ByteString.Builder (Builder, byteString, lazyByteString)
+import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef
 import Data.Map.Strict (Map)
@@ -41,6 +47,8 @@ import Lavoisier.Protocol.Stream (Producer (..))
 import Network.HTTP.Types (ResponseHeaders, hAuthorization, hContentType, status200, status400, status401, status404, status429)
 import Network.Wai
 import Network.Wai.Handler.Warp (run)
+import Network.Wai.Handler.WebSockets (websocketsOr)
+import Network.WebSockets qualified as WS
 
 -- | Auth + quota policy for the protected routes. Empty key set ⇒ open access; 'gcRateLimit' is an
 -- optional @(max requests, window seconds)@ per principal (the API key, or @anon@ when auth is off).
@@ -74,29 +82,33 @@ newHttpApp :: GatewayConfig -> AgentHandle -> IO Application
 newHttpApp cfg agent = do
   metrics <- newMetrics
   limiter <- traverse (uncurry newLimiter) (gcRateLimit cfg)
-  pure $ \req respond ->
-    case (requestMethod req, pathInfo req) of
-      ("GET", ["health"]) -> respond (responseLBS status200 [] "ok")
-      ("GET", ["metrics"]) -> do
-        body <- renderMetrics metrics
-        respond (responseLBS status200 [(hContentType, "text/plain; version=0.0.4")] (BL.fromStrict (encodeUtf8 body)))
-      ("POST", ["v1", "turns"])
-        | authorized cfg req -> do
-            ok <- maybe (pure True) (\l -> allow l (principal cfg req)) limiter
-            if not ok
-              then respond (responseLBS status429 jsonHeader "{\"error\":\"rate limit exceeded\"}")
-              else do
-                body <- strictRequestBody req
-                case decode body of
-                  Nothing -> respond (responseLBS status400 jsonHeader "{\"error\":\"invalid JSON body\"}")
-                  Just dto -> do
-                    let turn = TurnRequest (dtoSession dto) (dtoInput dto) Nothing
-                    estream <- submit agent turn
-                    case estream of
-                      Left e -> recordTurn metrics True >> respond (responseStream status200 sseHeader (sseError e))
-                      Right stream -> recordTurn metrics False >> respond (responseStream status200 sseHeader (sseBody metrics stream))
-        | otherwise -> respond (responseLBS status401 jsonHeader "{\"error\":\"missing or invalid API key\"}")
-      _ -> respond (responseLBS status404 jsonHeader "{\"error\":\"not found\"}")
+  pure (websocketsOr WS.defaultConnectionOptions (wsApp cfg agent metrics limiter) (httpHandler cfg agent metrics limiter))
+
+-- | The plain-HTTP request handler (used as the non-WebSocket fallback of 'websocketsOr').
+httpHandler :: GatewayConfig -> AgentHandle -> Metrics -> Maybe Limiter -> Application
+httpHandler cfg agent metrics limiter = \req respond ->
+  case (requestMethod req, pathInfo req) of
+    ("GET", ["health"]) -> respond (responseLBS status200 [] "ok")
+    ("GET", ["metrics"]) -> do
+      body <- renderMetrics metrics
+      respond (responseLBS status200 [(hContentType, "text/plain; version=0.0.4")] (BL.fromStrict (encodeUtf8 body)))
+    ("POST", ["v1", "turns"])
+      | authorized cfg req -> do
+          ok <- maybe (pure True) (\l -> allow l (principal cfg req)) limiter
+          if not ok
+            then respond (responseLBS status429 jsonHeader "{\"error\":\"rate limit exceeded\"}")
+            else do
+              body <- strictRequestBody req
+              case decode body of
+                Nothing -> respond (responseLBS status400 jsonHeader "{\"error\":\"invalid JSON body\"}")
+                Just dto -> do
+                  let turn = TurnRequest (dtoSession dto) (dtoInput dto) Nothing
+                  estream <- submit agent turn
+                  case estream of
+                    Left e -> recordTurn metrics True >> respond (responseStream status200 sseHeader (sseError e))
+                    Right stream -> recordTurn metrics False >> respond (responseStream status200 sseHeader (sseBody metrics stream))
+      | otherwise -> respond (responseLBS status401 jsonHeader "{\"error\":\"missing or invalid API key\"}")
+    _ -> respond (responseLBS status404 jsonHeader "{\"error\":\"not found\"}")
 
 -- | The stateless convenience 'Application' (fresh metrics\/limiter per request — fine for one-shot
 -- tests, but rate-limit\/metrics accumulation needs 'newHttpApp').
@@ -119,8 +131,74 @@ sseBody metrics stream write flush = loop
           write (frame (encodeItem item))
           flush
           loop
-    encodeItem (Right ev) = encode ev
-    encodeItem (Left err) = encode (object ["error" .= tshow (err :: AgentError)])
+
+-- | Encode one agent stream item as JSON: a success is the 'Event'; an error is @{"error": …}@.
+-- Shared by the SSE and WebSocket paths so both carry the identical per-item wire shape.
+encodeItem :: Either AgentError Event -> BL.ByteString
+encodeItem (Right ev) = encode ev
+encodeItem (Left err) = encode (object ["error" .= tshow (err :: AgentError)])
+
+-- --- WebSocket endpoint (/v1/ws) -------------------------------------------------------------------
+
+-- | The @/v1/ws@ upgrade handler: enforce the same auth + rate-limit guard as @/v1/turns@ (a browser
+-- cannot set @Authorization@ on a WebSocket, matching the Rust gateway), then serve turns on the
+-- accepted connection. Any other upgrade path, or a failed guard, is rejected before accept.
+wsApp :: GatewayConfig -> AgentHandle -> Metrics -> Maybe Limiter -> WS.ServerApp
+wsApp cfg agent metrics limiter pending
+  | reqPath /= "/v1/ws" = WS.rejectRequest pending "unknown websocket path"
+  | not (wsAuthorized cfg reqHead) = WS.rejectRequest pending "missing or invalid API key"
+  | otherwise = do
+      ok <- maybe (pure True) (\l -> allow l (wsPrincipal cfg reqHead)) limiter
+      if not ok
+        then WS.rejectRequest pending "rate limit exceeded"
+        else do
+          conn <- WS.acceptRequest pending
+          wsLoop conn agent metrics
+  where
+    reqHead = WS.pendingRequest pending
+    reqPath = fst (BC.break (== '?') (WS.requestPath reqHead))
+
+-- | Serve turns on one WebSocket connection: each inbound text frame is a 'TurnDto'; the turn's
+-- events stream back as JSON text frames before the next frame is read. A client disconnect
+-- ('WS.ConnectionException') ends the loop cleanly.
+wsLoop :: WS.Connection -> AgentHandle -> Metrics -> IO ()
+wsLoop conn agent metrics = handle (\(_ :: WS.ConnectionException) -> pure ()) loop
+  where
+    loop = do
+      raw <- WS.receiveData conn :: IO BL.ByteString
+      case decode raw of
+        Nothing -> WS.sendTextData conn (encode (object ["error" .= ("invalid JSON body" :: Text)])) >> loop
+        Just dto -> do
+          let turn = TurnRequest (dtoSession dto) (dtoInput dto) Nothing
+          estream <- submit agent turn
+          case estream of
+            Left e -> recordTurn metrics True >> WS.sendTextData conn (encodeItem (Left e)) >> loop
+            Right stream -> recordTurn metrics False >> streamWs stream >> loop
+    streamWs stream =
+      nextItem stream >>= \case
+        Nothing -> pure ()
+        Just item -> do
+          case item of
+            Right (Usage u) -> recordUsage metrics u
+            _ -> pure ()
+          WS.sendTextData conn (encodeItem item)
+          streamWs stream
+
+-- | @/v1/ws@ auth, mirroring 'authorized' but over the WebSocket handshake headers.
+wsAuthorized :: GatewayConfig -> WS.RequestHead -> Bool
+wsAuthorized cfg reqHead = case gcApiKeys cfg of
+  [] -> True
+  keys -> case lookup hAuthorization (WS.requestHeaders reqHead) of
+    Just v | Just key <- T.stripPrefix "Bearer " (decodeUtf8Lenient v) -> key `elem` keys
+    _ -> False
+
+-- | The rate-limit principal for a WebSocket handshake (mirrors 'principal').
+wsPrincipal :: GatewayConfig -> WS.RequestHead -> Text
+wsPrincipal cfg reqHead = case gcApiKeys cfg of
+  [] -> "anon"
+  _ -> case lookup hAuthorization (WS.requestHeaders reqHead) of
+    Just v | Just k <- T.stripPrefix "Bearer " (decodeUtf8Lenient v) -> k
+    _ -> "anon"
 
 -- --- metrics (Prometheus counters at /metrics) -----------------------------------------------------
 

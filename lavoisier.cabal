@@ -110,6 +110,7 @@ library
     , unordered-containers
     , vector
     , wai
+    , wai-websockets
     , warp
     , websockets
     , wuss
@@ -213,6 +214,7 @@ test-suite lavoisier-test
     , vector
     , wai
     , wai-extra
+    , websockets
 
 test-suite lavoisier-e2ee-test
   import:           lang
