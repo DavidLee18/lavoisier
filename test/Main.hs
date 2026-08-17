@@ -2541,7 +2541,12 @@ matrixTests =
         let sync = object ["next_batch" .= t "tok", "rooms" .= object ["invite" .= object ["!inv:hs" .= object []]]]
         MX.extractInvites sync @?= ["!inv:hs"]
         MX.parseNextBatch sync @?= Right "tok"
-        assertBool "no next_batch is an error" (isLeftE (MX.parseNextBatch (object [])))
+        assertBool "no next_batch is an error" (isLeftE (MX.parseNextBatch (object []))),
+      testCase "languageFromLocale selects Korean only for ko_KR" $ do
+        MX.languageFromLocale "ko_KR.UTF-8" @?= MX.Korean
+        MX.languageFromLocale "KO_kr" @?= MX.Korean
+        MX.languageFromLocale "en_US.UTF-8" @?= MX.English
+        MX.languageFromLocale "" @?= MX.English
     ]
   where
     t = id :: Text -> Text

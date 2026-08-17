@@ -25,6 +25,7 @@ import Lavoisier.Gateway.Acp (acpGateway, defaultAcpConfig)
 import Lavoisier.Gateway.Cron (CronJob, cronGateway, parseCliJob, parseFileJobs)
 import Lavoisier.Gateway.Http (GatewayConfig (..), httpGateway)
 import Lavoisier.Gateway.Matrix (matrixFromEnv, matrixGateway)
+import Lavoisier.Gateway.Matrix qualified as MX
 import Lavoisier.Gateway.Slack (slackFromEnv, slackGateway)
 import Lavoisier.Legion (Debater, languageFromLocale, mkDebater, newPanel, panelDeliberator, renderLegionError, withLanguage)
 import Lavoisier.Mcp (connectTools, mssLabel, parseServerSpec, renderMcpError)
@@ -175,7 +176,11 @@ runCli = do
         then buildCronJobs opts >>= \jobs -> serveWith (cronGateway jobs)
         else
           if optServeMatrix opts
-            then fromEnvGateway matrixFromEnv matrixGateway
+            then do
+              -- Localise the gateway-authored shutdown notice via --lang/LANG (only ko_KR ⇒ Korean).
+              langRaw <- maybe (fmap (fromMaybe "") (lookupEnv "LANG")) pure (optLang opts)
+              let lg = MX.languageFromLocale (T.pack langRaw)
+              fromEnvGateway matrixFromEnv (matrixGateway . MX.withLanguage lg)
             else
               if optServeSlack opts
                 then fromEnvGateway slackFromEnv slackGateway

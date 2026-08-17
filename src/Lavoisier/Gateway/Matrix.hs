@@ -20,6 +20,9 @@ module Lavoisier.Gateway.Matrix
     defaultMatrixConfig,
     matrixFromEnv,
     matrixGateway,
+    Language (..),
+    languageFromLocale,
+    withLanguage,
 
     -- * Pure logic (exposed for testing)
     IncomingMessage (..),
@@ -107,13 +110,30 @@ data MatrixConfig = MatrixConfig
     -- | Room to greet with a friendly "going offline" notice on shutdown (@MATRIX_HOME_ROOM@).
     mcHomeRoom :: Maybe Text,
     -- | If set, download inbound image\/file attachments here and hand the local path to the turn.
-    mcMediaDir :: Maybe FilePath
+    mcMediaDir :: Maybe FilePath,
+    -- | Language for gateway-authored notices (only the shutdown message; default 'English').
+    mcLanguage :: Language
   }
+
+-- | UI language for notices this gateway authors itself — currently just the graceful-shutdown
+-- notice. Inbound turns and the agent's replies are unaffected. Mirrors @lvz_gw_matrix::Language@.
+data Language = English | Korean
+  deriving stock (Eq, Show)
+
+-- | Resolve a POSIX locale to a 'Language': only @ko_KR@ (case-insensitive, any @.encoding@ suffix
+-- ignored) selects Korean; everything else is English.
+languageFromLocale :: Text -> Language
+languageFromLocale raw =
+  if T.toUpper (T.takeWhile (/= '.') raw) == "KO_KR" then Korean else English
+
+-- | Set the language for gateway-authored notices.
+withLanguage :: Language -> MatrixConfig -> MatrixConfig
+withLanguage lang cfg = cfg {mcLanguage = lang}
 
 -- | A config with only the required fields; everything else off.
 defaultMatrixConfig :: Text -> Text -> MatrixConfig
 defaultMatrixConfig homeserver user =
-  MatrixConfig homeserver user Nothing Nothing Nothing Nothing Nothing Map.empty Map.empty True Nothing Nothing Nothing Nothing
+  MatrixConfig homeserver user Nothing Nothing Nothing Nothing Nothing Map.empty Map.empty True Nothing Nothing Nothing Nothing English
 
 -- | Build the config from the @MATRIX_*@ environment (homeserver + user required; token or password
 -- for auth; optional device id, allowlists, auto-join).
@@ -270,12 +290,15 @@ installShutdown v = do
 onShutdown :: MatrixEnv -> IO ()
 onShutdown env = do
   case mcHomeRoom (meConfig env) of
-    Just room -> () <$ sendText env room shutdownNotice
+    Just room -> () <$ sendText env room (shutdownNotice (mcLanguage (meConfig env)))
     Nothing -> pure ()
   persistIfDirty env
 
-shutdownNotice :: Text
-shutdownNotice = "\128075 Lavoisier is going offline for a bit \8212 thanks for chatting, and see you soon!"
+-- | The friendly "going offline" notice, localised ('English' default, 'Korean' when @--lang@\/@LANG@
+-- resolves to @ko_KR@). "Lavoisier" is kept as a name.
+shutdownNotice :: Language -> Text
+shutdownNotice English = "👋 Lavoisier is going offline for a bit — thanks for chatting, and see you soon!"
+shutdownNotice Korean = "👋 Lavoisier가 잠시 오프라인 상태가 됩니다 — 대화 감사했어요, 곧 다시 만나요!"
 
 -- | The full engage → react → run → reply → outcome flow for one message.
 handleMessage :: MatrixEnv -> AgentHandle -> RecentIds -> IncomingMessage -> IO ()
