@@ -23,10 +23,11 @@ module Lavoisier.Gateway.Matrix
 
     -- * Pure logic (exposed for testing)
     IncomingMessage (..),
+    Attachment (..),
     extractMessages,
     mentionsBot,
     replyTarget,
-    messageBody,
+    messageContent,
     messageTriggers,
     senderAllowed,
     roomAllowed,
@@ -41,7 +42,10 @@ module Lavoisier.Gateway.Matrix
 where
 
 import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (race, withAsync)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, tryPutMVar)
 import Control.Exception (SomeException, try)
+import Control.Monad (forever)
 import Data.Aeson (Value (..), decode, encode, object, (.=))
 import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
@@ -68,6 +72,7 @@ import Network.HTTP.Types.Status (statusCode, statusIsSuccessful)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
+import System.Posix.Signals (Handler (Catch), installHandler, sigINT, sigTERM)
 #ifdef E2EE
 import Control.Monad (forM_, unless)
 import Data.Scientific (toBoundedInteger)
@@ -223,7 +228,15 @@ serveLoop cfg agent = do
           autoJoinInvites env baseline
           case parseNextBatch baseline of
             Left e -> pure (Left e)
-            Right since0 -> Right <$> loop env recent dmCache since0
+            Right since0 -> do
+              -- Race the sync loop against a shutdown signal: on SIGTERM/SIGINT, post a friendly
+              -- "going offline" notice to the home room, persist the crypto store, and exit cleanly.
+              shutdown <- newEmptyMVar
+              installShutdown shutdown
+              outcome <- race (takeMVar shutdown) (loop env recent dmCache since0)
+              case outcome of
+                Left () -> onShutdown env >> pure (Right ())
+                Right () -> pure (Right ())
   where
     loop env recent dmCache since = do
       eres <- syncOnce env (Just since)
@@ -244,12 +257,33 @@ serveLoop cfg agent = do
       trigger <- messageTriggers dm (imMentions msg) (imReplyTo msg) recent
       if trigger then handleMessage env agent recent msg else pure ()
 
+-- | Install SIGTERM\/SIGINT handlers that unblock the serve loop's shutdown race (idempotent fire).
+installShutdown :: MVar () -> IO ()
+installShutdown v = do
+  let fire = tryPutMVar v () >> pure ()
+  _ <- installHandler sigTERM (Catch fire) Nothing
+  _ <- installHandler sigINT (Catch fire) Nothing
+  pure ()
+
+-- | On shutdown: post the "going offline" notice to the home room (encrypted when the room is, via
+-- 'sendText') and flush the crypto store.
+onShutdown :: MatrixEnv -> IO ()
+onShutdown env = do
+  case mcHomeRoom (meConfig env) of
+    Just room -> () <$ sendText env room shutdownNotice
+    Nothing -> pure ()
+  persistIfDirty env
+
+shutdownNotice :: Text
+shutdownNotice = "\128075 Lavoisier is going offline for a bit \8212 thanks for chatting, and see you soon!"
+
 -- | The full engage → react → run → reply → outcome flow for one message.
 handleMessage :: MatrixEnv -> AgentHandle -> RecentIds -> IncomingMessage -> IO ()
 handleMessage env agent recent msg = do
   ack <- either (const Nothing) Just <$> react env room (imEventId msg) "👀"
   _ <- setTyping env room True
-  let base = turnRequest room (imBody msg)
+  turnText <- augmentWithMedia env msg
+  let base = turnRequest room turnText
       turn = base {trAllowedTools = toolsFor (meConfig env) room (imSender msg)}
   est <- submit agent turn
   case est of
@@ -257,7 +291,9 @@ handleMessage env agent recent msg = do
       _ <- setTyping env room False
       finishReaction env room (imEventId msg) ack False
     Right stream -> do
-      ok <- drain stream ""
+      -- Keep the typing indicator alive through a long, silent turn (e.g. a legion deliberation that
+      -- emits no events for 60 s+): the homeserver's typing timeout is 30 s, so refresh every 20 s.
+      ok <- withAsync (typingKeepAlive env room) (const (drain stream ""))
       _ <- setTyping env room False
       finishReaction env room (imEventId msg) ack ok
   where
@@ -281,6 +317,55 @@ handleMessage env agent recent msg = do
       | otherwise = do
           e <- sendText env room answer
           either (const (pure ())) (insertRecent recent) e
+
+-- | When a media dir is configured and the message carries a plaintext attachment, download it and
+-- append an @[attachment] …saved locally at \<path\>@ line to the turn text so a tool can act on the
+-- local file. The model never sees the bytes — only the path (the bytes-to-tool path).
+augmentWithMedia :: MatrixEnv -> IncomingMessage -> IO Text
+augmentWithMedia env msg = case (mcMediaDir (meConfig env), imAttachment msg) of
+  (Just dir, Just att) -> do
+    saved <- downloadMedia env dir (imEventId msg) att
+    pure $ case saved of
+      Right path -> imBody msg <> "\n[attachment] " <> atFilename att <> " (" <> atMime att <> ") saved locally at " <> T.pack path
+      Left _ -> imBody msg
+  _ -> pure (imBody msg)
+
+-- | Download an @mxc://server/mediaId@ via the authenticated media endpoint (Matrix 1.11+) to
+-- @\<dir\>/\<eventId\>_\<filename\>@ (both sanitised so nothing escapes the dir).
+downloadMedia :: MatrixEnv -> FilePath -> Text -> Attachment -> IO (Either GatewayError FilePath)
+downloadMedia env dir eventId att = case parseMxc (atMxc att) of
+  Nothing -> pure (Left (GEProtocol "bad mxc url"))
+  Just (server, mediaId) -> do
+    let path = dir </> (sanitizeComponent eventId <> "_" <> sanitizeComponent (atFilename att))
+        url = "/_matrix/client/v1/media/download/" <> enc server <> "/" <> enc mediaId
+    r <-
+      try
+        ( do
+            createDirectoryIfMissing True dir
+            req0 <- parseRequest (T.unpack (mcHomeserver (meConfig env) <> url))
+            resp <- httpLbs req0 {requestHeaders = [("Authorization", "Bearer " <> encodeUtf8 (meToken env))]} (meManager env)
+            if statusIsSuccessful (responseStatus resp)
+              then BL.writeFile path (responseBody resp) >> pure path
+              else ioError (userError ("media download status " <> show (statusCode (responseStatus resp))))
+        ) ::
+        IO (Either SomeException FilePath)
+    pure (either (Left . GEIo . tshow) Right r)
+
+-- | Parse @mxc://server/mediaId@ into @(server, mediaId)@.
+parseMxc :: Text -> Maybe (Text, Text)
+parseMxc t = case T.stripPrefix "mxc://" t of
+  Just rest -> case T.breakOn "/" rest of
+    (server, p) | not (T.null server), T.length p > 1 -> Just (server, T.drop 1 p)
+    _ -> Nothing
+  Nothing -> Nothing
+
+-- | Reduce a path component to @[A-Za-z0-9._-]@ so a filename\/event id can never escape the media dir.
+sanitizeComponent :: Text -> FilePath
+sanitizeComponent = T.unpack . T.map (\c -> if isAlphaNum c || c `elem` ("._-" :: String) then c else '_')
+
+-- | Refresh the typing indicator every 20 s until cancelled (the homeserver times it out at 30 s).
+typingKeepAlive :: MatrixEnv -> Text -> IO ()
+typingKeepAlive env room = forever (threadDelay 20000000 >> setTyping env room True)
 
 -- | Retract the transient 👀 ack and react ✅\/❌ with the outcome (best-effort).
 finishReaction :: MatrixEnv -> Text -> Text -> Maybe Text -> Bool -> IO ()
@@ -770,7 +855,18 @@ data IncomingMessage = IncomingMessage
     imBody :: Text,
     imEventId :: Text,
     imMentions :: Bool,
-    imReplyTo :: Maybe Text
+    imReplyTo :: Maybe Text,
+    -- | A plaintext media attachment (image\/file\/audio\/video), when present; downloaded to the
+    -- media dir and handed to the turn as a local path (E2EE media is not ingested).
+    imAttachment :: Maybe Attachment
+  }
+  deriving stock (Eq, Show)
+
+-- | A plaintext inbound attachment: its @mxc://@ URI, filename, and mimetype.
+data Attachment = Attachment
+  { atMxc :: Text,
+    atFilename :: Text,
+    atMime :: Text
   }
   deriving stock (Eq, Show)
 
@@ -779,7 +875,7 @@ data IncomingMessage = IncomingMessage
 -- signals.
 extractMessages :: Value -> Text -> Maybe (Set Text) -> Maybe (Set Text) -> [IncomingMessage]
 extractMessages sync self allowedUsers allowedRooms =
-  [ IncomingMessage roomId sender body eid (mentionsBot content self) (replyTarget content)
+  [ IncomingMessage roomId sender body eid (mentionsBot content self) (replyTarget content) att
   | (roomId, room) <- objToList (lookKey "rooms" sync >>= lookKey "join"),
     roomAllowed allowedRooms roomId,
     event <- arrGet "events" (fromMaybe Null (lookKey "timeline" room)),
@@ -788,7 +884,7 @@ extractMessages sync self allowedUsers allowedRooms =
     sender /= self,
     senderAllowed allowedUsers sender,
     let content = fromMaybe Null (lookKey "content" event),
-    Just body <- [messageBody content],
+    Just (body, att) <- [messageContent content],
     let eid = fromMaybe "" (lookStr "event_id" event)
   ]
 
@@ -815,11 +911,20 @@ replyTarget content =
     Just e | not (T.null e) -> Just e
     _ -> Nothing
 
--- | The answerable body of a message: an @m.text@ yields its body; other message types are ignored
--- (media ingest is deferred).
-messageBody :: Value -> Maybe Text
-messageBody content = case lookStr "msgtype" content of
-  Just "m.text" -> lookStr "body" content
+-- | The answerable content of a message: an @m.text@ yields @(body, Nothing)@; a plaintext
+-- @m.image@\/@m.file@\/@m.audio@\/@m.video@ (a cleartext @url@) yields @(caption, Just attachment)@;
+-- anything else (including E2EE media, whose reference is under @content.file@, not @url@) is ignored.
+messageContent :: Value -> Maybe (Text, Maybe Attachment)
+messageContent content = case lookStr "msgtype" content of
+  Just "m.text" -> (\b -> (b, Nothing)) <$> lookStr "body" content
+  Just mt
+    | mt `elem` ["m.image", "m.file", "m.audio", "m.video"] ->
+        case lookStr "url" content of
+          Just mxc ->
+            let name = fromMaybe "attachment" (lookStr "body" content)
+                mime = fromMaybe "application/octet-stream" (lookKey "info" content >>= lookStr "mimetype")
+             in Just (fromMaybe "" (lookStr "body" content), Just (Attachment mxc name mime))
+          Nothing -> Nothing
   _ -> Nothing
 
 -- | Decide whether to engage: always in a 1:1 DM; in a group room only when @-mentioned or when the

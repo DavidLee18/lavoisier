@@ -2482,7 +2482,14 @@ matrixTests =
             theirs = msgEvent "@alice:hs" "$2" (textContent "hello bot")
             msgs = MX.extractMessages sync "@bot:hs" Nothing Nothing
         map MX.imSender msgs @?= ["@alice:hs"]
-        map MX.imBody msgs @?= ["hello bot"],
+        map MX.imBody msgs @?= ["hello bot"]
+        map MX.imAttachment msgs @?= [Nothing],
+      testCase "messageContent: text vs plaintext media attachment vs unsupported" $ do
+        MX.messageContent (textContent "hi") @?= Just ("hi", Nothing)
+        let img = object ["msgtype" .= t "m.image", "body" .= t "cat.png", "url" .= t "mxc://hs/abc", "info" .= object ["mimetype" .= t "image/png"]]
+        MX.messageContent img @?= Just ("cat.png", Just (MX.Attachment "mxc://hs/abc" "cat.png" "image/png"))
+        -- an encrypted image (reference under `file`, no plaintext url) is not ingested
+        MX.messageContent (object ["msgtype" .= t "m.image", "body" .= t "secret.png", "file" .= object ["url" .= t "mxc://hs/enc"]]) @?= Nothing,
       testCase "the sender allowlist filters extraction" $ do
         let sync = syncWith (msgEvent "@mallory:hs" "$1" (textContent "hi"))
             allowed = Just (Set.fromList ["@alice:hs"])
