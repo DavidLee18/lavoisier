@@ -59,6 +59,9 @@ data Options = Options
     optMaxTokens :: Maybe Word32,
     optMaxSteps :: Maybe Int,
     optContextLimit :: Maybe Int,
+    optCheapModel :: Maybe Text,
+    optEscalateAfter :: Maybe Int,
+    optAdvisorModel :: Maybe Text,
     optServe :: Maybe Int,
     optServeA2a :: Maybe Int,
     optServeAcp :: Maybe Int,
@@ -93,6 +96,9 @@ optionsParser =
     <*> optional (option auto (long "max-tokens" <> metavar "N" <> help "Generated-token ceiling"))
     <*> optional (option auto (long "max-steps" <> metavar "N" <> help "Agent tool-loop step budget"))
     <*> optional (option auto (long "context-limit" <> metavar "N" <> help "Per-request token ceiling; evict oldest tool output when exceeded after compaction"))
+    <*> optional (strOption (long "cheap-model" <> metavar "MODEL" <> help "Cheaper model for the first --escalate-after round-trips, then escalate to --model"))
+    <*> optional (option auto (long "escalate-after" <> metavar "N" <> help "Round-trips on --cheap-model before escalating (default 2)"))
+    <*> optional (strOption (long "advisor-model" <> metavar "MODEL" <> help "Smarter model for a one-shot planning pre-pass that seeds the executor"))
     <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
     <*> optional (option auto (long "serve-a2a" <> metavar "PORT" <> help "Serve the agent as an A2A (Agent-to-Agent) gateway on this port"))
     <*> optional (option auto (long "serve-acp" <> metavar "PORT" <> help "Serve the agent as an ACP (Agent Communication Protocol) gateway on this port"))
@@ -192,6 +198,9 @@ applyConfig fc o =
       optMaxTokens = optMaxTokens o <|> fmap fromIntegral (maxTokens fc),
       optMaxSteps = optMaxSteps o <|> fmap fromIntegral (maxSteps fc),
       optContextLimit = optContextLimit o <|> fmap fromIntegral (contextLimit fc),
+      optCheapModel = optCheapModel o <|> cheapModel fc,
+      optEscalateAfter = optEscalateAfter o <|> fmap fromIntegral (escalateAfter fc),
+      optAdvisorModel = optAdvisorModel o <|> advisorModel fc,
       optServe = optServe o <|> fmap fromIntegral (serve fc),
       optServeA2a = optServeA2a o <|> fmap fromIntegral (serveA2a fc),
       optServeAcp = optServeAcp o <|> fmap fromIntegral (serveAcp fc),
@@ -378,7 +387,10 @@ assembleAgent prov opts model tuner delib registry = do
           { acThinking = optThinking opts,
             acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts),
             acMaxSteps = fromMaybe (acMaxSteps base) (optMaxSteps opts),
-            acContextLimit = optContextLimit opts
+            acContextLimit = optContextLimit opts,
+            acCheapModel = optCheapModel opts,
+            acEscalateAfter = fromMaybe (acEscalateAfter base) (optEscalateAfter opts),
+            acAdvisorModel = optAdvisorModel opts
           }
   agent0 <- mkAgent prov registry cfg tuner delib
   fallbacks <- buildFallbacks opts

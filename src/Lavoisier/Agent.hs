@@ -81,13 +81,21 @@ data AgentConfig = AgentConfig
     acSystem :: Maybe Text,
     -- | Per-request token ceiling for the context-budget manager (§6.3). When set and still
     -- exceeded after compaction, the oldest tool-result content is evicted. 'Nothing' ⇒ no eviction.
-    acContextLimit :: Maybe Int
+    acContextLimit :: Maybe Int,
+    -- | Cheaper model for the first 'acEscalateAfter' round-trips before escalating to 'acModel'
+    -- (§8 cheap-model-first). 'Nothing' ⇒ every round-trip runs on 'acModel'. Primary only.
+    acCheapModel :: Maybe Text,
+    -- | Round-trips to run on 'acCheapModel' before escalating (ignored when it is 'Nothing').
+    acEscalateAfter :: Int,
+    -- | Smarter model for a one-shot tool-less planning pre-pass that seeds the executor (§8).
+    -- 'Nothing' ⇒ no advisor. Superseded by a legion council when one is installed.
+    acAdvisorModel :: Maybe Text
   }
 
 -- | Sensible defaults: 12 steps, 4096 max tokens, no forced thinking, the default system prompt, no
--- context-eviction ceiling.
+-- context-eviction ceiling, no cheap\/advisor model (escalate-after 2).
 defaultAgentConfig :: Text -> AgentConfig
-defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing Nothing
+defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing Nothing Nothing 2 Nothing
 
 -- | A per-position __circuit breaker__ for the fallback chain, shared across turns so a dead model
 -- isn't re-probed every turn. Position @0@ is the primary; position @i>0@ is @fallbacks !! (i-1)@.
@@ -242,21 +250,22 @@ runLoopSeeded agent allowed initial emit = do
   knobs <- tunerSelect (agTuner agent) ctx
   usageRef <- newIORef emptyUsage
   stepRef <- newIORef (0 :: Int)
-  -- Legion pre-pass (best-effort, deliberate-then-act): if a council is configured, ask it to argue
-  -- the task out — grounded in the executor's system prompt + this turn's tools, with progress
-  -- streamed as Event.Notice — and seed the transcript with the agreed plan as an assistant opening
-  -- move. A failed deliberation is swallowed and the turn proceeds unseeded. Its token cost is folded
-  -- into the turn's usage so it flows into the tuner's outcome.
+  -- Pre-pass (best-effort, deliberate/advise-then-act): a legion council (if installed) argues the
+  -- task out grounded in the executor's system + tools, streaming Event.Notice progress; otherwise an
+  -- advisor model (if set) drafts a plan in one tool-less call. Either seeds the transcript with an
+  -- assistant opening move; a failure is swallowed (turn proceeds unseeded) and the plan's tokens fold
+  -- into the turn usage so they flow into the tuner's outcome.
+  let seedPlan u plan =
+        modifyIORef' usageRef (accumulateUsage u) >> pure (initial <> [Message Assistant [TextBlock plan False]])
   seeded <- case agDeliberator agent of
-    Nothing -> pure initial
-    Just delib -> do
-      let dctx = DeliberationContext systemText defs (Just (emit . Notice))
-      r <- runDeliberation delib (lastUserText initial) dctx
-      case r of
+    Just delib ->
+      runDeliberation delib (lastUserText initial) (DeliberationContext systemText defs (Just (emit . Notice))) >>= \case
         Left _ -> pure initial
-        Right del -> do
-          modifyIORef' usageRef (accumulateUsage (delUsage del))
-          pure (initial <> [Message Assistant [TextBlock (delPlan del) False]])
+        Right del -> seedPlan (delUsage del) (delPlan del)
+    Nothing ->
+      advise cfg (agProvider agent) (lastUserText initial) >>= \case
+        Just (plan, u) -> seedPlan u ("Plan:\n" <> plan)
+        Nothing -> pure initial
   let effThinking = maybe (acThinking cfg) Just (knobThinking knobs)
   -- ATO truncate dial: cap each tool result at the tuned byte budget before it re-enters the
   -- transcript (a large result billed every subsequent round-trip is a pure token sink). We also
@@ -287,8 +296,14 @@ runLoopSeeded agent allowed initial emit = do
     systemText = fromMaybe defaultSystemPrompt (acSystem cfg)
     system = SystemPrompt systemText True
 
-    candidates :: [(Provider, Text)]
-    candidates = (agProvider agent, acModel cfg) : agFallbacks agent
+    -- Cheap-model-first (§8) applies to the primary only: run 'acCheapModel' for the first
+    -- 'acEscalateAfter' round-trips, then escalate to 'acModel'. Fallbacks name their model.
+    candidatesAt :: Int -> [(Provider, Text)]
+    candidatesAt step = (agProvider agent, primary) : agFallbacks agent
+      where
+        primary = case acCheapModel cfg of
+          Just c | step < acEscalateAfter cfg -> c
+          _ -> acModel cfg
 
     fallbacksLen :: Int
     fallbacksLen = length (agFallbacks agent)
@@ -310,7 +325,7 @@ runLoopSeeded agent allowed initial emit = do
                     crMaxTokens = acMaxTokens cfg,
                     crThinking = effThinking
                   }
-          res <- attempt buildReq cursor
+          res <- attempt (candidatesAt step) buildReq cursor
           case res of
             Left e -> pure (Left e)
             Right (txt, calls, stop, roundUsage, cursor') -> do
@@ -347,13 +362,14 @@ runLoopSeeded agent allowed initial emit = do
     -- pre-token failure trips the breaker (demote for a cooldown) and a success resets it. Returns the
     -- (settled) cursor so it stays sticky across the turn's round-trips.
     attempt ::
+      [(Provider, Text)] ->
       (Text -> ChatRequest) ->
       Int ->
       IO (Either AgentError (Text, [PendingCall], StopReason, Usage, Int))
-    attempt buildReq = tryCursor
+    attempt cands buildReq = tryCursor
       where
         tryCursor c = do
-          let (prov, model) = candidates !! c
+          let (prov, model) = cands !! c
               hasNext = c < fallbacksLen
           estream <- providerStream prov (buildReq model)
           case estream of
@@ -497,6 +513,33 @@ compactionSystem =
 -- | Media blocks aren't text; approximate their prompt footprint with this placeholder.
 mediaProxy :: Text
 mediaProxy = "[media block ~1500 tokens placeholder]"
+
+-- | System prompt for the advisor pre-pass (§8): a terse plan, no code.
+advisorSystem :: Text
+advisorSystem =
+  "You are a planning advisor for a coding agent. Given the task, output a short, concrete plan: "
+    <> "which files or areas to inspect, the edits likely required, and the order of steps. Terse "
+    <> "bullet lines only — no prose, no code, no narration."
+
+-- | Generation ceiling for the advisor plan (plans are meant to be short).
+advisorMaxTokens :: Word32
+advisorMaxTokens = 512
+
+-- | Advisor pre-pass (§8): one tool-less call to 'acAdvisorModel' drafting a plan for @task@; the
+-- plan seeds the executor. 'Nothing' when the advisor is disabled, the call fails, or the plan is
+-- empty. Reuses 'toollessCall'; superseded by a legion council when one is installed.
+advise :: AgentConfig -> Provider -> Text -> IO (Maybe (Text, Usage))
+advise cfg prov task = case acAdvisorModel cfg of
+  Nothing -> pure Nothing
+  Just m -> (>>= nonEmpty) <$> toollessCall prov (req m)
+  where
+    req m =
+      (chatRequest m)
+        { crSystem = Just (SystemPrompt advisorSystem True),
+          crMessages = [userMessage task],
+          crMaxTokens = advisorMaxTokens
+        }
+    nonEmpty r@(plan, _) = if T.null (T.strip plan) then Nothing else Just r
 
 -- | Estimate the token footprint of the whole transcript (tool-call args + tool results dominate) —
 -- the trigger for compaction.

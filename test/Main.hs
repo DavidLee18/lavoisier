@@ -107,6 +107,7 @@ tests =
       toolTests,
       agentTests,
       compactionTests,
+      section8Tests,
       fallbackTests,
       contextTests,
       treeSitterTests,
@@ -670,6 +671,51 @@ compactionTests =
         assertBool "some oldest results evicted" (not (null evicted))
         assertBool "the most recent result is kept verbatim" (any (big `T.isInfixOf`) recent)
     ]
+
+-- --- §8 model routing: cheap-model-first + advisor pre-pass ----------------------------------------
+
+section8Tests :: TestTree
+section8Tests =
+  testGroup
+    "model routing (§8)"
+    [ testCase "cheap-model-first runs the cheap model then escalates after escalateAfter" $ do
+        models <- newIORef []
+        ref <- newIORef (0 :: Int)
+        let call i = [ToolUseStart i "read_file", ToolUseDelta i (jsonArg (object ["path" .= ("/no/such" :: Text)])), ToolUseEnd i, Usage emptyUsage, Done ToolUse]
+            final = [TextDelta "done", Usage emptyUsage, Done EndTurn]
+            stub =
+              Provider
+                { providerStream = \req -> do
+                    modifyIORef' models (<> [crModel req])
+                    n <- atomicModifyIORef' ref (\k -> (k + 1, k))
+                    fmap Right (fromList (map Right (if n < 2 then call (T.pack ('t' : show n)) else final))),
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+            cfg = (defaultAgentConfig "strong") {acCheapModel = Just "cheap", acEscalateAfter = 2}
+        agent <- mkAgent stub withBuiltins cfg Tn.noopTuner Nothing
+        _ <- runLoopSeeded agent Nothing [userMessage "go"] (const (pure ()))
+        readIORef models >>= (@?= ["cheap", "cheap", "strong"]),
+      testCase "advisor pre-pass seeds the transcript with a plan" $ do
+        let stub =
+              Provider
+                { providerStream = \req ->
+                    fmap Right . fromList . map Right $
+                      if null (crTools req)
+                        then [TextDelta "- inspect main.rs\n- edit it", Usage emptyUsage, Done EndTurn]
+                        else [TextDelta "final", Usage emptyUsage, Done EndTurn],
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+            cfg = (defaultAgentConfig "exec") {acAdvisorModel = Just "smart"}
+        agent <- mkAgent stub withBuiltins cfg Tn.noopTuner Nothing
+        r <- runLoopSeeded agent Nothing [userMessage "do the thing"] (const (pure ()))
+        case r of
+          Right msgs -> assertBool "plan seeded" (any ("Plan:\n- inspect main.rs" `T.isInfixOf`) [c | Message _ bs <- msgs, TextBlock c _ <- bs])
+          Left e -> assertFailure (show e)
+    ]
+  where
+    jsonArg = decodeUtf8Lenient . BL.toStrict . encode
 
 -- --- fallback chain (offline; scripted providers + the cross-turn circuit breaker) ---------------
 
