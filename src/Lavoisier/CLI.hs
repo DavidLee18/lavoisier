@@ -17,7 +17,7 @@ import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Lavoisier.Agent
 import Lavoisier.Config (FileConfig (..), loadConfig)
 import Lavoisier.Gateway.A2A (a2aGateway, defaultA2aConfig)
@@ -62,6 +62,8 @@ data Options = Options
     optCheapModel :: Maybe Text,
     optEscalateAfter :: Maybe Int,
     optAdvisorModel :: Maybe Text,
+    optBudget :: Maybe Word64,
+    optNoProgressLimit :: Maybe Int,
     optServe :: Maybe Int,
     optServeA2a :: Maybe Int,
     optServeAcp :: Maybe Int,
@@ -99,6 +101,8 @@ optionsParser =
     <*> optional (strOption (long "cheap-model" <> metavar "MODEL" <> help "Cheaper model for the first --escalate-after round-trips, then escalate to --model"))
     <*> optional (option auto (long "escalate-after" <> metavar "N" <> help "Round-trips on --cheap-model before escalating (default 2)"))
     <*> optional (strOption (long "advisor-model" <> metavar "MODEL" <> help "Smarter model for a one-shot planning pre-pass that seeds the executor"))
+    <*> optional (option auto (long "budget" <> metavar "N" <> help "Whole-task cost-weighted token budget; the turn stops when exceeded"))
+    <*> optional (option auto (long "no-progress-limit" <> metavar "N" <> help "Hard-stop after 2N edit-free round-trips (nudge at N)"))
     <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
     <*> optional (option auto (long "serve-a2a" <> metavar "PORT" <> help "Serve the agent as an A2A (Agent-to-Agent) gateway on this port"))
     <*> optional (option auto (long "serve-acp" <> metavar "PORT" <> help "Serve the agent as an ACP (Agent Communication Protocol) gateway on this port"))
@@ -201,6 +205,8 @@ applyConfig fc o =
       optCheapModel = optCheapModel o <|> cheapModel fc,
       optEscalateAfter = optEscalateAfter o <|> fmap fromIntegral (escalateAfter fc),
       optAdvisorModel = optAdvisorModel o <|> advisorModel fc,
+      optBudget = optBudget o <|> fmap fromIntegral (budget fc),
+      optNoProgressLimit = optNoProgressLimit o <|> fmap fromIntegral (noProgressLimit fc),
       optServe = optServe o <|> fmap fromIntegral (serve fc),
       optServeA2a = optServeA2a o <|> fmap fromIntegral (serveA2a fc),
       optServeAcp = optServeAcp o <|> fmap fromIntegral (serveAcp fc),
@@ -390,7 +396,9 @@ assembleAgent prov opts model tuner delib registry = do
             acContextLimit = optContextLimit opts,
             acCheapModel = optCheapModel opts,
             acEscalateAfter = fromMaybe (acEscalateAfter base) (optEscalateAfter opts),
-            acAdvisorModel = optAdvisorModel opts
+            acAdvisorModel = optAdvisorModel opts,
+            acTokenBudget = optBudget opts,
+            acNoProgressLimit = optNoProgressLimit opts
           }
   agent0 <- mkAgent prov registry cfg tuner delib
   fallbacks <- buildFallbacks opts

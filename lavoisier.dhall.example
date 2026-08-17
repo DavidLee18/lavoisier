@@ -14,6 +14,8 @@
 , cheapModel = None Text -- cheaper model for the first escalateAfter round-trips
 , escalateAfter = None Natural -- round-trips on cheapModel before escalating (default 2)
 , advisorModel = None Text -- smarter model for a one-shot planning pre-pass
+, budget = None Natural -- whole-task cost-weighted token budget; stop when exceeded
+, noProgressLimit = None Natural -- hard-stop after 2N edit-free round-trips (nudge at N)
 , serve = None Natural -- HTTP gateway port (POST /v1/turns, GET /health)
 , serveA2a = None Natural -- A2A gateway port
 , serveAcp = None Natural -- ACP gateway port

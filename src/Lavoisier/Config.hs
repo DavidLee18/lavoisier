@@ -30,6 +30,8 @@ data FileConfig = FileConfig
     cheapModel :: Maybe Text,
     escalateAfter :: Maybe Natural,
     advisorModel :: Maybe Text,
+    budget :: Maybe Natural,
+    noProgressLimit :: Maybe Natural,
     serve :: Maybe Natural,
     serveA2a :: Maybe Natural,
     serveAcp :: Maybe Natural,
@@ -57,7 +59,7 @@ instance Dhall.FromDhall FileConfig
 
 -- | The all-unset config (one 'Nothing' per 'FileConfig' field).
 defaultConfig :: FileConfig
-defaultConfig = FileConfig n n n n n n n n n n n n n n n n n n n n n n n n n n n n n
+defaultConfig = FileConfig n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n
   where
     n :: Maybe a
     n = Nothing
@@ -82,6 +84,8 @@ defaultsDhall =
       ", cheapModel = None Text",
       ", escalateAfter = None Natural",
       ", advisorModel = None Text",
+      ", budget = None Natural",
+      ", noProgressLimit = None Natural",
       ", serve = None Natural",
       ", serveA2a = None Natural",
       ", serveAcp = None Natural",

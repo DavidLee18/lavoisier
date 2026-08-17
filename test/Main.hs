@@ -108,6 +108,7 @@ tests =
       agentTests,
       compactionTests,
       section8Tests,
+      convergenceTests,
       fallbackTests,
       contextTests,
       treeSitterTests,
@@ -716,6 +717,42 @@ section8Tests =
     ]
   where
     jsonArg = decodeUtf8Lenient . BL.toStrict . encode
+
+-- --- convergence levers: whole-task budget + no-progress breaker ----------------------------------
+
+convergenceTests :: TestTree
+convergenceTests =
+  testGroup
+    "convergence levers"
+    [ testCase "budget stops the turn when the cost-weighted total exceeds it" $ do
+        let costly = MkUsage 0 100 0 0 -- cost = 100*5 = 500 ≫ 1
+            stub =
+              Provider
+                { providerStream = \_ -> fmap Right (fromList (map Right [ToolUseStart "t" "read_file", ToolUseDelta "t" "{}", ToolUseEnd "t", Usage costly, Done ToolUse])),
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+            cfg = (defaultAgentConfig "m") {acTokenBudget = Just 1}
+        agent <- mkAgent stub withBuiltins cfg Tn.noopTuner Nothing
+        r <- runLoopSeeded agent Nothing [userMessage "go"] (const (pure ()))
+        case r of
+          Left AEBudgetExceeded -> pure ()
+          other -> assertFailure ("expected AEBudgetExceeded, got " <> show (fmap (const ()) other)),
+      testCase "no-progress-limit hard-stops after 2N edit-free round-trips" $ do
+        emitted <- newIORef []
+        let arg = decodeUtf8Lenient . BL.toStrict . encode $ object ["path" .= ("/no/such" :: Text)]
+            stub =
+              Provider
+                { providerStream = \_ -> fmap Right (fromList (map Right [ToolUseStart "t" "read_file", ToolUseDelta "t" arg, ToolUseEnd "t", Usage emptyUsage, Done ToolUse])),
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+            cfg = (defaultAgentConfig "m") {acNoProgressLimit = Just 1}
+        agent <- mkAgent stub withBuiltins cfg Tn.noopTuner Nothing
+        _ <- runLoopSeeded agent Nothing [userMessage "go"] (\e -> modifyIORef' emitted (e :))
+        evs <- readIORef emitted
+        assertBool "emitted a no_progress stop" (Done (Other "no_progress") `elem` evs)
+    ]
 
 -- --- fallback chain (offline; scripted providers + the cross-turn circuit breaker) ---------------
 

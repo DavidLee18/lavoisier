@@ -45,7 +45,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Data.Vector qualified as V
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import GHC.Clock (getMonotonicTime)
 import Lavoisier.Context.Tokens (estimateTokens)
 import Lavoisier.Protocol.Agent
@@ -64,6 +64,7 @@ import Lavoisier.Protocol.Event
     emptyUsage,
     usageCost,
   )
+import Lavoisier.Protocol.Event qualified as Ev
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider (Provider (..), ProviderError)
 import Lavoisier.Protocol.Stream (Producer (..))
@@ -89,13 +90,20 @@ data AgentConfig = AgentConfig
     acEscalateAfter :: Int,
     -- | Smarter model for a one-shot tool-less planning pre-pass that seeds the executor (§8).
     -- 'Nothing' ⇒ no advisor. Superseded by a legion council when one is installed.
-    acAdvisorModel :: Maybe Text
+    acAdvisorModel :: Maybe Text,
+    -- | Whole-task cost-weighted token budget (§6.4). When the running total exceeds it the turn
+    -- ends with 'AEBudgetExceeded'. 'Nothing' ⇒ unbounded.
+    acTokenBudget :: Maybe Word64,
+    -- | No-progress circuit-breaker: after @2*limit@ edit-free round-trips the turn hard-stops with
+    -- @Done (Other "no_progress")@; a nudge is injected at @limit@. 'Nothing' disables it.
+    acNoProgressLimit :: Maybe Int
   }
 
 -- | Sensible defaults: 12 steps, 4096 max tokens, no forced thinking, the default system prompt, no
--- context-eviction ceiling, no cheap\/advisor model (escalate-after 2).
+-- context-eviction ceiling, no cheap\/advisor model (escalate-after 2), unbounded budget, no
+-- no-progress breaker.
 defaultAgentConfig :: Text -> AgentConfig
-defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing Nothing Nothing 2 Nothing
+defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing Nothing Nothing 2 Nothing Nothing Nothing
 
 -- | A per-position __circuit breaker__ for the fallback chain, shared across turns so a dead model
 -- isn't re-probed every turn. Position @0@ is the primary; position @i>0@ is @fallbacks !! (i-1)@.
@@ -276,7 +284,7 @@ runLoopSeeded agent allowed initial emit = do
   -- Fallback cursor start: the first chain position the cross-turn breaker isn't currently demoting,
   -- so a persistently-down primary isn't re-timed every turn. Sticky within the turn (only advances).
   startCursor <- cbFirstAvailable (agBreaker agent) (length (agFallbacks agent))
-  result <- go effThinking usageRef stepRef knobs maxToolBytesRef startCursor seeded 0
+  result <- go effThinking usageRef stepRef knobs maxToolBytesRef startCursor seeded 0 0
   finalUsage <- readIORef usageRef
   steps <- readIORef stepRef
   maxToolBytes <- readIORef maxToolBytesRef
@@ -308,8 +316,16 @@ runLoopSeeded agent allowed initial emit = do
     fallbacksLen :: Int
     fallbacksLen = length (agFallbacks agent)
 
-    go :: Maybe ThinkingLevel -> IORef Usage -> IORef Int -> Knobs -> IORef Int -> Int -> [Message] -> Int -> IO (Either AgentError [Message])
-    go effThinking usageRef stepRef knobs maxRef cursor msgs step
+    -- Whether an edit tool ran successfully this round (resets the no-progress streak).
+    edited :: PendingCall -> (Text, Text, Bool) -> Bool
+    edited (_, name, _) (_, _, isErr) = name `elem` editTools && not isErr
+
+    nudgeAt, hardStop :: Int -> Bool
+    nudgeAt s = maybe False (\l -> l > 0 && s == l) (acNoProgressLimit cfg)
+    hardStop s = maybe False (\l -> l > 0 && s >= 2 * l) (acNoProgressLimit cfg)
+
+    go :: Maybe ThinkingLevel -> IORef Usage -> IORef Int -> Knobs -> IORef Int -> Int -> [Message] -> Int -> Int -> IO (Either AgentError [Message])
+    go effThinking usageRef stepRef knobs maxRef cursor msgs step streak
       | step >= acMaxSteps cfg = pure (Right msgs)
       | otherwise = do
           -- History shaping before the send (§6.3), in the Rust pipeline order: mark stale reads →
@@ -331,13 +347,24 @@ runLoopSeeded agent allowed initial emit = do
             Right (txt, calls, stop, roundUsage, cursor') -> do
               modifyIORef' usageRef (accumulateUsage roundUsage)
               writeIORef stepRef (step + 1)
-              if stop == ToolUse && not (null calls)
-                then do
-                  results <- mapM (runCall knobs maxRef) calls
-                  let assistantMsg = Message Assistant (textPart txt <> map callBlock calls)
-                      userMsg = Message User (map resultBlock results)
-                  go effThinking usageRef stepRef knobs maxRef cursor' (msgs' <> [assistantMsg, userMsg]) (step + 1)
-                else pure (Right (msgs' <> [Message Assistant blocks | let blocks = textPart txt, not (null blocks)]))
+              spent <- readIORef usageRef
+              -- Whole-task budget ceiling (§6.4): stop once the cost-weighted total exceeds it.
+              if maybe False (usageCost spent defaultCostWeights >) (acTokenBudget cfg)
+                then pure (Left AEBudgetExceeded)
+                else
+                  if stop == ToolUse && not (null calls)
+                    then do
+                      results <- mapM (runCall knobs maxRef) calls
+                      -- No-progress breaker: an edit resets the streak; a nudge is injected once at
+                      -- the limit; the turn hard-stops (Done no_progress) at twice the limit.
+                      let streak' = if or (zipWith edited calls results) then 0 else streak + 1
+                          assistantMsg = Message Assistant (textPart txt <> map callBlock calls)
+                          userMsg = Message User (map resultBlock results <> [TextBlock noProgressNudge False | nudgeAt streak'])
+                          transcript = msgs' <> [assistantMsg, userMsg]
+                      if hardStop streak'
+                        then emit (Done (Ev.Other "no_progress")) >> pure (Right transcript)
+                        else go effThinking usageRef stepRef knobs maxRef cursor' transcript (step + 1) streak'
+                    else pure (Right (msgs' <> [Message Assistant blocks | let blocks = textPart txt, not (null blocks)]))
 
     -- The §6.3 pipeline: stale-reads → dedup (both lossless) → compact (best-effort) → evict-to-fit
     -- (only when a context limit is configured).
@@ -524,6 +551,13 @@ advisorSystem =
 -- | Generation ceiling for the advisor plan (plans are meant to be short).
 advisorMaxTokens :: Word32
 advisorMaxTokens = 512
+
+-- | Nudge injected once when the edit-free streak reaches the no-progress limit.
+noProgressNudge :: Text
+noProgressNudge =
+  "[no-progress] You have run several turns without editing any file. If you already have enough "
+    <> "information, make the edits now, then finish — do not keep exploring. If a step failed, fix "
+    <> "that specific step."
 
 -- | Advisor pre-pass (§8): one tool-less call to 'acAdvisorModel' drafting a plan for @task@; the
 -- plan seeds the executor. 'Nothing' when the advisor is disabled, the call fails, or the plan is
