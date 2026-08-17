@@ -77,6 +77,7 @@ import Lavoisier.Provider.Xai (buildMessages)
 import Lavoisier.Provider.Xai.Sse qualified as XS
 import Lavoisier.Schedule.Cron (Civil (..), CronError (..), civilFromUnix, nextAfter, parseCron)
 import Lavoisier.Tool.Builtins
+import Lavoisier.Tool.Edit
 import Lavoisier.Tool.Registry
 import Lavoisier.Tune
 import Lavoisier.Tune.Bayes (asBayesTuner, bayesTuner, loadBayes, newBayesTuner, sampleBeta, saveBayes)
@@ -105,6 +106,7 @@ tests =
       anthropicBodyTests,
       googleTests,
       toolTests,
+      editToolTests,
       agentTests,
       compactionTests,
       section8Tests,
@@ -487,6 +489,53 @@ toolTests =
     ]
 
 -- --- Phase 4: the agent loop (offline; a stub provider drives a full tool round-trip) --------------
+
+editToolTests :: TestTree
+editToolTests =
+  testGroup
+    "edit tools"
+    [ testCase "str_replace edits a unique match and reports changed" $ withTmp "sr" $ \dir -> do
+        let f = dir </> "a.txt"
+        TIO.writeFile f "hello world\n"
+        r <- toolInvoke strReplaceTool (object ["path" .= T.pack f, "old" .= ("world" :: Text), "new" .= ("haskell" :: Text)])
+        case r of
+          Right o -> do
+            toIsError o @?= False
+            toChanged o @?= True
+            TIO.readFile f >>= (@?= "hello haskell\n")
+          Left e -> assertFailure (show e),
+      testCase "str_replace refuses a non-unique match and does not write" $ withTmp "sr2" $ \dir -> do
+        let f = dir </> "b.txt"
+        TIO.writeFile f "x x\n"
+        r <- toolInvoke strReplaceTool (object ["path" .= T.pack f, "old" .= ("x" :: Text), "new" .= ("y" :: Text)])
+        case r of
+          Right o -> do
+            toIsError o @?= True
+            TIO.readFile f >>= (@?= "x x\n") -- unchanged
+          Left e -> assertFailure (show e),
+      testCase "str_replace with replace_all changes every occurrence" $ withTmp "sr3" $ \dir -> do
+        let f = dir </> "c.txt"
+        TIO.writeFile f "a a a\n"
+        r <- toolInvoke strReplaceTool (object ["path" .= T.pack f, "old" .= ("a" :: Text), "new" .= ("b" :: Text), "replace_all" .= True])
+        case r of
+          Right o -> do
+            toChanged o @?= True
+            TIO.readFile f >>= (@?= "b b b\n")
+          Left e -> assertFailure (show e),
+      testCase "edit_files applies an anchored replace" $ withTmp "ef" $ \dir -> do
+        let f = dir </> "d.txt"
+        TIO.writeFile f "line one\nline two\n"
+        let edit = object ["anchor" .= Anc.anchorOf "line two", "op" .= ("replace" :: Text), "text" .= ("LINE TWO" :: Text)]
+            files = [object ["path" .= T.pack f, "edits" .= [edit]]]
+        r <- toolInvoke editFilesTool (object ["files" .= files])
+        case r of
+          Right o -> do
+            toChanged o @?= True
+            c <- TIO.readFile f
+            assertBool "replaced" ("LINE TWO" `T.isInfixOf` c)
+            assertBool "old gone" (not ("line two" `T.isInfixOf` c))
+          Left e -> assertFailure (show e)
+    ]
 
 agentTests :: TestTree
 agentTests =

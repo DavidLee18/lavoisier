@@ -76,6 +76,7 @@ library
     Lavoisier.Provider.Xai
     Lavoisier.Provider.Xai.Sse
     Lavoisier.Tool.Builtins
+    Lavoisier.Tool.Edit
     Lavoisier.Tool.Registry
     Lavoisier.Tune
     Lavoisier.Tune.Bayes
