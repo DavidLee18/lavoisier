@@ -106,6 +106,7 @@ tests =
       googleTests,
       toolTests,
       agentTests,
+      compactionTests,
       fallbackTests,
       contextTests,
       treeSitterTests,
@@ -577,6 +578,69 @@ agentTests =
           _ -> assertFailure "not an object"
         let a = object ["path" .= ("x" :: Text)]
         applyKnobsToArgs knobs "read_file" a @?= a
+    ]
+
+-- --- history compaction (§6.3): dedup + summarise-the-middle ---------------------------------------
+
+compactionTests :: TestTree
+compactionTests =
+  testGroup
+    "history compaction"
+    [ testCase "dedupToolResults collapses a repeated large result, keeps the newest" $ do
+        let big = T.replicate 300 "y" -- > dedupMinBytes (200)
+            hist =
+              [ userMessage "task",
+                Message Assistant [ToolUseBlock "1" "read_file" (object [])],
+                Message User [ToolResultBlock "1" big False],
+                Message Assistant [ToolUseBlock "2" "read_file" (object [])],
+                Message User [ToolResultBlock "2" big False]
+              ]
+            contents = [c | Message _ bs <- dedupToolResults hist, ToolResultBlock _ c _ <- bs]
+        -- newest (last) kept verbatim; the older identical copy becomes a pointer.
+        contents @?= ["[duplicate of a more recent identical result, 300 bytes]", big],
+      testCase "dedupToolResults leaves small results alone" $ do
+        let small = "tiny" -- < 200 bytes
+            hist =
+              [ Message User [ToolResultBlock "1" small False],
+                Message User [ToolResultBlock "2" small False]
+              ]
+            contents = [c | Message _ bs <- dedupToolResults hist, ToolResultBlock _ c _ <- bs]
+        contents @?= [small, small],
+      testCase "compaction summarises the middle once history outgrows compactAfter" $ do
+        let big = T.replicate 400 "z"
+            mkPair i =
+              [ Message Assistant [ToolUseBlock (T.pack (show i)) "read_file" (object [])],
+                Message User [ToolResultBlock (T.pack (show i)) (big <> T.pack (show i)) False]
+              ]
+            seed = userMessage "the original task" : concatMap mkPair [1 .. 3 :: Int] -- 7 messages
+            stub =
+              Provider
+                { providerStream = \req -> do
+                    let evs =
+                          if null (crTools req)
+                            then [TextDelta "SUMMARY: read files 1-3", Usage emptyUsage, Done EndTurn]
+                            else [TextDelta "final answer", Usage emptyUsage, Done EndTurn]
+                    s <- fromList (map Right evs)
+                    pure (Right s),
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+            tuner =
+              Tn.Tuner
+                { Tn.tunerSelect = \_ -> pure Tn.defaultKnobs {Tn.compactAfter = 1},
+                  Tn.tunerObserve = \_ _ _ -> pure ()
+                }
+        agent <- mkAgent stub withBuiltins (defaultAgentConfig "stub-model") tuner Nothing
+        r <- runLoopSeeded agent Nothing seed (const (pure ()))
+        case r of
+          Left e -> assertFailure ("loop failed: " <> show e)
+          Right msgs -> do
+            let texts = [c | Message _ bs <- msgs, TextBlock c _ <- bs]
+                results = [c | Message _ bs <- msgs, ToolResultBlock _ c _ <- bs]
+            assertBool "compaction note present" (any ("[Earlier conversation compacted to save tokens]" `T.isInfixOf`) texts)
+            assertBool "the summary text is in the note" (any ("SUMMARY: read files 1-3" `T.isInfixOf`) texts)
+            assertBool "summarised pair-1 result elided" (not (any ((big <> "1") `T.isInfixOf`) results))
+            assertBool "recent pair-3 result kept verbatim" (any ((big <> "3") `T.isInfixOf`) results)
     ]
 
 -- --- fallback chain (offline; scripted providers + the cross-turn circuit breaker) ---------------

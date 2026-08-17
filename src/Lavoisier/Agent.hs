@@ -21,23 +21,29 @@ module Lavoisier.Agent
     agentHandle,
     defaultSystemPrompt,
     applyKnobsToArgs,
+    dedupToolResults,
+    historyTokens,
   )
 where
 
 import Control.Concurrent (forkIO)
 import Control.Concurrent.Chan
 import Control.Monad (replicateM)
-import Data.Aeson (Value (..), decodeStrict, object, toJSON)
+import Data.Aeson (Value (..), decodeStrict, encode, object, toJSON)
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as BS
+import Data.ByteString.Lazy qualified as BL
 import Data.IORef
+import Data.List (mapAccumL)
 import Data.Maybe (fromMaybe)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding (encodeUtf8)
+import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Data.Vector qualified as V
 import Data.Word (Word32)
 import GHC.Clock (getMonotonicTime)
+import Lavoisier.Context.Tokens (estimateTokens)
 import Lavoisier.Protocol.Agent
 import Lavoisier.Protocol.Deliberate
   ( Deliberation (..),
@@ -283,10 +289,15 @@ runLoopSeeded agent allowed initial emit = do
     go effThinking usageRef stepRef knobs maxRef cursor msgs step
       | step >= acMaxSteps cfg = pure (Right msgs)
       | otherwise = do
+          -- History shaping before the send (§6.3): dedup byte-identical tool results (lossless),
+          -- then, once the transcript outgrows the compactAfter knob, summarise the middle turns via
+          -- a tool-less call (its tokens fold into the turn usage). The shrunk history carries into
+          -- the recursion so the saving persists, not just this one request.
+          msgs' <- maybeCompact knobs usageRef msgs
           let buildReq model =
                 (chatRequest model)
                   { crSystem = Just system,
-                    crMessages = msgs,
+                    crMessages = msgs',
                     crTools = defs,
                     crMaxTokens = acMaxTokens cfg,
                     crThinking = effThinking
@@ -302,8 +313,21 @@ runLoopSeeded agent allowed initial emit = do
                   results <- mapM (runCall knobs maxRef) calls
                   let assistantMsg = Message Assistant (textPart txt <> map callBlock calls)
                       userMsg = Message User (map resultBlock results)
-                  go effThinking usageRef stepRef knobs maxRef cursor' (msgs <> [assistantMsg, userMsg]) (step + 1)
-                else pure (Right (msgs <> [Message Assistant blocks | let blocks = textPart txt, not (null blocks)]))
+                  go effThinking usageRef stepRef knobs maxRef cursor' (msgs' <> [assistantMsg, userMsg]) (step + 1)
+                else pure (Right (msgs' <> [Message Assistant blocks | let blocks = textPart txt, not (null blocks)]))
+
+    -- Dedup always (cheap, lossless), then compact when over the knob (best-effort — a failed or
+    -- too-small compaction leaves the deduped history unchanged).
+    maybeCompact :: Knobs -> IORef Usage -> [Message] -> IO [Message]
+    maybeCompact knobs usageRef msgs
+      | historyTokens deduped > compactAfter knobs = do
+          mc <- compactHistory (agProvider agent) cfg deduped
+          case mc of
+            Just (h, u) -> modifyIORef' usageRef (accumulateUsage u) >> pure h
+            Nothing -> pure deduped
+      | otherwise = pure deduped
+      where
+        deduped = dedupToolResults msgs
 
     -- Fallback-aware send: try the model at `cursor`, then each remaining fallback in order. We only
     -- switch models *before any output has been forwarded* this round-trip — a stream-open error, or
@@ -437,6 +461,136 @@ parseArgs :: Text -> Value
 parseArgs s =
   let s' = if T.null (T.strip s) then "{}" else s
    in fromMaybe (object []) (decodeStrict (encodeUtf8 s'))
+
+-- --- history compaction (§6.3) --------------------------------------------------------------------
+
+-- | Trailing (assistant, tool-result) turn-pairs kept verbatim when compacting.
+keepRecentTurns :: Int
+keepRecentTurns = 2
+
+-- | Generation ceiling for a compaction summary (summaries are meant to be short).
+summaryMaxTokens :: Word32
+summaryMaxTokens = 512
+
+-- | Tool results at or below this byte size are never deduplicated — the saving isn't worth churn.
+dedupMinBytes :: Int
+dedupMinBytes = 200
+
+-- | System prompt for the compaction summariser: terse, structured, fact-preserving.
+compactionSystem :: Text
+compactionSystem =
+  "You compress a coding agent's transcript so it can keep working with fewer tokens. Produce a "
+    <> "terse note that preserves: files inspected or edited (with their paths), key findings, "
+    <> "decisions made, and any steps still pending. Use short bullet lines. Omit pleasantries and "
+    <> "reasoning narration. Output only the note."
+
+-- | Media blocks aren't text; approximate their prompt footprint with this placeholder.
+mediaProxy :: Text
+mediaProxy = "[media block ~1500 tokens placeholder]"
+
+-- | Estimate the token footprint of the whole transcript (tool-call args + tool results dominate) —
+-- the trigger for compaction.
+historyTokens :: [Message] -> Int
+historyTokens = sum . map (estimateTokens . proxyText)
+
+-- | A message flattened to a text proxy for token estimation.
+proxyText :: Message -> Text
+proxyText (Message _ blocks) = T.unwords (map blockProxy blocks)
+  where
+    blockProxy = \case
+      TextBlock t _ -> t
+      ThinkingBlock t -> t
+      ToolUseBlock _ n inp -> n <> renderJson inp
+      ToolResultBlock _ c _ -> c
+      ImageBlock _ -> mediaProxy
+      DocumentBlock _ _ -> mediaProxy
+
+-- | Render messages to a plain-text transcript for the summariser (tool blocks flattened to text,
+-- since the summary request advertises no tools).
+renderTranscript :: [Message] -> Text
+renderTranscript = T.concat . map renderMsg
+  where
+    renderMsg (Message role blocks) = T.concat (map (renderBlock (roleLabel role)) blocks)
+    roleLabel User = "user"
+    roleLabel Assistant = "assistant"
+    renderBlock role = \case
+      TextBlock t _ -> role <> ": " <> t <> "\n"
+      ThinkingBlock t -> role <> ": " <> t <> "\n"
+      ToolUseBlock _ n inp -> role <> " called " <> n <> "(" <> renderJson inp <> ")\n"
+      ToolResultBlock _ c err -> "tool result" <> (if err then " (error)" else "") <> ": " <> c <> "\n"
+      ImageBlock _ -> role <> ": [image]\n"
+      DocumentBlock _ _ -> role <> ": [document]\n"
+
+-- | Collapse byte-identical tool-result content that appears more than once (e.g. the same file
+-- read\/outlined twice unchanged). Walking newest→oldest, the most recent copy is kept verbatim and
+-- earlier identical copies become a short pointer. Small results and existing placeholders are left
+-- alone; @tool_use@\/@tool_result@ structure is preserved.
+dedupToolResults :: [Message] -> [Message]
+dedupToolResults msgs = reverse (go' Set.empty (reverse msgs))
+  where
+    go' _ [] = []
+    go' seen (Message role blocks : rest) =
+      let (seen', blocks') = mapAccumL dedupBlock seen blocks
+       in Message role blocks' : go' seen' rest
+    dedupBlock seen b@(ToolResultBlock i content err)
+      | nbytes content < dedupMinBytes
+          || "[evicted" `T.isPrefixOf` content
+          || "[duplicate" `T.isPrefixOf` content =
+          (seen, b)
+      | Set.member content seen =
+          (seen, ToolResultBlock i ("[duplicate of a more recent identical result, " <> tshow (nbytes content) <> " bytes]") err)
+      | otherwise = (Set.insert content seen, b)
+    dedupBlock seen b = (seen, b)
+    nbytes = BS.length . encodeUtf8
+
+-- | Summarise the middle of @history@ into one note via a tool-less provider call. Returns 'Nothing'
+-- (leaving history untouched) if there is too little to compact or the summary is empty\/failed. The
+-- task message and the last @2*keepRecentTurns@ messages are kept verbatim; the slice between them is
+-- replaced by a single user note. The cut lands on a turn boundary so an assistant @tool_use@ is
+-- never split from its @tool_result@.
+compactHistory :: Provider -> AgentConfig -> [Message] -> IO (Maybe ([Message], Usage))
+compactHistory prov cfg history = case history of
+  (h0 : _)
+    | length history >= keep + 3 -> do
+        let cutEnd = length history - keep
+            prefix = take (cutEnd - 1) (drop 1 history)
+            req =
+              (chatRequest (acModel cfg))
+                { crSystem = Just (SystemPrompt compactionSystem True),
+                  crMessages = [userMessage (renderTranscript prefix)],
+                  crMaxTokens = summaryMaxTokens
+                }
+        r <- toollessCall prov req
+        pure $ case r of
+          Just (summary, usage)
+            | not (T.null (T.strip summary)) ->
+                let note = userMessage ("[Earlier conversation compacted to save tokens]\n" <> summary)
+                 in Just (h0 : note : drop cutEnd history, usage)
+          _ -> Nothing
+  _ -> pure Nothing
+  where
+    keep = 2 * keepRecentTurns
+
+-- | Run one tool-less provider request, collecting streamed text and the (last) usage. 'Nothing' on
+-- a stream-open error or any mid-stream error (mirrors the Rust compaction\/advisor drain).
+toollessCall :: Provider -> ChatRequest -> IO (Maybe (Text, Usage))
+toollessCall prov req = do
+  est <- providerStream prov req
+  case est of
+    Left _ -> pure Nothing
+    Right stream -> drainSummary stream "" emptyUsage
+  where
+    drainSummary stream acc usg =
+      nextItem stream >>= \case
+        Nothing -> pure (Just (acc, usg))
+        Just (Left _) -> pure Nothing
+        Just (Right (TextDelta t)) -> drainSummary stream (acc <> t) usg
+        Just (Right (Usage u)) -> drainSummary stream acc u
+        Just (Right _) -> drainSummary stream acc usg
+
+-- | A JSON value rendered to compact text (for token-proxy\/transcript rendering).
+renderJson :: Value -> Text
+renderJson = decodeUtf8Lenient . BL.toStrict . encode
 
 -- | Apply the knobs the agent enforces directly on a tool call's arguments (§6.6\/§6.1): inject the
 -- tuned skeleton radius into an @outline_*@ call that focuses a symbol but left @radius@ unset, and
