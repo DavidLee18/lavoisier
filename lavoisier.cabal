@@ -67,6 +67,7 @@ library
     Lavoisier.Protocol.Stream
     Lavoisier.Protocol.Tool
     Lavoisier.Protocol.Tune
+    Lavoisier.Schedule
     Lavoisier.Schedule.Cron
     Lavoisier.Provider.Anthropic
     Lavoisier.Provider.Anthropic.Sse

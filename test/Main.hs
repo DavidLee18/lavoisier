@@ -79,6 +79,7 @@ import Lavoisier.Provider.Google.Sse qualified as GS
 import Lavoisier.Provider.Xai (buildMessages)
 import Lavoisier.Provider.Xai.Grpc qualified as XG
 import Lavoisier.Provider.Xai.Sse qualified as XS
+import Lavoisier.Schedule qualified as Sch
 import Lavoisier.Schedule.Cron (Civil (..), CronError (..), civilFromUnix, nextAfter, parseCron)
 import Lavoisier.Tool.Builtins
 import Lavoisier.Tool.Edit
@@ -137,6 +138,7 @@ tests =
       legionTests,
       slackTests,
       cronTests,
+      scheduleTests,
       xaiTests,
       xaiGrpcTests,
       matrixTests
@@ -2018,6 +2020,56 @@ slackTests =
     t = id :: Text -> Text
 
 -- --- Phase 18: cron engine + gateway (offline; ports lvz-schedule cron.rs + lvz-gw-cron) ----------
+
+scheduleTests :: TestTree
+scheduleTests =
+  testGroup
+    "schedule (jobs + registry + tools)"
+    [ testCase "parseScheduleFile builds tool + prompt jobs with defaults" $ do
+        let json = "[{\"id\":\"disk\",\"schedule\":\"0 * * * *\",\"tool\":\"shell\",\"args\":{\"command\":\"df\"}},{\"id\":\"digest\",\"schedule\":\"0 9 * * *\",\"prompt\":\"summarize\"}]"
+        js <- either (assertFailure . show) pure (Sch.parseScheduleFile json 2 30)
+        map Sch.sjId js @?= ["disk", "digest"]
+        case js of
+          (a : b : _) -> do
+            Sch.sjAction a @?= Sch.ActTool "shell" (object ["command" .= ("df" :: Text)])
+            Sch.sjSession a @?= "schedule-disk" -- default session
+            Sch.sjRetryMax a @?= 2 -- global default applied
+            Sch.sjAction b @?= Sch.ActPrompt "summarize"
+          _ -> assertFailure "expected two jobs",
+      testCase "parseScheduleFile rejects ambiguous action / duplicate id / bad cron" $ do
+        let bad e j = case Sch.parseScheduleFile j 0 0 of Left err | err == e -> pure (); other -> assertFailure ("expected " <> show e <> ", got " <> show (fmap (map Sch.sjId) other))
+        bad (Sch.SceAction "x") "[{\"id\":\"x\",\"schedule\":\"* * * * *\"}]"
+        bad (Sch.SceDuplicateId "x") "[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"tool\":\"t\"},{\"id\":\"x\",\"schedule\":\"* * * * *\",\"prompt\":\"p\"}]"
+        case Sch.parseScheduleFile "[{\"id\":\"x\",\"schedule\":\"nonsense\",\"prompt\":\"p\"}]" 0 0 of
+          Left (Sch.SceCron "x" _) -> pure ()
+          other -> assertFailure ("expected SceCron, got " <> show (fmap (map Sch.sjId) other)),
+      testCase "recordOutcome tracks runs/failures/streak and retry scheduling" $ do
+        js <- either (assertFailure . show) pure (Sch.parseScheduleFile "[{\"id\":\"j\",\"schedule\":\"* * * * *\",\"prompt\":\"p\",\"retry_max\":1,\"retry_wait\":60}]" 0 0)
+        let j = js !! 0
+        reg <- Sch.newRegistry 0 js
+        Sch.recordOutcome reg 100 j (Left "boom") -- attempt 1, retry (1<=1)
+        s1 <- maybe (assertFailure "no state") pure =<< Sch.stateOf reg "j"
+        (Sch.jsRuns s1, Sch.jsFailures s1, Sch.jsConsecutiveFailures s1) @?= (1, 1, 1)
+        Sch.jsRetryAt s1 @?= Just 160
+        Sch.jsNextDue s1 @?= Nothing -- cron slot suppressed during a retry chain
+        Sch.recordOutcome reg 200 j (Left "boom2") -- attempt 2, retries exhausted
+        s2 <- maybe (assertFailure "no state") pure =<< Sch.stateOf reg "j"
+        Sch.jsRetryAt s2 @?= Nothing
+        assertBool "next cron slot rearmed" (Sch.jsNextDue s2 /= Nothing)
+        Sch.recordOutcome reg 300 j (Right "ok") -- success resets the streak
+        s3 <- maybe (assertFailure "no state") pure =<< Sch.stateOf reg "j"
+        Sch.jsConsecutiveFailures s3 @?= 0,
+      testCase "schedule_run queues a known job and errors on an unknown one" $ do
+        js <- either (assertFailure . show) pure (Sch.parseScheduleFile "[{\"id\":\"j\",\"schedule\":\"* * * * *\",\"prompt\":\"p\"}]" 0 0)
+        reg <- Sch.newRegistry 0 js
+        let runTool = Sch.scheduleTools reg !! 2 -- list, status, run
+        r1 <- toolInvoke runTool (object ["id" .= ("j" :: Text)])
+        either (assertFailure . show) (\o -> toIsError o @?= False) r1
+        q <- Sch.takeRequested reg
+        q @?= [0]
+        r2 <- toolInvoke runTool (object ["id" .= ("nope" :: Text)])
+        either (assertFailure . show) (\o -> toIsError o @?= True) r2
+    ]
 
 cronTests :: TestTree
 cronTests =
