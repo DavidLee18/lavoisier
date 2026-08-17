@@ -10,6 +10,7 @@
 , thinking = None Text -- "off" | "low" | "medium" | "high"
 , maxTokens = None Natural -- generated-token ceiling
 , maxSteps = Some 12 -- agent tool-loop step budget
+, contextLimit = None Natural -- per-request token ceiling; evict oldest tool output when exceeded
 , serve = None Natural -- HTTP gateway port (POST /v1/turns, GET /health)
 , serveA2a = None Natural -- A2A gateway port
 , serveAcp = None Natural -- ACP gateway port

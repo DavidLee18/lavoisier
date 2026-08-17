@@ -640,7 +640,35 @@ compactionTests =
             assertBool "compaction note present" (any ("[Earlier conversation compacted to save tokens]" `T.isInfixOf`) texts)
             assertBool "the summary text is in the note" (any ("SUMMARY: read files 1-3" `T.isInfixOf`) texts)
             assertBool "summarised pair-1 result elided" (not (any ((big <> "1") `T.isInfixOf`) results))
-            assertBool "recent pair-3 result kept verbatim" (any ((big <> "3") `T.isInfixOf`) results)
+            assertBool "recent pair-3 result kept verbatim" (any ((big <> "3") `T.isInfixOf`) results),
+      testCase "markStaleReads elides a read superseded by a later edit of the same file" $ do
+        let big = T.replicate 300 "r"
+            hist =
+              [ userMessage "task",
+                Message Assistant [ToolUseBlock "r1" "read_file" (object ["path" .= ("a.rs" :: Text)])],
+                Message User [ToolResultBlock "r1" big False],
+                Message Assistant [ToolUseBlock "e1" "write_file" (object ["path" .= ("a.rs" :: Text), "content" .= ("new" :: Text)])],
+                Message User [ToolResultBlock "e1" "wrote 3 bytes to a.rs" False]
+              ]
+            results = [c | Message _ bs <- markStaleReads hist, ToolResultBlock _ c _ <- bs]
+        assertBool "read result marked stale" (any ("[stale: a.rs was edited" `T.isInfixOf`) results)
+        assertBool "original read bytes elided" (not (any (big `T.isInfixOf`) results)),
+      testCase "markStaleReads leaves a read with no later edit intact" $ do
+        let big = T.replicate 300 "r"
+            hist =
+              [ Message Assistant [ToolUseBlock "r1" "read_file" (object ["path" .= ("b.rs" :: Text)])],
+                Message User [ToolResultBlock "r1" big False]
+              ]
+        markStaleReads hist @?= hist,
+      testCase "evictToFit evicts oldest tool output until under the limit, keeps recent" $ do
+        let big = T.intercalate " " (replicate 200 "lorem")
+            pair i = [Message Assistant [ToolUseBlock (T.pack (show i)) "shell" (object [])], Message User [ToolResultBlock (T.pack (show i)) big False]]
+            hist = userMessage "task" : concatMap pair [1 .. 4 :: Int] -- 9 messages; protected window = last 4
+            out = evictToFit 50 hist
+            evicted = [c | Message _ bs <- out, ToolResultBlock _ c _ <- bs, "[evicted" `T.isInfixOf` c]
+            recent = [c | Message _ bs <- drop (length out - 2) out, ToolResultBlock _ c _ <- bs]
+        assertBool "some oldest results evicted" (not (null evicted))
+        assertBool "the most recent result is kept verbatim" (any (big `T.isInfixOf`) recent)
     ]
 
 -- --- fallback chain (offline; scripted providers + the cross-turn circuit breaker) ---------------

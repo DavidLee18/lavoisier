@@ -22,6 +22,8 @@ module Lavoisier.Agent
     defaultSystemPrompt,
     applyKnobsToArgs,
     dedupToolResults,
+    markStaleReads,
+    evictToFit,
     historyTokens,
   )
 where
@@ -30,11 +32,13 @@ import Control.Concurrent (forkIO)
 import Control.Concurrent.Chan
 import Control.Monad (replicateM)
 import Data.Aeson (Value (..), decodeStrict, encode, object, toJSON)
+import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef
 import Data.List (mapAccumL)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -74,12 +78,16 @@ data AgentConfig = AgentConfig
     acMaxTokens :: Word32,
     acThinking :: Maybe ThinkingLevel,
     -- | System prompt; 'Nothing' uses 'defaultSystemPrompt'.
-    acSystem :: Maybe Text
+    acSystem :: Maybe Text,
+    -- | Per-request token ceiling for the context-budget manager (§6.3). When set and still
+    -- exceeded after compaction, the oldest tool-result content is evicted. 'Nothing' ⇒ no eviction.
+    acContextLimit :: Maybe Int
   }
 
--- | Sensible defaults: 12 steps, 4096 max tokens, no forced thinking, the default system prompt.
+-- | Sensible defaults: 12 steps, 4096 max tokens, no forced thinking, the default system prompt, no
+-- context-eviction ceiling.
 defaultAgentConfig :: Text -> AgentConfig
-defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing
+defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing Nothing
 
 -- | A per-position __circuit breaker__ for the fallback chain, shared across turns so a dead model
 -- isn't re-probed every turn. Position @0@ is the primary; position @i>0@ is @fallbacks !! (i-1)@.
@@ -289,11 +297,11 @@ runLoopSeeded agent allowed initial emit = do
     go effThinking usageRef stepRef knobs maxRef cursor msgs step
       | step >= acMaxSteps cfg = pure (Right msgs)
       | otherwise = do
-          -- History shaping before the send (§6.3): dedup byte-identical tool results (lossless),
-          -- then, once the transcript outgrows the compactAfter knob, summarise the middle turns via
-          -- a tool-less call (its tokens fold into the turn usage). The shrunk history carries into
-          -- the recursion so the saving persists, not just this one request.
-          msgs' <- maybeCompact knobs usageRef msgs
+          -- History shaping before the send (§6.3), in the Rust pipeline order: mark stale reads →
+          -- dedup byte-identical results (both lossless) → compact the middle once over the
+          -- compactAfter knob (tokens fold into the turn usage) → evict oldest results if a
+          -- context-limit ceiling is still exceeded. The shrunk history carries into the recursion.
+          msgs' <- shapeHistory knobs usageRef msgs
           let buildReq model =
                 (chatRequest model)
                   { crSystem = Just system,
@@ -316,18 +324,20 @@ runLoopSeeded agent allowed initial emit = do
                   go effThinking usageRef stepRef knobs maxRef cursor' (msgs' <> [assistantMsg, userMsg]) (step + 1)
                 else pure (Right (msgs' <> [Message Assistant blocks | let blocks = textPart txt, not (null blocks)]))
 
-    -- Dedup always (cheap, lossless), then compact when over the knob (best-effort — a failed or
-    -- too-small compaction leaves the deduped history unchanged).
-    maybeCompact :: Knobs -> IORef Usage -> [Message] -> IO [Message]
-    maybeCompact knobs usageRef msgs
-      | historyTokens deduped > compactAfter knobs = do
-          mc <- compactHistory (agProvider agent) cfg deduped
-          case mc of
-            Just (h, u) -> modifyIORef' usageRef (accumulateUsage u) >> pure h
-            Nothing -> pure deduped
-      | otherwise = pure deduped
-      where
-        deduped = dedupToolResults msgs
+    -- The §6.3 pipeline: stale-reads → dedup (both lossless) → compact (best-effort) → evict-to-fit
+    -- (only when a context limit is configured).
+    shapeHistory :: Knobs -> IORef Usage -> [Message] -> IO [Message]
+    shapeHistory knobs usageRef msgs = do
+      let shrunk = dedupToolResults (markStaleReads msgs)
+      compacted <-
+        if historyTokens shrunk > compactAfter knobs
+          then do
+            mc <- compactHistory (agProvider agent) cfg shrunk
+            case mc of
+              Just (h, u) -> modifyIORef' usageRef (accumulateUsage u) >> pure h
+              Nothing -> pure shrunk
+          else pure shrunk
+      pure $ maybe compacted (`evictToFit` compacted) (acContextLimit cfg)
 
     -- Fallback-aware send: try the model at `cursor`, then each remaining fallback in order. We only
     -- switch models *before any output has been forwarded* this round-trip — a stream-open error, or
@@ -542,6 +552,107 @@ dedupToolResults msgs = reverse (go' Set.empty (reverse msgs))
       | otherwise = (Set.insert content seen, b)
     dedupBlock seen b = (seen, b)
     nbytes = BS.length . encodeUtf8
+
+-- | Tools whose result is file content that goes stale once the file is edited.
+readTools :: [Text]
+readTools = ["read_file", "read_files", "read_anchored", "outline_file", "outline_files"]
+
+-- | Tools that edit a file (their success supersedes earlier reads of the same path).
+editTools :: [Text]
+editTools = ["str_replace", "edit_anchored", "edit_files", "write_file", "batch_edit"]
+
+-- | Every file path referenced in a tool call's args — @path@ (string) and @paths@ (array) at any
+-- nesting depth (so a nested @edits[].path@ is captured too).
+collectPaths :: Value -> [Text]
+collectPaths (Object m) = concatMap fromKey (KM.toList m)
+  where
+    fromKey (k, val) = case K.toText k of
+      "path" -> case val of String s -> [s]; _ -> []
+      "paths" -> case val of Array a -> [s | String s <- V.toList a]; _ -> []
+      _ -> collectPaths val
+collectPaths (Array a) = concatMap collectPaths (V.toList a)
+collectPaths _ = []
+
+-- | Staleness-aware eviction (§6.3): once a file has been successfully edited, replace each earlier
+-- read\/outline of that same path with a short "[stale: …]" pointer (the carried bytes are now
+-- wrong). The most recent read of a path (with no later edit), non-read results, small results,
+-- errored results, and already-elided placeholders are left intact.
+markStaleReads :: [Message] -> [Message]
+markStaleReads history
+  | Map.null lastEdit = history
+  | otherwise = map reviseMsg history
+  where
+    -- Pass 1: linear index of read/edit calls (id → (position, isRead, isEdit, paths)) + errored ids.
+    -- A position is assigned to every tool-use block in transcript order (as in Rust).
+    (calls, errored) = indexCalls 0 Map.empty Set.empty (concatMap (\(Message _ bs) -> bs) history)
+    indexCalls _ cs es [] = (cs, es)
+    indexCalls pos cs es (b : bs) = case b of
+      ToolUseBlock i n inp ->
+        let isRead = n `elem` readTools
+            isEdit = n `elem` editTools
+            cs' =
+              if isRead || isEdit
+                then Map.insert i (pos, isRead, isEdit, collectPaths inp) cs
+                else cs
+         in indexCalls (pos + 1) cs' es bs
+      ToolResultBlock tid _ err -> indexCalls pos cs (if err then Set.insert tid es else es) bs
+      _ -> indexCalls pos cs es bs
+    -- Latest position at which each path was *successfully* edited.
+    lastEdit :: Map.Map Text Int
+    lastEdit =
+      Map.fromListWith
+        max
+        [ (p, pos)
+        | (i, (pos, _, isEdit, paths)) <- Map.toList calls,
+          isEdit,
+          not (Set.member i errored),
+          p <- paths
+        ]
+    reviseMsg (Message role bs) = Message role (map reviseBlock bs)
+    reviseBlock b@(ToolResultBlock tid content err)
+      | err || nbytes content < dedupMinBytes || "[" `T.isPrefixOf` content = b
+      | otherwise = case Map.lookup tid calls of
+          Just (pos, True, _, paths) ->
+            case [p | p <- paths, maybe False (> pos) (Map.lookup p lastEdit)] of
+              (stalePath : _) ->
+                ToolResultBlock
+                  tid
+                  ("[stale: " <> stalePath <> " was edited after this read; " <> tshow (nbytes content) <> " bytes elided — re-read it if you need the current contents]")
+                  err
+              [] -> b
+          _ -> b
+    reviseBlock b = b
+    nbytes = BS.length . encodeUtf8
+
+-- | Context-budget eviction (§6.3): when the transcript still exceeds @limit@ tokens (e.g. one huge
+-- recent result compaction can't touch), replace the /content/ of the oldest tool results (skipping
+-- the task message and the protected recent window) with a placeholder, oldest-first, until it fits
+-- or nothing more is evictable.
+evictToFit :: Int -> [Message] -> [Message]
+evictToFit limit history
+  | historyTokens history <= limit = history
+  | otherwise = evictFrom 1 history
+  where
+    evictableEnd = max 0 (length history - 2 * keepRecentTurns)
+    evictFrom i hist
+      | i >= evictableEnd = hist
+      | otherwise =
+          let (hist', changed) = evictAt i hist
+           in if changed && historyTokens hist' <= limit
+                then hist'
+                else evictFrom (i + 1) hist'
+    evictAt i hist = case splitAt i hist of
+      (before, m : after) -> let (m', changed) = evictMsg m in (before ++ m' : after, changed)
+      (_, []) -> (hist, False)
+    evictMsg (Message role bs) =
+      let (bs', anyChanged) = foldr step ([], False) bs
+       in (Message role bs', anyChanged)
+      where
+        step b (acc, ch) = case b of
+          ToolResultBlock tid content err
+            | not ("[evicted" `T.isPrefixOf` content) ->
+                (ToolResultBlock tid ("[evicted: " <> tshow (BS.length (encodeUtf8 content)) <> " bytes of older tool output]") err : acc, True)
+          _ -> (b : acc, ch)
 
 -- | Summarise the middle of @history@ into one note via a tool-less provider call. Returns 'Nothing'
 -- (leaving history untouched) if there is too little to compact or the summary is empty\/failed. The
