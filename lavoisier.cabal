@@ -112,10 +112,19 @@ library
   include-dirs:
     cbits
     cbits/ts-rust
+    cbits/ts-python
+    cbits/ts-javascript
+    cbits/ts-typescript/typescript/src
   c-sources:
     cbits/lvz_ts_shim.c
     cbits/ts-rust/parser.c
     cbits/ts-rust/scanner.c
+    cbits/ts-python/parser.c
+    cbits/ts-python/scanner.c
+    cbits/ts-javascript/parser.c
+    cbits/ts-javascript/scanner.c
+    cbits/ts-typescript/typescript/src/parser.c
+    cbits/ts-typescript/typescript/src/scanner.c
 
   if flag(e2ee)
     exposed-modules: Lavoisier.Gateway.Matrix.E2ee

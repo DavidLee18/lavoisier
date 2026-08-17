@@ -6,12 +6,18 @@
 
 /* Each vendored grammar exports this symbol from its parser.c. */
 extern const TSLanguage *tree_sitter_rust(void);
+extern const TSLanguage *tree_sitter_python(void);
+extern const TSLanguage *tree_sitter_javascript(void);
+extern const TSLanguage *tree_sitter_typescript(void);
 
 struct LvzNode {
   TSNode node;
 };
 
 const TSLanguage *lvz_ts_lang_rust(void) { return tree_sitter_rust(); }
+const TSLanguage *lvz_ts_lang_python(void) { return tree_sitter_python(); }
+const TSLanguage *lvz_ts_lang_javascript(void) { return tree_sitter_javascript(); }
+const TSLanguage *lvz_ts_lang_typescript(void) { return tree_sitter_typescript(); }
 
 TSTree *lvz_ts_parse(const TSLanguage *lang, const char *src, uint32_t len) {
   TSParser *parser = ts_parser_new();

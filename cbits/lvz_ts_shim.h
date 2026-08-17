@@ -19,6 +19,9 @@ typedef struct LvzNode LvzNode;
 
 /* Grammar entry points (each vendored grammar exports `tree_sitter_<lang>`). */
 const TSLanguage *lvz_ts_lang_rust(void);
+const TSLanguage *lvz_ts_lang_python(void);
+const TSLanguage *lvz_ts_lang_javascript(void);
+const TSLanguage *lvz_ts_lang_typescript(void);
 
 /* Parse `src` (length `len` bytes) with `lang`; returns a tree to be freed with
  * lvz_tree_delete, or NULL on failure. Owns its own parser internally. */

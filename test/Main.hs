@@ -614,9 +614,11 @@ treeSitterTests =
         elision (langSpec Rust) @?= "{ … }"
         keepsDocstring (langSpec Python) @?= True
         keepsDocstring (langSpec Rust) @?= False,
-      testCase "supported: Rust is wired, other grammars pending" $ do
+      testCase "supported: all four grammars are wired" $ do
         TS.supported Rust @?= True
-        TS.supported Python @?= False,
+        TS.supported Python @?= True
+        TS.supported JavaScript @?= True
+        TS.supported TypeScript @?= True,
       testCase "parse: a Rust fn yields a named function_item with name + body fields" $ do
         let code = BS8.pack "fn add(a: i32, b: i32) -> i32 { a + b }\n"
         mroot <- TS.parse Rust code
@@ -633,9 +635,25 @@ treeSitterTests =
                   Just body -> TS.synType body @?= "block"
                   Nothing -> assertFailure "function_item has no body field"
               other -> assertFailure ("expected exactly one function_item, got " <> show (length other)),
-      testCase "parse: an unsupported language returns Nothing" $ do
-        r <- TS.parse Python (BS8.pack "def f(): pass\n")
-        r @?= Nothing
+      testCase "parse: Python finds a function_definition named greet" $ do
+        let code = BS8.pack "def greet(name):\n    return name\n"
+        mroot <- TS.parse Python code
+        case mroot of
+          Nothing -> assertFailure "expected a Python parse tree"
+          Just root -> case [n | n <- TS.descendants root, TS.synType n == "function_definition"] of
+            (fn : _) -> case TS.childByField "name" fn of
+              Just nm -> TS.nodeText code nm @?= BS8.pack "greet"
+              Nothing -> assertFailure "def has no name field"
+            [] -> assertFailure "no function_definition found",
+      testCase "parse: JavaScript and TypeScript both parse a declaration" $ do
+        jsRoot <- TS.parse JavaScript (BS8.pack "function f(x) { return x; }\n")
+        case jsRoot of
+          Just r -> assertBool "js function_declaration" (any ((== "function_declaration") . TS.synType) (TS.descendants r))
+          Nothing -> assertFailure "expected a JS parse tree"
+        tsRoot <- TS.parse TypeScript (BS8.pack "interface P { x: number }\n")
+        case tsRoot of
+          Just r -> assertBool "ts interface_declaration" (any ((== "interface_declaration") . TS.synType) (TS.descendants r))
+          Nothing -> assertFailure "expected a TS parse tree"
     ]
 
 -- --- Phase 6: the HTTP gateway (offline; WAI test harness, no socket or API) ----------------------

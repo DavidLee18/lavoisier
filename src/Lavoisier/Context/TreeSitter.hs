@@ -39,6 +39,15 @@ data LvzNode
 foreign import ccall unsafe "lvz_ts_lang_rust"
   c_lang_rust :: IO (Ptr LvzLanguage)
 
+foreign import ccall unsafe "lvz_ts_lang_python"
+  c_lang_python :: IO (Ptr LvzLanguage)
+
+foreign import ccall unsafe "lvz_ts_lang_javascript"
+  c_lang_javascript :: IO (Ptr LvzLanguage)
+
+foreign import ccall unsafe "lvz_ts_lang_typescript"
+  c_lang_typescript :: IO (Ptr LvzLanguage)
+
 foreign import ccall unsafe "lvz_ts_parse"
   c_parse :: Ptr LvzLanguage -> CString -> CUInt -> IO (Ptr LvzTree)
 
@@ -94,9 +103,9 @@ data Child = Child
 grammar :: Lang -> Maybe (IO (Ptr LvzLanguage))
 grammar = \case
   Rust -> Just c_lang_rust
-  Python -> Nothing
-  JavaScript -> Nothing
-  TypeScript -> Nothing
+  Python -> Just c_lang_python
+  JavaScript -> Just c_lang_javascript
+  TypeScript -> Just c_lang_typescript
 
 -- | Whether 'parse' can handle a language (its tree-sitter grammar is linked in).
 supported :: Lang -> Bool
