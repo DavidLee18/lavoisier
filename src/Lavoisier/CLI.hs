@@ -6,8 +6,17 @@
 -- stop reason on stderr.
 module Lavoisier.CLI
   ( runCli,
+    mainWith,
     Options (..),
     optionsParser,
+
+    -- * Custom-tool extension point (re-exported for downstream @main_with@-style crates)
+    Tool (..),
+    ToolOutput,
+    ToolError (..),
+    toolOk,
+    toolErr,
+    setChanged,
   )
 where
 
@@ -37,7 +46,7 @@ import Lavoisier.Protocol.Gateway (Gateway (..))
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider (Provider (..), ProviderError)
 import Lavoisier.Protocol.Stream (Producer (..))
-import Lavoisier.Protocol.Tool (Tool)
+import Lavoisier.Protocol.Tool (Tool (..), ToolError (..), ToolOutput, setChanged, toolErr, toolOk)
 import Lavoisier.Protocol.Tune (Tuner, noopTuner)
 import Lavoisier.Provider.Anthropic (anthropicFromEnv, newAnthropicConfig)
 import Lavoisier.Provider.Anthropic.Batch (anthropicBatch)
@@ -167,9 +176,17 @@ thinkingReader = maybeReader $ \s -> case s of
   "high" -> Just ThinkHigh
   _ -> Nothing
 
--- | Parse arguments and run the requested mode.
+-- | Parse arguments and run the requested mode with no extra tools ('mainWith' @[]@).
 runCli :: IO ()
-runCli = do
+runCli = mainWith []
+
+-- | The custom-tool extension point (the Haskell analogue of Rust @lavoisier::main_with@): the whole
+-- CLI\/gateway stack, but with @extra@ tools registered alongside the built-ins wherever tools are
+-- used (every gateway, and @--agent@). A downstream crate depends on @lavoisier@, implements 'Tool',
+-- and calls @mainWith [myTool, …]@ from its @main@. Extra tools do not apply to a one-shot @ask@
+-- (which uses no tools), matching the Rust behaviour.
+mainWith :: [Tool] -> IO ()
+mainWith extra = do
   -- Force UTF-8 on the product streams so non-ASCII output (the ε in the --tune help, the 🔧/👀
   -- gateway markers, Korean notices) never hits `commitBuffer: invalid argument` under a C locale.
   hSetEncoding stdout utf8
@@ -181,7 +198,7 @@ runCli = do
     Left e -> errExit e
     Right (prov, defModel) -> do
       let model = fromMaybe defModel (optModel opts)
-          serveWith gw = withRegistry opts model (serveGateway gw prov opts model)
+          serveWith gw = withRegistryExtra opts model extra (serveGateway gw prov opts model)
           fromEnvGateway build wrap = build >>= either (errExit . tshow) (serveWith . wrap)
       if cronActive opts
         then buildCronJobs opts >>= \jobs -> serveWith (cronGateway jobs)
@@ -199,7 +216,7 @@ runCli = do
                   -- Build the in-gateway schedule (if --schedule-file), register its schedule_* tools
                   -- into the same registry the executor gets, and hand the gateway a direct invoker.
                   msched <- buildScheduleReg opts
-                  withRegistryExtra opts model (maybe [] scheduleTools msched) $ \registry ->
+                  withRegistryExtra opts model (extra <> maybe [] scheduleTools msched) $ \registry ->
                     let mctx = fmap (\reg -> MX.ScheduleCtx reg (\n a -> invokeTool n a registry)) msched
                         gw = maybe (matrixGateway cfg) (MX.matrixScheduleGateway cfg) mctx
                      in serveGateway gw prov opts model registry
@@ -216,7 +233,7 @@ runCli = do
                       then errExit "empty prompt (pass it as arguments or on stdin)"
                       else
                         if optAgent opts
-                          then withRegistry opts model (runAgentMode prov opts model prompt)
+                          then withRegistryExtra opts model extra (runAgentMode prov opts model prompt)
                           else runAskMode prov opts model prompt
   where
     pinfo =
@@ -342,11 +359,9 @@ runAskMode prov opts model prompt = do
 -- (namespaced @\<label\>_\<tool\>@), then hand it to the continuation. Connecting only happens for
 -- tool-using modes (@--agent@ or a gateway) — a plain @ask@ spawns nothing. A bad spec or a dead
 -- server fails fast with the offending label.
-withRegistry :: Options -> Text -> (ToolRegistry -> IO ()) -> IO ()
-withRegistry opts model = withRegistryExtra opts model []
-
--- | 'withRegistry' plus @extra@ tools registered after the built-ins (used to add the @schedule_*@
--- tools alongside the schedule gateway).
+-- | Build the tool registry (MCP + batch_edit + built-ins) plus any @extra@ tools registered after
+-- the built-ins (the caller's 'mainWith' tools, and\/or the @schedule_*@ tools), and run the
+-- continuation with it.
 withRegistryExtra :: Options -> Text -> [Tool] -> (ToolRegistry -> IO ()) -> IO ()
 withRegistryExtra opts model extra k = do
   toolss <- mapM connectOne (optMcpServers opts)
