@@ -54,7 +54,7 @@ import Options.Applicative
 import System.Directory (doesFileExist)
 import System.Environment (lookupEnv)
 import System.Exit (exitFailure)
-import System.IO (hFlush, stderr, stdout)
+import System.IO (hFlush, hSetEncoding, stderr, stdout, utf8)
 
 -- | Parsed command-line options.
 data Options = Options
@@ -163,6 +163,10 @@ thinkingReader = maybeReader $ \s -> case s of
 -- | Parse arguments and run the requested mode.
 runCli :: IO ()
 runCli = do
+  -- Force UTF-8 on the product streams so non-ASCII output (the ε in the --tune help, the 🔧/👀
+  -- gateway markers, Korean notices) never hits `commitBuffer: invalid argument` under a C locale.
+  hSetEncoding stdout utf8
+  hSetEncoding stderr utf8
   opts0 <- execParser pinfo
   opts <- mergeConfig opts0
   eprov <- selectProvider (fromMaybe "anthropic" (optProvider opts))
