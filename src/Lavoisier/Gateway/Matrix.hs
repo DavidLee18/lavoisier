@@ -444,15 +444,19 @@ fireDueSchedule env agent recent ctx = do
         go seen (x : xs) = if x `elem` seen then go seen xs else go (x : seen) xs
 
 -- | Run one job's action, record the verdict (the action's — untouched by summarisation), and post a
--- report: a __failure__ goes to the room verbatim (its retry countdown must be visible); a __success__
--- may be rewritten as prose by a tool-less @summarize@ turn (degrading to the raw output on failure).
+-- report. A job with @summarize@ rewrites __both__ outcomes as room prose via a tool-less turn,
+-- prefixing the raw output with a @SUCCESS@\/@FAILURE@ first line so the instruction can branch (the
+-- deployed broadcast jobs read it) — the raw still drives the verdict, and a failed summary degrades
+-- to the raw output so a failure's cause + retry countdown always reach the room. No @summarize@ ⇒ the
+-- raw output is posted verbatim.
 fireScheduleJob :: MatrixEnv -> AgentHandle -> RecentIds -> ScheduleCtx -> ScheduleJob -> Integer -> IO ()
 fireScheduleJob env agent recent ctx job now = do
   result <- runScheduleAction agent ctx job
   recordOutcome (scRegistry ctx) now job result
-  body <- case (result, sjSummarize job) of
-    (Right raw, Just instr) -> summariseForRoom agent job instr raw
-    _ -> pure (either id id result)
+  let raw = either id id result
+  body <- case sjSummarize job of
+    Just instr -> summariseForRoom agent job instr (outcomeLine result <> raw) raw
+    Nothing -> pure raw
   -- Untruncated operator log to stderr per fire (every frontend gets it).
   hPutStrLn stderr (T.unpack ("[schedule] " <> sjId job <> " " <> either (const "FAIL") (const "ok") result <> ": " <> either id id result))
   let marker = either (const ("\10060" :: Text)) (const "\9989") result
@@ -477,14 +481,19 @@ runScheduleAction agent ctx job = case sjAction job of
       Left e -> pure (Left (tshow e))
       Right stream -> drainScheduleTurn stream
 
--- | Rewrite a successful tool result as room prose with a __tool-less__ turn (empty @allowed_tools@,
--- so the model can only write text, never act). Best-effort: any failure degrades to the raw output.
-summariseForRoom :: AgentHandle -> ScheduleJob -> Text -> Text -> IO Text
-summariseForRoom agent job instr raw = do
-  let tr = (turnRequest (sjSession job) (instr <> "\n\n" <> raw)) {trAllowedTools = Just []}
+-- | Rewrite an action result (@toSummarize@, its raw output prefixed with the outcome line) as room
+-- prose with a __tool-less__ turn (empty @allowed_tools@, so the model can only write text, never
+-- act). Best-effort: any failure of the summary turn degrades to @fallback@ (the clean raw output).
+summariseForRoom :: AgentHandle -> ScheduleJob -> Text -> Text -> Text -> IO Text
+summariseForRoom agent job instr toSummarize fallback = do
+  let tr = (turnRequest (sjSession job) (instr <> "\n\n" <> toSummarize)) {trAllowedTools = Just []}
   submit agent tr >>= \case
-    Left _ -> pure raw
-    Right stream -> either (const raw) id <$> drainScheduleTurn stream
+    Left _ -> pure fallback
+    Right stream -> either (const fallback) id <$> drainScheduleTurn stream
+
+-- | The @SUCCESS@\/@FAILURE@ first line prepended to a result before summarisation.
+outcomeLine :: Either a b -> Text
+outcomeLine = either (const "FAILURE\n") (const "SUCCESS\n")
 
 -- | Fold a turn's stream to its answer text (or a Left on a mid-stream error).
 drainScheduleTurn :: TurnStream -> IO (Either Text Text)
