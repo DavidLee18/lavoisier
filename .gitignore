@@ -8,6 +8,9 @@ reference-rust/target
 dist-newstyle/
 *.hi
 *.o
+# Per-machine / per-runner cabal overrides (the release workflow generates cabal.project.dist.local)
+cabal.project.local
+cabal.project.*.local
 
 # Secrets — never commit keys (RECIPE.md §10)
 .env
