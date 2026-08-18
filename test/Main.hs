@@ -39,7 +39,7 @@ import Lavoisier.Context.Tokens (estimateTokens)
 import Lavoisier.Context.TreeSitter qualified as TS
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
 import Lavoisier.Gateway.Acp (defaultAcpConfig, newAcpApp)
-import Lavoisier.Gateway.Cron (CronConfigError (..), CronJob (..), parseCliJob, parseFileJobs)
+import Lavoisier.Gateway.Cron (CronConfigError (..), CronJob (..), loadFileJobs, parseCliJob)
 import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp, newHttpApp, stepWindow, wsAuthorized, wsPrincipal)
 import Lavoisier.Gateway.Matrix qualified as MX
 import Lavoisier.Gateway.Slack (SlackMessage (..), parseEvent, senderAllowed, slackSession)
@@ -2188,30 +2188,57 @@ slackTests =
 
 -- --- Phase 18: cron engine + gateway (offline; ports lvz-schedule cron.rs + lvz-gw-cron) ----------
 
+-- | Write a cron Dhall file (type @C@ + default record @c@ to merge over) and load it.
+loadCron :: FilePath -> Int -> Int -> Text -> IO (Either CronConfigError [CronJob])
+loadCron dir rmax rwait body = do
+  let path = dir </> "cron.dhall"
+      preamble =
+        "let C = { schedule : Text, session : Optional Text, prompt : Text, retryMax : Optional Natural, retryWait : Optional Natural }\n"
+          <> "let c : C = { schedule = \"* * * * *\", session = None Text, prompt = \"\", retryMax = None Natural, retryWait = None Natural }\n"
+          <> "in "
+  TIO.writeFile path (preamble <> body)
+  loadFileJobs path rmax rwait
+
+-- | Write a schedule Dhall file (with a type @J@ and an all-@None@ default record @d@ to merge over
+-- with @//@) and load it through the real Dhall loader.
+loadSched :: FilePath -> Int -> Integer -> Text -> IO (Either Sch.ScheduleConfigError [Sch.ScheduleJob])
+loadSched dir rmax rwait body = do
+  let path = dir </> "sched.dhall"
+      preamble =
+        "let J = { jobId : Text, schedule : Text, room : Optional Text, session : Optional Text, tool : Optional Text, toolArgs : Optional Text, prompt : Optional Text, summarize : Optional Text, retryMax : Optional Natural, retryWait : Optional Natural }\n"
+          <> "let d : J = { jobId = \"\", schedule = \"* * * * *\", room = None Text, session = None Text, tool = None Text, toolArgs = None Text, prompt = None Text, summarize = None Text, retryMax = None Natural, retryWait = None Natural }\n"
+          <> "in "
+  TIO.writeFile path (preamble <> body)
+  Sch.loadScheduleFile path rmax rwait
+
 scheduleTests :: TestTree
 scheduleTests =
   testGroup
     "schedule (jobs + registry + tools)"
-    [ testCase "parseScheduleFile builds tool + prompt jobs with defaults" $ do
-        let json = "[{\"id\":\"disk\",\"schedule\":\"0 * * * *\",\"tool\":\"shell\",\"args\":{\"command\":\"df\"}},{\"id\":\"digest\",\"schedule\":\"0 9 * * *\",\"prompt\":\"summarize\"}]"
-        js <- either (assertFailure . show) pure (Sch.parseScheduleFile json 2 30)
-        map Sch.sjId js @?= ["disk", "digest"]
-        case js of
+    [ testCase "loadScheduleFile builds tool + prompt jobs with defaults (Dhall)" $ withTmp "sch" $ \dir -> do
+        js <-
+          loadSched dir 2 30 $
+            "[ d // { jobId = \"disk\", schedule = \"0 * * * *\", tool = Some \"shell\", toolArgs = Some \"{\\\"command\\\":\\\"df\\\"}\" }"
+              <> ", d // { jobId = \"digest\", schedule = \"0 9 * * *\", prompt = Some \"summarize\" } ]"
+        js2 <- either (assertFailure . show) pure js
+        map Sch.sjId js2 @?= ["disk", "digest"]
+        case js2 of
           (a : b : _) -> do
             Sch.sjAction a @?= Sch.ActTool "shell" (object ["command" .= ("df" :: Text)])
             Sch.sjSession a @?= "schedule-disk" -- default session
             Sch.sjRetryMax a @?= 2 -- global default applied
             Sch.sjAction b @?= Sch.ActPrompt "summarize"
           _ -> assertFailure "expected two jobs",
-      testCase "parseScheduleFile rejects ambiguous action / duplicate id / bad cron" $ do
-        let bad e j = case Sch.parseScheduleFile j 0 0 of Left err | err == e -> pure (); other -> assertFailure ("expected " <> show e <> ", got " <> show (fmap (map Sch.sjId) other))
-        bad (Sch.SceAction "x") "[{\"id\":\"x\",\"schedule\":\"* * * * *\"}]"
-        bad (Sch.SceDuplicateId "x") "[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"tool\":\"t\"},{\"id\":\"x\",\"schedule\":\"* * * * *\",\"prompt\":\"p\"}]"
-        case Sch.parseScheduleFile "[{\"id\":\"x\",\"schedule\":\"nonsense\",\"prompt\":\"p\"}]" 0 0 of
+      testCase "loadScheduleFile rejects ambiguous action / duplicate id / bad cron (Dhall)" $ withTmp "sch" $ \dir -> do
+        let bad e body = loadSched dir 0 0 body >>= \r -> case r of Left err | err == e -> pure (); other -> assertFailure ("expected " <> show e <> ", got " <> show (fmap (map Sch.sjId) other))
+        bad (Sch.SceAction "x") "[ d // { jobId = \"x\" } ]"
+        bad (Sch.SceDuplicateId "x") "[ d // { jobId = \"x\", tool = Some \"t\" }, d // { jobId = \"x\", prompt = Some \"p\" } ]"
+        r <- loadSched dir 0 0 "[ d // { jobId = \"x\", schedule = \"nonsense\", prompt = Some \"p\" } ]"
+        case r of
           Left (Sch.SceCron "x" _) -> pure ()
           other -> assertFailure ("expected SceCron, got " <> show (fmap (map Sch.sjId) other)),
-      testCase "recordOutcome tracks runs/failures/streak and retry scheduling" $ do
-        js <- either (assertFailure . show) pure (Sch.parseScheduleFile "[{\"id\":\"j\",\"schedule\":\"* * * * *\",\"prompt\":\"p\",\"retry_max\":1,\"retry_wait\":60}]" 0 0)
+      testCase "recordOutcome tracks runs/failures/streak and retry scheduling" $ withTmp "sch" $ \dir -> do
+        js <- either (assertFailure . show) pure =<< loadSched dir 0 0 "[ d // { jobId = \"j\", prompt = Some \"p\", retryMax = Some 1, retryWait = Some 60 } ]"
         let j = js !! 0
         reg <- Sch.newRegistry 0 js
         Sch.recordOutcome reg 100 j (Left "boom") -- attempt 1, retry (1<=1)
@@ -2226,8 +2253,8 @@ scheduleTests =
         Sch.recordOutcome reg 300 j (Right "ok") -- success resets the streak
         s3 <- maybe (assertFailure "no state") pure =<< Sch.stateOf reg "j"
         Sch.jsConsecutiveFailures s3 @?= 0,
-      testCase "schedule_run queues a known job and errors on an unknown one" $ do
-        js <- either (assertFailure . show) pure (Sch.parseScheduleFile "[{\"id\":\"j\",\"schedule\":\"* * * * *\",\"prompt\":\"p\"}]" 0 0)
+      testCase "schedule_run queues a known job and errors on an unknown one" $ withTmp "sch" $ \dir -> do
+        js <- either (assertFailure . show) pure =<< loadSched dir 0 0 "[ d // { jobId = \"j\", prompt = Some \"p\" } ]"
         reg <- Sch.newRegistry 0 js
         let runTool = Sch.scheduleTools reg !! 2 -- list, status, run
         r1 <- toolInvoke runTool (object ["id" .= ("j" :: Text)])
@@ -2302,25 +2329,32 @@ cronTests =
         case parseCliJob "* * * * * ping" 0 3 30 of
           Right j -> (cjRetryMax j, cjRetryWait j) @?= (3, 30)
           Left e -> assertFailure (show e),
-      testCase "parse_file reads jobs with session defaults" $ do
-        let json = "[{\"schedule\":\"0 9 * * *\",\"session\":\"digest\",\"prompt\":\"morning digest\"},{\"schedule\":\"*/15 * * * *\",\"prompt\":\"poll the queue\"}]"
-        case parseFileJobs json 0 0 of
+      testCase "cron-file (Dhall) reads jobs with session defaults" $ withTmp "cron" $ \dir -> do
+        r <-
+          loadCron dir 0 0 $
+            "[ c // { schedule = \"0 9 * * *\", session = Some \"digest\", prompt = \"morning digest\" }"
+              <> ", c // { schedule = \"*/15 * * * *\", prompt = \"poll the queue\" } ]"
+        case r of
           Right [j0, j1] -> do
             cjSession j0 @?= "digest"
             cjSession j1 @?= "cron-1"
             cjPrompt j1 @?= "poll the queue"
           Right _ -> assertFailure "expected two jobs"
           Left e -> assertFailure (show e),
-      testCase "parse_file per-job retry overrides the global default" $ do
-        let json = "[{\"schedule\":\"0 9 * * *\",\"prompt\":\"defaults\"},{\"schedule\":\"0 9 * * *\",\"prompt\":\"override\",\"retry_max\":5,\"retry_wait\":120}]"
-        case parseFileJobs json 2 60 of
+      testCase "cron-file (Dhall) per-job retry overrides the global default" $ withTmp "cron" $ \dir -> do
+        r <-
+          loadCron dir 2 60 $
+            "[ c // { schedule = \"0 9 * * *\", prompt = \"defaults\" }"
+              <> ", c // { schedule = \"0 9 * * *\", prompt = \"override\", retryMax = Some 5, retryWait = Some 120 } ]"
+        case r of
           Right [j0, j1] -> do
             (cjRetryMax j0, cjRetryWait j0) @?= (2, 60)
             (cjRetryMax j1, cjRetryWait j1) @?= (5, 120)
           Right _ -> assertFailure "expected two jobs"
           Left e -> assertFailure (show e),
-      testCase "parse_file surfaces a bad schedule" $
-        assertBool "bad schedule" (isLeftCfg (parseFileJobs "[{\"schedule\":\"bad\",\"prompt\":\"x\"}]" 0 0))
+      testCase "cron-file (Dhall) surfaces a bad schedule" $ withTmp "cron" $ \dir -> do
+        r <- loadCron dir 0 0 "[ c // { schedule = \"bad\", prompt = \"x\" } ]"
+        assertBool "bad schedule" (isLeftCfg r)
     ]
   where
     parseOk e = either (assertFailure . ("bad cron: " <>) . show) pure (parseCron e)

@@ -13,13 +13,16 @@
 -- Sessions are keyed per room. Sender\/room allowlists and per-room\/user tool permissions gate turns.
 --
 -- The pure decision logic (engagement, message extraction, allowlists, 'RecentIds') is unit-tested;
--- the @\/sync@ loop and REST calls are live-only (need a homeserver). Deferred here: media ingest, the
--- schedule integration, the graceful-shutdown room notice, and the 20s typing keep-alive.
+-- the @\/sync@ loop and REST calls are live-only (need a homeserver). Media ingest, the in-gateway
+-- schedule ('ScheduleCtx'), the graceful-shutdown room notice, and the 20s typing keep-alive are all
+-- wired in.
 module Lavoisier.Gateway.Matrix
   ( MatrixConfig (..),
     defaultMatrixConfig,
     matrixFromEnv,
     matrixGateway,
+    matrixScheduleGateway,
+    ScheduleCtx (..),
     Language (..),
     languageFromLocale,
     withLanguage,
@@ -63,11 +66,14 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
+import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Vector qualified as V
-import Lavoisier.Protocol.Agent (AgentHandle (..), TurnRequest (..), turnRequest)
+import Lavoisier.Protocol.Agent (AgentHandle (..), TurnRequest (..), TurnStream, turnRequest)
 import Lavoisier.Protocol.Event (Event (..))
 import Lavoisier.Protocol.Gateway (Gateway (..), GatewayError (..))
 import Lavoisier.Protocol.Stream (Producer (..))
+import Lavoisier.Protocol.Tool (ToolError, ToolOutput, toContent, toIsError)
+import Lavoisier.Schedule (Action (..), ScheduleJob (..), ScheduleRegistry, dueJobs, recordOutcome, registryJobs, takeRequested)
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (QueryItem, urlEncode)
@@ -75,6 +81,7 @@ import Network.HTTP.Types.Status (statusCode, statusIsSuccessful)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
+import System.IO (hPutStrLn, stderr)
 import System.Posix.Signals (Handler (Catch), installHandler, sigINT, sigTERM)
 #ifdef E2EE
 import Control.Monad (forM_, unless)
@@ -178,13 +185,30 @@ matrixFromEnv = do
       let s = Set.fromList [u | u <- map T.strip (T.splitOn "," (T.pack raw)), not (T.null u)]
        in if Set.null s then Nothing else Just s
 
--- | The 'Gateway' record backed by a 'MatrixConfig'.
+-- | The 'Gateway' record backed by a 'MatrixConfig' (no in-gateway schedule).
 matrixGateway :: MatrixConfig -> Gateway
 matrixGateway cfg =
   Gateway
     { gatewayName = "matrix",
-      gatewayServe = serveLoop cfg
+      gatewayServe = serveLoop cfg Nothing
     }
+
+-- | The Matrix gateway with an in-gateway schedule: its jobs fire inside the serve loop and report
+-- their outcomes to a room. The @schedule_*@ tools query\/re-run it via the shared registry.
+matrixScheduleGateway :: MatrixConfig -> ScheduleCtx -> Gateway
+matrixScheduleGateway cfg ctx =
+  Gateway
+    { gatewayName = "matrix",
+      gatewayServe = serveLoop cfg (Just ctx)
+    }
+
+-- | What the Matrix gateway needs to fire scheduled jobs: the live 'ScheduleRegistry' and a direct
+-- tool invoker (the shared 'Lavoisier.Tool.Registry.ToolRegistry', so an 'Action' tool call runs
+-- deterministically with no model round-trip).
+data ScheduleCtx = ScheduleCtx
+  { scRegistry :: ScheduleRegistry,
+    scInvoke :: Text -> Value -> IO (Either ToolError ToolOutput)
+  }
 
 -- --- runtime environment ---------------------------------------------------------------------------
 
@@ -228,8 +252,8 @@ data MatrixEnv = MatrixEnv
 
 -- --- the serve loop (live-only) --------------------------------------------------------------------
 
-serveLoop :: MatrixConfig -> AgentHandle -> IO (Either GatewayError ())
-serveLoop cfg agent = do
+serveLoop :: MatrixConfig -> Maybe ScheduleCtx -> AgentHandle -> IO (Either GatewayError ())
+serveLoop cfg mctx agent = do
   mgr <- newManager tlsManagerSettings
   esess <- resolveSession cfg mgr
   case esess of
@@ -268,6 +292,7 @@ serveLoop cfg agent = do
           let msgs = extractMessages syncD (meUserId env) (mcAllowedUsers cfg) (mcAllowedRooms cfg)
           mapM_ (dispatch env recent dmCache) msgs
           persistIfDirty env
+          maybe (pure ()) (fireDueSchedule env agent recent) mctx
           case parseNextBatch sync of
             Right next -> loop env recent dmCache next
             Left _ -> loop env recent dmCache since
@@ -396,6 +421,81 @@ finishReaction env room eventId ack ok = do
   maybe (pure ()) (\a -> () <$ redact env room a) ack
   _ <- react env room eventId (if ok then "✅" else "❌")
   pure ()
+
+-- --- in-gateway schedule (jobs fire inside the serve loop, report to a room) -----------------------
+
+nowUnix :: IO Integer
+nowUnix = round <$> getPOSIXTime
+
+-- | Fire every due-or-manually-requested schedule job once (registration order, deduped), recording
+-- each outcome and posting a report to its room. Runs single-threaded inside the serve loop so it
+-- shares the (non-thread-safe) crypto state, exactly as the sync\/message handling does.
+fireDueSchedule :: MatrixEnv -> AgentHandle -> RecentIds -> ScheduleCtx -> IO ()
+fireDueSchedule env agent recent ctx = do
+  now <- nowUnix
+  manual <- takeRequested (scRegistry ctx)
+  due <- dueJobs (scRegistry ctx) now
+  let jobs = registryJobs (scRegistry ctx)
+  mapM_ (\i -> case drop i jobs of (job : _) -> fireScheduleJob env agent recent ctx job now; [] -> pure ()) (dedup (manual <> due))
+  where
+    dedup = go []
+      where
+        go seen [] = reverse seen
+        go seen (x : xs) = if x `elem` seen then go seen xs else go (x : seen) xs
+
+-- | Run one job's action, record the verdict (the action's — untouched by summarisation), and post a
+-- report: a __failure__ goes to the room verbatim (its retry countdown must be visible); a __success__
+-- may be rewritten as prose by a tool-less @summarize@ turn (degrading to the raw output on failure).
+fireScheduleJob :: MatrixEnv -> AgentHandle -> RecentIds -> ScheduleCtx -> ScheduleJob -> Integer -> IO ()
+fireScheduleJob env agent recent ctx job now = do
+  result <- runScheduleAction agent ctx job
+  recordOutcome (scRegistry ctx) now job result
+  body <- case (result, sjSummarize job) of
+    (Right raw, Just instr) -> summariseForRoom agent job instr raw
+    _ -> pure (either id id result)
+  -- Untruncated operator log to stderr per fire (every frontend gets it).
+  hPutStrLn stderr (T.unpack ("[schedule] " <> sjId job <> " " <> either (const "FAIL") (const "ok") result <> ": " <> either id id result))
+  let marker = either (const ("\10060" :: Text)) (const "\9989") result
+      report = "\9200 schedule `" <> sjId job <> "` " <> marker <> "\n" <> body
+  case sjRoom job of
+    Just room -> sendText env room report >>= either (const (pure ())) (insertRecent recent)
+    Nothing -> pure ()
+
+-- | A job's action → @Either failureDetail successOutput@. A tool @isError@ or a rejected\/errored
+-- turn is a failure (drives retry); a completed turn or a clean tool result is a success.
+runScheduleAction :: AgentHandle -> ScheduleCtx -> ScheduleJob -> IO (Either Text Text)
+runScheduleAction agent ctx job = case sjAction job of
+  ActTool name args -> do
+    r <- scInvoke ctx name args
+    pure $ case r of
+      Left e -> Left (tshow e)
+      Right out
+        | toIsError out -> Left (toContent out)
+        | otherwise -> Right (toContent out)
+  ActPrompt p ->
+    submit agent (turnRequest (sjSession job) p) >>= \case
+      Left e -> pure (Left (tshow e))
+      Right stream -> drainScheduleTurn stream
+
+-- | Rewrite a successful tool result as room prose with a __tool-less__ turn (empty @allowed_tools@,
+-- so the model can only write text, never act). Best-effort: any failure degrades to the raw output.
+summariseForRoom :: AgentHandle -> ScheduleJob -> Text -> Text -> IO Text
+summariseForRoom agent job instr raw = do
+  let tr = (turnRequest (sjSession job) (instr <> "\n\n" <> raw)) {trAllowedTools = Just []}
+  submit agent tr >>= \case
+    Left _ -> pure raw
+    Right stream -> either (const raw) id <$> drainScheduleTurn stream
+
+-- | Fold a turn's stream to its answer text (or a Left on a mid-stream error).
+drainScheduleTurn :: TurnStream -> IO (Either Text Text)
+drainScheduleTurn stream = go ""
+  where
+    go acc =
+      nextItem stream >>= \case
+        Nothing -> pure (Right (T.strip acc))
+        Just (Left _) -> pure (Left "turn stream error")
+        Just (Right (TextDelta t)) -> go (acc <> t)
+        Just (Right _) -> go acc
 
 -- --- E2EE serve-loop wiring (only under -DE2EE) ----------------------------------------------------
 

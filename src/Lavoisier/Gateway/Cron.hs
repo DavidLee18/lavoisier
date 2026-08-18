@@ -14,23 +14,25 @@ module Lavoisier.Gateway.Cron
   ( CronJob (..),
     CronConfigError (..),
     parseCliJob,
-    parseFileJobs,
+    loadFileJobs,
     cronGateway,
   )
 where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently_)
-import Data.Aeson (FromJSON (..), eitherDecode, withObject, (.:), (.:?))
-import Data.ByteString.Lazy qualified as BL
+import Control.Exception (SomeException, try)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time.Clock.POSIX (getPOSIXTime)
+import Dhall qualified
+import GHC.Generics (Generic)
 import Lavoisier.Protocol.Agent (AgentHandle (..), turnRequest)
 import Lavoisier.Protocol.Gateway (Gateway (..), GatewayError)
 import Lavoisier.Protocol.Stream (Producer (..))
 import Lavoisier.Schedule.Cron (CronError, CronSchedule, nextAfter, parseCron)
+import Numeric.Natural (Natural)
 
 -- | One scheduled task: when to fire, which session to run it under, the prompt to submit, and the
 -- retry policy after a failed fire.
@@ -52,8 +54,8 @@ data CronConfigError
     CCECron CronError
   | -- | A @--cron@ quick spec lacked a prompt after its 5 schedule fields.
     CCEMissingPrompt Text
-  | -- | The @--cron-file@ JSON was malformed.
-    CCEJson Text
+  | -- | The @--cron-file@ Dhall failed to parse or type-check.
+    CCEFile Text
   deriving stock (Eq, Show)
 
 -- | Parse a quick CLI spec: the first __five__ whitespace-separated tokens are the cron schedule, the
@@ -69,43 +71,41 @@ parseCliJob spec index retryMax retryWait =
           Right sched ->
             Right (CronJob sched ("cron-" <> tshow index) (T.unwords (drop 5 toks)) retryMax retryWait)
 
--- | JSON shape for a @--cron-file@ job: @{schedule, session?, prompt, retry_max?, retry_wait?}@. A
--- per-job @retry_max@\/@retry_wait@ overrides the global default.
-data JobSpec = JobSpec
-  { jsSchedule :: Text,
-    jsSession :: Maybe Text,
-    jsPrompt :: Text,
-    jsRetryMax :: Maybe Int,
-    jsRetryWait :: Maybe Int
+-- | Dhall shape for a @--cron-file@ job: a list of records
+-- @{ schedule : Text, session : Optional Text, prompt : Text, retryMax : Optional Natural,
+-- retryWait : Optional Natural }@. A per-job @retryMax@\/@retryWait@ overrides the global default.
+-- The field names are the Dhall record keys (Dhall is camelCase by convention).
+data CronSpec = CronSpec
+  { schedule :: Text,
+    session :: Maybe Text,
+    prompt :: Text,
+    retryMax :: Maybe Natural,
+    retryWait :: Maybe Natural
   }
+  deriving stock (Generic)
 
-instance FromJSON JobSpec where
-  parseJSON = withObject "JobSpec" $ \o ->
-    JobSpec
-      <$> o .: "schedule"
-      <*> o .:? "session"
-      <*> o .: "prompt"
-      <*> o .:? "retry_max"
-      <*> o .:? "retry_wait"
+instance Dhall.FromDhall CronSpec
 
--- | Parse a @--cron-file@ JSON document (an array of job specs). A missing @session@ defaults to
--- @cron-\<index\>@; a missing @retry_max@\/@retry_wait@ falls back to the global default.
-parseFileJobs :: BL.ByteString -> Int -> Int -> Either CronConfigError [CronJob]
-parseFileJobs json retryMax retryWait =
-  case eitherDecode json :: Either String [JobSpec] of
-    Left e -> Left (CCEJson (T.pack e))
+-- | Load a @--cron-file@ Dhall document (a list of job specs), type-checked by Dhall at load. A
+-- missing @session@ defaults to @cron-\<index\>@; a missing @retryMax@\/@retryWait@ falls back to the
+-- global default. A parse\/type error surfaces as 'CCEFile'.
+loadFileJobs :: FilePath -> Int -> Int -> IO (Either CronConfigError [CronJob])
+loadFileJobs path defRetryMax defRetryWait = do
+  r <- try (Dhall.inputFile Dhall.auto path :: IO [CronSpec]) :: IO (Either SomeException [CronSpec])
+  pure $ case r of
+    Left e -> Left (CCEFile (T.pack (show e)))
     Right specs -> traverse toJob (zip [0 ..] specs)
   where
-    toJob (i, s) = case parseCron (jsSchedule s) of
+    toJob (i, s) = case parseCron (schedule s) of
       Left e -> Left (CCECron e)
       Right sched ->
         Right
           CronJob
             { cjSchedule = sched,
-              cjSession = fromMaybe ("cron-" <> tshow (i :: Int)) (jsSession s),
-              cjPrompt = jsPrompt s,
-              cjRetryMax = fromMaybe retryMax (jsRetryMax s),
-              cjRetryWait = fromMaybe retryWait (jsRetryWait s)
+              cjSession = fromMaybe ("cron-" <> tshow (i :: Int)) (session s),
+              cjPrompt = prompt s,
+              cjRetryMax = maybe defRetryMax fromIntegral (retryMax s),
+              cjRetryWait = maybe defRetryWait fromIntegral (retryWait s)
             }
 
 -- | The 'Gateway' record: drives the shared agent from a set of 'CronJob's. An empty set returns

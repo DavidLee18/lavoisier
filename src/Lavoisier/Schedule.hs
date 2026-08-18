@@ -12,7 +12,7 @@ module Lavoisier.Schedule
     JobState (..),
     emptyJobState,
     ScheduleConfigError (..),
-    parseScheduleFile,
+    loadScheduleFile,
     ScheduleRegistry,
     newRegistry,
     registryJobs,
@@ -20,12 +20,14 @@ module Lavoisier.Schedule
     indexOf,
     requestRun,
     takeRequested,
+    dueJobs,
     recordOutcome,
     scheduleTools,
   )
 where
 
-import Data.Aeson (FromJSON (..), Value (..), decode, object, withObject, (.:), (.:?), (.=))
+import Control.Exception (SomeException, try)
+import Data.Aeson (Value (..), decode, object, withObject, (.:), (.=))
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef
@@ -36,8 +38,12 @@ import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding (encodeUtf8)
+import Dhall qualified
+import GHC.Generics (Generic)
 import Lavoisier.Protocol.Tool
 import Lavoisier.Schedule.Cron (CronError, CronSchedule, nextAfter, parseCron)
+import Numeric.Natural (Natural)
 
 -- | Recent outcomes kept per job (for @schedule_status@).
 historyCap :: Int
@@ -73,72 +79,71 @@ data ScheduleJob = ScheduleJob
     sjRetryWait :: Integer
   }
 
--- | The JSON shape of one entry in a schedule file.
+-- | The Dhall shape of one entry in a schedule file: a list of records
+-- @{ jobId : Text, schedule : Text, room : Optional Text, session : Optional Text,
+-- tool : Optional Text, toolArgs : Optional Text, prompt : Optional Text, summarize : Optional Text,
+-- retryMax : Optional Natural, retryWait : Optional Natural }@. @tool@\/@prompt@ are mutually
+-- exclusive (one required); @toolArgs@ is a JSON-object string decoded into the tool's arguments.
+-- The field names are the Dhall record keys.
 data JobSpec = JobSpec
-  { specId :: Text,
-    specSchedule :: Text,
-    specRoom :: Maybe Text,
-    specSession :: Maybe Text,
-    specTool :: Maybe Text,
-    specArgs :: Maybe Value,
-    specPrompt :: Maybe Text,
-    specSummarize :: Maybe Text,
-    specRetryMax :: Maybe Int,
-    specRetryWait :: Maybe Integer
+  { jobId :: Text,
+    schedule :: Text,
+    room :: Maybe Text,
+    session :: Maybe Text,
+    tool :: Maybe Text,
+    toolArgs :: Maybe Text,
+    prompt :: Maybe Text,
+    summarize :: Maybe Text,
+    retryMax :: Maybe Natural,
+    retryWait :: Maybe Natural
   }
+  deriving stock (Generic)
 
-instance FromJSON JobSpec where
-  parseJSON = withObject "JobSpec" $ \o ->
-    JobSpec
-      <$> o .: "id"
-      <*> o .: "schedule"
-      <*> o .:? "room"
-      <*> o .:? "session"
-      <*> o .:? "tool"
-      <*> o .:? "args"
-      <*> o .:? "prompt"
-      <*> o .:? "summarize"
-      <*> o .:? "retry_max"
-      <*> o .:? "retry_wait"
+instance Dhall.FromDhall JobSpec
 
 -- | A failure building jobs from a schedule file.
 data ScheduleConfigError
-  = SceJson Text
+  = SceFile Text
   | SceCron Text CronError
   | SceAction Text
   | SceDuplicateId Text
   deriving stock (Show, Eq)
 
--- | Parse a JSON array of job specs, applying the global @retry_max@\/@retry_wait@ defaults to any
--- job that doesn't override them. @tool@ and @prompt@ are mutually exclusive and one is required;
--- ids must be unique.
-parseScheduleFile :: BL.ByteString -> Int -> Integer -> Either ScheduleConfigError [ScheduleJob]
-parseScheduleFile json retryMax retryWait =
-  maybe (Left (SceJson "not a JSON array of job specs")) (go Set.empty) (decode json)
+-- | Load a Dhall list of job specs (type-checked by Dhall at load), applying the global @retryMax@\/
+-- @retryWait@ defaults to any job that doesn't override them. @tool@ and @prompt@ are mutually
+-- exclusive and one is required; ids must be unique. A parse\/type error surfaces as 'SceFile'.
+loadScheduleFile :: FilePath -> Int -> Integer -> IO (Either ScheduleConfigError [ScheduleJob])
+loadScheduleFile path defRetryMax defRetryWait = do
+  r <- try (Dhall.inputFile Dhall.auto path :: IO [JobSpec]) :: IO (Either SomeException [JobSpec])
+  pure $ case r of
+    Left e -> Left (SceFile (T.pack (show e)))
+    Right specs -> go Set.empty specs
   where
     go _ [] = Right []
     go seen (s : ss)
-      | Set.member (specId s) seen = Left (SceDuplicateId (specId s))
+      | Set.member (jobId s) seen = Left (SceDuplicateId (jobId s))
       | otherwise = do
-          action <- case (specTool s, specPrompt s) of
-            (Just n, Nothing) -> Right (ActTool n (fromMaybe (object []) (specArgs s)))
+          action <- case (tool s, prompt s) of
+            (Just n, Nothing) -> Right (ActTool n (argsValue (toolArgs s)))
             (Nothing, Just t) -> Right (ActPrompt t)
-            _ -> Left (SceAction (specId s))
-          sched <- either (Left . SceCron (specId s)) Right (parseCron (specSchedule s))
-          rest <- go (Set.insert (specId s) seen) ss
+            _ -> Left (SceAction (jobId s))
+          sched <- either (Left . SceCron (jobId s)) Right (parseCron (schedule s))
+          rest <- go (Set.insert (jobId s) seen) ss
           pure (mkJob s action sched : rest)
     mkJob s action sched =
       ScheduleJob
-        { sjId = specId s,
-          sjExpr = specSchedule s,
+        { sjId = jobId s,
+          sjExpr = schedule s,
           sjSchedule = sched,
           sjAction = action,
-          sjRoom = specRoom s,
-          sjSession = fromMaybe ("schedule-" <> specId s) (specSession s),
-          sjSummarize = specSummarize s,
-          sjRetryMax = fromMaybe retryMax (specRetryMax s),
-          sjRetryWait = fromMaybe retryWait (specRetryWait s)
+          sjRoom = room s,
+          sjSession = fromMaybe ("schedule-" <> jobId s) (session s),
+          sjSummarize = summarize s,
+          sjRetryMax = maybe defRetryMax fromIntegral (retryMax s),
+          sjRetryWait = maybe defRetryWait fromIntegral (retryWait s)
         }
+    argsValue Nothing = object []
+    argsValue (Just t) = fromMaybe (object []) (decode (BL.fromStrict (encodeUtf8 t)))
 
 -- | One recorded fire.
 data Outcome = Outcome
@@ -201,6 +206,18 @@ requestRun reg jid = case indexOf reg jid of
 -- | Drain and return the queued manual-run job indices.
 takeRequested :: ScheduleRegistry -> IO [Int]
 takeRequested reg = atomicModifyIORef' (srRequested reg) (\q -> ([], q))
+
+-- | Indices of jobs due to fire at @now@: a pending retry (@retry_at@) if its time has come, else the
+-- next cron slot (@next_due@) if reached. A job in retry never fires on its cron slot until the chain
+-- resolves.
+dueJobs :: ScheduleRegistry -> Integer -> IO [Int]
+dueJobs reg now = do
+  st <- readIORef (srState reg)
+  pure [i | (i, j) <- zip [0 ..] (srJobs reg), due (Map.findWithDefault emptyJobState (sjId j) st)]
+  where
+    due s = case jsRetryAt s of
+      Just r -> r <= now
+      Nothing -> maybe False (<= now) (jsNextDue s)
 
 -- | Record a fire's outcome against a job's state (mirrors the Rust @record@): bump counters + the
 -- failure streak, cap history, and set the follow-up — a pending retry suppresses the cron slot

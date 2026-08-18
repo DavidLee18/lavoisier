@@ -12,17 +12,17 @@ module Lavoisier.CLI
 where
 
 import Control.Exception (SomeException, try)
-import Data.ByteString.Lazy qualified as BL
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word32, Word64)
 import Lavoisier.Agent
 import Lavoisier.Config (FileConfig (..), loadConfig)
 import Lavoisier.Gateway.A2A (a2aGateway, defaultA2aConfig)
 import Lavoisier.Gateway.Acp (acpGateway, defaultAcpConfig)
-import Lavoisier.Gateway.Cron (CronJob, cronGateway, parseCliJob, parseFileJobs)
+import Lavoisier.Gateway.Cron (CronJob, cronGateway, loadFileJobs, parseCliJob)
 import Lavoisier.Gateway.Http (GatewayConfig (..), httpGateway)
 import Lavoisier.Gateway.Matrix (matrixFromEnv, matrixGateway)
 import Lavoisier.Gateway.Matrix qualified as MX
@@ -46,8 +46,9 @@ import Lavoisier.Provider.Google (googleFromEnv, newGoogleConfig)
 import Lavoisier.Provider.Google.Batch (googleBatch)
 import Lavoisier.Provider.Xai (xaiFromEnv)
 import Lavoisier.Provider.Xai.Grpc (defaultXaiGrpcEndpoint, xaiGrpcProvider)
+import Lavoisier.Schedule (ScheduleRegistry, loadScheduleFile, newRegistry, scheduleTools)
 import Lavoisier.Tool.Batch (batchEditTool)
-import Lavoisier.Tool.Registry (ToolRegistry, registerTools, withBuiltins)
+import Lavoisier.Tool.Registry (ToolRegistry, invokeTool, registerTools, withBuiltins)
 import Lavoisier.Tune (LearningTuner, asTuner, defaultTuneConfig, learningTuner, loadTuner, saveTuner)
 import Lavoisier.Tune.Bayes (BayesTuner, asBayesTuner, bayesTuner, loadBayes, saveBayes)
 import Options.Applicative
@@ -99,6 +100,9 @@ data Options = Options
     optCronFile :: Maybe FilePath,
     optCronRetryMax :: Maybe Int,
     optCronRetryWait :: Maybe Int,
+    optScheduleFile :: Maybe FilePath,
+    optScheduleRetryMax :: Maybe Int,
+    optScheduleRetryWait :: Maybe Int,
     optFallback :: [String],
     optFallbackCooldown :: Maybe Int,
     optWords :: [String]
@@ -148,6 +152,9 @@ optionsParser =
     <*> optional (strOption (long "cron-file" <> metavar "PATH" <> help "A JSON file of cron jobs [{schedule,session?,prompt,retry_max?,retry_wait?}]"))
     <*> optional (option auto (long "cron-retry-max" <> metavar "N" <> help "Global default retries after a failed cron fire (default 0)"))
     <*> optional (option auto (long "cron-retry-wait" <> metavar "SECS" <> help "Global default seconds between cron retries (default 0)"))
+    <*> optional (strOption (long "schedule-file" <> metavar "PATH" <> help "A Dhall file of Matrix schedule jobs: jobs fire inside --serve-matrix and report to a room"))
+    <*> optional (option auto (long "schedule-retry-max" <> metavar "N" <> help "Global default retries after a failed schedule fire (default 0)"))
+    <*> optional (option auto (long "schedule-retry-wait" <> metavar "SECS" <> help "Global default seconds between schedule retries (default 0)"))
     <*> many (strOption (long "fallback" <> metavar "PROVIDER:MODEL" <> help "A fallback model (repeatable, ordered): rerouted to when the primary is unresponsive/errors before streaming any output"))
     <*> optional (option auto (long "fallback-cooldown" <> metavar "SECS" <> help "Seconds a failed fallback-chain model stays demoted before it's re-probed (circuit breaker; default 60)"))
     <*> many (argument str (metavar "PROMPT..."))
@@ -184,7 +191,18 @@ runCli = do
               -- Localise the gateway-authored shutdown notice via --lang/LANG (only ko_KR ⇒ Korean).
               langRaw <- maybe (fmap (fromMaybe "") (lookupEnv "LANG")) pure (optLang opts)
               let lg = MX.languageFromLocale (T.pack langRaw)
-              fromEnvGateway matrixFromEnv (matrixGateway . MX.withLanguage lg)
+              ecfg <- matrixFromEnv
+              case ecfg of
+                Left e -> errExit (tshow e)
+                Right cfg0 -> do
+                  let cfg = MX.withLanguage lg cfg0
+                  -- Build the in-gateway schedule (if --schedule-file), register its schedule_* tools
+                  -- into the same registry the executor gets, and hand the gateway a direct invoker.
+                  msched <- buildScheduleReg opts
+                  withRegistryExtra opts model (maybe [] scheduleTools msched) $ \registry ->
+                    let mctx = fmap (\reg -> MX.ScheduleCtx reg (\n a -> invokeTool n a registry)) msched
+                        gw = maybe (matrixGateway cfg) (MX.matrixScheduleGateway cfg) mctx
+                     in serveGateway gw prov opts model registry
             else
               if optServeSlack opts
                 then fromEnvGateway slackFromEnv slackGateway
@@ -325,10 +343,30 @@ runAskMode prov opts model prompt = do
 -- tool-using modes (@--agent@ or a gateway) — a plain @ask@ spawns nothing. A bad spec or a dead
 -- server fails fast with the offending label.
 withRegistry :: Options -> Text -> (ToolRegistry -> IO ()) -> IO ()
-withRegistry opts model k = do
+withRegistry opts model = withRegistryExtra opts model []
+
+-- | 'withRegistry' plus @extra@ tools registered after the built-ins (used to add the @schedule_*@
+-- tools alongside the schedule gateway).
+withRegistryExtra :: Options -> Text -> [Tool] -> (ToolRegistry -> IO ()) -> IO ()
+withRegistryExtra opts model extra k = do
   toolss <- mapM connectOne (optMcpServers opts)
   batch <- batchEditTools opts model
-  k (registerTools (concat toolss <> batch) withBuiltins)
+  k (registerTools (concat toolss <> batch <> extra) withBuiltins)
+
+-- | Build the Matrix in-gateway schedule registry from @--schedule-file@ (a Dhall job list), arming
+-- each job's first cron slot; 'Nothing' when no schedule file is set. A bad file fails fast.
+buildScheduleReg :: Options -> IO (Maybe ScheduleRegistry)
+buildScheduleReg opts = case optScheduleFile opts of
+  Nothing -> pure Nothing
+  Just path -> do
+    let rmax = fromMaybe 0 (optScheduleRetryMax opts)
+        rwait = fromMaybe 0 (optScheduleRetryWait opts)
+    ejobs <- loadScheduleFile path rmax (fromIntegral rwait)
+    case ejobs of
+      Left e -> errExit ("schedule: " <> tshow e)
+      Right jobs -> do
+        now <- round <$> getPOSIXTime
+        Just <$> newRegistry now jobs
 
 -- | Offer @batch_edit@ when the provider has a discounted batch API (Anthropic today) and it wasn't
 -- disabled. A missing key just omits the tool.
@@ -422,9 +460,7 @@ buildCronJobs opts = do
       (zip [0 ..] (optCron opts))
   fileJobs <- case optCronFile opts of
     Nothing -> pure []
-    Just path -> do
-      json <- BL.readFile path
-      either (errExit . cronErr) pure (parseFileJobs json rmax rwait)
+    Just path -> loadFileJobs path rmax rwait >>= either (errExit . cronErr) pure
   pure (cliJobs <> fileJobs)
   where
     cronErr e = "cron: " <> tshow e
