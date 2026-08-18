@@ -31,6 +31,22 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      # proto-lens-protobuf-types (pulled in by the xai-proto codec) runs protoc at build time even
+      # though the xAI bindings are committed — same pinned download as the Rust ci.yml.
+      - name: Install protoc
+        shell: bash
+        env:
+          PROTOC_VERSION: "29.3"
+        run: |
+          set -euo pipefail
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sha=3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a
+          curl -fsSL -o protoc.zip "$url"
+          echo "${sha}  protoc.zip" | sha256sum -c -
+          unzip -q protoc.zip -d "$HOME/.protoc"
+          echo "$HOME/.protoc/bin" >> "$GITHUB_PATH"
+          "$HOME/.protoc/bin/protoc" --version
+
       - name: Install system libraries (snappy + tree-sitter build tools)
         run: |
           set -euo pipefail
@@ -86,6 +102,20 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      - name: Install protoc
+        shell: bash
+        env:
+          PROTOC_VERSION: "29.3"
+        run: |
+          set -euo pipefail
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sha=3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a
+          curl -fsSL -o protoc.zip "$url"
+          echo "${sha}  protoc.zip" | sha256sum -c -
+          unzip -q protoc.zip -d "$HOME/.protoc"
+          echo "$HOME/.protoc/bin" >> "$GITHUB_PATH"
+          "$HOME/.protoc/bin/protoc" --version
+
       - name: Install system libraries
         run: |
           set -euo pipefail
@@ -106,10 +136,14 @@ jobs:
       - name: Build libolm from source
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "${OLM_REF}" https://gitlab.matrix.org/matrix-org/olm.git
-          sed -i 's/T \* const other_pos/T * other_pos/' olm/include/olm/list.hh || true
-          cmake -S olm -B olm/build -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON
-          cmake --build olm/build --target install -j"$(nproc)"
+          # Clone into libolm-src, NOT ./olm — the repo already has a top-level olm/ (the Haskell FFI
+          # package), so cloning into ./olm would collide.
+          git clone --depth 1 --branch "${OLM_REF}" https://gitlab.matrix.org/matrix-org/olm.git libolm-src
+          # Modern-toolchain fix: a const-correctness bug clang/gcc reject.
+          sed -i 's/T \* const other_pos/T * other_pos/' libolm-src/include/olm/list.hh
+          cmake -S libolm-src -B libolm-src/build -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON
+          cmake --build libolm-src/build -j"$(nproc)"
+          sudo cmake --install libolm-src/build
           sudo ldconfig
 
       - name: Set up GHC and cabal
