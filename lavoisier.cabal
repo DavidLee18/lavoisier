@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               lavoisier
-version:            0.13.1
+version:            0.13.2
 synopsis:           Token-efficient CLI coding agent — a Haskell port of the Rust `lavoisier`.
 description:
   A modular, token-efficient CLI coding agent with a provider-agnostic core.
@@ -12,6 +12,11 @@ maintainer:         djwodus@gmail.com
 homepage:           https://github.com/DavidLee18/lavoisier
 category:           Development
 build-type:         Simple
+
+-- The C shim + vendored tree-sitter headers. `include-dirs` is only a compiler
+-- flag and `c-sources` cannot list headers, so without this they are absent from
+-- the sdist tarball cabal builds for `source-repository-package` consumers.
+extra-source-files: cbits/**/*.h
 
 flag e2ee
   description: Matrix end-to-end encryption (Olm/Megolm via the olm/libolm FFI package).

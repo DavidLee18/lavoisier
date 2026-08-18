@@ -31,14 +31,20 @@ Pin the engine by git ref (it is not on Hackage — use an `hs-v*` release tag).
 wherever those live on your build host — the same machine-specific `extra-lib-dirs` the engine's own
 `cabal.project` uses.
 
-```dhall
+`subdir` must list `olm` as well as `.`. The engine's `e2ee` flag pulls in the sibling `olm` package
+from the same repo; with `subdir: .` alone, resolution fails with `unknown package: olm`.
+
+Pin at least `hs-v0.13.2` — earlier tags omit the C headers from the packaged tarball and fail to
+build as a git dependency (`fatal error: 'lvz_ts_shim.h' file not found`).
+
+```cabal
 packages: .
 
 source-repository-package
   type: git
   location: https://github.com/DavidLee18/lavoisier
-  tag: hs-v0.13.1            -- an hs-v* release tag (NOT the Rust v* tags)
-  subdir: .
+  tag: hs-v0.13.2            -- an hs-v* release tag (NOT the Rust v* tags)
+  subdir: . olm              -- `olm` too: the engine's e2ee flag depends on it
 
 -- Native libs (adjust paths for your host; Homebrew / ~/.local shown).
 package lavoisier
@@ -70,13 +76,15 @@ executable my-lav
   ghc-options:      -threaded -rtsopts -with-rtsopts=-N   -- warp needs the threaded RTS
   build-depends:    base, text, aeson, lavoisier
   if flag(e2ee)
-    -- forward the flag to the engine so encrypted Matrix rooms work
-    cpp-options: -DE2EE
+    cpp-options: -DE2EE      -- your own code only; see below for the engine's flag
 ```
 
-Build the engine with its `e2ee` flag on when you pass `-f e2ee` — `cabal build -f e2ee` propagates
-constraints; if it does not pick up the engine flag automatically, add
-`constraints: lavoisier +e2ee` to `cabal.project`.
+**A cabal flag never propagates to a dependency**, so `cabal build -f e2ee` sets *your* flag and
+leaves the engine's off. Turn the engine's on in `cabal.project`:
+
+```cabal
+constraints: lavoisier +e2ee
+```
 
 ## 4. `app/Main.hs` — implement `Tool` and call `mainWith`
 
