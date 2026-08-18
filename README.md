@@ -396,11 +396,11 @@ use `run_with` if you manage your own.)
 ## Deployment
 
 Container + Terraform IaC for the HTTP gateway on **AWS Fargate (arm64, us-west-2)** ship in
-[`infra/`](infra/) (Podman, not Docker; secrets via AWS Secrets Manager). See
+[`infra/`](infra/) (colima + nerdctl, not Docker; secrets via AWS Secrets Manager). See
 [`infra/README.md`](infra/README.md) for the runbook.
 
 ```sh
-podman build --platform linux/arm64 -f Containerfile -t lavoisier:dev .
+nerdctl build --platform linux/arm64 -f Containerfile -t lavoisier:dev .
 ./infra/scripts/build-and-push.zsh dev   # push to ECR
 ./infra/scripts/deploy.zsh               # terraform apply
 ```

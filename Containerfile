@@ -1,8 +1,8 @@
 # Containerfile for the `lavoisier` gateway — multi-stage, linux/arm64 (RECIPE §9 M10, §10).
 #
-#   podman build --platform linux/arm64 -f Containerfile -t lavoisier:dev .
+#   nerdctl build --platform linux/arm64 -f Containerfile -t lavoisier:dev .
 #
-# Conventions: arm64 (Fargate target), Podman not Docker. `protoc` is required only in the
+# Conventions: arm64 (Fargate target), colima + nerdctl (not Docker). `protoc` is required only in the
 # builder stage (lvz-xai/build.rs compiles the vendored protos); the runtime image has none.
 
 # --- builder ---------------------------------------------------------------
