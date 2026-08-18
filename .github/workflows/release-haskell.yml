@@ -87,13 +87,18 @@ jobs:
           ghc-version: ${{ env.GHC_VERSION }}
           cabal-version: ${{ env.CABAL_VERSION }}
 
-      - name: Build (optimised)
-        run: cabal build --project-file=cabal.project.dist --enable-optimization=2 exe:lav
+      - name: Build
+        run: cabal build --project-file=cabal.project.dist exe:lav
 
       - name: Package (bundle non-system shared libraries)
         run: |
           set -euo pipefail
+          # list-bin must use the same project/flags as the build so it reports the built path.
           BIN="$(cabal list-bin --project-file=cabal.project.dist exe:lav)"
+          if [ ! -f "$BIN" ]; then
+            BIN="$(find dist-newstyle -type f -path '*x/lav/build/lav/lav' | head -1)"
+          fi
+          echo "binary: $BIN"
           scripts/package-haskell.sh "$BIN" pkg
           tar czf "lavoisier-hs-${{ matrix.target }}.tar.gz" -C pkg .
           ls -la "lavoisier-hs-${{ matrix.target }}.tar.gz"
