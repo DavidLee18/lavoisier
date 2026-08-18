@@ -9,6 +9,8 @@ module Lavoisier.CLI
     mainWith,
     Options (..),
     optionsParser,
+    applyConfig,
+    layerPersona,
 
     -- * Custom-tool extension point (re-exported for downstream @mainWith@ crates)
     Tool (..),
@@ -28,6 +30,9 @@ module Lavoisier.CLI
 where
 
 import Control.Exception (SomeException, try)
+import Control.Monad (when)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -93,6 +98,9 @@ data Options = Options
     optVerifyAndFix :: Bool,
     optInLoopVerify :: Bool,
     optSummaryModel :: Maybe Text,
+    optPersona :: Maybe FilePath,
+    optNoPersona :: Bool,
+    optSystem :: Maybe Text,
     optBudgetAwareness :: Bool,
     optClassifyWithModel :: Bool,
     optNoBatchEdit :: Bool,
@@ -103,6 +111,10 @@ data Options = Options
     optServeAcp :: Maybe Int,
     optServeSlack :: Bool,
     optServeMatrix :: Bool,
+    -- | Per-room\/per-member Matrix tool permissions. Config-file only (they are nested maps);
+    -- empty ⇒ unconstrained, which is why the file has to be able to set them.
+    optMatrixRoomTools :: Map Text [Text],
+    optMatrixUserTools :: Map Text [Text],
     optSessionDir :: Maybe FilePath,
     optConfig :: Maybe FilePath,
     optMcpServers :: [String],
@@ -146,6 +158,9 @@ optionsParser =
     <*> switch (long "verify-and-fix" <> help "On a would-be finish, if --verify-cmd fails, feed the output back and keep working (bounded)")
     <*> switch (long "in-loop-verify" <> help "Stop as soon as an edit turn makes --verify-cmd pass")
     <*> optional (strOption (long "summary-model" <> metavar "MODEL" <> help "Cheaper model for history-compaction summaries (defaults to --model)"))
+    <*> optional (strOption (long "persona" <> metavar "PATH" <> help "Persona/standing-instructions file layered above the operating instructions (default ./PERSONA.md if present)"))
+    <*> switch (long "no-persona" <> help "Don't auto-load ./PERSONA.md (an explicit --persona still loads)")
+    <*> optional (strOption (long "system" <> metavar "PROMPT" <> help "Replace the built-in operating instructions (the persona still layers above whatever this leaves)"))
     <*> switch (long "budget-awareness" <> help "Append a progress/token note to each turn so the model sees the ceilings")
     <*> switch (long "classify-with-model" <> help "Classify the task archetype with a model call instead of the keyword heuristic")
     <*> switch (long "no-batch-edit" <> help "Don't offer the batch_edit fan-out tool (only offered with a batch-capable provider)")
@@ -156,6 +171,9 @@ optionsParser =
     <*> optional (option auto (long "serve-acp" <> metavar "PORT" <> help "Serve the agent as an ACP (Agent Communication Protocol) gateway on this port"))
     <*> switch (long "serve-slack" <> help "Serve the agent as a Slack gateway over Socket Mode (needs SLACK_APP_TOKEN + SLACK_BOT_TOKEN)")
     <*> switch (long "serve-matrix" <> help "Serve the agent as a Matrix gateway (needs MATRIX_HOMESERVER + MATRIX_USER + token/password)")
+    -- matrixRoomTools / matrixUserTools: config-file only (nested maps), so no flag — see applyConfig.
+    <*> pure Map.empty
+    <*> pure Map.empty
     <*> optional (strOption (long "session-dir" <> metavar "DIR" <> help "Persist gateway session transcripts under DIR (durable file store; default in-memory)"))
     <*> optional (strOption (long "config" <> metavar "PATH" <> help "Dhall config file (default ./lavoisier.dhall if present)"))
     <*> many (strOption (long "mcp-server" <> metavar "LABEL:TARGET" <> help "Connect to an MCP server and expose its tools (stdio command or http(s):// URL); repeatable"))
@@ -225,7 +243,11 @@ mainWith extra = do
               case ecfg of
                 Left e -> errExit (tshow e)
                 Right cfg0 -> do
-                  let cfg = MX.withLanguage lg cfg0
+                  let cfg =
+                        (MX.withLanguage lg cfg0)
+                          { MX.mcRoomTools = optMatrixRoomTools opts,
+                            MX.mcUserTools = optMatrixUserTools opts
+                          }
                   -- Build the in-gateway schedule (if --schedule-file), register its schedule_* tools
                   -- into the same registry the executor gets, and hand the gateway a direct invoker.
                   msched <- buildScheduleReg opts
@@ -294,12 +316,17 @@ applyConfig fc o =
       optVerifyAndFix = optVerifyAndFix o || fromMaybe False (verifyAndFix fc),
       optInLoopVerify = optInLoopVerify o || fromMaybe False (inLoopVerify fc),
       optSummaryModel = optSummaryModel o <|> summaryModel fc,
+      optPersona = optPersona o <|> fmap T.unpack (persona fc),
+      optSystem = optSystem o <|> system fc,
       optBudgetAwareness = optBudgetAwareness o || fromMaybe False (budgetAwareness fc),
       optServe = optServe o <|> fmap fromIntegral (serve fc),
       optServeA2a = optServeA2a o <|> fmap fromIntegral (serveA2a fc),
       optServeAcp = optServeAcp o <|> fmap fromIntegral (serveAcp fc),
       optServeSlack = optServeSlack o || fromMaybe False (serveSlack fc),
       optServeMatrix = optServeMatrix o || fromMaybe False (serveMatrix fc),
+      -- No flag sets these, so the file is the only source: take it as-is.
+      optMatrixRoomTools = fromMaybe Map.empty (matrixRoomTools fc),
+      optMatrixUserTools = fromMaybe Map.empty (matrixUserTools fc),
       optSessionDir = optSessionDir o <|> fmap T.unpack (sessionDir fc),
       -- A CLI --mcp-server (non-empty) wins wholesale; otherwise take the file's list.
       optMcpServers = case optMcpServers o of
@@ -321,6 +348,8 @@ applyConfig fc o =
       optCronFile = optCronFile o <|> fmap T.unpack (cronFile fc),
       optCronRetryMax = optCronRetryMax o <|> fmap fromIntegral (cronRetryMax fc),
       optCronRetryWait = optCronRetryWait o <|> fmap fromIntegral (cronRetryWait fc),
+      optScheduleRetryMax = optScheduleRetryMax o <|> fmap fromIntegral (scheduleRetryMax fc),
+      optScheduleRetryWait = optScheduleRetryWait o <|> fmap fromIntegral (scheduleRetryWait fc),
       optFallback = case optFallback o of
         [] -> maybe [] (map T.unpack) (fallback fc)
         given -> given,
@@ -524,10 +553,12 @@ buildFallbacks opts = mapM one (optFallback opts)
 -- chain (and its cross-turn circuit breaker) if @--fallback@ was given.
 assembleAgent :: Provider -> Options -> Text -> Tuner -> Maybe Deliberator -> ToolRegistry -> IO Agent
 assembleAgent prov opts model tuner delib registry = do
+  sys <- systemPromptFor opts
   let base = defaultAgentConfig model
       cfg =
         base
-          { acThinking = optThinking opts,
+          { acSystem = sys,
+            acThinking = optThinking opts,
             acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts),
             acMaxSteps = fromMaybe (acMaxSteps base) (optMaxSteps opts),
             acContextLimit = optContextLimit opts,
@@ -549,6 +580,44 @@ assembleAgent prov opts model tuner delib registry = do
   if null fallbacks
     then pure agent0
     else withFallbacks fallbacks (fromIntegral (fromMaybe 60 (optFallbackCooldown opts))) agent0
+
+-- | The agent's system prompt: the operating instructions (@--system@, else the built-in default)
+-- with the persona layered __above__ them, mirroring the Rust @lvz-cli@ composition. The persona
+-- sits in the cached prefix, so carrying it costs almost nothing per turn.
+systemPromptFor :: Options -> IO (Maybe Text)
+systemPromptFor opts = do
+  mpersona <- loadPersona opts
+  pure (layerPersona mpersona (optSystem opts))
+
+-- | Layer a persona /above/ the operating instructions: 'Nothing' persona leaves the prompt alone,
+-- otherwise the persona is prepended to @--system@ (or to 'defaultSystemPrompt' when unset). Note it
+-- __appends to__ rather than replaces the operating instructions, which the tool loop depends on.
+layerPersona :: Maybe Text -> Maybe Text -> Maybe Text
+layerPersona Nothing msystem = msystem
+layerPersona (Just p) msystem =
+  Just (p <> "\n\n--- (operating instructions follow) ---\n\n" <> fromMaybe defaultSystemPrompt msystem)
+
+-- | Read the persona file: an explicit @--persona PATH@, else @.\/PERSONA.md@ when present (unless
+-- @--no-persona@). An unreadable\/empty file yields 'Nothing'; only an explicitly requested one warns,
+-- so the default path stays silent when absent.
+loadPersona :: Options -> IO (Maybe Text)
+loadPersona opts = case (optPersona opts, optNoPersona opts) of
+  (Just p, _) -> readIt True p
+  (Nothing, True) -> pure Nothing
+  (Nothing, False) -> do
+    here <- doesFileExist "PERSONA.md"
+    if here then readIt False "PERSONA.md" else pure Nothing
+  where
+    readIt explicit path = do
+      r <- try (TIO.readFile path) :: IO (Either SomeException Text)
+      case r of
+        Right raw | not (T.null (T.strip raw)) -> do
+          logInfo "persona" ("loaded persona from " <> T.pack path)
+          pure (Just (T.strip raw))
+        Right _ -> pure Nothing
+        Left e -> do
+          when explicit $ logWarn "persona" ("could not read --persona " <> T.pack path <> ": " <> tshow e)
+          pure Nothing
 
 -- | Serve the agent through any 'Gateway', wrapped with a session store (durable if --session-dir).
 serveGateway :: Gateway -> Provider -> Options -> Text -> ToolRegistry -> IO ()

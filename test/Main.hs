@@ -30,6 +30,7 @@ import Data.Text.IO qualified as TIO
 import Data.Vector qualified as V
 import Data.Word (Word64)
 import Lavoisier.Agent
+import Lavoisier.CLI qualified as CLI
 import Lavoisier.Config (FileConfig (..), defaultConfig, loadConfig)
 import Lavoisier.Context.Anchor qualified as Anc
 import Lavoisier.Context.Budget qualified as Bud
@@ -99,6 +100,7 @@ import Network.HTTP.Types (hAuthorization, hContentType, status200, status401, s
 import Network.Wai (defaultRequest, pathInfo, requestHeaders, requestMethod)
 import Network.Wai.Test (SRequest (..), runSession, simpleBody, simpleStatus, srequest)
 import Network.WebSockets qualified as WS
+import Options.Applicative (ParserResult (..), defaultPrefs, execParserPure, info)
 import Proto.Xai.Api.V1.Chat qualified as PX
 import Proto.Xai.Api.V1.Sample qualified as SX
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
@@ -317,6 +319,18 @@ pureProperties =
         MX.senderAllowed (Just (Set.fromList us)) u === (u `elem` us),
       testProperty "roomAllowed: no allowlist admits everywhere" $ \r ->
         MX.roomAllowed Nothing r === True,
+      testCase "toolsFor: a room absent from the map is unconstrained, one present is restricted" $ do
+        let cfg = (MX.defaultMatrixConfig "hs" "@b:hs") {MX.mcRoomTools = Map.singleton "!ops" ["obs_start", "schedule_list"]}
+        MX.toolsFor cfg "!dev" "@a:hs" @?= Nothing
+        MX.toolsFor cfg "!ops" "@a:hs" @?= Just ["obs_start", "schedule_list"],
+      testCase "toolsFor: room ∩ user, so a member cannot exceed the room's grant" $ do
+        let cfg =
+              (MX.defaultMatrixConfig "hs" "@b:hs")
+                { MX.mcRoomTools = Map.singleton "!bcast" ["obs_start", "server_shutdown"],
+                  MX.mcUserTools = Map.singleton "@rian:hs" ["obs_start", "schedule_list"]
+                }
+        MX.toolsFor cfg "!bcast" "@rian:hs" @?= Just ["obs_start"]
+        MX.toolsFor cfg "!bcast" "@david:hs" @?= Just ["obs_start", "server_shutdown"],
       testProperty "toolsFor returns the room∩user intersection, a subset of both" $ \rs us ->
         let cfg = (MX.defaultMatrixConfig "hs" "@b:hs") {MX.mcRoomTools = Map.singleton "r" rs, MX.mcUserTools = Map.singleton "u" us}
          in case MX.toolsFor cfg "r" "u" of
@@ -1742,8 +1756,66 @@ configTests =
         let f = dir </> "c.dhall"
         TIO.writeFile f "{=}"
         fc <- loadConfig f
-        fc @?= defaultConfig
+        fc @?= defaultConfig,
+      -- The Matrix permission maps are the reason the file has to be able to reach the gateway at
+      -- all: with them unset every sender gets the whole registry in every room, silently.
+      testCase "the Matrix tool maps decode from Dhall's assoc-list encoding" $ withTmp "config3" $ \dir -> do
+        let f = dir </> "c.dhall"
+        TIO.writeFile
+          f
+          "{ matrixRoomTools = Some (toMap { `!ops:hs` = [\"obs_start\", \"schedule_list\"] })\n\
+          \, matrixUserTools = Some (toMap { `@rian:hs` = [\"obs_start\"] })\n\
+          \, persona = Some \"/etc/lavoisier/PERSONA.md\"\n\
+          \, scheduleRetryMax = Some 3, scheduleRetryWait = Some 60 }"
+        fc <- loadConfig f
+        matrixRoomTools fc @?= Just (Map.fromList [("!ops:hs", ["obs_start", "schedule_list"])])
+        matrixUserTools fc @?= Just (Map.fromList [("@rian:hs", ["obs_start"])])
+        persona fc @?= Just "/etc/lavoisier/PERSONA.md"
+        scheduleRetryMax fc @?= Just 3
+        scheduleRetryWait fc @?= Just 60,
+      testCase "applyConfig writes them onto Options (the file is their only source)" $ do
+        let fc =
+              defaultConfig
+                { matrixRoomTools = Just (Map.fromList [("!ops:hs", ["obs_start"])]),
+                  matrixUserTools = Just (Map.fromList [("@rian:hs", ["obs_start"])]),
+                  persona = Just "/etc/lavoisier/PERSONA.md",
+                  system = Just "custom",
+                  scheduleRetryMax = Just 3,
+                  scheduleRetryWait = Just 60
+                }
+            o = CLI.applyConfig fc bareOptions
+        CLI.optMatrixRoomTools o @?= Map.fromList [("!ops:hs", ["obs_start"])]
+        CLI.optMatrixUserTools o @?= Map.fromList [("@rian:hs", ["obs_start"])]
+        CLI.optPersona o @?= Just "/etc/lavoisier/PERSONA.md"
+        CLI.optSystem o @?= Just "custom"
+        CLI.optScheduleRetryMax o @?= Just 3
+        CLI.optScheduleRetryWait o @?= Just 60,
+      testCase "a CLI --persona wins over the file" $ do
+        let o = CLI.applyConfig defaultConfig {persona = Just "from-file"} bareOptions {CLI.optPersona = Just "from-flag"}
+        CLI.optPersona o @?= Just "from-flag",
+      testCase "layerPersona puts the persona above the operating instructions, never over them" $ do
+        layerPersona Nothing Nothing @?= Nothing
+        layerPersona Nothing (Just "sys") @?= Just "sys"
+        case layerPersona (Just "I am Lavoisier.") Nothing of
+          Nothing -> assertFailure "expected a layered prompt"
+          Just t -> do
+            assertBool "persona first" ("I am Lavoisier." `T.isPrefixOf` t)
+            assertBool "operating instructions retained" (defaultSystemPrompt `T.isInfixOf` t)
+        case layerPersona (Just "persona") (Just "custom ops") of
+          Nothing -> assertFailure "expected a layered prompt"
+          Just t -> do
+            assertBool "custom ops used" ("custom ops" `T.isInfixOf` t)
+            assertBool "default not smuggled in" (not (defaultSystemPrompt `T.isInfixOf` t))
     ]
+  where
+    layerPersona = CLI.layerPersona
+
+-- | The all-unset 'CLI.Options', built through the real parser so the record and the parser stay
+-- aligned (they are positional — a mismatch is a silent field swap, not a type error).
+bareOptions :: CLI.Options
+bareOptions = case execParserPure defaultPrefs (info CLI.optionsParser mempty) [] of
+  Success o -> o
+  _ -> error "optionsParser must accept an empty argument list"
 
 -- --- Phase 13: MCP client (offline; specs/rendering + a real in-process pipe server) --------------
 

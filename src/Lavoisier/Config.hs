@@ -12,6 +12,7 @@ module Lavoisier.Config
   )
 where
 
+import Data.Map.Strict (Map)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -38,11 +39,19 @@ data FileConfig = FileConfig
     inLoopVerify :: Maybe Bool,
     summaryModel :: Maybe Text,
     budgetAwareness :: Maybe Bool,
+    -- | Path to a persona file layered /above/ the operational system prompt.
+    persona :: Maybe Text,
+    -- | Replaces the operational system prompt outright (the persona still layers above it).
+    system :: Maybe Text,
     serve :: Maybe Natural,
     serveA2a :: Maybe Natural,
     serveAcp :: Maybe Natural,
     serveSlack :: Maybe Bool,
     serveMatrix :: Maybe Bool,
+    -- | Per-room Matrix tool permissions (a room absent from the map is unconstrained).
+    matrixRoomTools :: Maybe (Map Text [Text]),
+    -- | Per-member Matrix tool permissions (intersected with the room's when both apply).
+    matrixUserTools :: Maybe (Map Text [Text]),
     sessionDir :: Maybe Text,
     mcpServers :: Maybe [Text],
     tune :: Maybe Bool,
@@ -56,6 +65,8 @@ data FileConfig = FileConfig
     cronFile :: Maybe Text,
     cronRetryMax :: Maybe Natural,
     cronRetryWait :: Maybe Natural,
+    scheduleRetryMax :: Maybe Natural,
+    scheduleRetryWait :: Maybe Natural,
     fallback :: Maybe [Text],
     fallbackCooldown :: Maybe Natural
   }
@@ -65,7 +76,7 @@ instance Dhall.FromDhall FileConfig
 
 -- | The all-unset config (one 'Nothing' per 'FileConfig' field).
 defaultConfig :: FileConfig
-defaultConfig = FileConfig n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n
+defaultConfig = FileConfig n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n
   where
     n :: Maybe a
     n = Nothing
@@ -98,11 +109,15 @@ defaultsDhall =
       ", inLoopVerify = None Bool",
       ", summaryModel = None Text",
       ", budgetAwareness = None Bool",
+      ", persona = None Text",
+      ", system = None Text",
       ", serve = None Natural",
       ", serveA2a = None Natural",
       ", serveAcp = None Natural",
       ", serveSlack = None Bool",
       ", serveMatrix = None Bool",
+      ", matrixRoomTools = None (List { mapKey : Text, mapValue : List Text })",
+      ", matrixUserTools = None (List { mapKey : Text, mapValue : List Text })",
       ", sessionDir = None Text",
       ", mcpServers = None (List Text)",
       ", tune = None Bool",
@@ -116,6 +131,8 @@ defaultsDhall =
       ", cronFile = None Text",
       ", cronRetryMax = None Natural",
       ", cronRetryWait = None Natural",
+      ", scheduleRetryMax = None Natural",
+      ", scheduleRetryWait = None Natural",
       ", fallback = None (List Text)",
       ", fallbackCooldown = None Natural }"
     ]

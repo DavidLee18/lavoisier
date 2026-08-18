@@ -22,11 +22,25 @@
 , inLoopVerify = None Bool -- stop as soon as an edit turn makes verifyCmd pass
 , summaryModel = None Text -- cheaper model for history-compaction summaries
 , budgetAwareness = None Bool -- append a progress/token note to each turn
+, persona = None Text -- Some "/etc/lavoisier/PERSONA.md": persona/standing instructions layered
+    -- ABOVE the operating instructions (it does not replace them), and inside the cached prefix.
+    -- Unset ⇒ ./PERSONA.md is auto-loaded when present (--no-persona opts out).
+, system = None Text -- replace the built-in operating instructions outright (persona still layers above)
 , serve = None Natural -- HTTP gateway port (POST /v1/turns, GET /health)
 , serveA2a = None Natural -- A2A gateway port
 , serveAcp = None Natural -- ACP gateway port
 , serveSlack = None Bool -- Some True serves over Slack Socket Mode (needs SLACK_APP_TOKEN + SLACK_BOT_TOKEN)
 , serveMatrix = None Bool -- Some True serves over Matrix (needs MATRIX_HOMESERVER + MATRIX_USER + token/password)
+-- Per-room / per-member Matrix tool permissions. No env equivalent — this file is the only way to
+-- set them, and leaving them unset means every allowed sender gets the WHOLE tool registry in every
+-- room they can reach. A room/user absent from a map is unconstrained; when both apply the effective
+-- set is their INTERSECTION. `toMap` turns a record into the assoc list the decoder wants.
+, matrixRoomTools =
+    None (List { mapKey : Text, mapValue : List Text })
+    -- e.g. Some (toMap { `!ops:hs` = [ "shell", "read_file" ], `!general:hs` = [ "read_file" ] })
+, matrixUserTools =
+    None (List { mapKey : Text, mapValue : List Text })
+    -- e.g. Some (toMap { `@bob:hs` = [ "read_file", "read_files" ] })
 , sessionDir = None Text -- durable session store dir (else in-memory)
 , mcpServers = -- external MCP servers whose tools are exposed to the agent (--agent / --serve*)
     Some [ "fs: npx -y @modelcontextprotocol/server-filesystem ." ]
@@ -45,4 +59,6 @@
 , cronFile = None Text -- Some "path" to a JSON file of {schedule,session?,prompt,retry_max?,retry_wait?}
 , cronRetryMax = None Natural -- global default retries after a failed cron fire (default 0)
 , cronRetryWait = None Natural -- global default seconds between cron retries (default 0)
+, scheduleRetryMax = None Natural -- global default retries after a failed --schedule-file fire (default 0)
+, scheduleRetryWait = None Natural -- global default seconds between schedule retries (default 0)
 }
