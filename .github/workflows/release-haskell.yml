@@ -12,7 +12,6 @@ name: release-haskell
 on:
   push:
     tags: ["hs-v*"]
-    branches: ["haskell-port"] # TEMPORARY: validate the pipeline on the branch; revert before merge
   workflow_dispatch:
 
 permissions:
