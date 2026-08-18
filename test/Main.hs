@@ -14,7 +14,9 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.ByteString.Lazy qualified as BL
+import Data.Char (isHexDigit)
 import Data.IORef
+import Data.List (isSuffixOf)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, isNothing)
 import Data.ProtoLens (defMessage)
@@ -102,7 +104,7 @@ import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, remove
 import System.FilePath ((</>))
 import System.IO (Handle, hClose, hFlush, hSetBinaryMode)
 import System.Process (createPipe)
-import Test.QuickCheck (Arbitrary (..), Gen, choose, elements, listOf, oneof, resize)
+import Test.QuickCheck (Arbitrary (..), Gen, NonNegative (..), Positive (..), choose, counterexample, elements, forAll, ioProperty, listOf, oneof, resize, (.&&.))
 import Test.Tasty
 import Test.Tasty.HUnit
 import Test.Tasty.QuickCheck (Property, testProperty, (===))
@@ -116,6 +118,8 @@ tests =
     "lavoisier"
     [ jsonProperties,
       usageProperties,
+      pureProperties,
+      monadicProperties,
       sseTests,
       anthropicBodyTests,
       googleTests,
@@ -155,6 +159,13 @@ tests =
 
 genText :: Gen Text
 genText = T.pack <$> arbitrary
+
+instance Arbitrary Text where
+  arbitrary = genText
+
+-- | Text safe to splice into a Dhall string literal (no quotes/backslashes/newlines to escape).
+genSafe :: Gen Text
+genSafe = T.pack <$> listOf (elements (['a' .. 'z'] <> ['0' .. '9'] <> "-_ "))
 
 instance Arbitrary Usage where
   -- Realistic token magnitudes: usageCost sums via Double (faithful to the Rust `.round() as u64`),
@@ -261,6 +272,102 @@ prop_costFlat u =
 
 prop_total :: Usage -> Property
 prop_total u = usageTotal u === inputTokens u + outputTokens u
+
+-- --- Pure-function properties (QuickCheck) — invariants over the deterministic core ----------------
+
+pureProperties :: TestTree
+pureProperties =
+  testGroup
+    "pure invariants (QuickCheck)"
+    [ testProperty "estimateTokens: leading/trailing spaces don't change the count" $ \t ->
+        estimateTokens (" " <> t <> " ") === estimateTokens t,
+      testProperty "estimateTokens: a leading space-separated word adds exactly one" $ \t ->
+        estimateTokens ("x " <> t) === 1 + estimateTokens t,
+      testProperty "anchorOf is an 8-char lowercase-hex string" $ \t ->
+        let a = Anc.anchorOf t in (T.length a === 8) .&&. counterexample (T.unpack a) (T.all isHexDigit a),
+      testProperty "anchorOf is indentation-insensitive" $ \t ->
+        Anc.anchorOf ("    " <> t) === Anc.anchorOf t,
+      testProperty "stepWindow admits exactly min(n, cap) within one window" $
+        forAll (choose (1, 20)) $ \mx ->
+          forAll (choose (0, 40)) $ \n ->
+            let go _ 0 = 0 :: Int
+                go st k = let (ok, st') = stepWindow mx 60 1000 st in (if ok then 1 else 0) + go (Just st') (k - 1)
+             in go Nothing n === min n (fromIntegral mx),
+      testProperty "stepWindow re-admits once the window has elapsed" $
+        forAll (choose (1, 20)) $ \mx ->
+          fst (stepWindow mx 60 1060 (Just (1000, mx))) === True,
+      testProperty "nextAfter of `* * * * *` is the next minute boundary in (t, t+60]" $
+        forAll (choose (0, 4_000_000_000)) $ \t ->
+          case parseCron "* * * * *" of
+            Left _ -> counterexample "parse failed" False
+            Right s -> case nextAfter s t of
+              Nothing -> counterexample "no next fire" False
+              Just t' -> (t' > t) .&&. (t' - t <= 60) .&&. (t' `mod` 60 === 0),
+      testProperty "trimTo (Just n) keeps min(n, len) messages" $ \(NonNegative n) h ->
+        length (trimTo (Just n) (h :: [Message])) === min n (length h),
+      testProperty "trimTo (Just n) is a suffix of the input" $ \(NonNegative n) h ->
+        trimTo (Just n) (h :: [Message]) `isSuffixOf` h,
+      testProperty "trimTo Nothing is the identity" $ \h ->
+        trimTo Nothing (h :: [Message]) === h,
+      testProperty "senderAllowed: no allowlist admits everyone" $ \u ->
+        MX.senderAllowed Nothing u === True,
+      testProperty "senderAllowed: an allowlist is exactly set membership" $ \u us ->
+        MX.senderAllowed (Just (Set.fromList us)) u === (u `elem` us),
+      testProperty "roomAllowed: no allowlist admits everywhere" $ \r ->
+        MX.roomAllowed Nothing r === True,
+      testProperty "toolsFor returns the room∩user intersection, a subset of both" $ \rs us ->
+        let cfg = (MX.defaultMatrixConfig "hs" "@b:hs") {MX.mcRoomTools = Map.singleton "r" rs, MX.mcUserTools = Map.singleton "u" us}
+         in case MX.toolsFor cfg "r" "u" of
+              Just ts -> counterexample (show ts) (all (`elem` rs) ts && all (`elem` us) ts && ts == filter (`elem` us) rs)
+              Nothing -> counterexample "expected Just" False
+    ]
+
+-- --- Monadic (IO) properties (QuickCheck) ----------------------------------------------------------
+
+monadicProperties :: TestTree
+monadicProperties =
+  testGroup
+    "IO invariants (QuickCheck)"
+    [ testProperty "RecentIds: the most recently inserted id is always contained" $ \(Positive cap) xs x ->
+        ioProperty $ do
+          r <- MX.newRecentIds cap
+          mapM_ (MX.insertRecent r) (xs <> [x] :: [Text]) -- x inserted last
+          MX.containsRecent r x,
+      testProperty "RecentIds: cap+1 distinct ids evicts the oldest, keeps the newest" $
+        forAll (choose (1, 30)) $ \cap ->
+          ioProperty $ do
+            let oldestId = T.pack (show (1 :: Int))
+                newestId = T.pack (show (cap + 1))
+                xs = map (T.pack . show) [1 .. cap + 1]
+            r <- MX.newRecentIds cap
+            mapM_ (MX.insertRecent r) xs
+            oldest <- MX.containsRecent r oldestId
+            newest <- MX.containsRecent r newestId
+            pure (not oldest && newest),
+      testProperty "in-memory store round-trips a session as the trimmed history" $
+        forAll (choose (0, 12)) $ \n ->
+          \h -> ioProperty $ do
+            store <- newInMemoryStore (Just n)
+            saveSession store "s" (h :: [Message])
+            loaded <- loadSession store "s"
+            pure (loaded === trimTo (Just n) h),
+      testProperty "cron-file (Dhall) round-trips a job's session/prompt/retry" $
+        forAll genSafe $ \sess ->
+          forAll genSafe $ \prm ->
+            forAll (choose (0, 9)) $ \(rmax :: Int) ->
+              forAll (choose (0, 300)) $ \(rwait :: Int) ->
+                ioProperty $
+                  withTmp "cronqc" $ \dir -> do
+                    r <-
+                      loadCron dir 0 0 $
+                        "[ c // { schedule = \"* * * * *\", session = Some \"" <> sess <> "\", prompt = \"" <> prm <> "\", retryMax = Some " <> tshow' rmax <> ", retryWait = Some " <> tshow' rwait <> " } ]"
+                    pure $ case r of
+                      Right [j] -> (cjSession j === sess) .&&. (cjPrompt j === prm) .&&. (cjRetryMax j === rmax) .&&. (cjRetryWait j === rwait)
+                      other -> counterexample (show (fmap (map cjSession) other)) False
+    ]
+  where
+    tshow' :: Int -> Text
+    tshow' = T.pack . show
 
 -- --- Phase 2: Anthropic SSE decoder (example-based; ports sse.rs tests) ----------------------------
 
@@ -1148,9 +1255,6 @@ contextTests =
       testCase "changedLines: counts inserts and deletes" $
         -- one line replaced => one delete + one insert.
         Dff.changedLines "a\nb\nc\n" "a\nB\nc\n" @?= 2,
-      testCase "anchorOf is indentation-insensitive and stable 8-hex" $ do
-        Anc.anchorOf "    let x = 1;" @?= Anc.anchorOf "let x = 1;"
-        T.length (Anc.anchorOf "let x = 1;") @?= 8,
       testCase "replace targets the anchored line" $ do
         out <- expectRight (Anc.applyEdits src [Anc.replaceEdit (Anc.anchorOf "    let x = 1;") "    let x = 42;"])
         assertBool "new value present" ("let x = 42;" `T.isInfixOf` out)
@@ -1567,10 +1671,6 @@ memoryTests =
         back <- loadSession store "s"
         length back @?= 2
         map msgRole back @?= [Assistant, User],
-      testCase "trimTo keeps the most recent, or all when unbounded" $ do
-        let h = [userMessage "1", userMessage "2", userMessage "3"]
-        map messageText (trimTo (Just 2) h) @?= ["2", "3"]
-        trimTo Nothing h @?= h,
       testCase "session agent threads the transcript across turns" $ do
         store <- newInMemoryStore Nothing
         let stub =
@@ -2564,13 +2664,6 @@ matrixTests =
         MX.toolsFor cfg "!r:hs" "@bob:hs" @?= Just ["read_file", "shell", "write_file"] -- room only
         MX.toolsFor cfg "!other:hs" "@alice:hs" @?= Just ["read_file", "shell"] -- user only
         MX.toolsFor cfg "!other:hs" "@bob:hs" @?= Nothing, -- unconstrained
-      testCase "RecentIds is bounded and FIFO-evicts" $ do
-        recent <- MX.newRecentIds 2
-        mapM_ (MX.insertRecent recent) ["$a", "$b", "$c"]
-        -- \$a evicted
-        MX.containsRecent recent "$a" >>= (@?= False)
-        MX.containsRecent recent "$b" >>= (@?= True)
-        MX.containsRecent recent "$c" >>= (@?= True),
       testCase "extractInvites and parseNextBatch" $ do
         let sync = object ["next_batch" .= t "tok", "rooms" .= object ["invite" .= object ["!inv:hs" .= object []]]]
         MX.extractInvites sync @?= ["!inv:hs"]
