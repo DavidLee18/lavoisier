@@ -10,13 +10,20 @@ module Lavoisier.CLI
     Options (..),
     optionsParser,
 
-    -- * Custom-tool extension point (re-exported for downstream @main_with@-style crates)
+    -- * Custom-tool extension point (re-exported for downstream @mainWith@ crates)
     Tool (..),
     ToolOutput,
     ToolError (..),
     toolOk,
     toolErr,
     setChanged,
+
+    -- * Operator logging (re-exported so downstream tools instrument themselves)
+    LogLevel (..),
+    logError,
+    logWarn,
+    logInfo,
+    logDebug,
   )
 where
 
@@ -37,6 +44,7 @@ import Lavoisier.Gateway.Matrix (matrixFromEnv, matrixGateway)
 import Lavoisier.Gateway.Matrix qualified as MX
 import Lavoisier.Gateway.Slack (slackFromEnv, slackGateway)
 import Lavoisier.Legion (Debater, languageFromLocale, mkDebater, newPanel, panelDeliberator, renderLegionError, withLanguage)
+import Lavoisier.Log (LogLevel (..), logDebug, logError, logInfo, logWarn, parseLogLevel, setLogLevel)
 import Lavoisier.Mcp (connectTools, mssLabel, parseServerSpec, renderMcpError)
 import Lavoisier.Memory (newFileStore, newInMemoryStore, sessionAgentHandle)
 import Lavoisier.Protocol.Agent (turnRequest)
@@ -114,6 +122,7 @@ data Options = Options
     optScheduleRetryWait :: Maybe Int,
     optFallback :: [String],
     optFallbackCooldown :: Maybe Int,
+    optLogLevel :: Maybe String,
     optWords :: [String]
   }
 
@@ -166,6 +175,7 @@ optionsParser =
     <*> optional (option auto (long "schedule-retry-wait" <> metavar "SECS" <> help "Global default seconds between schedule retries (default 0)"))
     <*> many (strOption (long "fallback" <> metavar "PROVIDER:MODEL" <> help "A fallback model (repeatable, ordered): rerouted to when the primary is unresponsive/errors before streaming any output"))
     <*> optional (option auto (long "fallback-cooldown" <> metavar "SECS" <> help "Seconds a failed fallback-chain model stays demoted before it's re-probed (circuit breaker; default 60)"))
+    <*> optional (strOption (long "log-level" <> metavar "FILTER" <> help "Operator-log threshold: error|warn|info|debug (also LVZ_LOG_LEVEL; default info)"))
     <*> many (argument str (metavar "PROMPT..."))
 
 thinkingReader :: ReadM ThinkingLevel
@@ -193,6 +203,9 @@ mainWith extra = do
   hSetEncoding stderr utf8
   opts0 <- execParser pinfo
   opts <- mergeConfig opts0
+  -- Operator-log threshold: --log-level > LVZ_LOG_LEVEL > default info.
+  levelRaw <- maybe (lookupEnv "LVZ_LOG_LEVEL") (pure . Just) (optLogLevel opts)
+  maybe (pure ()) (setLogLevel . parseLogLevel . T.pack) levelRaw
   eprov <- selectProvider (fromMaybe "anthropic" (optProvider opts))
   case eprov of
     Left e -> errExit e
@@ -544,7 +557,7 @@ serveGateway gw prov opts model registry = do
   delib <- buildLegion opts
   agent <- assembleAgent prov opts model tuner delib registry
   store <- maybe (newInMemoryStore (Just 200)) (`newFileStore` Just 200) (optSessionDir opts)
-  herr ("gateway '" <> gatewayName gw <> "' starting")
+  logInfo "gateway" (gatewayName gw <> " starting")
   res <- gatewayServe gw (sessionAgentHandle store agent)
   case res of
     Left e -> errExit (tshow e)

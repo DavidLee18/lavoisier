@@ -68,6 +68,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Vector qualified as V
+import Lavoisier.Log (logInfo)
 import Lavoisier.Protocol.Agent (AgentHandle (..), TurnRequest (..), TurnStream, turnRequest)
 import Lavoisier.Protocol.Event (Event (..))
 import Lavoisier.Protocol.Gateway (Gateway (..), GatewayError (..))
@@ -81,7 +82,6 @@ import Network.HTTP.Types.Status (statusCode, statusIsSuccessful)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
-import System.IO (hPutStrLn, stderr)
 import System.Posix.Signals (Handler (Catch), installHandler, sigINT, sigTERM)
 #ifdef E2EE
 import Control.Monad (forM_, unless)
@@ -457,8 +457,8 @@ fireScheduleJob env agent recent ctx job now = do
   body <- case sjSummarize job of
     Just instr -> summariseForRoom agent job instr (outcomeLine result <> raw) raw
     Nothing -> pure raw
-  -- Untruncated operator log to stderr per fire (every frontend gets it).
-  hPutStrLn stderr (T.unpack ("[schedule] " <> sjId job <> " " <> either (const "FAIL") (const "ok") result <> ": " <> either id id result))
+  -- Untruncated operator log per fire (respects the log level; every frontend gets it).
+  logInfo "schedule" (sjId job <> " " <> either (const "FAIL") (const "ok") result <> ": " <> raw)
   let marker = either (const ("\10060" :: Text)) (const "\9989") result
       report = "\9200 schedule `" <> sjId job <> "` " <> marker <> "\n" <> body
   case sjRoom job of

@@ -46,6 +46,7 @@ import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp
 import Lavoisier.Gateway.Matrix qualified as MX
 import Lavoisier.Gateway.Slack (SlackMessage (..), parseEvent, senderAllowed, slackSession)
 import Lavoisier.Legion (Debater, Language (..), LegionError (..), languageFromLocale, mkDebater, newPanel, panelDeliberator, withLanguage)
+import Lavoisier.Log (LogLevel (..), parseLogLevel)
 import Lavoisier.Mcp
   ( CallResult (..),
     McpClient,
@@ -142,6 +143,7 @@ tests =
       acpTests,
       memoryTests,
       configTests,
+      logTests,
       mcpTests,
       tuneTests,
       bayesTests,
@@ -1704,6 +1706,25 @@ memoryTests =
     ]
 
 -- --- Phase 12: Dhall config (offline; loads real Dhall from a temp file) --------------------------
+
+logTests :: TestTree
+logTests =
+  testGroup
+    "operator logging"
+    [ testCase "parseLogLevel reads bare level names" $ do
+        map parseLogLevel ["error", "warn", "info", "debug"] @?= [LogError, LogWarn, LogInfo, LogDebug]
+        parseLogLevel "WARN" @?= LogWarn
+        parseLogLevel "trace" @?= LogDebug,
+      testCase "parseLogLevel reduces a RUST_LOG directive set to its last bare level" $ do
+        parseLogLevel "lvz_gw_matrix=debug,info" @?= LogInfo
+        parseLogLevel "lvz_agent=debug,warn,foo=trace" @?= LogWarn,
+      testCase "parseLogLevel falls back to info" $ do
+        parseLogLevel "" @?= LogInfo
+        parseLogLevel "garbage" @?= LogInfo
+        parseLogLevel "lvz_gw_matrix=debug" @?= LogInfo, -- no bare token
+      testCase "the level ordering makes info admit warn+error, not debug" $
+        assertBool "info < debug, error < info" (LogError < LogInfo && LogInfo < LogDebug)
+    ]
 
 configTests :: TestTree
 configTests =

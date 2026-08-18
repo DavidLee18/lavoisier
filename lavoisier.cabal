@@ -55,6 +55,7 @@ library
     Lavoisier.Gateway.Matrix
     Lavoisier.Gateway.Slack
     Lavoisier.Legion
+    Lavoisier.Log
     Lavoisier.Mcp
     Lavoisier.Memory
     Lavoisier.Protocol
