@@ -4,15 +4,20 @@
 
 # Lavoisier
 
-A modular, **token-efficient** CLI coding agent in Rust with a provider-agnostic core
-(**Anthropic + xAI native, plus Google Gemini**). The same agent brain drives the CLI today and a
-multi-gateway "Hermes" service (HTTP/WebSocket, Matrix) tomorrow.
+A modular, **token-efficient** CLI coding agent with a provider-agnostic core (**Anthropic, xAI,
+and Google Gemini — all native**). One agent brain drives the CLI and every gateway: HTTP/WebSocket,
+Matrix, Slack, cron, A2A, ACP.
 
-> Status: **complete** — provider streaming over SSE **and** xAI gRPC, the agent loop, fs/shell/
-> context tools, the token-efficiency engine, session memory, gateways, AWS packaging, and the
-> adaptive-token-optimisation learner are all implemented and tested. Live-verified against real
-> `XAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY`. See [`ARCHITECTURE.md`](ARCHITECTURE.md)
-> for the design.
+> **This branch (`haskell-port`) is the Haskell implementation** — a Cabal package at the repo root.
+> The Rust workspace it was ported from lives in [`reference-rust/`](reference-rust) and is the
+> parity reference; `main` carries Rust at the root.
+>
+> Status: the port covers the same surface — providers, context engine, ATO, tools, and all gateways
+> including Matrix E2EE — and is live-verified on 7 of them against real `ANTHROPIC_API_KEY`,
+> `XAI_API_KEY`, and `GOOGLE_API_KEY` (Slack is offline-tested only, for want of tokens). Parity is
+> measured against the `reference-rust/` **v0.13.0** snapshot, not the deployed Rust v0.15.0; the
+> drift between them (an ACP-stdio rework and a TUI frontend, neither on the served paths) is
+> undiffed. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design.
 
 ## Why
 
@@ -22,9 +27,8 @@ goal at every layer:
 
 - **Prompt caching** on stable prefixes via Anthropic's native Messages API (`cache_control:
   ephemeral`) — context is ordered immutable → stable → volatile so the cached prefix stays warm.
-- **Cache-aware repo-skeleton prefix** — a tree-sitter outline of the whole repo, built once and
-  pinned in the cached prefix, so the model has whole-repo structure without per-task reads.
-- **File-skeleton extraction** — send signatures, elide bodies; Python docstrings kept.
+- **File-skeleton extraction** — `outline_file`/`outline_files` send signatures and type definitions
+  and elide bodies (doc comments kept), so structure costs a fraction of the source.
 - **AST-resolved symbol-dependency graph** drives the skeleton-radius knob `N` ("include full
   bodies for symbols within `N` hops of the edit target") — references resolved from identifier
   nodes, scope-aware (string/comment mentions and shadowing locals don't create edges).
@@ -34,58 +38,65 @@ goal at every layer:
   from realised outcomes (ε-greedy hill-climb or Thompson sampling), gated by a real success signal.
 - **History compaction**, context-budget eviction, and model routing (cheap-model-first, advisor+
   executor) for long tasks.
-- A **budget-fixture CI loop** that gates skeleton-size regressions against committed token ceilings.
+- A **budget-sweep test suite** over the context engine that pins the radius lever's behaviour — the
+  kept set grows monotonically with radius and a wider radius really does cost more tokens — so a
+  regression in the size/relevance trade is a test failure, not a slow cost creep.
 
 **Two modes.** By default Lavoisier is **efficiency-first** — lean context, caching, minimal
 round-trips. When you have a real test gate, opt into **accuracy-mode** (`--verify-cmd <tests>
 --require-edit --verify-and-fix`): the agent iterates until the tests pass. In the measured
 head-to-head this matches or beats the comparison agent on task completion *while costing less per
 completed task* — see [`bench/README.md`](bench/README.md) (cost + reproducible correctness via
-`bench/verify.zsh`). Tuner internals: [`ATO.md`](ATO.md).
+`bench/verify.zsh`). That benchmark was run against the Rust build; the port shares the design but
+has not been re-benchmarked. Tuner internals: [`ATO.md`](ATO.md).
 
 ## Architecture
 
-A Cargo workspace, trait-segmented so the agent core never depends on a wire protocol or a frontend.
-The keystone is `lvz-protocol`; dependencies point inward only. See [`ARCHITECTURE.md`](ARCHITECTURE.md)
-for the crate map, the invariants, and the key design decisions.
+One Cabal package whose module tree mirrors the Rust crates (`lvz-protocol` → `Lavoisier.Protocol.*`,
+and so on), segmented so the agent core never depends on a wire protocol or a frontend. The keystone
+is `Lavoisier.Protocol.*`, which defines the `Event` stream and the `Provider`/`Tool`/`Gateway`/
+`Tuner`/`Deliberator` contracts; dependencies point inward only. Those contracts are **records of
+functions** held as ordinary values (the `Arc<dyn Trait>` analogue), and `EventStream` is a
+hand-rolled pull stream standing in for Rust's `BoxStream`. Plain `IO`, no effect framework. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md) for the module map, the invariants, and the key design decisions.
 
 ## Install
 
-The crate is `lavoisier`; the installed command is **`lav`**.
-
-```sh
-cargo binstall lavoisier   # prebuilt binary, no toolchain/protoc needed
-cargo install lavoisier    # from source (needs protoc: brew install protobuf)
-
-# Opt-in Matrix end-to-end encryption (Olm/Megolm); needs Rust >= 1.93:
-cargo install lavoisier --features e2ee
-```
+The package is `lavoisier`; the built command is **`lav`**. It is **not on Hackage** — take a
+self-contained tarball from a `hs-v*` [release](https://github.com/DavidLee18/lavoisier/releases)
+(macOS arm64, Linux x86_64/arm64), or build from source below.
 
 ## Quickstart (from source)
 
-Requires a recent Rust toolchain (**edition 2021, MSRV 1.88**) and **`protoc`**
-(`brew install protobuf`) — `lvz-xai`'s build compiles the vendored xAI protos.
+Requires **GHC 9.10** + Cabal, and the native libraries the engine links: `tree-sitter` (0.26.x, for
+grammar ABI 15), `snappy`, and — only under the `e2ee` flag — `libolm` (3.2.x). No `protoc`: the xAI
+gRPC bindings are committed under `gen/`.
 
 ```sh
-cargo build
+cabal build
+cabal build -fe2ee          # + Matrix end-to-end encryption (Olm/Megolm via the olm/ FFI package)
 
-# One streaming turn (no tools). xAI uses gRPC by default (XAI_TRANSPORT=grpc):
-XAI_API_KEY=…       cargo run -p lavoisier -- "explain a monad in one sentence"
-ANTHROPIC_API_KEY=… cargo run -p lavoisier -- --provider anthropic "…"
+# One streaming turn (no tools):
+ANTHROPIC_API_KEY=… cabal run lav -- "explain a monad in one sentence"
+XAI_API_KEY=…       cabal run lav -- --provider xai-grpc "…"
 
 # The multi-step agent with filesystem + shell + context tools:
-XAI_API_KEY=… cargo run -p lavoisier -- --agent "add a doc comment to the add() fn in src/lib.rs"
+ANTHROPIC_API_KEY=… cabal run lav -- --agent "add a doc comment to the add() fn in src/Lib.hs"
 
 # Serve the shared agent as an HTTP/WebSocket gateway (+ in-memory session continuity):
-XAI_API_KEY=… cargo run -p lavoisier -- --serve 127.0.0.1:8080
+ANTHROPIC_API_KEY=… cabal run lav -- --serve 8080
 
 # Run scheduled agent turns (in-process cron, UTC) — standalone or alongside --serve/--serve-matrix:
-XAI_API_KEY=… cargo run -p lavoisier -- --cron "*/30 9-17 * * 1-5 summarise new CI failures"
+ANTHROPIC_API_KEY=… cabal run lav -- --cron "*/30 9-17 * * 1-5 summarise new CI failures"
 
 # Chat gateways: Matrix (one room per session) and Slack (Socket Mode, one channel/thread per session):
-ANTHROPIC_API_KEY=… cargo run -p lavoisier -- --serve-matrix
-ANTHROPIC_API_KEY=… cargo run -p lavoisier -- --serve-slack
+ANTHROPIC_API_KEY=… cabal run lav -- --serve-matrix
+ANTHROPIC_API_KEY=… cabal run lav -- --serve-slack
 ```
+
+The built-in tools are `read_file` · `read_files` · `write_file` · `str_replace` · `edit_files` ·
+`list_dir` · `shell` · `outline_file` · `outline_files`, plus `batch_edit` on a provider with a
+discounted batch API, and `schedule_list`/`schedule_status`/`schedule_run` inside a Matrix schedule.
 
 Gateways compose: `--serve`, `--serve-matrix`, `--serve-slack`, and `--cron`/`--cron-file` all drive
 **one** shared agent and run concurrently in the same process, so a single low-resource host can
@@ -94,27 +105,47 @@ the full tool-using agent loop, so scheduled jobs can read, edit, and run comman
 interactive turn. Each cron job keeps a fixed session, so it accrues memory across fires (like the
 Matrix per-room / Slack per-channel sessions). A failed fire (a rejected submit or a mid-turn stream
 error) can be **retried**: `--cron-retry-max N` + `--cron-retry-wait SECS` set global defaults, and a
-`--cron-file` job may override either per-job (`"retry_max"`/`"retry_wait"`); the next scheduled slot
+`--cron-file` job may override either per-job (`retryMax`/`retryWait`); the next scheduled slot
 is recomputed only after retries finish, so a retry never double-fires the following slot.
 
 **Schedules (Matrix).** Where `--cron` fires a *prompt* into stderr, `--schedule-file` runs jobs
 **inside the Matrix gateway** and reports each outcome to a room. A job is either a **direct tool
 call** — which runs *unconditionally*, with no model round-trip and so no tokens — or a prompt turn:
 
-```jsonc
-[
-  // Deterministic: the tool always runs. Retries twice, 60s apart, on a non-zero exit.
-  {"id":"disk","schedule":"0 9 * * *","room":"!ops:example.org",
-   "tool":"shell","args":{"command":"df -h"},"retry_max":2,"retry_wait":60},
-  // Model-driven: fires an agent turn, which may chain tools.
-  {"id":"build","schedule":"*/15 * * * *","prompt":"check the build and summarise failures"}
-]
+```dhall
+-- jobs.dhall — a Dhall list of job records, type-checked at load. Dhall records carry no
+-- defaults, so every field must be present: name the shape once and override per job.
+-- Note `jobId`/`toolArgs`, not `id`/`args` — Dhall selectors are top-level, so `id` and
+-- `args` would collide with function parameters. `toolArgs` is a JSON-object *string*.
+let Job =
+      { jobId : Text, schedule : Text, room : Optional Text, session : Optional Text
+      , tool : Optional Text, toolArgs : Optional Text, prompt : Optional Text
+      , summarize : Optional Text, retryMax : Optional Natural, retryWait : Optional Natural }
+
+let empty : Job =
+      { jobId = "", schedule = "* * * * *", room = None Text, session = None Text
+      , tool = None Text, toolArgs = None Text, prompt = None Text
+      , summarize = None Text, retryMax = None Natural, retryWait = None Natural }
+
+in  [ -- Deterministic: the tool always runs, no model round-trip and so no tokens.
+      empty // { jobId = "disk", schedule = "0 9 * * *", room = Some "!ops:example.org"
+               , tool = Some "shell", toolArgs = Some "{\"command\":\"df -h\"}"
+               , retryMax = Some 2, retryWait = Some 60 }
+    , -- Model-driven: fires an agent turn, which may chain tools.
+      empty // { jobId = "build", schedule = "*/15 * * * *"
+               , prompt = Some "check the build and summarise failures" }
+    ]
 ```
 
+A tool job may also carry `summarize`, an instruction that rewrites the raw output into prose for the
+room (the full output still goes to stderr). `tool` and `prompt` are mutually exclusive, and one of
+them is required.
+
 ```sh
-ANTHROPIC_API_KEY=… cargo run -p lavoisier -- --serve-matrix \
-  --schedule-file jobs.json --schedule-room '!ops:example.org'
+ANTHROPIC_API_KEY=… cabal run lav -- --serve-matrix --schedule-file jobs.dhall
 ```
+
+There is no `--schedule-room`: each job names its own `room`.
 
 Every fire posts a result (`✅ \`disk\` · …`); failures are louder, carrying the error plus the retry
 countdown or a give-up notice. Reports are **addressable**: the bot registers `schedule_list`,
@@ -140,31 +171,33 @@ stream error: provider error: 503 upstream unavailable
 ```
 
 **Persona / priorities.** Point `--persona <PATH>` at a file (or drop a `PERSONA.md` in the working
-dir) to give a long-running gateway a stable identity and standing instructions: it's layered above
-the operating system-prompt and rides in the cached prefix, so it costs almost nothing per turn.
+dir, or set `persona` in the config) to give a long-running gateway a stable identity and standing
+instructions. It is layered **above** the operating instructions rather than replacing them — the
+tool-loop steering survives — and rides in the cached prefix, so it costs almost nothing per turn.
+`--no-persona` suppresses the `./PERSONA.md` auto-load; `--system` replaces the operating
+instructions themselves, with the persona still layered above whatever that leaves.
 
 **Matrix auth & identity.** The Matrix gateway authenticates with either an **access token**
 (`MATRIX_ACCESS_TOKEN` — identity resolved via `whoami`, no login) or **password**
 (`MATRIX_USER` + `MATRIX_PASSWORD`). Set `MATRIX_STATE_DIR` to persist the session (token + device
 id) and keep a **stable device identity across restarts** — a prerequisite for durable E2EE. Restrict
-who can drive the bot with `MATRIX_ALLOWED_USERS` (or `[gateway] matrix_allowed_users`).
+who can drive the bot with `MATRIX_ALLOWED_USERS`.
 
 **Matrix access control & tool permissions.** Three layers, all opt-in and applied uniformly to
 plaintext and encrypted rooms:
-- **Allowed rooms** — `MATRIX_ALLOWED_ROOMS` (or `[gateway] matrix_allowed_rooms`) limits the rooms
+- **Allowed rooms** — `MATRIX_ALLOWED_ROOMS` limits the rooms
   the bot acts in. Combined with the sender allowlist as a **conjunction**: a turn runs only if the
   sender is allowed *and* the room is allowed — so an allowed user is answered only inside allowed rooms.
-- **Per-room / per-member tool permissions** — `[gateway.matrix_room_tools]` maps a room to the tools
-  permitted there, and `[gateway.matrix_user_tools]` maps a member to the tools permitted to them
-  (config-file only; richer than env can express cleanly). A room/user absent from a map is
+- **Per-room / per-member tool permissions** — `matrixRoomTools` maps a room to the tools permitted
+  there, and `matrixUserTools` maps a member to the tools permitted to them (config-file only: these
+  are nested maps, richer than env can express cleanly). A room/user absent from a map is
   unconstrained; when both apply, the effective set is their **intersection** (a tool must be allowed
   by the room *and* the member). Enforced in the agent core per turn, so a disallowed tool is neither
   advertised to the model nor runnable. Pair with allowed-rooms/-users for a deny-by-default perimeter.
-- **Home room** — `MATRIX_HOME_ROOM` (or `[gateway] matrix_home_room`) names one room that receives a
+- **Home room** — `MATRIX_HOME_ROOM` names one room that receives a
   friendly "going offline" notice when the gateway is stopped (SIGTERM / Ctrl-C); the process then exits
   cleanly. The notice is localised (Korean when `--lang`/`LANG` is `KO_KR`, English otherwise).
-- **Media ingest** — `--matrix-media-dir <DIR>` (or `MATRIX_MEDIA_DIR` / `[gateway] matrix_media_dir`)
-  **enables** inbound image/file handling: when the bot is engaged by a message carrying a file, it
+- **Media ingest** — `MATRIX_MEDIA_DIR` **enables** inbound image/file handling: when the bot is engaged by a message carrying a file, it
   downloads the bytes to `<DIR>` and appends the local path to the turn so a tool can act on it — the
   "bytes-to-tool" path (the model never sees the image, it just gets a path to hand to a tool, e.g. a
   custom upload tool). Unset ⇒ media messages are ignored, as before. Unencrypted rooms only for now
@@ -180,21 +213,28 @@ export MATRIX_ACCESS_TOKEN=…                        # bot identity (or MATRIX_
 export MATRIX_ALLOWED_USERS="@alice:hs,@bob:hs"      # answer only these senders
 export MATRIX_ALLOWED_ROOMS="!ops:hs,!general:hs"    # …and only in these rooms (AND'd with the above)
 export MATRIX_HOME_ROOM="!ops:hs"                    # gets the friendly "going offline" notice on SIGTERM
-ANTHROPIC_API_KEY=… lav --serve-matrix --config lavoisier.toml
+ANTHROPIC_API_KEY=… lav --serve-matrix --config lavoisier.dhall
 ```
 
-```toml
-# lavoisier.toml — per-room / per-member tool permissions (no env equivalent).
-# Absent from a map ⇒ unconstrained; when a room AND a member both apply, the effective
-# set is their INTERSECTION (a tool must be permitted by the room *and* the member).
-[gateway.matrix_room_tools]
-"!ops:hs"     = ["shell", "read_file", "write_file", "str_replace"]
-"!general:hs" = ["read_file", "read_files", "outline_file"]   # read-only room
-
-[gateway.matrix_user_tools]
-"@alice:hs" = ["shell", "read_file", "write_file", "str_replace"]
-"@bob:hs"   = ["read_file", "read_files"]                     # bob: reads only
+```dhall
+-- lavoisier.dhall — per-room / per-member tool permissions (no env equivalent).
+-- Absent from a map ⇒ unconstrained; when a room AND a member both apply, the effective
+-- set is their INTERSECTION (a tool must be permitted by the room *and* the member).
+-- `toMap` turns a record into the assoc list the decoder reads.
+{ matrixRoomTools = Some (toMap
+    { `!ops:hs`     = [ "shell", "read_file", "write_file", "str_replace" ]
+    , `!general:hs` = [ "read_file", "read_files", "outline_file" ]   -- read-only room
+    })
+, matrixUserTools = Some (toMap
+    { `@alice:hs` = [ "shell", "read_file", "write_file", "str_replace" ]
+    , `@bob:hs`   = [ "read_file", "read_files" ]                     -- bob: reads only
+    })
+}
 ```
+
+**Leaving these unset means no restriction at all** — every allowed sender is offered the whole tool
+registry in every room they can reach. They fail open by design (a room absent from the map is
+unconstrained), so a deployment that relies on them must set them in the config file.
 
 Resulting effective tool sets (room ∩ member):
 - **Alice in `!ops`** → `shell, read_file, write_file, str_replace` (both sets agree — full power).
@@ -216,65 +256,69 @@ or **❌** (the agent or the answer failed), so the reaction on your message tel
 glance. (These behaviours are Matrix-only; the Slack gateway answers `message`/`app_mention` as before.)
 
 **Matrix encryption.** The Matrix gateway targets unencrypted rooms by default; build with
-`--features e2ee` (needs Rust ≥ 1.93) for Olm/Megolm end-to-end encryption via `matrix-sdk-crypto`.
-With `MATRIX_STATE_DIR` set, the crypto store is persisted to SQLite (`<dir>/crypto`,
-optionally encrypted at rest with `MATRIX_CRYPTO_STORE_KEY`) so the bot keeps its keys and decrypts
-existing rooms after a restart — no re-verification. The gateway **auto-accepts room invites** so you
-can just invite the bot; disable with `--matrix-no-auto-join` or `[gateway] matrix_auto_join = false`.
+`-fe2ee` for Olm/Megolm end-to-end encryption, orchestrated here over the `olm/` FFI package against
+the system `libolm` (where the Rust tree delegates to `matrix-sdk-crypto`). With `MATRIX_STATE_DIR`
+set, the account and its sessions are **pickled** to that directory — optionally encrypted at rest
+with `MATRIX_CRYPTO_STORE_KEY` — so the bot keeps its keys and decrypts existing rooms after a
+restart, no re-verification. Use a **fresh `MATRIX_DEVICE_ID` for each new live run**: reusing one
+leaves stale one-time keys on the homeserver and peers fail with `BAD_MESSAGE_KEY_ID`. The gateway
+**auto-accepts room invites** so you can just invite the bot; disable by setting
+`MATRIX_NO_AUTO_JOIN`.
 
 **Slack.** The Slack gateway uses **Socket Mode** (no inbound port): a Slack app with an app-level
 token (`SLACK_APP_TOKEN`, `xapp-…`) and a bot token (`SLACK_BOT_TOKEN`, `xoxb-…`). It answers
 `message` and `app_mention` events, threads replies in threads, keys a session per channel (or
-thread), and can be restricted with `SLACK_ALLOWED_USERS` (or `[gateway] slack_allowed_users`).
+thread), and can be restricted with `SLACK_ALLOWED_USERS`.
 
 ### Configuration file
 
-For long-running deployments, a **TOML config** sets defaults for most flags so you don't pass a
-long command line. `--config <PATH>` (or an auto-loaded `./lavoisier.toml`) is split into
-`[provider]`, `[agent]`, `[memory]`, and `[gateway]` sections; **an explicit CLI flag or env var
-always wins over the file**, which wins over the built-in default. Unknown keys are rejected.
-See [`lavoisier.example.toml`](lavoisier.example.toml).
+For long-running deployments, a **Dhall config** sets defaults for most flags so you don't pass a
+long command line. (Dhall here, TOML in the Rust tree.) `--config <PATH>` — or an auto-loaded
+`./lavoisier.dhall` — is one flat record whose keys are the flag names in camelCase; **an explicit
+CLI flag or env var always wins over the file**, which wins over the built-in default. Every field is
+optional: the file is merged over an all-`None` defaults record, so write only what you set, and
+Dhall type-checks it at load, making a typo or a wrong type a clear error rather than a silent
+default. See [`lavoisier.dhall.example`](lavoisier.dhall.example) for the annotated full schema.
 
-**Memory** is configured here. The in-memory session store is unbounded by default; `[memory]` can
-cap it — `max_messages` (most-recent-N per session) and `max_sessions` (LRU eviction) — or switch to
-a **durable file store** (`store = "file"`, `path = "..."`) so sessions survive restarts.
+The Matrix per-room/per-member tool maps (above) have **no flag and no env var** — the config file is
+the only way to set them. Sessions are durable when `sessionDir` is set (a file store under that
+directory) and in-memory otherwise, capped at the most recent 200 messages per session either way.
 
-```toml
-# lavoisier.toml
-[provider]
-provider = "anthropic"
-[agent]
-compact_after = 60000          # compact history past ~this many tokens
-context_limit = 120000         # evict oldest tool output to fit
-[memory]
-store = "file"                 # durable; survives restarts
-path  = "./.lavoisier/sessions"
-max_messages = 200             # cap each session's transcript
-[gateway]
-serve = "0.0.0.0:8080"
-api_keys = ["secret"]
+```dhall
+-- lavoisier.dhall
+{ provider = Some "anthropic"
+, contextLimit = Some 120000        -- evict oldest tool output to fit
+, summaryModel = Some "claude-haiku-4-5-20251001"
+, sessionDir = Some "./.lavoisier/sessions"   -- durable; survives restarts
+, persona = Some "/etc/lavoisier/PERSONA.md"
+, serve = Some 8080
+}
 ```
 
 ### Flags
 
-`--config <PATH>` (TOML defaults; see above) ·
-`--agent` (tool loop) · `--serve <host:port>` (HTTP/WS gateway) · `--serve-matrix` (Matrix) ·
-`--serve-slack` (Slack Socket Mode) · `--matrix-no-auto-join` (don't auto-accept Matrix invites) ·
+`--config <PATH>` (Dhall defaults; see above) ·
+`--agent` (tool loop) · `--serve <PORT>` (HTTP/WS gateway, all interfaces) · `--serve-matrix` (Matrix) ·
+`--serve-slack` (Slack Socket Mode) ·
 `--cron "<min hour dom month dow> <prompt>"` (in-process scheduler, UTC; repeatable) ·
-`--cron-file <path>` (JSON jobs: `[{"schedule","session"?,"prompt","retry_max"?,"retry_wait"?}]`) ·
+`--cron-file <path>` (a Dhall list of `{schedule, session, prompt, retryMax, retryWait}` — the
+`Optional` fields must still be present as `None`) ·
 `--cron-retry-max <N>` / `--cron-retry-wait <SECS>` (retry a failed cron fire; per-job overridable) ·
-`--schedule-file <path>` (Matrix schedules: JSON jobs
-`[{"id","schedule","room"?,"session"?,"tool"+"args"|"prompt","retry_max"?,"retry_wait"?}]`;
-requires `--serve-matrix`) · `--schedule-room <room>` (default report room) ·
+`--schedule-file <path>` (Matrix schedules: a Dhall list of
+`{jobId, schedule, room, session, tool, toolArgs, prompt, summarize, retryMax, retryWait}`, as
+above; requires `--serve-matrix`) ·
 `--schedule-retry-max <N>` / `--schedule-retry-wait <SECS>` (per-job overridable) ·
-`--provider xai|anthropic|google|claude-cli` · `--model` · `--max-tokens` · `--system` ·
-`--persona <PATH>` (persistent persona/priorities layered above the system prompt; defaults to
-`./PERSONA.md` if present, `--no-persona` to disable) ·
-`--thinking <low|high|dynamic|N>` (Gemini thinking effort) · `--budget` (total-task token ceiling).
+`--provider anthropic|google|xai|xai-grpc|claude-cli` · `--model` · `--max-tokens` · `--max-steps` ·
+`--system` · `--persona <PATH>` / `--no-persona` (persona layered above the operating instructions;
+`./PERSONA.md` auto-loads when present) ·
+`--thinking <off|low|medium|high>` · `--budget` (total-task token ceiling) ·
+`--session-dir <DIR>` (durable gateway sessions).
 
-Efficiency / cost levers: `--repo-skeleton <TOKENS>` (cache-aware repo-skeleton prefix) ·
-`--summary-model` / `--compact-after` / `--context-limit` (compaction + eviction) ·
-`--cheap-model` / `--escalate-after` (cheap-model-first) · `--advisor-model` (advisor+executor split).
+Efficiency / cost levers: `--summary-model` / `--context-limit` (compaction + eviction) ·
+`--cheap-model` / `--escalate-after` (cheap-model-first) · `--advisor-model` (advisor+executor split) ·
+`--no-progress-limit <N>` (hard-stop after 2N edit-free round-trips) · `--budget-awareness` (show the
+model its own ceilings) · `--classify-with-model` (model the task archetype instead of the keyword
+heuristic) · `--no-batch-edit` (don't offer the `batch_edit` fan-out).
 
 Resilience: `--fallback <PROVIDER:MODEL>` (repeatable, ordered) sets a **fallback chain** — if the
 primary model is unresponsive or errors *before streaming any output* for a round-trip (a connect
@@ -284,114 +328,126 @@ turn. Cross-provider is first-class (each named provider needs its API key in th
 model is demoted by a **circuit breaker** (`--fallback-cooldown <SECONDS>`, default 60): it is
 skipped from the start of subsequent turns for the cooldown — so a persistently-down provider isn't
 re-tried every turn — then re-probed once it elapses (a probe success clears it, a failure re-trips
-it). `--fallback-cooldown 0` re-probes every turn. Configurable via `[provider] fallback` /
-`fallback_cooldown`. E.g. `--fallback anthropic:claude-sonnet-4-6 --fallback google:gemini-3-flash-preview`.
+it). `--fallback-cooldown 0` re-probes every turn. Configurable via `fallback` /
+`fallbackCooldown`. E.g. `--fallback anthropic:claude-sonnet-4-6 --fallback google:gemini-3-flash-preview`.
 
 Legion (multi-model council): `--legion-debater <PROVIDER:MODEL>` (repeatable — pass two or more,
 e.g. `--legion-debater anthropic:claude-opus-4-8 --legion-debater xai:grok-4`) makes those models
 **argue the task out before the agent acts**: each drafts a position, they critique each other
 (`--legion-rounds <N>`, default 1), and a judge (`--legion-judge <PROVIDER:MODEL>`, default the first
 debater) synthesises one agreed plan that seeds the executor (deliberate-then-act). Cross-provider is
-first-class; each named provider needs its API key in the env. Configurable via `[legion]`. Supersedes
-`--advisor-model`; the debate itself is internal (see it with `--log-level 'lvz_legion=debug'`). The
+first-class; each named provider needs its API key in the env. Configurable via `legionDebaters` /
+`legionJudge` / `legionRounds`. Supersedes `--advisor-model`; the debate itself is internal (see it
+with `--log-level debug`). The
 council streams short progress notices per phase (`🧠 council convened…` → `🗣 critique round…` →
 `⚖️ judge synthesising…`); these **localise** via `--lang <LOCALE>` (falls back to the `LANG` env var)
 — `KO_KR` renders them in Korean, anything else keeps English.
 
-A2A (Agent-to-Agent server): `--serve-a2a <ADDR>` exposes Lavoisier as a Google **A2A** agent — an
+A2A (Agent-to-Agent server): `--serve-a2a <PORT>` exposes Lavoisier as a Google **A2A** agent — an
 Agent Card at `/.well-known/agent-card.json` plus a JSON-RPC endpoint (`message/send`,
 `message/stream` over SSE, `tasks/get`) so other agents can delegate tasks to it. Reuses `--api-key`
-for auth; runs alongside the other gateways. Configurable via `[gateway] serve_a2a`.
+for auth; runs alongside the other gateways. Configurable via `serveA2a`. Takes a **port**, not an
+address.
 
-ACP (Agent Communication Protocol server, BeeAI/IBM): `--serve-acp <ADDR>` exposes Lavoisier over the
+ACP (Agent Communication Protocol server, BeeAI/IBM): `--serve-acp <PORT>` exposes Lavoisier over the
 **ACP** REST agents/runs API — `GET /agents`, `POST /runs` (sync / SSE-stream / async modes),
 `GET /runs/{id}` — so ACP clients can run it. Reuses `--api-key` for auth. Configurable via
-`[gateway] serve_acp`.
+`serveAcp`; takes a **port**. (The deployed Rust replaced this with a stdio Zed ACP agent at v0.14.0;
+the port still carries the REST server it was ported from.)
 
 MCP (Model Context Protocol client): `--mcp-server <LABEL:TARGET>` (repeatable) connects to an
 external MCP server and exposes **its** tools as Lavoisier tools, so the agent and every gateway gain
 them. `TARGET` is either a command to spawn (stdio transport) or an `http(s)://` URL (Streamable
 HTTP). Tools are namespaced `<label>_<tool>` so they never shadow the built-ins. E.g.
-`--mcp-server 'fs: npx -y @modelcontextprotocol/server-filesystem .'`. Configurable via `[mcp] servers`.
+`--mcp-server 'fs: npx -y @modelcontextprotocol/server-filesystem .'`. Configurable via `mcpServers`.
 
 ATO: `--tune` (ε-greedy) or `--tune-bayes` (Thompson sampling) · `--verify-cmd <cmd>` (real
-success gate, e.g. `cargo test`) · `--tune-state <path>` (persist learned profiles) · `--tune-decay`
-· `--telemetry` (per-task token/cost summary to stderr).
+success gate, e.g. `cabal test`) · `--tune-state <path>` (persist learned profiles, saved after an
+`--agent` turn).
 
 Accuracy levers (opt-in — Lavoisier is efficient by default, so these trade cost for completion and
 are **off** unless asked for): `--require-edit` (don't let an edit task finish having changed nothing)
 · `--verify-and-fix` (when finishing, if `--verify-cmd` fails, feed the failure back and keep fixing,
-bounded — best with a real test gate).
+bounded — best with a real test gate) · `--in-loop-verify` (stop as soon as an edit makes
+`--verify-cmd` pass).
 
 Gateway: `--api-key <KEY>` (repeatable) · `--rate-limit <N per 60s>`.
 
-Logging: operator diagnostics are structured `tracing` events on **stderr**. `--log-level <FILTER>`
-(env `LVZ_LOG_LEVEL`, or `[log] level`) retunes them; the value is a `RUST_LOG`-style filter, so it
-takes a bare level (`info`, `debug`) or per-target directives
-(`--log-level 'lvz_gw_matrix=debug,warn'`). The **default is our own crates at `info` and everything
-else at `warn`** — which keeps the gateway/scheduler output printing as it always has, while the
-scoping stops `tracing` (a facade shared with tonic/hyper/h2/axum) from dragging dependency chatter
-into view. Go quieter with `--log-level warn`, louder with `debug`, or target one subsystem. A
-malformed filter is reported and the default is used, so a typo can't silence a running daemon.
+Logging: operator diagnostics go to **stderr** through `Lavoisier.Log`, the port's stand-in for the
+Rust `tracing` facade — one process-wide threshold rather than per-target filters.
+`--log-level <error|warn|info|debug>` (env `LVZ_LOG_LEVEL`) retunes it; the default is `info`. An
+unrecognised value falls back to `info`, so a typo can't silence a running daemon. Downstream
+`mainWith` binaries get `logError`/`logWarn`/`logInfo`/`logDebug` re-exported from `Lavoisier.CLI`,
+so custom tools instrument themselves through the same threshold. Never log a secret — lengths and
+counters only.
 
-Note the CLI's own interface — the streamed `[tool]` / `[usage]` / `[done]` rendering and the
-`--telemetry` summary — is **not** routed through logging: it's product output, so it always prints
-and no log filter can suppress it.
+Note the CLI's own interface — the streamed `[tool]` / `[usage]` / `[done]` rendering — is **not**
+routed through logging: it's product output, so it always prints and no log filter can suppress it.
 
-Env: `XAI_API_KEY` / `XAI_TRANSPORT=grpc|http` (default `grpc`) / `XAI_GRPC_ENDPOINT` /
-`XAI_BASE_URL` · `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` · `GOOGLE_API_KEY` (or `GEMINI_API_KEY`)
-/ `GOOGLE_THINKING` · Matrix: `MATRIX_HOMESERVER` / `MATRIX_ACCESS_TOKEN` /
-`MATRIX_USER` / `MATRIX_PASSWORD` / `MATRIX_DEVICE_ID` / `MATRIX_STATE_DIR` /
-`MATRIX_CRYPTO_STORE_KEY` / `MATRIX_ALLOWED_USERS` / `MATRIX_ALLOWED_ROOMS` / `MATRIX_HOME_ROOM` /
-`MATRIX_MEDIA_DIR` ·
-Slack: `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN` /
-`SLACK_ALLOWED_USERS` · `LVZ_PROVIDER` / `LVZ_MODEL` / `LVZ_API_KEYS` / `LVZ_RATE_LIMIT` /
-`LVZ_SERVE_ADDR` / `LVZ_LOG_LEVEL`.
+Env: `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` · `XAI_API_KEY` / `XAI_BASE_URL` (transport is
+picked by `--provider xai` vs `xai-grpc`) · `GOOGLE_API_KEY` / `GOOGLE_BASE_URL` · `CLAUDE_CLI_BIN` ·
+Matrix: `MATRIX_HOMESERVER` / `MATRIX_USER` / `MATRIX_ACCESS_TOKEN` / `MATRIX_PASSWORD` /
+`MATRIX_DEVICE_ID` / `MATRIX_STATE_DIR` / `MATRIX_CRYPTO_STORE_KEY` / `MATRIX_ALLOWED_USERS` /
+`MATRIX_ALLOWED_ROOMS` / `MATRIX_HOME_ROOM` / `MATRIX_MEDIA_DIR` / `MATRIX_NO_AUTO_JOIN` ·
+Slack: `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN` / `SLACK_ALLOWED_USERS` · `LVZ_LOG_LEVEL` · `LANG`
+(locale for the localised notices).
 
 ## Custom (private) tools
 
-Tools are compiled-in Rust (no dynamic plugins), so your own tools are just Rust code — and they
-can stay **private**: depend on the published `lavoisier` crate as a library and inject your tools,
-without forking or touching the public repo.
+Tools are compiled in (no dynamic plugins), so your own tools are just Haskell code — and they can
+stay **private**: depend on this package as a git dependency and inject your tools, without forking
+or touching the public repo.
 
-```rust
-// your-private-crate/src/main.rs   (private repo; never published)
-use std::sync::Arc;
-use async_trait::async_trait;
-use lavoisier::{Tool, ToolError, ToolOutput};   // tool types re-exported by lavoisier
-use serde_json::{json, Value};
+```haskell
+-- your-private-package/app/Main.hs   (private repo; never published)
+{-# LANGUAGE OverloadedStrings #-}
+module Main (main) where
 
-struct QueryDb;
-#[async_trait]
-impl Tool for QueryDb {
-    fn name(&self) -> &str { "query_db" }
-    fn description(&self) -> &str { "Run a read-only SQL query." }
-    fn schema(&self) -> Value {
-        json!({"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"]})
+import Data.Aeson (Value (..), object, (.=))
+import Data.Aeson.Key qualified as K
+import Data.Aeson.KeyMap qualified as KM
+import Data.Text (Text)
+import Lavoisier.CLI (Tool (..), mainWith, toolErr, toolOk)
+
+queryDb :: Tool
+queryDb =
+  Tool
+    { toolName = "query_db",
+      toolDescription = "Run a read-only SQL query.",
+      toolSchema =
+        object
+          [ "type" .= String "object",
+            "properties" .= object ["sql" .= object ["type" .= String "string"]],
+            "required" .= [String "sql"]
+          ],
+      -- Errors are values: a recoverable failure is `Right (toolErr …)`, model-visible, and the
+      -- loop continues. `setChanged True` on the output only if it mutated the workspace.
+      toolInvoke = \args -> pure $ case strArg "sql" args of
+        Nothing -> Right (toolErr "query_db: missing `sql`")
+        Just sql -> Right (toolOk ("ran: " <> sql))
     }
-    async fn invoke(&self, args: Value) -> Result<ToolOutput, ToolError> {
-        let sql = args["sql"].as_str().ok_or_else(|| ToolError::InvalidArgs("sql".into()))?;
-        Ok(ToolOutput::ok(format!("ran: {sql}")))   // .changed(true) only if it mutates the workspace
-    }
-}
 
-fn main() -> std::process::ExitCode {
-    lavoisier::main_with(vec![Arc::new(QueryDb)])    // your tools, plus all the built-ins
-}
+main :: IO ()
+main = mainWith [queryDb]    -- your tools, plus all the built-ins
+
+strArg :: Text -> Value -> Maybe Text
+strArg k (Object o) = case KM.lookup (K.fromText k) o of Just (String v) -> Just v; _ -> Nothing
+strArg _ _ = Nothing
 ```
 
-```toml
-# your-private-crate/Cargo.toml
-[dependencies]
-lavoisier   = "0.4"
-async-trait = "0.1"
-serde_json  = "1"
+```cabal
+-- your-private-package/cabal.project — pin an hs-v* tag; `olm` is needed for the e2ee flag.
+source-repository-package
+  type: git
+  location: https://github.com/DavidLee18/lavoisier
+  tag: hs-v0.13.3
+  subdir: . olm
 ```
 
-Your binary then behaves exactly like `lav` — same flags, config, and gateways (HTTP/Matrix/Slack/cron,
-E2EE, persona) — with your tools additionally available to the agent. A ready-to-copy template is in
-[`examples/private-tools/`](examples/private-tools). (`main_with` builds the tokio runtime for you;
-use `run_with` if you manage your own.)
+Your binary then behaves exactly like `lav` — same flags, config, and gateways (HTTP/Matrix/Slack/
+cron, E2EE, persona) — with your tools additionally available to the agent. The full recipe, including
+the native-library paths and how to turn the engine's `e2ee` flag on from a consumer, is in
+[`CUSTOM_TOOL_INSTRUCTIONS.md`](CUSTOM_TOOL_INSTRUCTIONS.md).
 
 ## Deployment
 
@@ -408,11 +464,13 @@ nerdctl build --platform linux/arm64 -f Containerfile -t lavoisier:dev .
 ## Development
 
 ```sh
-cargo test                                               # all tests (125+)
-cargo clippy --all-targets                               # lints (kept zero-warning)
-cargo fmt --check                                        # formatting
-cargo test -p lvz-context --test budget -- --nocapture   # token-budget trend line (§6.5)
+cabal build && cabal test                      # -Wall -Werror; tasty (240+ tests)
+cabal build -fe2ee && cabal test lavoisier-e2ee-test
+ormolu --mode inplace $(git ls-files '*.hs')   # formatting; run before every commit
 ```
+
+`gen/` holds the committed xAI proto-lens bindings — generated code, so leave it out of the ormolu
+sweep. For the Rust reference tree, `cd reference-rust && cargo test && cargo clippy --all-targets`.
 
 ## License
 

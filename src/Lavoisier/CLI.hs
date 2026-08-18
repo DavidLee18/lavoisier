@@ -185,7 +185,7 @@ optionsParser =
     <*> optional (option auto (long "legion-rounds" <> metavar "N" <> help "Number of critique rounds after the draft (default 1)"))
     <*> optional (strOption (long "lang" <> metavar "LOCALE" <> help "Locale for council progress notices (only ko_KR selects Korean; default English/LANG)"))
     <*> many (strOption (long "cron" <> metavar "SPEC" <> help "A cron job: 5 schedule fields then a prompt (repeatable), e.g. '*/30 9-17 * * 1-5 check CI'"))
-    <*> optional (strOption (long "cron-file" <> metavar "PATH" <> help "A JSON file of cron jobs [{schedule,session?,prompt,retry_max?,retry_wait?}]"))
+    <*> optional (strOption (long "cron-file" <> metavar "PATH" <> help "A Dhall file of cron jobs: a list of {schedule,session,prompt,retryMax,retryWait}"))
     <*> optional (option auto (long "cron-retry-max" <> metavar "N" <> help "Global default retries after a failed cron fire (default 0)"))
     <*> optional (option auto (long "cron-retry-wait" <> metavar "SECS" <> help "Global default seconds between cron retries (default 0)"))
     <*> optional (strOption (long "schedule-file" <> metavar "PATH" <> help "A Dhall file of Matrix schedule jobs: jobs fire inside --serve-matrix and report to a room"))
