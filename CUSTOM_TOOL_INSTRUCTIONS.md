@@ -1,178 +1,163 @@
-# Building private custom tools for Lavoisier
+# Building private custom tools for Lavoisier (Haskell)
 
 How to give the agent your own tools **without forking Lavoisier or putting your code in this
-repo**. Your tools live in a separate, private crate that depends on the published `lavoisier`
-crate and injects them at startup. Your binary then behaves exactly like `lav` — same flags,
-config, and gateways (HTTP/Matrix/Slack/cron, E2EE, persona) — with your tools additionally available to
-the agent.
+repo**. Your tools live in a separate, private Cabal package that depends on the `lavoisier` library
+and injects them at startup via `mainWith`. Your binary then behaves exactly like `lav` — same flags,
+config, and gateways (HTTP/Matrix/Slack/cron/schedule/A2A/ACP/MCP, E2EE, persona) — with your tools
+additionally available to the agent.
 
-> Tools are **compiled-in Rust** — there is no dynamic/plugin loading. "Private" means the Rust
+> Tools are **compiled-in Haskell** — there is no dynamic/plugin loading. "Private" means the Haskell
 > code stays in your own repo; it never touches the public `lavoisier` source.
 
-A ready-to-copy version of everything below lives in this repo at
-[`examples/private-tools/`](examples/private-tools).
+This is the Haskell port (branch `haskell-port`). It is the analogue of the Rust engine's
+`main_with`; the entry point here is **`Lavoisier.CLI.mainWith :: [Tool] -> IO ()`**.
 
 ---
 
 ## 1. Create the project
 
-Make a **standalone crate in its own (private) git repo, outside the `lavoisier` checkout** — not a
-member of this workspace, not a fork.
+Make a **standalone Cabal package in its own (private) git repo, outside the `lavoisier` checkout**.
 
 ```sh
 cd ~/source                 # anywhere EXCEPT inside ~/source/lavoisier
-cargo new my-lav --bin      # package + binary "my-lav" (rename freely)
-cd my-lav
-git init                    # your own private repo
+mkdir my-lav && cd my-lav
+git init
 ```
 
-## 2. `Cargo.toml`
+## 2. `cabal.project`
 
-```toml
-[package]
-name = "my-lav"
-version = "0.1.0"
-edition = "2021"
-publish = false             # private — never goes to crates.io
+Pin the engine by git ref (it is not on Hackage — use an `hs-v*` release tag). The engine links
+`libtree-sitter` + `libsnappy` (always) and `libolm` (only under the `e2ee` flag), so point cabal at
+wherever those live on your build host — the same machine-specific `extra-lib-dirs` the engine's own
+`cabal.project` uses.
 
-[dependencies]
-lavoisier   = "0.4"         # the published engine
-async-trait = "0.1"
-serde_json  = "1"
-# ...plus whatever your tools need (reqwest, sqlx, ...)
+```dhall
+packages: .
+
+source-repository-package
+  type: git
+  location: https://github.com/DavidLee18/lavoisier
+  tag: hs-v0.13.1            -- an hs-v* release tag (NOT the Rust v* tags)
+  subdir: .
+
+-- Native libs (adjust paths for your host; Homebrew / ~/.local shown).
+package lavoisier
+  extra-lib-dirs: /opt/homebrew/lib /Users/you/.local/lib
+  extra-include-dirs: /opt/homebrew/include /Users/you/.local/include
+package snappy-c
+  extra-lib-dirs: /opt/homebrew/lib
+  extra-include-dirs: /opt/homebrew/include
 ```
 
-For opt-in Matrix end-to-end encryption, enable the feature (needs Rust ≥ 1.93):
+## 3. `my-lav.cabal`
 
-```toml
-lavoisier = { version = "0.4", features = ["e2ee"] }
+```cabal
+cabal-version:      3.0
+name:               my-lav
+version:            0.1.0
+build-type:         Simple
+
+flag e2ee
+  description: Matrix end-to-end encryption (forwards to lavoisier's e2ee/libolm).
+  default:     False
+  manual:      True
+
+executable my-lav
+  main-is:          Main.hs
+  hs-source-dirs:   app
+  default-language: GHC2021
+  default-extensions: OverloadedStrings LambdaCase
+  ghc-options:      -threaded -rtsopts -with-rtsopts=-N   -- warp needs the threaded RTS
+  build-depends:    base, text, aeson, lavoisier
+  if flag(e2ee)
+    -- forward the flag to the engine so encrypted Matrix rooms work
+    cpp-options: -DE2EE
 ```
 
-## 3. `src/main.rs`
+Build the engine with its `e2ee` flag on when you pass `-f e2ee` — `cabal build -f e2ee` propagates
+constraints; if it does not pick up the engine flag automatically, add
+`constraints: lavoisier +e2ee` to `cabal.project`.
 
-```rust
-use std::sync::Arc;
-mod tools;
+## 4. `app/Main.hs` — implement `Tool` and call `mainWith`
 
-fn main() -> std::process::ExitCode {
-    lavoisier::main_with(vec![
-        Arc::new(tools::QueryDb::new()),
-        // Arc::new(tools::Deploy::new()), ...
-    ])
-}
+Everything you need is re-exported from `Lavoisier.CLI`:
+`Tool(..)`, `ToolOutput`, `ToolError(..)` (`TEUnknown` / `TEInvalidArgs` / `TEExecution`),
+`toolOk`, `toolErr`, `setChanged`.
+
+A `Tool` is a record of four fields:
+
+```haskell
+data Tool = Tool
+  { toolName        :: Text
+  , toolDescription :: Text
+  , toolSchema      :: Value                                  -- JSON Schema (advisory; validate yourself)
+  , toolInvoke      :: Value -> IO (Either ToolError ToolOutput)
+  }
 ```
 
-- `main_with(extra_tools)` builds the tokio runtime, runs the full CLI, and returns an exit code.
-- If you manage your own runtime, call `lavoisier::run_with(extra_tools).await` instead (async).
+```haskell
+{-# LANGUAGE OverloadedStrings #-}
+module Main (main) where
 
-## 4. `src/tools.rs` — your tools
+import Data.Aeson (Value (..), object, (.=))
+import Data.Aeson.Key qualified as K
+import Data.Aeson.KeyMap qualified as KM
+import Data.Text (Text)
+import Data.Text qualified as T
+import Lavoisier.CLI (Tool (..), ToolError (..), mainWith, toolErr, toolOk)
 
-Implement `lavoisier::Tool` for each tool. They're registered alongside the built-ins
-(`read_file`, `str_replace`, `shell`, …); the model picks them by `name` using `schema`.
-
-```rust
-use async_trait::async_trait;
-use lavoisier::{Tool, ToolError, ToolOutput};   // re-exported — no lvz-protocol dependency needed
-use serde_json::{json, Value};
-
-pub struct QueryDb {
-    // hold whatever state the tool needs: a DB pool, an HTTP client, config, ...
-}
-
-impl QueryDb {
-    pub fn new() -> Self {
-        Self { /* ... */ }
-    }
-}
-
-#[async_trait]
-impl Tool for QueryDb {
-    /// Stable identifier the model calls. Must be unique across all tools.
-    fn name(&self) -> &str {
-        "query_db"
-    }
-
-    /// Shown to the model — be precise; this is how it learns when/how to call the tool.
-    fn description(&self) -> &str {
-        "Run a read-only SQL query against the prod replica and return the rows."
+-- A trivial tool: `greet {"name": "Ada"}` -> "Hello, Ada!".
+greetTool :: Tool
+greetTool =
+  Tool
+    { toolName = "greet",
+      -- Descriptions steer the model's tool choice — write them the way you want it invoked
+      -- (bilingual if your rooms are). Errors are values: return toolErr, never throw.
+      toolDescription = "Return a friendly greeting for a given name. / 이름을 받아 인사말을 돌려줍니다.",
+      toolSchema =
+        object
+          [ "type" .= String "object",
+            "properties" .= object ["name" .= object ["type" .= String "string"]],
+            "required" .= [String "name"]
+          ],
+      toolInvoke = \args -> case strArg "name" args of
+        Nothing -> pure (Right (toolErr "greet: missing `name`"))   -- recoverable, model-visible
+        Just n -> pure (Right (toolOk ("Hello, " <> n <> "!")))
     }
 
-    /// JSON Schema for the argument object the model must produce.
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "sql": { "type": "string", "description": "a SELECT statement" }
-            },
-            "required": ["sql"]
-        })
-    }
+main :: IO ()
+main = mainWith [greetTool]
 
-    /// Execute against the parsed argument JSON.
-    async fn invoke(&self, args: Value) -> Result<ToolOutput, ToolError> {
-        let sql = args["sql"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArgs("`sql` must be a string".into()))?;
-
-        // ... run the query ...
-        let rows = 0;
-
-        Ok(ToolOutput::ok(format!("{rows} rows")))
-    }
-}
+strArg :: Text -> Value -> Maybe Text
+strArg k (Object o) = case KM.lookup (K.fromText k) o of Just (String s) -> Just s; _ -> Nothing
+strArg _ _ = Nothing
 ```
 
-### The `Tool` contract
+### Conventions (match these or the agent misbehaves)
+- **Errors are values.** A recoverable failure (bad args, upstream 4xx) is
+  `Right (toolErr "…")` — model-visible, the loop continues. Reserve
+  `Left (TEExecution "…")` for a failure that should abort the turn. Never let `toolInvoke` throw.
+- **Validate every argument yourself.** `toolSchema` is advertised to the model but not enforced;
+  read args defensively.
+- **Signal edits.** If your tool changed a file, wrap the output with `setChanged True` so the
+  `--require-edit`/`--verify-and-fix` convergence levers see it.
+- **Never log secrets** — lengths/counters only.
 
-| Method | Purpose |
-| --- | --- |
-| `name(&self) -> &str` | Unique id the model calls. |
-| `description(&self) -> &str` | Human-readable; tells the model what it does (defaults to `""`). |
-| `schema(&self) -> serde_json::Value` | JSON Schema of the argument object. |
-| `async fn invoke(&self, args) -> Result<ToolOutput, ToolError>` | Run it. |
-
-Return values:
-
-- **`ToolOutput::ok(text)`** — success; `text` goes back to the model.
-- **`.changed(true)`** — call this **only if the tool mutated the workspace** (wrote/edited a file).
-  It feeds the agent's convergence/no-progress logic; leave it `false` for read-only tools.
-  e.g. `Ok(ToolOutput::ok("wrote 3 files").changed(true))`.
-- **`ToolOutput::error(msg)`** — a *recoverable* failure the model should see and can retry
-  (bad input, command exited non-zero). The turn continues.
-- **`Err(ToolError::InvalidArgs(..))` / `Err(ToolError::Execution(..))`** — a *hard* failure
-  (couldn't run the tool at all).
-
-## 5. Build, run, install
+## 5. Build and run
 
 ```sh
-cargo run -- --help                                          # same flags as `lav`
-ANTHROPIC_API_KEY=… cargo run -- --provider anthropic --agent "use query_db to count users"
-cargo install --path .                                       # put `my-lav` on your PATH
-my-lav --serve-matrix                                        # gateways/config/persona/cron all work
+cabal build                 # or:  cabal build -f e2ee
+cabal run my-lav -- --agent "greet me as Ada"
+cabal run my-lav -- --serve-matrix --schedule-file schedule.dhall   # all gateways, plus your tools
 ```
 
-Your tools are available in every mode the agent runs in: `--agent`, `--serve` (HTTP), `--serve-matrix`, and `--cron`.
+Your tools are registered **alongside the built-ins** wherever tools are used — every gateway and
+`--agent`. A one-shot `ask` (no `--agent`, no `--serve*`) uses no tools, so your tools are not loaded
+there (matching the engine). The `schedule_*` tools and any `--mcp-server` tools compose the same way.
 
----
+## 6. Packaging for deployment
 
-## Gotchas
-
-- **`protoc` is required to build.** Your crate compiles `lavoisier` from source, which pulls in
-  `lvz-xai` (vendored protobuf). Install it: `brew install protobuf` (macOS) /
-  `apt-get install -y protobuf-compiler` (Debian). (This is why `cargo binstall lavoisier` — a
-  prebuilt binary — needs no protoc, but a custom binary always builds from source.)
-- **Keep the crate outside `~/source/lavoisier`.** If it sits inside that checkout it becomes part
-  of this repo. It must be its own directory / repo with a `lavoisier = "0.4"` dependency.
-- **Unique tool names.** A custom tool name must not collide with a built-in (`read_file`,
-  `read_files`, `write_file`, `list_dir`, `shell`, `outline_file`, `outline_files`, `read_anchored`,
-  `str_replace`, `edit_anchored`, `edit_files`, `find_references`, and `batch_edit` when enabled).
-- **Schemas matter.** The model only calls a tool as well as its `schema` + `description` let it;
-  be specific about required fields and types.
-- **Set `.changed(true)` for mutating tools** so the agent's stop/progress logic stays accurate.
-- **Pin the version** in `Cargo.toml` (`lavoisier = "0.4"`); bump it deliberately to pick up engine
-  updates. Your `Cargo.lock` keeps builds reproducible.
-
-## Updating
-
-To pull in a newer engine, bump the dependency (e.g. `lavoisier = "0.5"`), `cargo update -p
-lavoisier`, and rebuild. Your tools are unaffected unless the `Tool` trait changes (it's stable).
+`mainWith` gives you the whole CLI, so your binary deploys exactly like `lav`: build a self-contained
+tarball (bundle `libtree-sitter`/`libsnappy`, and `libolm` under e2ee; rewrite load paths — see the
+engine's `scripts/package-haskell.sh`), or build in-container with `cabal install`. Config is **Dhall**
+(`--config lavoisier.dhall`); the cron/schedule files are Dhall too.
