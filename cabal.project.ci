@@ -1,0 +1,17 @@
+-- CI project file. Unlike the machine-specific dev `cabal.project` (which points at ~/.local and
+-- /opt/homebrew), CI installs the native libraries to standard prefixes: libtree-sitter and (for the
+-- e2ee job) libolm are built from source into /usr/local, and libsnappy comes from apt. Pass this with
+-- `cabal --project-file=cabal.project.ci`.
+packages: . olm/
+
+package olm
+  extra-lib-dirs: /usr/local/lib
+  extra-include-dirs: /usr/local/include
+
+package lavoisier
+  extra-lib-dirs: /usr/local/lib
+  extra-include-dirs: /usr/local/include
+
+package snappy-c
+  extra-lib-dirs: /usr/lib/x86_64-linux-gnu
+  extra-include-dirs: /usr/include
