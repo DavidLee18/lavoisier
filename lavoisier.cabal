@@ -1,10 +1,10 @@
 cabal-version:      3.0
 name:               lavoisier
-version:            0.13.4
+version:            0.15.0
 synopsis:           Token-efficient CLI coding agent — a Haskell port of the Rust `lavoisier`.
 description:
   A modular, token-efficient CLI coding agent with a provider-agnostic core.
-  This is the Haskell port (see reference-rust/ for the original Rust workspace).
+  This is the Haskell port; the original Rust workspace lives on the `main` branch.
 license:            MIT
 license-file:       LICENSE
 author:             Jaehyun Lee

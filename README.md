@@ -6,18 +6,16 @@
 
 A modular, **token-efficient** CLI coding agent with a provider-agnostic core (**Anthropic, xAI,
 and Google Gemini — all native**). One agent brain drives the CLI and every gateway: HTTP/WebSocket,
-Matrix, Slack, cron, A2A, ACP.
+Matrix, Slack, cron, A2A, ACP, and an inline TUI.
 
 > **This branch (`haskell-port`) is the Haskell implementation** — a Cabal package at the repo root.
-> The Rust workspace it was ported from lives in [`reference-rust/`](reference-rust) and is the
-> parity reference; `main` carries Rust at the root.
+> `main` carries the Rust workspace it was ported from, and is the parity reference.
 >
 > Status: the port covers the same surface — providers, context engine, ATO, tools, and all gateways
 > including Matrix E2EE — and is live-verified on 7 of them against real `ANTHROPIC_API_KEY`,
 > `XAI_API_KEY`, and `GOOGLE_API_KEY` (Slack is offline-tested only, for want of tokens). Parity is
-> measured against the `reference-rust/` **v0.13.0** snapshot, not the deployed Rust v0.15.0; the
-> drift between them (an ACP-stdio rework and a TUI frontend, neither on the served paths) is
-> undiffed. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design.
+> against the deployed Rust **v0.15.0**: the whole lineage, including the Zed-ACP rework and the
+> inline TUI, is ported and offline-tested. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design.
 
 ## Why
 
@@ -360,11 +358,32 @@ Agent Card at `/.well-known/agent-card.json` plus a JSON-RPC endpoint (`message/
 for auth; runs alongside the other gateways. Configurable via `serveA2a`. Takes a **port**, not an
 address.
 
-ACP (Agent Communication Protocol server, BeeAI/IBM): `--serve-acp <PORT>` exposes Lavoisier over the
-**ACP** REST agents/runs API — `GET /agents`, `POST /runs` (sync / SSE-stream / async modes),
-`GET /runs/{id}` — so ACP clients can run it. Reuses `--api-key` for auth. Configurable via
-`serveAcp`; takes a **port**. (The deployed Rust replaced this with a stdio Zed ACP agent at v0.14.0;
-the port still carries the REST server it was ported from.)
+ACP (Zed **Agent Client Protocol** agent — the *editor* protocol): `--acp` runs Lavoisier as an ACP
+agent over **stdio** (JSON-RPC 2.0), so an ACP-capable editor (Zed, or Neovim via a bridge) launches
+it as a subprocess and drives the full tool loop from its agent panel. It owns stdin/stdout for the
+protocol (diagnostics stay on stderr); point your editor's agent command at `lav --acp`. Implements
+`initialize`, `session/new`, `session/prompt` (streaming `session/update`s — message/thought chunks
+and tool-call updates), and `session/cancel`. Configurable via `acp`. (For agent-to-agent interop —
+the role IBM/BeeAI's *Agent Communication Protocol* played before it folded into A2A — use
+`--serve-a2a`.)
+
+TUI (interactive inline terminal UI): `--tui` launches a scrollback-native REPL — the coding-agent
+shell, modelled on Claude Code / Grok CLI — driving the same shared agent. It keeps an *inline*
+viewport (not fullscreen), so output flows into the terminal's normal scrollback while an input box,
+status line, and footer stay pinned at the bottom. Assistant output is **markdown-rendered** (bold,
+italic, code, headings, bordered fenced code blocks, and column-aligned tables); the **footer shows a
+token breakdown and an estimated USD cost**. Slash commands `/help` `/model <name|reset>`
+`/session <id>` `/new` `/clear` `/quit` — `/model` switches the model mid-session; `Ctrl-C` cancels a
+turn, `Ctrl-D` quits, `Ctrl-L` clears the screen, `Alt+Enter` inserts a newline. **Tool approval**
+follows Claude Code's default — read-only tools run unattended, mutating tools and shells prompt (the
+call's full arguments are shown, then `y` allow once · `a` always · `n` deny); waive it with
+`--tui-auto-approve`. Logs are routed to `$LVZ_LOG_FILE` (or suppressed) so they don't corrupt the
+display. Configurable via `tui` / `tuiAutoApprove`.
+
+The port drives the terminal with ANSI escapes directly rather than through a TUI framework: the
+inline viewport is what makes this scrollback-native, and it has no Haskell equivalent (brick and vty
+are alt-screen shaped), so it is implemented as cursor arithmetic in the same hand-rolled spirit as
+the rest of the adapters.
 
 MCP (Model Context Protocol client): `--mcp-server <LABEL:TARGET>` (repeatable) connects to an
 external MCP server and exposes **its** tools as Lavoisier tools, so the agent and every gateway gain
@@ -451,7 +470,7 @@ strArg _ _ = Nothing
 source-repository-package
   type: git
   location: https://github.com/DavidLee18/lavoisier
-  tag: hs-v0.13.4
+  tag: hs-v0.15.0
   subdir: . olm
 ```
 
@@ -481,7 +500,8 @@ ormolu --mode inplace $(git ls-files '*.hs')   # formatting; run before every co
 ```
 
 `gen/` holds the committed xAI proto-lens bindings — generated code, so leave it out of the ormolu
-sweep. For the Rust reference tree, `cd reference-rust && cargo test && cargo clippy --all-targets`.
+sweep. For the Rust reference, check out `main` (`git worktree add ../lavoisier-rust main`) and run
+`cargo test && cargo clippy --all-targets`.
 
 ## License
 

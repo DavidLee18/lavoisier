@@ -5,8 +5,8 @@
 # Conventions: arm64 (Fargate target), colima + nerdctl (not Docker).
 #
 # PORTED TO THE HASKELL TREE (2026-08-18). This file previously built the Rust workspace — it did
-# `COPY Cargo.toml Cargo.lock ./` + `COPY crates ./crates`, paths that on `haskell-port` exist only
-# under `reference-rust/`, so the build failed at the COPY before compiling anything.
+# `COPY Cargo.toml Cargo.lock ./` + `COPY crates ./crates`, paths that do not exist on
+# `haskell-port`, so the build failed at the COPY before compiling anything.
 #
 # This is the SIMPLE stack: `infra/`'s HTTP/WS gateway on Fargate — no Matrix, no EFS. So the
 # `e2ee` flag stays OFF (its default) and **libolm is deliberately not built here**; only the Matrix
@@ -56,8 +56,8 @@ RUN set -eu; \
 
 WORKDIR /build
 
-# Explicit COPYs rather than `COPY . .`: .containerignore does not exclude reference-rust/ or
-# dist-newstyle/, and both would bloat the build context enormously.
+# Explicit COPYs rather than `COPY . .`: .containerignore does not exclude dist-newstyle/, which
+# would bloat the build context enormously.
 # cabal.project.dist is the packaging project file — no machine-specific paths, unlike the dev
 # cabal.project which points at ~/.local and /opt/homebrew.
 COPY cabal.project.dist lavoisier.cabal ./

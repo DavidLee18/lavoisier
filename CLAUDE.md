@@ -4,9 +4,9 @@
 drives the CLI and every gateway (HTTP/WS, Matrix, Slack, cron, A2A, ACP).
 
 **This branch (`haskell-port`) is the Haskell port**: Cabal package at the repo root (`src/`, `app/`,
-`test/`, `lavoisier.cabal`). The Rust workspace it was ported from lives in `reference-rust/` and is
-the parity reference — read it when porting or when behaviour is ambiguous. `main` is the Rust
-implementation, at the root, with the same layout `reference-rust/` has here.
+`test/`, `lavoisier.cabal`). `main` is the Rust implementation, at the root, and is the parity
+reference — read it (`git show v0.15.0:crates/…`, `git log main`) when porting or when behaviour is
+ambiguous. There is no in-tree Rust copy; the tags on `main` are the record.
 
 Read before working in that area: [`ARCHITECTURE.md`](ARCHITECTURE.md) (crate/module map, dependency
 invariants, design decisions) · [`ATO.md`](ATO.md) (the adaptive-token-optimisation tuner) ·
@@ -42,8 +42,8 @@ posture is efficiency-first.
 
 - **Haskell**: GHC 9.10 / Cabal, `GHC2021`, `-Wall -Werror` kept clean, **ormolu** before every
   commit. Correctness via ADTs + exhaustive `case`. Tests are `tasty` — prefer QuickCheck properties.
-- **Rust** (`reference-rust/`, `main`): edition 2021, MSRV 1.88; `cargo clippy --all-targets` and
-  `cargo fmt --check` kept green.
+- **Rust** (`main`): edition 2021, MSRV 1.88; `cargo clippy --all-targets` and `cargo fmt --check`
+  kept green.
 - **Config is Dhall** in the port (`lavoisier.dhall.example`), TOML in Rust. `--cron-file` and
   `--schedule-file` are Dhall record lists here, JSON/TOML there.
 - Keep dependencies minimal: **no agent frameworks, no vendor SDKs** — hand-roll thin HTTP adapters
@@ -111,10 +111,16 @@ The Rust implementation is complete and live-verified against real API keys acro
 gateways. The Haskell port covers the same surface — providers, context engine, ATO, tools, all
 gateways including Matrix E2EE — and is live-verified on 7 surfaces (Slack is offline-tested only).
 
-**Parity is against the `reference-rust/` snapshot (v0.13.0), not the deployed Rust (v0.15.0).** The
-v0.13.1→v0.15.0 drift (ACP-stdio rework, the TUI frontend) is undiffed because those sources are not
-in-tree. Neither touches the deployed `--serve-matrix`/`--serve-slack`/`--schedule` paths, but that
-is reasoning, not verification — say so rather than claiming full parity.
+**Parity is against the deployed Rust v0.15.0.** The v0.13.1→v0.15.0 lineage — the atomic/corruption-
+surfacing `FileStore`, the structural schedule report body, the `ToolGate` + per-turn model override,
+the ACP rework (BeeAI REST → Zed stdio), and the inline TUI — is ported and offline-tested. The Rust
+lineage was diffed straight from `main` in this repo, which carries every tag; `reference-rust/` was
+only ever a v0.13.0 snapshot and has been removed. Read `git show v0.15.0:crates/…` (or any tag) when
+behaviour is ambiguous.
+
+The TUI is the one place the port deliberately diverges in **means**, not surface: the Rust builds on
+ratatui's inline viewport, which has no Haskell equivalent (brick/vty are alt-screen shaped), so
+`Lavoisier.Gateway.Tui` drives the terminal with ANSI escapes directly.
 
 Deferred in both trees: module-qualified symbol resolution in the cross-file graph; an unambiguous
 line-range/occurrence edit path (weak models are steered to `sed` for repeated-symbol renames);
@@ -129,14 +135,14 @@ cabal build -fe2ee && cabal test lavoisier-e2ee-test
 ormolu --mode inplace $(git ls-files '*.hs')
 cabal run lav -- --agent "edit task"
 
-# Rust (reference-rust/, main)
+# Rust (on `main`; `git worktree add ../lavoisier-rust main` for a build tree)
 cargo test && cargo clippy --all-targets && cargo fmt --check
 cargo run -p lavoisier -- --agent "edit task"
 ```
 
 Providers are selected with `--provider anthropic|xai|google|claude-cli` and keyed from
 `ANTHROPIC_API_KEY` / `XAI_API_KEY` / `GOOGLE_API_KEY`. Gateways (`--serve`, `--serve-matrix`,
-`--serve-slack`, `--serve-a2a`, `--serve-acp`, `--cron-file`, `--schedule-file`) compose — they all
+`--serve-slack`, `--serve-a2a`, `--acp`, `--tui`, `--cron-file`, `--schedule-file`) compose — they all
 run concurrently over one shared agent. Full flag list in `README.md`.
 
 ## Working here

@@ -1,8 +1,10 @@
-# Rust (now under reference-rust/)
+# Rust build output (the Rust tree lives on `main`; a worktree here would drop a target/)
 /target
-reference-rust/target
 **/*.rs.bk
 *.pdb
+
+# Unrelated project directory that lives alongside this repo (never track it)
+/42_webserv/
 
 # Haskell / Cabal build output
 dist-newstyle/
