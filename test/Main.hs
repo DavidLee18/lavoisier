@@ -4,7 +4,7 @@
 
 module Main (main) where
 
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (IOException, try)
 import Control.Monad (replicateM, replicateM_, void)
 import Data.Aeson (Value (..), decode, encode, object, toJSON, (.=))
@@ -46,6 +46,10 @@ import Lavoisier.Gateway.Cron (CronConfigError (..), CronJob (..), loadFileJobs,
 import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp, newHttpApp, stepWindow, wsAuthorized, wsPrincipal)
 import Lavoisier.Gateway.Matrix qualified as MX
 import Lavoisier.Gateway.Slack (SlackMessage (..), parseEvent, senderAllowed, slackSession)
+import Lavoisier.Gateway.Tui qualified as Tui
+import Lavoisier.Gateway.Tui.Gate qualified as TG
+import Lavoisier.Gateway.Tui.Md qualified as Md
+import Lavoisier.Gateway.Tui.Price qualified as Price
 import Lavoisier.Legion (Debater, Language (..), LegionError (..), languageFromLocale, mkDebater, newPanel, panelDeliberator, withLanguage)
 import Lavoisier.Log (LogLevel (..), parseLogLevel)
 import Lavoisier.Mcp
@@ -144,6 +148,7 @@ tests =
       gatewayTests,
       a2aTests,
       acpTests,
+      tuiTests,
       memoryTests,
       configTests,
       logTests,
@@ -1831,6 +1836,141 @@ acpRecvUntilResult c = go []
       case v of
         Object o | KM.member "result" o || KM.member "error" o -> pure (reverse acc, v)
         _ -> go (v : acc)
+
+-- --- Phase 15: the inline TUI (offline; the pure render/pricing/approval logic) -------------------
+
+tuiTests :: TestTree
+tuiTests =
+  testGroup
+    "tui frontend"
+    [ testGroup
+        "markdown"
+        [ testCase "inline styles bold, italic, and code" $ do
+            let segs = Md.inline "a **b** c `d` _e_"
+            -- Reconstruct the text to confirm markers are consumed, not literal.
+            T.concat (map fst segs) @?= "a b c d e"
+            assertBool "bold b" (any (\(t, st) -> t == "b" && Md.stBold st) segs)
+            assertBool "code d" (any (\(t, st) -> t == "d" && Md.stFg st == Just Md.Cyan) segs)
+            assertBool "italic e" (any (\(t, st) -> t == "e" && Md.stItalic st) segs),
+          testCase "an unterminated marker stays literal" $ do
+            let segs = Md.inline "2 * 3 = 6"
+            T.concat (map fst segs) @?= "2 * 3 = 6"
+            assertBool "nothing italicised" (not (any (Md.stItalic . snd) segs)),
+          testCase "wrap splits at width and preserves style" $ do
+            let rows = Md.wrap [("abcdef", Md.bold Md.defaultStyle)] 3
+            length rows @?= 2
+            map (T.concat . map fst) rows @?= ["abc", "def"]
+            assertBool "style survives the wrap" (all (all (Md.stBold . snd)) rows),
+          testCase "wide characters count as two columns" $ do
+            Md.displayWidth "한글" @?= 4
+            Md.charWidth 'a' @?= 1
+            map (T.concat . map fst) (Md.wrap [("한글", Md.defaultStyle)] 2) @?= ["한", "글"],
+          testCase "detects table and separator rows" $ do
+            assertBool "row" (Md.isTableRow "| a | b |")
+            assertBool "indented row" (Md.isTableRow "  |x|")
+            assertBool "prose" (not (Md.isTableRow "just text"))
+            assertBool "sep" (Md.isSeparatorRow "|---|:--:|")
+            assertBool "sep with spaces" (Md.isSeparatorRow "| :-- | --: |")
+            assertBool "header is not a sep" (not (Md.isSeparatorRow "| a | b |")),
+          testCase "renders an aligned table" $ do
+            let ls = ["| Name | Score |", "|------|------:|", "| alice | 3 |", "| bob | 100 |"]
+            rows <- maybe (assertFailure "valid table") pure (Md.renderTable ls 80)
+            -- header + rule + 2 data rows.
+            length rows @?= 4
+            assertBool "header cells are bold" (any (\(t, st) -> "Name" `T.isInfixOf` t && Md.stBold st) (rows !! 0))
+            let rule = T.concat (map fst (rows !! 1))
+            assertBool "rule uses box characters" ("─" `T.isInfixOf` rule && "┼" `T.isInfixOf` rule)
+            -- Right-aligned Score column pads on the left ("  3").
+            assertBool "right-aligned" ("  3" `T.isInfixOf` T.concat (map fst (rows !! 2))),
+          testCase "lines without a separator row are not a table" $
+            Md.renderTable ["| a | b |", "| c | d |"] 80 @?= Nothing,
+          testCase "a too-wide table shrinks to fit" $ do
+            let ls = ["| col |", "|-----|", "| " <> T.replicate 200 "x" <> " |"]
+            rows <- maybe (assertFailure "valid table") pure (Md.renderTable ls 40)
+            mapM_ (\r -> assertBool "row within width" (sum (map (Md.displayWidth . fst) r) <= 40)) rows
+        ],
+      testGroup
+        "pricing"
+        [ testCase "known models price out" $ do
+            let usage = MkUsage 1000000 1000000 0 0
+            -- Sonnet: $3 in + $15 out per 1M = $18.
+            sonnet <- maybe (assertFailure "sonnet priced") pure (Price.estimateUsd "claude-sonnet-4" usage)
+            assertBool ("got " <> show sonnet) (abs (sonnet - 18.0) < 1e-9)
+            -- Opus is pricier than Sonnet for identical usage.
+            opus <- maybe (assertFailure "opus priced") pure (Price.estimateUsd "claude-opus-4" usage)
+            assertBool "opus > sonnet" (opus > sonnet),
+          testCase "an unknown model has no estimate" $
+            Price.estimateUsd "some-random-model" emptyUsage @?= Nothing,
+          testCase "token formatting" $ do
+            Price.fmtTokens 950 @?= "950"
+            Price.fmtTokens 1500 @?= "1.5k"
+        ],
+      testGroup
+        "approval gate"
+        [ testCase "read-only tools are auto-allowed, others ask" $ do
+            map TG.isReadOnly ["read_file", "find_references", "grep", "write_file", "edit_files", "shell", "fs_delete"]
+              @?= [True, True, True, False, False, False, False],
+          testCase "a read-only call needs no prompt" $ do
+            (gate, _permits) <- TG.newChannelGate
+            -- No one is draining the permits; a read-only tool must still resolve immediately.
+            d <- review gate "read_file" (object ["path" .= ("a" :: Text)])
+            d @?= Allow,
+          testCase "a mutating call prompts, and 'always' is remembered" $ do
+            (gate, permits) <- TG.newChannelGate
+            -- Drive the "UI": approve-always the first prompt.
+            done <- newEmptyMVar
+            _ <- forkIO (review gate "write_file" (object ["path" .= ("a" :: Text)]) >>= putMVar done)
+            req <- TG.recvPermit permits
+            TG.prName req @?= "write_file"
+            assertBool "the preview carries the arguments" ("\"a\"" `T.isInfixOf` TG.prArgs req)
+            TG.answerPermit req TG.AllowAlways
+            takeMVar done >>= (@?= Allow)
+            -- The second call is now auto-allowed with no prompt.
+            d <- review gate "write_file" (object ["path" .= ("b" :: Text)])
+            d @?= Allow,
+          testCase "a denied call is reported back to the model" $ do
+            (gate, permits) <- TG.newChannelGate
+            done <- newEmptyMVar
+            _ <- forkIO (review gate "shell" (object []) >>= putMVar done)
+            req <- TG.recvPermit permits
+            TG.answerPermit req TG.DenyOnce
+            takeMVar done >>= \case
+              Deny _ -> pure ()
+              other -> assertFailure ("expected Deny, got " <> show other)
+        ],
+      testGroup
+        "app state"
+        [ testCase "slash commands parse" $ do
+            map Tui.parseCommand ["help", "q", "clear", "new", "session work", "session", "model opus", "m", "frob"]
+              @?= [ Tui.CmdHelp,
+                    Tui.CmdQuit,
+                    Tui.CmdClear,
+                    Tui.CmdNew,
+                    Tui.CmdSession "work",
+                    Tui.CmdSession "",
+                    Tui.CmdModel "opus",
+                    Tui.CmdModel "",
+                    Tui.CmdUnknown "frob"
+                  ],
+          testCase "tool_hint pulls the salient argument" $ do
+            map Tui.toolHint ["{\"path\":\"src/Main.hs\"}", "{\"command\":\"cabal test\"}", "{\"unknown\":1}", "not json"]
+              @?= ["src/Main.hs", "cabal test", "", ""],
+          testCase "hardWrap breaks at width without clipping" $ do
+            Tui.hardWrap "abcdef" 3 @?= ["abc", "def"]
+            Tui.hardWrap "" 5 @?= [""],
+          testCase "a model override selects the active model" $ do
+            let app = Tui.newApp "s" "base"
+            Tui.activeModel app @?= "base"
+            Tui.activeModel app {Tui.appModelOverride = Just "opus"} @?= "opus",
+          testCase "the footer reports session, model, flows, and spend" $ do
+            let app = (Tui.newApp "s" "claude-sonnet-4") {Tui.appUsage = MkUsage 1000000 0 0 0}
+            -- 1M sonnet input tokens = $3.
+            Tui.footerLine app @?= "s · claude-sonnet-4 · ↑1000.0k ↓0 · ~$3.0000"
+            -- An unpriced model falls back to a raw token count.
+            let unknown = (Tui.newApp "s" "mystery") {Tui.appUsage = MkUsage 1200 300 0 0}
+            assertBool "token fallback" ("1.5k tok" `T.isSuffixOf` Tui.footerLine unknown)
+        ]
+    ]
 
 -- --- Phase 7: session memory (offline; stub provider) ---------------------------------------------
 

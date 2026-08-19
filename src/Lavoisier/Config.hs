@@ -47,6 +47,10 @@ data FileConfig = FileConfig
     serveA2a :: Maybe Natural,
     -- | Run as a Zed Agent Client Protocol agent over stdio (see @--acp@). The flag takes precedence.
     acp :: Maybe Bool,
+    -- | Launch the interactive inline terminal UI (see @--tui@). The flag takes precedence.
+    tui :: Maybe Bool,
+    -- | Skip TUI tool-approval prompts (see @--tui-auto-approve@). The flag takes precedence.
+    tuiAutoApprove :: Maybe Bool,
     serveSlack :: Maybe Bool,
     serveMatrix :: Maybe Bool,
     -- | Per-room Matrix tool permissions (a room absent from the map is unconstrained).
@@ -77,7 +81,7 @@ instance Dhall.FromDhall FileConfig
 
 -- | The all-unset config (one 'Nothing' per 'FileConfig' field).
 defaultConfig :: FileConfig
-defaultConfig = FileConfig n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n
+defaultConfig = FileConfig n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n n
   where
     n :: Maybe a
     n = Nothing
@@ -115,6 +119,8 @@ defaultsDhall =
       ", serve = None Natural",
       ", serveA2a = None Natural",
       ", acp = None Bool",
+      ", tui = None Bool",
+      ", tuiAutoApprove = None Bool",
       ", serveSlack = None Bool",
       ", serveMatrix = None Bool",
       ", matrixRoomTools = None (List { mapKey : Text, mapValue : List Text })",

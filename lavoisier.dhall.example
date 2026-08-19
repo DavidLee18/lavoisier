@@ -29,6 +29,8 @@
 , serve = None Natural -- HTTP gateway port (POST /v1/turns, GET /health)
 , serveA2a = None Natural -- A2A gateway port
 , acp = None Bool -- Zed Agent Client Protocol agent over stdio (run `lav --acp` from an editor)
+, tui = None Bool -- Some True launches the interactive inline terminal UI (scrollback-native REPL)
+, tuiAutoApprove = None Bool -- Some True skips the TUI tool-approval prompts (default: reads auto, mutations ask)
 , serveSlack = None Bool -- Some True serves over Slack Socket Mode (needs SLACK_APP_TOKEN + SLACK_BOT_TOKEN)
 , serveMatrix = None Bool -- Some True serves over Matrix (needs MATRIX_HOMESERVER + MATRIX_USER + token/password)
 -- Per-room / per-member Matrix tool permissions. No env equivalent — this file is the only way to

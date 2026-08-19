@@ -48,8 +48,10 @@ import Lavoisier.Gateway.Http (GatewayConfig (..), httpGateway)
 import Lavoisier.Gateway.Matrix (matrixFromEnv, matrixGateway)
 import Lavoisier.Gateway.Matrix qualified as MX
 import Lavoisier.Gateway.Slack (slackFromEnv, slackGateway)
+import Lavoisier.Gateway.Tui (TuiConfig (..), defaultTuiConfig, tuiGateway)
+import Lavoisier.Gateway.Tui.Gate (newChannelGate)
 import Lavoisier.Legion (Debater, languageFromLocale, mkDebater, newPanel, panelDeliberator, renderLegionError, withLanguage)
-import Lavoisier.Log (LogLevel (..), logDebug, logError, logInfo, logWarn, parseLogLevel, setLogLevel)
+import Lavoisier.Log (LogLevel (..), fileLogSink, logDebug, logError, logInfo, logWarn, nullLogSink, parseLogLevel, setLogLevel, setLogSink)
 import Lavoisier.Mcp (connectTools, mssLabel, parseServerSpec, renderMcpError)
 import Lavoisier.Memory (newFileStore, newInMemoryStore, sessionAgentHandle)
 import Lavoisier.Protocol.Agent (turnRequest)
@@ -109,6 +111,8 @@ data Options = Options
     optServe :: Maybe Int,
     optServeA2a :: Maybe Int,
     optAcp :: Bool,
+    optTui :: Bool,
+    optTuiAutoApprove :: Bool,
     optServeSlack :: Bool,
     optServeMatrix :: Bool,
     -- | Per-room\/per-member Matrix tool permissions. Config-file only (they are nested maps);
@@ -169,6 +173,8 @@ optionsParser =
     <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
     <*> optional (option auto (long "serve-a2a" <> metavar "PORT" <> help "Serve the agent as an A2A (Agent-to-Agent) gateway on this port"))
     <*> switch (long "acp" <> help "Run as a Zed Agent Client Protocol (ACP) agent over stdio (JSON-RPC 2.0), so an ACP-capable editor can launch `lav --acp` as a subprocess and drive the full tool loop from its agent panel. Takes over stdin/stdout; no bind address. For agent-to-agent interop use --serve-a2a instead.")
+    <*> switch (long "tui" <> help "Launch the interactive inline terminal UI - a scrollback-native REPL that drives the agent with streaming output, tool-call cards, and Claude-Code-style tool-approval prompts. Takes over the terminal (logs go to $LVZ_LOG_FILE, or are suppressed, so they cannot corrupt the display).")
+    <*> switch (long "tui-auto-approve" <> help "With --tui, skip the tool-approval prompts and run every tool unattended (the default is Claude-Code-style: read-only tools run, mutating tools and shells ask first).")
     <*> switch (long "serve-slack" <> help "Serve the agent as a Slack gateway over Socket Mode (needs SLACK_APP_TOKEN + SLACK_BOT_TOKEN)")
     <*> switch (long "serve-matrix" <> help "Serve the agent as a Matrix gateway (needs MATRIX_HOMESERVER + MATRIX_USER + token/password)")
     -- matrixRoomTools / matrixUserTools: config-file only (nested maps), so no flag — see applyConfig.
@@ -224,6 +230,12 @@ mainWith extra = do
   -- Operator-log threshold: --log-level > LVZ_LOG_LEVEL > default info.
   levelRaw <- maybe (lookupEnv "LVZ_LOG_LEVEL") (pure . Just) (optLogLevel opts)
   maybe (pure ()) (setLogLevel . parseLogLevel . T.pack) levelRaw
+  -- The inline TUI owns the terminal: stderr writes would corrupt its viewport, so route logs to
+  -- \$LVZ_LOG_FILE when set, else drop them. Every other frontend keeps stderr as usual.
+  when (optTui opts) $ do
+    mpath <- lookupEnv "LVZ_LOG_FILE"
+    msink <- maybe (pure Nothing) fileLogSink mpath
+    setLogSink (fromMaybe nullLogSink msink)
   eprov <- selectProvider (fromMaybe "anthropic" (optProvider opts))
   case eprov of
     Left e -> errExit e
@@ -258,10 +270,11 @@ mainWith extra = do
             else
               if optServeSlack opts
                 then fromEnvGateway slackFromEnv slackGateway
-                else case (optAcp opts, optServeA2a opts, optServe opts) of
-                  (True, _, _) -> serveWith acpGateway
-                  (_, Just port, _) -> serveWith (a2aGateway port defaultA2aConfig)
-                  (_, _, Just port) -> serveWith (httpGateway port (GatewayConfig (optApiKey opts) (fmap (\n -> (fromIntegral n, 60)) (optRateLimit opts))))
+                else case (optTui opts, optAcp opts, optServeA2a opts, optServe opts) of
+                  (True, _, _, _) -> withRegistryExtra opts model extra (serveTui prov opts model)
+                  (_, True, _, _) -> serveWith acpGateway
+                  (_, _, Just port, _) -> serveWith (a2aGateway port defaultA2aConfig)
+                  (_, _, _, Just port) -> serveWith (httpGateway port (GatewayConfig (optApiKey opts) (fmap (\n -> (fromIntegral n, 60)) (optRateLimit opts))))
                   _ -> do
                     prompt <- resolvePrompt (optWords opts)
                     if T.null prompt
@@ -322,6 +335,8 @@ applyConfig fc o =
       optServe = optServe o <|> fmap fromIntegral (serve fc),
       optServeA2a = optServeA2a o <|> fmap fromIntegral (serveA2a fc),
       optAcp = optAcp o || fromMaybe False (acp fc),
+      optTui = optTui o || fromMaybe False (tui fc),
+      optTuiAutoApprove = optTuiAutoApprove o || fromMaybe False (tuiAutoApprove fc),
       optServeSlack = optServeSlack o || fromMaybe False (serveSlack fc),
       optServeMatrix = optServeMatrix o || fromMaybe False (serveMatrix fc),
       -- No flag sets these, so the file is the only source: take it as-is.
@@ -631,6 +646,26 @@ serveGateway gw prov opts model registry = do
   case res of
     Left e -> errExit (tshow e)
     Right () -> pure ()
+
+-- | Serve the inline TUI. Unlike the other gateways it wants an interactive __tool-approval gate__
+-- installed on the agent (the Claude-Code default: read-only tools run unattended, mutating tools and
+-- shells ask first), whose receiver the TUI drains — so it builds its agent here rather than going
+-- through 'serveGateway'. @--tui-auto-approve@ waives the gate entirely.
+serveTui :: Provider -> Options -> Text -> ToolRegistry -> IO ()
+serveTui prov opts model registry = do
+  (tuner, _persist) <- buildTuner opts
+  delib <- buildLegion opts
+  agent0 <- assembleAgent prov opts model tuner delib registry
+  (agent, permits) <-
+    if optTuiAutoApprove opts
+      then pure (agent0, Nothing)
+      else do
+        (gate, ps) <- newChannelGate
+        pure (withToolGate gate agent0, Just ps)
+  store <- maybe (newInMemoryStore (Just 200)) (`newFileStore` Just 200) (optSessionDir opts)
+  let gw = tuiGateway defaultTuiConfig {tuiSession = "tui", tuiModel = model, tuiPermits = permits}
+  logInfo "gateway" "tui starting"
+  gatewayServe gw (sessionAgentHandle store agent) >>= either (errExit . tshow) pure
 
 runAgentMode :: Provider -> Options -> Text -> Text -> ToolRegistry -> IO ()
 runAgentMode prov opts model prompt registry = do

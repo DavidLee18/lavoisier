@@ -59,6 +59,10 @@ library
     Lavoisier.Gateway.Http
     Lavoisier.Gateway.Matrix
     Lavoisier.Gateway.Slack
+    Lavoisier.Gateway.Tui
+    Lavoisier.Gateway.Tui.Gate
+    Lavoisier.Gateway.Tui.Md
+    Lavoisier.Gateway.Tui.Price
     Lavoisier.Legion
     Lavoisier.Log
     Lavoisier.Mcp
@@ -111,6 +115,7 @@ library
     , network-uri
     , optparse-applicative
     , scientific
+    , terminal-size
     , text
     , time
     , typed-process
