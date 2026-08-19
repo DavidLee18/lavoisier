@@ -66,6 +66,7 @@ module Lavoisier.Gateway.Matrix.E2ee
 where
 
 import Control.Exception (SomeException, try)
+import Control.Monad (foldM)
 import Crypto.Olm
 import Data.Aeson (Value (..), decodeStrict, encode, object, (.=))
 import Data.Aeson.Key qualified as K
@@ -160,7 +161,8 @@ unpickleStore userId deviceId passphrase v =
       (curve, ed) <- identityKeysRaw acc
       olmMap <- restoreMap (lookKey "olm" v) (unpickleSession key)
       outMap <- restoreMap (lookKey "outbound" v) (unpickleOutbound key)
-      inbMap <- restoreInbound (lookKey "inbound" v)
+      inbMap0 <- restoreInbound (lookKey "inbound" v)
+      inbMap <- seedSelfInbound curve outMap inbMap0
       Crypto acc userId deviceId curve ed <$> newIORef inbMap <*> newIORef outMap <*> newIORef olmMap
     restoreMap (Just (Object o)) un =
       Map.fromList <$> mapM (\(k, val) -> case val of String p -> (,) (K.toText k) <$> un (encodeUtf8 p); _ -> fail "non-string pickle") (KM.toList o)
@@ -173,6 +175,18 @@ unpickleStore userId deviceId passphrase v =
             [String curve, String sid, String p] <- [V.toList e]
           ]
     restoreInbound _ = pure Map.empty
+    -- Every sending session needs our own inbound copy so we can read our own echoed sends
+    -- ('outboundFor' seeds it at creation). A store written before that existed — every store in
+    -- the field, including a migrated one — has outbound sessions with no such copy, so seed any
+    -- that are missing on restore rather than warning on our own messages until the session rotates.
+    seedSelfInbound curve outMap inbMap = foldM (seedOne curve) inbMap (Map.elems outMap)
+    seedOne curve inbMap out = do
+      sid <- decodeUtf8Lenient <$> outboundSessionId out
+      if Map.member (curve, sid) inbMap
+        then pure inbMap
+        else do
+          inb <- outboundSessionKey out >>= newInboundGroupSession
+          pure (Map.insert (curve, sid) inb inbMap)
 
 -- | Verify a peer @device_keys@ object's Ed25519 __self-signature__ over Matrix canonical JSON: the
 -- device advertises its ed25519 key and signs its own key object with it. Returns 'False' when the
@@ -349,17 +363,29 @@ decryptMegolm c content =
 -- The session key is what must be shared with recipients via 'roomKeyEvent' + 'olmEncryptTo'.
 getOrCreateOutbound :: Crypto -> Text -> IO (Text, Text)
 getOrCreateOutbound c room = do
+  out <- outboundFor c room
+  sid <- decodeUtf8Lenient <$> outboundSessionId out
+  skey <- decodeUtf8Lenient <$> outboundSessionKey out
+  pure (sid, skey)
+
+-- | This room's Megolm sending session, created on first use.
+--
+-- Creating one also seeds our __own__ inbound copy, keyed by our own curve25519 key. The homeserver
+-- echoes our sends back down @\/sync@, so without it every message the bot itself sends returns as an
+-- event it cannot decrypt — noise that is indistinguishable from a real missing key, and which would
+-- otherwise have the gateway asking itself for a room key it already holds.
+outboundFor :: Crypto -> Text -> IO OutboundGroupSession
+outboundFor c room = do
   outs <- readIORef (crOutbound c)
-  out <- case Map.lookup room outs of
+  case Map.lookup room outs of
     Just o -> pure o
     Nothing -> do
       o <- newOutboundGroupSession
       modifyIORef' (crOutbound c) (Map.insert room o)
-      -- Also seed our own inbound copy so we could decrypt our own messages if echoed.
+      sid <- decodeUtf8Lenient <$> outboundSessionId o
+      inb <- outboundSessionKey o >>= newInboundGroupSession
+      modifyIORef' (crInbound c) (Map.insert (crCurve c, sid) inb)
       pure o
-  sid <- decodeUtf8Lenient <$> outboundSessionId out
-  skey <- decodeUtf8Lenient <$> outboundSessionKey out
-  pure (sid, skey)
 
 -- | The @m.room_key@ event body sharing @room@'s current Megolm session with recipients.
 roomKeyEvent :: Crypto -> Text -> IO Value
@@ -395,13 +421,7 @@ olmEncryptTo c theirIdentityKey theirOtk event = do
 -- | Megolm-encrypt an inner event for @room@; returns the @m.room.encrypted@ event content.
 encryptMegolm :: Crypto -> Text -> Value -> IO Value
 encryptMegolm c room event = do
-  outs <- readIORef (crOutbound c)
-  out <- case Map.lookup room outs of
-    Just o -> pure o
-    Nothing -> do
-      o <- newOutboundGroupSession
-      modifyIORef' (crOutbound c) (Map.insert room o)
-      pure o
+  out <- outboundFor c room
   sid <- decodeUtf8Lenient <$> outboundSessionId out
   ct <- decodeUtf8Lenient <$> groupEncrypt out (BL.toStrict (encode event))
   pure

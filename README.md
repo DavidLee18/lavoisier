@@ -209,7 +209,10 @@ plaintext and encrypted rooms:
   which makes the peer replace its own, and a Megolm event with no known session triggers an
   `m.room_key_request` to the sender's devices — cancelled once the key arrives, since repairing the
   channel alone does not make a peer re-share a key it believes it already delivered. Both failures are
-  logged at `warn` with the `sender_key`/`session_id` needed to identify the missing key.
+  logged at `warn` with the `sender_key`/`session_id` needed to identify the missing key. Note that
+  current clients (matrix-nio, Element) forward keys only to **their own** other devices, so a request
+  to a different user is accepted and dropped — the reliable path back is the unwedge plus that peer's
+  next room key; the request is what recovers the multi-device case, and costs nothing otherwise.
 
 A worked example — a deny-by-default perimeter where the bot answers only Alice and Bob, only in the
 `!ops` and `!general` rooms, runs the shell only in `!ops`, treats `!general` as read-only, and limits

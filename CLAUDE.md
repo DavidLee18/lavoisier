@@ -73,6 +73,12 @@ posture is efficiency-first.
   reads a room and answers nothing, silently. Since 0.13.4 both failures log at `warn` and drive
   recovery (`m.dummy` unwedge, `m.room_key_request`). The two are **not** interchangeable: repairing
   the Olm channel does not make a peer re-share the key for the session it believes it delivered.
+  (Clients forward keys only to their *own* other devices, so the request is a bonus — the unwedge is
+  what actually recovers a cross-user peer.)
+- **The Matrix txn counter must be seeded from process-start nanos**, not 0 — Matrix dedupes by
+  `(device, txn id)` and answers a repeat with the *previous* response, so a counter restarting at 0
+  makes the first sends after every restart vanish silently. The Rust `process_seed` says so in a
+  comment; the port had dropped it, and it swallowed room-key shares and the unwedge until 0.13.4.
 - Dhall record fields become top-level selectors, so they collide with same-named function
   parameters and lambdas. Hence `jobId`/`toolArgs` rather than `id`/`args`.
 - On Apple Silicon, `install_name_tool` invalidates the signature — re-sign ad hoc (`codesign -f -s -`)

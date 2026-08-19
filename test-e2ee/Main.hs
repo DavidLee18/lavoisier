@@ -231,6 +231,27 @@ tests =
         (content reqBody >>= lookK "body" >>= lookK "room_id") @?= Just (String "!room:hs")
         (content cancelBody >>= lookK "action") @?= Just (String "request_cancellation")
         (content cancelBody >>= lookK "request_id") @?= Just (String "SESS1"),
+      -- The homeserver echoes our own sends back down /sync. Without a self-inbound copy they are
+      -- undecryptable events indistinguishable from a real missing key -- found in live verification.
+      testCase "a bot can decrypt its own echoed sends, before and after a restart" $ do
+        bot <- newCrypto "@bot:hs" "BOTDEV"
+        ev <- encryptMegolm bot "!room:hs" (object ["type" .= t "m.room.message", "content" .= object ["body" .= t "own send"]])
+        selfDec <- decryptMegolm bot ev
+        case selfDec of
+          Right dec -> (lookK "content" dec >>= lookK "body") @?= Just (String "own send")
+          Left e -> assertFailure ("own echo undecryptable: " <> T.unpack e)
+        -- And a store written before that seeding existed -- every store in the field -- must be
+        -- repaired on restore rather than warning on its own messages until the session rotates.
+        pickled <- pickleStore bot "pw"
+        let noSelf = case pickled of
+              Object o -> Object (KM.insert "inbound" (object []) o)
+              v -> v
+        Just restored <- unpickleStore "@bot:hs" "BOTDEV" "pw" noSelf
+        ev2 <- encryptMegolm restored "!room:hs" (object ["type" .= t "m.room.message", "content" .= object ["body" .= t "after restart"]])
+        restoredDec <- decryptMegolm restored ev2
+        case restoredDec of
+          Right dec -> (lookK "content" dec >>= lookK "body") @?= Just (String "after restart")
+          Left e -> assertFailure ("own echo undecryptable after restore: " <> T.unpack e),
       testCase "a forwarded room key decrypts the session it was exported from" $ do
         alice <- newCrypto "@alice:hs" "ALICEDEV"
         bot <- newCrypto "@bot:hs" "BOTDEV"

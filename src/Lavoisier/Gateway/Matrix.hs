@@ -267,7 +267,7 @@ serveLoop cfg mctx agent = do
   case esess of
     Left e -> pure (Left e)
     Right (token, userId, deviceId) -> do
-      txn <- newIORef (0 :: Int)
+      txn <- newIORef =<< processSeed
       logInfo "matrix" (bootLine cfg mctx userId deviceId)
       env <- mkEnv cfg mgr token userId deviceId txn
       recent <- newRecentIds 256
@@ -737,7 +737,9 @@ unwedgeCooldown = 300
 requestRoomKeyFor :: MatrixEnv -> Text -> Text -> Value -> IO ()
 requestRoomKeyFor env room sender content =
   case (lookStr "sender_key" content, lookStr "session_id" content) of
-    (Just sk, Just sid) | not (T.null sender) -> do
+    -- Never ask ourselves: our own sends echo back down /sync, and a self-addressed request would
+    -- be answered by nobody. 'E2.getOrCreateOutbound' seeds the inbound copy that makes them readable.
+    (Just sk, Just sid) | not (T.null sender), sender /= meUserId env -> do
       pending <- readIORef (esRequested (meE2 env))
       unless (Map.member sid pending) $ do
         modifyIORef' (esRequested (meE2 env)) (Map.insert sid sender)
@@ -1108,6 +1110,17 @@ autoJoinInvites env sync
 
 nextTxn :: MatrixEnv -> IO Int
 nextTxn env = atomicModifyIORef' (meTxn env) (\n -> (n + 1, n))
+
+-- | Seed for the per-process transaction counter: nanoseconds since the epoch, so a fresh process
+-- starts well past any txn id a prior run could have emitted (the counter only ever increments).
+--
+-- Matrix dedupes by @(device, txn id)@ and answers a repeat with the __previous__ response rather
+-- than sending anything. A counter that restarted at 0 each boot therefore made the first few sends
+-- and to-device messages after every restart vanish silently — including room-key shares and the
+-- @m.dummy@ unwedge, which is precisely when the gateway can least afford to be ignored. Matches
+-- @process_seed@ in the Rust gateway.
+processSeed :: IO Int
+processSeed = (\t -> max 0 (floor (t * 1e9))) <$> getPOSIXTime
 
 enc :: Text -> Text
 enc = decodeUtf8Lenient . urlEncode True . encodeUtf8
