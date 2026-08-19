@@ -1,289 +1,371 @@
--- | The ACP (Agent Communication Protocol, BeeAI\/IBM) server gateway — a REST agents\/runs API.
--- Ported from Rust @lvz-gw-acp@ (built earlier the same day). Depends only on the protocol contracts;
--- hand-rolled REST over warp\/wai — no ACP SDK.
+-- | @Lavoisier.Gateway.Acp@ — a __Zed Agent Client Protocol (ACP)__ agent gateway.
 --
--- Surface: @GET \/agents@ + @GET \/agents\/{name}@ (manifest), @POST \/runs@ (create a run in
--- @sync@\/@stream@\/@async@ mode), @GET \/runs\/{id}@, @POST \/runs\/{id}\/cancel@, @GET \/ping@. The
--- ACP @session_id@ maps to a Lavoisier session.
+-- The __Agent Client Protocol__ (from Zed; <https://agentclientprotocol.com>) lets a code editor
+-- drive an AI coding agent that it launches __as a subprocess__, speaking __JSON-RPC 2.0 over
+-- stdio__. The editor is the /client/; Lavoisier is the /agent/. Wire an ACP-capable editor (Zed, or
+-- Neovim via a bridge) to run @lav --acp@ and it gains the full Lavoisier tool loop inside the
+-- editor's agent panel — with __zero core change__, like every other gateway.
+--
+-- (Not to be confused with IBM\/BeeAI's /Agent Communication Protocol/, which shared the acronym —
+-- that project folded into A2A, so @--serve-a2a@ is the interop server surface now. This @acp@ is
+-- the editor-facing stdio protocol. Ported from Rust @lvz-gw-acp@ 0.2.0, which replaced the REST
+-- agents\/runs server this module used to be.)
+--
+-- It depends only on the protocol contracts — never on a provider or on the agent's internals — so
+-- the same shared agent drives the CLI and this gateway unchanged.
+--
+-- Surface (client → agent):
+--
+-- * @initialize@ — capability negotiation. We advertise protocol version @1@, text prompts, and no
+--   auth methods (Lavoisier authenticates to model providers itself, via env keys).
+-- * @session\/new@ — allocate a session id (mapped straight onto a Lavoisier session, so a
+--   multi-turn ACP conversation accrues memory through the shared session store).
+-- * @session\/prompt@ — run one turn. Text\/thinking deltas stream out as @session\/update@
+--   notifications (@agent_message_chunk@ \/ @agent_thought_chunk@); tool calls surface as
+--   @tool_call@ + @tool_call_update@ updates; the request resolves with a @stopReason@.
+-- * @session\/cancel@ — a notification that cancels the session's in-flight prompt, which then
+--   resolves with @stopReason: \"cancelled\"@.
+--
+-- Deferred (documented, not yet wired): delegating file reads\/writes to the editor
+-- (@fs\/read_text_file@ \/ @fs\/write_text_file@) and @session\/request_permission@ — for now
+-- Lavoisier runs its own tools directly, which is a valid ACP posture. @session\/load@ is likewise
+-- not offered (@loadSession: false@). JSON-RPC is __hand-rolled__ over aeson — no ACP SDK.
 module Lavoisier.Gateway.Acp
-  ( AcpConfig (..),
-    defaultAcpConfig,
-    newAcpApp,
-    acpGateway,
+  ( acpGateway,
+    acpProtocolVersion,
+    serveAcpOver,
+
+    -- * Exposed for tests
+    toolKind,
+    mapStopReason,
+    extractPromptText,
+    eventToUpdate,
   )
 where
 
 import Control.Concurrent (forkIO)
-import Control.Exception (SomeException, try)
-import Data.Aeson (Value (..), decode, encode, object, (.=))
+import Control.Concurrent.Async (race)
+import Control.Concurrent.MVar
+import Control.Exception (IOException, try)
+import Control.Monad (unless, void)
+import Data.Aeson (Value (..), decodeStrict, encode, object, (.=))
 import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
-import Data.ByteString.Builder (byteString, lazyByteString)
+import Data.ByteString.Lazy qualified as BL
 import Data.IORef
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding (decodeUtf8Lenient)
-import Data.Vector qualified as V
+import Data.Text.Encoding (encodeUtf8)
+import Data.Text.IO qualified as TIO
+import Lavoisier.Log (logDebug, logInfo)
 import Lavoisier.Protocol.Agent (AgentHandle (..), TurnStream, turnRequest)
-import Lavoisier.Protocol.Event (Event (..))
+import Lavoisier.Protocol.Event (Event (..), StopReason (..))
 import Lavoisier.Protocol.Gateway (Gateway (..), GatewayError (..))
 import Lavoisier.Protocol.Stream (Producer (..))
-import Network.HTTP.Types (ResponseHeaders, Status, hAuthorization, hContentType, status200, status400, status401, status404)
-import Network.Wai
-import Network.Wai.Handler.Warp (run)
+import System.IO (BufferMode (LineBuffering), Handle, hFlush, hIsEOF, hSetBuffering, hSetEncoding, stdin, stdout, utf8)
 
-agentName :: Text
-agentName = "lavoisier"
+-- | The ACP protocol version this agent implements.
+acpProtocolVersion :: Int
+acpProtocolVersion = 1
 
--- | Manifest description + auth.
-data AcpConfig = AcpConfig
-  { acpDescription :: Text,
-    acpApiKeys :: [Text]
-  }
-
-defaultAcpConfig :: AcpConfig
-defaultAcpConfig =
-  AcpConfig
-    { acpDescription = "Token-efficient CLI coding agent, exposed over ACP.",
-      acpApiKeys = []
-    }
-
-data AcpState = AcpState
-  { stRuns :: IORef (Map Text Value),
-    stIds :: IORef Int,
-    stManifest :: Value,
-    stKeys :: [Text],
-    stAgent :: AgentHandle
-  }
-
--- | Build the WAI 'Application' (creates the mutable state). Exposed for tests.
-newAcpApp :: AcpConfig -> AgentHandle -> IO Application
-newAcpApp cfg agent = do
-  runs <- newIORef Map.empty
-  ids <- newIORef 0
-  let st = AcpState runs ids (manifest cfg) (acpApiKeys cfg) agent
-  pure (acpApp st)
-
--- | The 'Gateway' record: bind and serve with warp.
-acpGateway :: Int -> AcpConfig -> Gateway
-acpGateway port cfg =
+-- | The Zed ACP agent gateway. Serving takes over the process's stdin\/stdout for the protocol.
+acpGateway :: Gateway
+acpGateway =
   Gateway
     { gatewayName = "acp",
       gatewayServe = \agent -> do
-        app <- newAcpApp cfg agent
-        r <- try (run port app) :: IO (Either SomeException ())
-        pure $ case r of
-          Left e -> Left (GEBind (T.pack (show e)))
-          Right () -> Right ()
+        logInfo "acp" "Zed ACP agent on stdio (JSON-RPC 2.0)"
+        serveAcpOver agent stdin stdout
     }
 
-manifest :: AcpConfig -> Value
-manifest cfg =
+-- | The transport-agnostic serve loop: read newline-framed JSON-RPC from @inH@, dispatch, and write
+-- responses + @session\/update@ notifications to @outH@. Generic over the pipe so it can be
+-- unit-tested over a pair of pipes instead of real stdio.
+--
+-- The loop stays responsive while a prompt runs: @session\/prompt@ is forked (so a concurrent
+-- @session\/cancel@ can still be read and acted on), and the writer lock serialises whole JSON-RPC
+-- lines so interleaved notifications and responses never corrupt each other. Ends cleanly on EOF
+-- (the editor closing the pipe).
+serveAcpOver :: AgentHandle -> Handle -> Handle -> IO (Either GatewayError ())
+serveAcpOver agent inH outH = do
+  hSetEncoding inH utf8
+  hSetEncoding outH utf8
+  hSetBuffering outH LineBuffering
+  st <- newServerState agent outH
+  r <- try (loop st) :: IO (Either IOException ())
+  pure (either (Left . GEIo . T.pack . show) Right r)
+  where
+    loop st = do
+      eof <- hIsEOF inH
+      unless eof $ do
+        line <- TIO.hGetLine inH
+        unless (T.null (T.strip line)) $ case decodeStrict (encodeUtf8 line) of
+          -- A malformed line has no reliable id to answer; log and keep serving.
+          Nothing -> logDebug "acp" ("unparseable line: " <> T.take 200 line)
+          Just msg -> dispatch st msg
+        loop st
+
+-- | Route one inbound JSON-RPC message. Requests carry a non-null @id@ and get a response;
+-- notifications (no id) do not. Only @session\/prompt@ is long-running, so only it is forked.
+dispatch :: ServerState -> Value -> IO ()
+dispatch st msg = case method of
+  "initialize" -> respond st reqId initializeResult
+  -- No ACP auth methods are advertised, so `authenticate` is a no-op acknowledgement.
+  "authenticate" -> respond st reqId (object [])
+  "session/new" -> do
+    sid <- newSession st
+    logInfo "acp" ("session/new " <> sid)
+    respond st reqId (object ["sessionId" .= sid])
+  "session/prompt" -> void (forkIO (runPrompt st reqId params))
+  "session/cancel" ->
+    -- A notification: no response. Signal the session's in-flight prompt to stop.
+    case lookStr "sessionId" params of
+      Just sid -> logInfo "acp" ("session/cancel " <> sid) >> cancelSession st sid
+      Nothing -> pure ()
+  other ->
+    case reqId of
+      Just _ -> respondErr st reqId (-32601) ("method not found: " <> other)
+      Nothing -> pure ()
+  where
+    reqId = case lookKey "id" msg of
+      Just Null -> Nothing
+      v -> v
+    method = fromMaybe "" (lookStr "method" msg)
+    params = fromMaybe Null (lookKey "params" msg)
+
+-- | The @initialize@ result: protocol version, agent capabilities, and (no) auth methods.
+initializeResult :: Value
+initializeResult =
   object
-    [ "name" .= agentName,
-      "description" .= acpDescription cfg,
-      "metadata" .= object ["programming_language" .= t "Haskell"],
-      "input_content_types" .= [t "text/plain"],
-      "output_content_types" .= [t "text/plain"]
+    [ "protocolVersion" .= acpProtocolVersion,
+      "agentCapabilities"
+        .= object
+          [ "loadSession" .= False,
+            "promptCapabilities"
+              .= object ["image" .= False, "audio" .= False, "embeddedContext" .= False]
+          ],
+      "authMethods" .= ([] :: [Value])
     ]
 
-acpApp :: AcpState -> Application
-acpApp st req respond =
-  case (requestMethod req, pathInfo req) of
-    ("GET", ["ping"]) -> respond (responseLBS status200 [] "pong")
-    ("GET", ["agents"]) -> respond (jsonResp status200 (object ["agents" .= [stManifest st]]))
-    ("GET", ["agents", name])
-      | name == agentName -> respond (jsonResp status200 (stManifest st))
-      | otherwise -> respond (errResp status404 ("no such agent: " <> name))
-    ("POST", ["runs"])
-      | authorized st req -> do
-          body <- strictRequestBody req
-          case decode body of
-            Nothing -> respond (errResp status400 "invalid JSON body")
-            Just j -> createRun st j respond
-      | otherwise -> respond (errResp status401 "missing or invalid API key")
-    ("GET", ["runs", rid])
-      | authorized st req -> do
-          store <- readIORef (stRuns st)
-          case Map.lookup rid store of
-            Just r -> respond (jsonResp status200 r)
-            Nothing -> respond (errResp status404 ("no such run: " <> rid))
-      | otherwise -> respond (errResp status401 "missing or invalid API key")
-    ("POST", ["runs", rid, "cancel"])
-      | authorized st req -> do
-          store <- readIORef (stRuns st)
-          case Map.lookup rid store of
-            Just r -> respond (jsonResp status200 r)
-            Nothing -> respond (errResp status404 ("no such run: " <> rid))
-      | otherwise -> respond (errResp status401 "missing or invalid API key")
-    _ -> respond (errResp status404 "not found")
+-- | Run one @session\/prompt@ to completion: submit the turn, stream its events as @session\/update@
+-- notifications, and answer the original request with a @stopReason@ (or a JSON-RPC error).
+runPrompt :: ServerState -> Maybe Value -> Value -> IO ()
+runPrompt st reqId params = case lookStr "sessionId" params of
+  Nothing -> respondErr st reqId (-32602) "missing `sessionId`"
+  Just sid -> do
+    let text = extractPromptText (lookKey "prompt" params)
+    if T.null text
+      then respondErr st reqId (-32602) "prompt has no text content"
+      else do
+        -- Arm cancellation *before* submitting so a race between the turn starting and a cancel
+        -- arriving is caught (the MVar holds the signal even if nothing is awaiting it yet).
+        cancel <- armSession st sid
+        submit (ssAgent st) (turnRequest sid text) >>= \case
+          Left e -> disarmSession st sid >> respondErr st reqId (-32603) (T.pack (show e))
+          Right stream -> do
+            result <- streamUpdates st sid stream cancel
+            disarmSession st sid
+            case result of
+              Right stopReason -> respond st reqId (object ["stopReason" .= stopReason])
+              Left e -> respondErr st reqId (-32603) e
 
-createRun :: AcpState -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-createRun st body respond =
-  let text = extractInput body
-   in if T.null text
-        then respond (errResp status400 "run input has no text content")
-        else do
-          session <- case look "session_id" body >>= asText of
-            Just s -> pure s
-            Nothing -> nextId st "session"
-          runId <- nextId st "run"
-          case fromMaybe "sync" (look "mode" body >>= asText) of
-            "stream" -> streamRun st runId session text respond
-            "async" -> asyncRun st runId session text respond
-            _ -> syncRun st runId session text respond
-
-syncRun :: AcpState -> Text -> Text -> Text -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-syncRun st runId session text respond = do
-  eanswer <- runToText (stAgent st) session text
-  case eanswer of
-    Left e -> respond (errResp status400 ("run failed: " <> tshow e))
-    Right answer -> do
-      let r = buildRun runId session "completed" (answerOutput answer)
-      modifyIORef' (stRuns st) (Map.insert runId r)
-      respond (jsonResp status200 r)
-
-asyncRun :: AcpState -> Text -> Text -> Text -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-asyncRun st runId session text respond = do
-  let inProgress = buildRun runId session "in-progress" (Array V.empty)
-  modifyIORef' (stRuns st) (Map.insert runId inProgress)
-  _ <- forkIO $ do
-    eanswer <- runToText (stAgent st) session text
-    let final = case eanswer of
-          Right answer -> buildRun runId session "completed" (answerOutput answer)
-          Left e -> addError (buildRun runId session "failed" (Array V.empty)) (tshow e)
-    modifyIORef' (stRuns st) (Map.insert runId final)
-  respond (jsonResp status200 inProgress)
-
-streamRun :: AcpState -> Text -> Text -> Text -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-streamRun st runId session text respond = do
-  let inProgress = buildRun runId session "in-progress" (Array V.empty)
-  modifyIORef' (stRuns st) (Map.insert runId inProgress)
-  estream <- submit (stAgent st) (turnRequest session text)
-  case estream of
-    Left _ -> respond (responseStream status200 sseHeader (frameOnce (object ["type" .= t "run.failed", "run" .= buildRun runId session "failed" (Array V.empty)])))
-    Right stream -> respond (responseStream status200 sseHeader (streamBody st runId session inProgress stream))
-
-streamBody :: AcpState -> Text -> Text -> Value -> TurnStream -> StreamingBody
-streamBody st runId session inProgress stream write flush = do
-  emit (object ["type" .= t "run.in-progress", "run" .= inProgress])
-  loop ""
+-- | Consume the agent's event stream, emitting one @session\/update@ per relevant 'Event', until the
+-- turn ends, is cancelled, or errors. Returns the ACP @stopReason@ on a clean finish.
+streamUpdates :: ServerState -> Text -> TurnStream -> MVar () -> IO (Either Text Text)
+streamUpdates st sid stream cancel = do
+  -- Accumulated tool-argument JSON per call id, so `tool_call_update` can carry the whole input.
+  argsRef <- newIORef Map.empty
+  go argsRef "end_turn"
   where
-    emit v = write (byteString "data: ") >> write (lazyByteString (encode v)) >> write (byteString "\n\n") >> flush
-    loop acc =
-      nextItem stream >>= \case
-        Nothing -> do
-          let r = buildRun runId session "completed" (answerOutput (T.strip acc))
-          modifyIORef' (stRuns st) (Map.insert runId r)
-          emit (object ["type" .= t "run.completed", "run" .= r])
-        Just (Left _) -> emit (object ["type" .= t "run.failed", "run" .= buildRun runId session "failed" (Array V.empty)])
-        Just (Right (TextDelta chunk)) -> do
-          emit (object ["type" .= t "message.part", "part" .= object ["content_type" .= t "text/plain", "content" .= chunk]])
-          loop (acc <> chunk)
-        Just (Right _) -> loop acc
+    go argsRef stopReason =
+      -- Cancellation wins the race: abandoning the stream cancels the provider request.
+      race (readMVar cancel) (nextItem stream) >>= \case
+        Left () -> pure (Right "cancelled")
+        Right Nothing -> pure (Right stopReason)
+        Right (Just (Left e)) -> pure (Left (T.pack (show e)))
+        Right (Just (Right ev)) -> do
+          acc <- readIORef argsRef
+          let (upd, acc') = eventToUpdate ev acc
+          writeIORef argsRef acc'
+          case upd of
+            Just u -> notify st "session/update" (object ["sessionId" .= sid, "update" .= u])
+            Nothing -> pure ()
+          go argsRef (case ev of Done r -> mapStopReason r; _ -> stopReason)
 
--- --- helpers --------------------------------------------------------------------------------------
-
-runToText :: AgentHandle -> Text -> Text -> IO (Either GatewayError Text)
-runToText handle session input = do
-  e <- submit handle (turnRequest session input)
-  case e of
-    Left err -> pure (Left (GEProtocol (tshow err)))
-    Right stream -> fold "" stream
+-- | Translate one 'Event' into an ACP @session\/update@ payload (or 'Nothing' for events ACP has no
+-- slot for — usage, citations: informational, folded away for now), threading the per-call
+-- accumulated argument JSON so a completed call can surface its whole input as @rawInput@.
+eventToUpdate :: Event -> Map Text Text -> (Maybe Value, Map Text Text)
+eventToUpdate ev acc = case ev of
+  TextDelta t -> (Just (chunk "agent_message_chunk" t), acc)
+  Thinking t -> (Just (chunk "agent_thought_chunk" t), acc)
+  Notice t -> (Just (chunk "agent_thought_chunk" t), acc)
+  ToolUseStart i n -> (Just (callStart i n), acc)
+  ServerToolUse i n -> (Just (callStart i n), acc)
+  ToolUseDelta i j -> (Nothing, Map.insertWith (flip (<>)) i j acc)
+  ToolUseEnd i ->
+    -- The call's arguments are now whole. Surface the parsed input if it parses.
+    let raw = Map.lookup i acc >>= decodeStrict . encodeUtf8 :: Maybe Value
+        base =
+          [ "sessionUpdate" .= ("tool_call_update" :: Text),
+            "toolCallId" .= i,
+            "status" .= ("completed" :: Text)
+          ]
+     in (Just (object (base <> maybe [] (\v -> ["rawInput" .= v]) raw)), Map.delete i acc)
+  ServerToolResult i content ->
+    ( Just
+        ( object
+            [ "sessionUpdate" .= ("tool_call_update" :: Text),
+              "toolCallId" .= i,
+              "status" .= ("completed" :: Text),
+              "content"
+                .= [ object
+                       [ "type" .= ("content" :: Text),
+                         "content" .= object ["type" .= ("text" :: Text), "text" .= content]
+                       ]
+                   ]
+            ]
+        ),
+      acc
+    )
+  -- Usage/Citation/Done carry no user-visible update chunk of their own.
+  _ -> (Nothing, acc)
   where
-    fold acc stream =
-      nextItem stream >>= \case
-        Nothing -> pure (Right (T.strip acc))
-        Just (Left err) -> pure (Left (GEProtocol (tshow err)))
-        Just (Right (TextDelta chunk)) -> fold (acc <> chunk) stream
-        Just (Right _) -> fold acc stream
-
--- | Pull all text-part content out of a run's @input@ messages.
-extractInput :: Value -> Text
-extractInput body =
-  case look "input" body >>= asArray of
-    Nothing -> ""
-    Just msgs ->
-      T.concat
-        [ c
-        | msg <- msgs,
-          Just parts <- [look "parts" msg >>= asArray],
-          p <- parts,
-          isText p,
-          Just c <- [look "content" p >>= asText]
+    chunk kind t =
+      object
+        [ "sessionUpdate" .= (kind :: Text),
+          "content" .= object ["type" .= ("text" :: Text), "text" .= t]
         ]
+    callStart i n =
+      object
+        [ "sessionUpdate" .= ("tool_call" :: Text),
+          "toolCallId" .= i,
+          "title" .= n,
+          "kind" .= toolKind n,
+          "status" .= ("in_progress" :: Text)
+        ]
+
+-- | Best-effort mapping of a Lavoisier tool name onto an ACP tool-call @kind@ (drives the editor's
+-- icon\/label). Unknown tools fall to @other@.
+toolKind :: Text -> Text
+toolKind n
+  | any (`T.isPrefixOf` n) ["read", "outline", "list"] = "read"
+  | any (`T.isPrefixOf` n) ["write", "edit", "batch_edit", "apply"] = "edit"
+  | any (`T.isPrefixOf` n) ["find", "grep", "search"] = "search"
+  | n `elem` ["shell", "bash"] = "execute"
+  | otherwise = "other"
+
+-- | Map a Lavoisier 'StopReason' onto an ACP @stopReason@. ACP has a narrower set — the extras all
+-- fold to the natural end of a turn.
+mapStopReason :: StopReason -> Text
+mapStopReason = \case
+  MaxTokens -> "max_tokens"
+  Refusal -> "refusal"
+  -- EndTurn / ToolUse / StopSequence / PauseTurn / Other all present as a completed turn.
+  _ -> "end_turn"
+
+-- | Pull the text out of an ACP prompt (an array of content blocks): concatenate every @text@ block,
+-- plus the text of any embedded @resource@.
+extractPromptText :: Maybe Value -> Text
+extractPromptText (Just (Array blocks)) = foldMap blockText blocks
   where
-    isText p = case look "content_type" p >>= asText of
-      Just ct -> "text" `T.isPrefixOf` ct
-      Nothing -> True -- default content_type is text/plain
+    blockText b = case lookStr "type" b of
+      -- A plain text block …
+      Just "text" -> fromMaybe "" (lookStr "text" b)
+      Nothing -> fromMaybe "" (lookStr "text" b)
+      -- … or a `resource` block whose embedded resource is text.
+      Just "resource" -> fromMaybe "" (lookKey "resource" b >>= lookStr "text")
+      Just _ -> ""
+extractPromptText _ = ""
 
-answerOutput :: Text -> Value
-answerOutput answer =
-  Array
-    $ V.singleton
-    $ object
-      [ "role" .= t "agent/lavoisier",
-        "parts" .= [object ["content_type" .= t "text/plain", "content" .= answer]]
-      ]
+-- --- JSON-RPC write helpers -----------------------------------------------------------------------
 
-buildRun :: Text -> Text -> Text -> Value -> Value
-buildRun runId session status output =
-  object
-    [ "run_id" .= runId,
-      "agent_name" .= agentName,
-      "session_id" .= session,
-      "status" .= status,
-      "output" .= output
-    ]
+-- | Write a JSON-RPC success response.
+respond :: ServerState -> Maybe Value -> Value -> IO ()
+respond st reqId result =
+  writeLine st (object ["jsonrpc" .= ("2.0" :: Text), "id" .= fromMaybe Null reqId, "result" .= result])
 
-addError :: Value -> Text -> Value
-addError (Object o) msg = Object (KM.insert (K.fromText "error") (object ["message" .= msg]) o)
-addError v _ = v
+-- | Write a JSON-RPC error response.
+respondErr :: ServerState -> Maybe Value -> Int -> Text -> IO ()
+respondErr st reqId code message =
+  writeLine
+    st
+    ( object
+        [ "jsonrpc" .= ("2.0" :: Text),
+          "id" .= fromMaybe Null reqId,
+          "error" .= object ["code" .= code, "message" .= message]
+        ]
+    )
 
-nextId :: AcpState -> Text -> IO Text
-nextId st prefix = do
-  n <- atomicModifyIORef' (stIds st) (\k -> (k + 1, k))
-  pure (prefix <> "-" <> tshow n)
+-- | Write a JSON-RPC notification (no id).
+notify :: ServerState -> Text -> Value -> IO ()
+notify st method params =
+  writeLine st (object ["jsonrpc" .= ("2.0" :: Text), "method" .= method, "params" .= params])
 
-authorized :: AcpState -> Request -> Bool
-authorized st req = case stKeys st of
-  [] -> True
-  keys -> case lookup hAuthorization (requestHeaders req) of
-    Just v | Just key <- T.stripPrefix "Bearer " (decodeUtf8Lenient v) -> key `elem` keys
-    _ -> False
+-- | Serialise one message and write it as a newline-framed line, flushing so the editor sees it at
+-- once. A write failure (the editor closed the pipe) is logged, not fatal — the reader loop's EOF is
+-- the authoritative end-of-serve. The lock serialises whole lines across the reader loop and every
+-- forked prompt.
+writeLine :: ServerState -> Value -> IO ()
+writeLine st msg = withMVar (ssWriteLock st) $ \() -> do
+  let h = ssOut st
+  r <- try (BL.hPut h (encode msg <> "\n") >> hFlush h) :: IO (Either IOException ())
+  case r of
+    Right () -> pure ()
+    Left e -> logDebug "acp" ("write failed: " <> T.pack (show e))
 
-jsonResp :: Status -> Value -> Response
-jsonResp status = responseLBS status jsonHeader . encode
+-- --- server state ---------------------------------------------------------------------------------
 
-errResp :: Status -> Text -> Response
-errResp status msg = responseLBS status jsonHeader (encode (object ["error" .= msg]))
+-- | Per-connection server state: the shared agent, the output handle + its write lock, a session-id
+-- counter, and the set of in-flight prompts (so a @session\/cancel@ can find and stop one).
+data ServerState = ServerState
+  { ssAgent :: AgentHandle,
+    ssOut :: Handle,
+    ssWriteLock :: MVar (),
+    ssNextSession :: IORef Int,
+    -- | sessionId → its in-flight prompt's cancellation signal. Present only while a prompt runs.
+    ssPrompts :: IORef (Map Text (MVar ()))
+  }
 
-frameOnce :: Value -> StreamingBody
-frameOnce v write flush = write (byteString "data: ") >> write (lazyByteString (encode v)) >> write (byteString "\n\n") >> flush
+newServerState :: AgentHandle -> Handle -> IO ServerState
+newServerState agent outH =
+  ServerState agent outH <$> newMVar () <*> newIORef 1 <*> newIORef Map.empty
 
-sseHeader :: ResponseHeaders
-sseHeader = [(hContentType, "text/event-stream")]
+newSession :: ServerState -> IO Text
+newSession st = do
+  n <- atomicModifyIORef' (ssNextSession st) (\k -> (k + 1, k))
+  pure ("acp-" <> T.pack (show n))
 
-jsonHeader :: ResponseHeaders
-jsonHeader = [(hContentType, "application/json")]
+-- | Register a cancellation signal for @session@'s prompt, returning it for the stream loop to await.
+-- Replaces any prior signal for the same session (a new prompt supersedes the old).
+armSession :: ServerState -> Text -> IO (MVar ())
+armSession st sid = do
+  sig <- newEmptyMVar
+  modifyIORef' (ssPrompts st) (Map.insert sid sig)
+  pure sig
 
-look :: Text -> Value -> Maybe Value
-look k (Object o) = KM.lookup (K.fromText k) o
-look _ _ = Nothing
+disarmSession :: ServerState -> Text -> IO ()
+disarmSession st sid = modifyIORef' (ssPrompts st) (Map.delete sid)
 
-asText :: Value -> Maybe Text
-asText (String s) = Just s
-asText _ = Nothing
+-- | Signal @session@'s in-flight prompt to cancel. The MVar holds the signal even if the stream loop
+-- is momentarily between awaits, so the cancel is never lost to a race.
+cancelSession :: ServerState -> Text -> IO ()
+cancelSession st sid = do
+  ps <- readIORef (ssPrompts st)
+  case Map.lookup sid ps of
+    Just sig -> void (tryPutMVar sig ())
+    Nothing -> pure ()
 
-asArray :: Value -> Maybe [Value]
-asArray (Array a) = Just (V.toList a)
-asArray _ = Nothing
+-- --- small JSON helpers ---------------------------------------------------------------------------
 
-t :: Text -> Text
-t = id
+lookKey :: Text -> Value -> Maybe Value
+lookKey k (Object o) = KM.lookup (K.fromText k) o
+lookKey _ _ = Nothing
 
-tshow :: (Show a) => a -> Text
-tshow = T.pack . show
+lookStr :: Text -> Value -> Maybe Text
+lookStr k v = case lookKey k v of
+  Just (String s) -> Just s
+  _ -> Nothing

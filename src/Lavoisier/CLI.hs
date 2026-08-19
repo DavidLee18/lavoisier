@@ -42,7 +42,7 @@ import Data.Word (Word32, Word64)
 import Lavoisier.Agent
 import Lavoisier.Config (FileConfig (..), loadConfig)
 import Lavoisier.Gateway.A2A (a2aGateway, defaultA2aConfig)
-import Lavoisier.Gateway.Acp (acpGateway, defaultAcpConfig)
+import Lavoisier.Gateway.Acp (acpGateway)
 import Lavoisier.Gateway.Cron (CronJob, cronGateway, loadFileJobs, parseCliJob)
 import Lavoisier.Gateway.Http (GatewayConfig (..), httpGateway)
 import Lavoisier.Gateway.Matrix (matrixFromEnv, matrixGateway)
@@ -108,7 +108,7 @@ data Options = Options
     optRateLimit :: Maybe Int,
     optServe :: Maybe Int,
     optServeA2a :: Maybe Int,
-    optServeAcp :: Maybe Int,
+    optAcp :: Bool,
     optServeSlack :: Bool,
     optServeMatrix :: Bool,
     -- | Per-room\/per-member Matrix tool permissions. Config-file only (they are nested maps);
@@ -168,7 +168,7 @@ optionsParser =
     <*> optional (option auto (long "rate-limit" <> metavar "N" <> help "HTTP gateway per-key request cap over a 60s window"))
     <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
     <*> optional (option auto (long "serve-a2a" <> metavar "PORT" <> help "Serve the agent as an A2A (Agent-to-Agent) gateway on this port"))
-    <*> optional (option auto (long "serve-acp" <> metavar "PORT" <> help "Serve the agent as an ACP (Agent Communication Protocol) gateway on this port"))
+    <*> switch (long "acp" <> help "Run as a Zed Agent Client Protocol (ACP) agent over stdio (JSON-RPC 2.0), so an ACP-capable editor can launch `lav --acp` as a subprocess and drive the full tool loop from its agent panel. Takes over stdin/stdout; no bind address. For agent-to-agent interop use --serve-a2a instead.")
     <*> switch (long "serve-slack" <> help "Serve the agent as a Slack gateway over Socket Mode (needs SLACK_APP_TOKEN + SLACK_BOT_TOKEN)")
     <*> switch (long "serve-matrix" <> help "Serve the agent as a Matrix gateway (needs MATRIX_HOMESERVER + MATRIX_USER + token/password)")
     -- matrixRoomTools / matrixUserTools: config-file only (nested maps), so no flag — see applyConfig.
@@ -258,8 +258,8 @@ mainWith extra = do
             else
               if optServeSlack opts
                 then fromEnvGateway slackFromEnv slackGateway
-                else case (optServeAcp opts, optServeA2a opts, optServe opts) of
-                  (Just port, _, _) -> serveWith (acpGateway port defaultAcpConfig)
+                else case (optAcp opts, optServeA2a opts, optServe opts) of
+                  (True, _, _) -> serveWith acpGateway
                   (_, Just port, _) -> serveWith (a2aGateway port defaultA2aConfig)
                   (_, _, Just port) -> serveWith (httpGateway port (GatewayConfig (optApiKey opts) (fmap (\n -> (fromIntegral n, 60)) (optRateLimit opts))))
                   _ -> do
@@ -321,7 +321,7 @@ applyConfig fc o =
       optBudgetAwareness = optBudgetAwareness o || fromMaybe False (budgetAwareness fc),
       optServe = optServe o <|> fmap fromIntegral (serve fc),
       optServeA2a = optServeA2a o <|> fmap fromIntegral (serveA2a fc),
-      optServeAcp = optServeAcp o <|> fmap fromIntegral (serveAcp fc),
+      optAcp = optAcp o || fromMaybe False (acp fc),
       optServeSlack = optServeSlack o || fromMaybe False (serveSlack fc),
       optServeMatrix = optServeMatrix o || fromMaybe False (serveMatrix fc),
       -- No flag sets these, so the file is the only source: take it as-is.

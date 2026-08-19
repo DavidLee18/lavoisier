@@ -7,7 +7,7 @@ module Main (main) where
 import Control.Concurrent (forkIO)
 import Control.Exception (IOException, try)
 import Control.Monad (replicateM, replicateM_, void)
-import Data.Aeson (Value (..), decode, encode, object, (.=))
+import Data.Aeson (Value (..), decode, encode, object, toJSON, (.=))
 import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString (ByteString)
@@ -16,7 +16,7 @@ import Data.ByteString.Char8 qualified as BS8
 import Data.ByteString.Lazy qualified as BL
 import Data.Char (isHexDigit)
 import Data.IORef
-import Data.List (isSuffixOf)
+import Data.List (find, isSuffixOf)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, isNothing)
 import Data.ProtoLens (defMessage)
@@ -41,7 +41,7 @@ import Lavoisier.Context.Symbols qualified as Sym
 import Lavoisier.Context.Tokens (estimateTokens)
 import Lavoisier.Context.TreeSitter qualified as TS
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
-import Lavoisier.Gateway.Acp (defaultAcpConfig, newAcpApp)
+import Lavoisier.Gateway.Acp qualified as Acp
 import Lavoisier.Gateway.Cron (CronConfigError (..), CronJob (..), loadFileJobs, parseCliJob)
 import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp, newHttpApp, stepWindow, wsAuthorized, wsPrincipal)
 import Lavoisier.Gateway.Matrix qualified as MX
@@ -106,7 +106,7 @@ import Proto.Xai.Api.V1.Chat qualified as PX
 import Proto.Xai.Api.V1.Sample qualified as SX
 import System.Directory (createDirectoryIfMissing, doesFileExist, getTemporaryDirectory, listDirectory, removeDirectoryRecursive)
 import System.FilePath ((</>))
-import System.IO (Handle, hClose, hFlush, hSetBinaryMode)
+import System.IO (BufferMode (LineBuffering), Handle, hClose, hFlush, hSetBinaryMode, hSetBuffering, hSetEncoding, utf8)
 import System.Process (createPipe)
 import Test.QuickCheck (Arbitrary (..), Gen, NonNegative (..), Positive (..), choose, counterexample, elements, forAll, ioProperty, listOf, oneof, resize, (.&&.))
 import Test.Tasty
@@ -1698,39 +1698,139 @@ a2aTests =
     a2aBody = decodeUtf8Lenient . BL.toStrict . simpleBody
     a2aStub evs = AgentHandle $ \_ -> do s <- fromList (map Right evs); pure (Right s)
 
--- --- Phase 10: the ACP gateway (offline; WAI harness, stub agent) ----------------------------------
+-- --- Phase 10: the ACP gateway (offline; a real pipe pair, stub agent) ---------------------------
 
 acpTests :: TestTree
 acpTests =
   testGroup
-    "acp gateway"
-    [ testCase "lists the manifest" $ do
-        app <- newAcpApp defaultAcpConfig (acpStub [])
-        r <- runSession (srequest (SRequest (getP ["agents"]) "")) app
-        simpleStatus r @?= status200
-        assertBool "agent name" ("lavoisier" `T.isInfixOf` acpBody r),
-      testCase "sync run returns completed with output" $ do
-        app <- newAcpApp defaultAcpConfig (acpStub [TextDelta "ACPOK", Done EndTurn])
-        r <- runSession (srequest (SRequest postRuns syncBody)) app
-        simpleStatus r @?= status200
-        assertBool "completed" ("completed" `T.isInfixOf` acpBody r)
-        assertBool "carries the answer" ("ACPOK" `T.isInfixOf` acpBody r),
-      testCase "GET /runs/{id} reflects the store" $ do
-        app <- newAcpApp defaultAcpConfig (acpStub [TextDelta "ACPOK", Done EndTurn])
-        _ <- runSession (srequest (SRequest postRuns syncBody)) app
-        r <- runSession (srequest (SRequest (getP ["runs", "run-0"]) "")) app
-        assertBool "completed" ("completed" `T.isInfixOf` acpBody r),
-      testCase "ping" $ do
-        app <- newAcpApp defaultAcpConfig (acpStub [])
-        r <- runSession (srequest (SRequest (getP ["ping"]) "")) app
-        simpleBody r @?= "pong"
+    "acp gateway (Zed ACP over stdio)"
+    [ testCase "initialize advertises the protocol version and no auth methods" $ do
+        c <- spawnAcp []
+        acpSend c (object ["jsonrpc" .= t "2.0", "id" .= (1 :: Int), "method" .= t "initialize", "params" .= object []])
+        resp <- acpRecv c
+        at resp ["result", "protocolVersion"] @?= Just (toJSON Acp.acpProtocolVersion)
+        at resp ["result", "authMethods"] @?= Just (toJSON ([] :: [Value]))
+        at resp ["result", "agentCapabilities", "loadSession"] @?= Just (Bool False),
+      testCase "session/new then session/prompt streams message chunks and ends" $ do
+        c <- spawnAcp [TextDelta "the answer ", TextDelta "is 42", Done EndTurn]
+        acpSend c (object ["jsonrpc" .= t "2.0", "id" .= (1 :: Int), "method" .= t "session/new", "params" .= object []])
+        sid <- acpRecv c >>= \v -> maybe (assertFailure "no sessionId") pure (at v ["result", "sessionId"] >>= asStr)
+        assertBool "session ids are namespaced" ("acp-" `T.isPrefixOf` sid)
+        acpSend c (promptReq 2 sid "hi")
+        (notes, resp) <- acpRecvUntilResult c
+        -- The two deltas arrive as agent_message_chunk updates on this session.
+        let chunks = [x | n <- notes, at n ["params", "update", "sessionUpdate"] == Just (String "agent_message_chunk"), Just x <- [at n ["params", "update", "content", "text"] >>= asStr]]
+        T.concat chunks @?= "the answer is 42"
+        assertBool "every update names the session" (all (\n -> at n ["params", "sessionId"] == Just (String sid)) notes)
+        at resp ["result", "stopReason"] @?= Just (String "end_turn"),
+      testCase "tool calls surface as tool_call then tool_call_update with rawInput" $ do
+        c <-
+          spawnAcp
+            [ ToolUseStart "call_1" "read_file",
+              ToolUseDelta "call_1" "{\"path\":\"a.hs\"}",
+              ToolUseEnd "call_1",
+              TextDelta "done",
+              Done EndTurn
+            ]
+        acpSend c (promptReq 1 "acp-1" "read it")
+        (notes, resp) <- acpRecvUntilResult c
+        start <- maybe (assertFailure "a tool_call update") pure (find (\n -> at n ["params", "update", "sessionUpdate"] == Just (String "tool_call")) notes)
+        at start ["params", "update", "toolCallId"] @?= Just (String "call_1")
+        at start ["params", "update", "kind"] @?= Just (String "read")
+        end <- maybe (assertFailure "a tool_call_update") pure (find (\n -> at n ["params", "update", "sessionUpdate"] == Just (String "tool_call_update")) notes)
+        at end ["params", "update", "status"] @?= Just (String "completed")
+        -- The accumulated argument JSON is surfaced as rawInput.
+        at end ["params", "update", "rawInput", "path"] @?= Just (String "a.hs")
+        at resp ["result", "stopReason"] @?= Just (String "end_turn"),
+      testCase "a refusal maps to the refusal stop reason" $ do
+        c <- spawnAcp [Done Refusal]
+        acpSend c (promptReq 1 "acp-1" "x")
+        (_, resp) <- acpRecvUntilResult c
+        at resp ["result", "stopReason"] @?= Just (String "refusal"),
+      testCase "an empty prompt is an invalid-params error" $ do
+        c <- spawnAcp []
+        acpSend c (object ["jsonrpc" .= t "2.0", "id" .= (5 :: Int), "method" .= t "session/prompt", "params" .= object ["sessionId" .= t "acp-1", "prompt" .= ([] :: [Value])]])
+        resp <- acpRecv c
+        at resp ["error", "code"] @?= Just (toJSON (-32602 :: Int)),
+      testCase "an unknown method is a -32601" $ do
+        c <- spawnAcp []
+        acpSend c (object ["jsonrpc" .= t "2.0", "id" .= (9 :: Int), "method" .= t "frobnicate", "params" .= object []])
+        resp <- acpRecv c
+        at resp ["error", "code"] @?= Just (toJSON (-32601 :: Int)),
+      testCase "a malformed line is skipped, not fatal" $ do
+        c <- spawnAcp []
+        acpSendRaw c "{not json"
+        acpSend c (object ["jsonrpc" .= t "2.0", "id" .= (1 :: Int), "method" .= t "initialize", "params" .= object []])
+        resp <- acpRecv c
+        at resp ["result", "protocolVersion"] @?= Just (toJSON Acp.acpProtocolVersion),
+      testCase "tool kinds map sensibly" $ do
+        map Acp.toolKind ["read_files", "edit_files", "find_references", "shell", "whatever"]
+          @?= ["read", "edit", "search", "execute", "other"],
+      testCase "prompt text extraction reads text blocks and embedded resources" $ do
+        let prompt =
+              toJSON
+                [ object ["type" .= t "text", "text" .= t "hello "],
+                  object ["type" .= t "resource_link", "uri" .= t "file:///x"],
+                  object ["type" .= t "resource", "resource" .= object ["text" .= t "big "]],
+                  object ["type" .= t "text", "text" .= t "world"]
+                ]
+        Acp.extractPromptText (Just prompt) @?= "hello big world"
+        Acp.extractPromptText Nothing @?= "",
+      testCase "stop reasons narrow to the ACP set" $ do
+        map Acp.mapStopReason [MaxTokens, Refusal, EndTurn, ToolUse, Other "x"]
+          @?= ["max_tokens", "refusal", "end_turn", "end_turn", "end_turn"]
     ]
   where
-    getP p = defaultRequest {requestMethod = "GET", pathInfo = p}
-    postRuns = defaultRequest {requestMethod = "POST", pathInfo = ["runs"], requestHeaders = [(hContentType, "application/json")]}
-    syncBody = "{\"agent_name\":\"lavoisier\",\"session_id\":\"s1\",\"input\":[{\"parts\":[{\"content_type\":\"text/plain\",\"content\":\"hi\"}]}]}"
-    acpBody = decodeUtf8Lenient . BL.toStrict . simpleBody
-    acpStub evs = AgentHandle $ \_ -> do s <- fromList (map Right evs); pure (Right s)
+    t = id :: Text -> Text
+    promptReq :: Int -> Text -> Text -> Value
+    promptReq i sid txt =
+      object
+        [ "jsonrpc" .= t "2.0",
+          "id" .= i,
+          "method" .= t "session/prompt",
+          "params" .= object ["sessionId" .= sid, "prompt" .= [object ["type" .= t "text", "text" .= txt]]]
+        ]
+    asStr = \case String x -> Just x; _ -> Nothing
+    -- Walk a JSON path, so assertions read like the Rust `resp["result"]["stopReason"]`.
+    at v [] = Just v
+    at (Object o) (k : ks) = KM.lookup (K.fromText k) o >>= \v -> at v ks
+    at _ _ = Nothing
+
+-- | A live ACP server over a real pipe pair, plus the client end of each pipe. The gateway is
+-- transport-agnostic, so this exercises the actual framing/dispatch it uses on stdio.
+data AcpClient = AcpClient {acpIn :: Handle, acpOut :: Handle}
+
+spawnAcp :: [Event] -> IO AcpClient
+spawnAcp evs = do
+  (serverIn, clientOut) <- createPipe -- client → server
+  (clientIn, serverOut) <- createPipe -- server → client
+  mapM_ (`hSetEncoding` utf8) [serverIn, clientOut, clientIn, serverOut]
+  hSetBuffering clientOut LineBuffering
+  let stub = AgentHandle $ \_ -> do s <- fromList (map Right evs); pure (Right s)
+  _ <- forkIO (void (Acp.serveAcpOver stub serverIn serverOut))
+  pure (AcpClient clientIn clientOut)
+
+acpSend :: AcpClient -> Value -> IO ()
+acpSend c = acpSendRaw c . decodeUtf8Lenient . BL.toStrict . encode
+
+acpSendRaw :: AcpClient -> Text -> IO ()
+acpSendRaw c line = TIO.hPutStrLn (acpOut c) line >> hFlush (acpOut c)
+
+acpRecv :: AcpClient -> IO Value
+acpRecv c = do
+  line <- TIO.hGetLine (acpIn c)
+  maybe (assertFailure ("unparseable reply: " <> T.unpack line)) pure (decode (BL.fromStrict (encodeUtf8 line)))
+
+-- | Read reply lines until one carries a @result@ or @error@ (a response), collecting the
+-- notifications seen on the way.
+acpRecvUntilResult :: AcpClient -> IO ([Value], Value)
+acpRecvUntilResult c = go []
+  where
+    go acc = do
+      v <- acpRecv c
+      case v of
+        Object o | KM.member "result" o || KM.member "error" o -> pure (reverse acc, v)
+        _ -> go (v : acc)
 
 -- --- Phase 7: session memory (offline; stub provider) ---------------------------------------------
 

@@ -45,7 +45,8 @@ data FileConfig = FileConfig
     system :: Maybe Text,
     serve :: Maybe Natural,
     serveA2a :: Maybe Natural,
-    serveAcp :: Maybe Natural,
+    -- | Run as a Zed Agent Client Protocol agent over stdio (see @--acp@). The flag takes precedence.
+    acp :: Maybe Bool,
     serveSlack :: Maybe Bool,
     serveMatrix :: Maybe Bool,
     -- | Per-room Matrix tool permissions (a room absent from the map is unconstrained).
@@ -113,7 +114,7 @@ defaultsDhall =
       ", system = None Text",
       ", serve = None Natural",
       ", serveA2a = None Natural",
-      ", serveAcp = None Natural",
+      ", acp = None Bool",
       ", serveSlack = None Bool",
       ", serveMatrix = None Bool",
       ", matrixRoomTools = None (List { mapKey : Text, mapValue : List Text })",
