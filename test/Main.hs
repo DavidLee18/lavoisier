@@ -6,7 +6,7 @@ module Main (main) where
 
 import Control.Concurrent (forkIO)
 import Control.Exception (IOException, try)
-import Control.Monad (replicateM, replicateM_)
+import Control.Monad (replicateM, replicateM_, void)
 import Data.Aeson (Value (..), decode, encode, object, (.=))
 import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
@@ -25,10 +25,10 @@ import Data.Scientific (toBoundedInteger)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding (decodeUtf8Lenient)
+import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Data.Text.IO qualified as TIO
 import Data.Vector qualified as V
-import Data.Word (Word64)
+import Data.Word (Word64, Word8)
 import Lavoisier.Agent
 import Lavoisier.CLI qualified as CLI
 import Lavoisier.Config (FileConfig (..), defaultConfig, loadConfig)
@@ -67,10 +67,11 @@ import Lavoisier.Mcp
     toTool,
   )
 import Lavoisier.Memory (SessionStore (..), newFileStore, newInMemoryStore, sessionAgentHandle, trimTo)
-import Lavoisier.Protocol.Agent (AgentError (..), AgentHandle (..), turnRequest)
+import Lavoisier.Protocol.Agent (AgentError (..), AgentHandle (..), turnRequest, withModel)
 import Lavoisier.Protocol.Batch (Batch (..), BatchItem (..), BatchTask (..))
 import Lavoisier.Protocol.Deliberate (DeliberateError (..), Deliberation (..), DeliberationContext (..), deliberate, runDeliberation)
 import Lavoisier.Protocol.Event
+import Lavoisier.Protocol.Gate (ToolDecision (..), ToolGate (..))
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider
 import Lavoisier.Protocol.Stream (drain, fromList)
@@ -103,7 +104,7 @@ import Network.WebSockets qualified as WS
 import Options.Applicative (ParserResult (..), defaultPrefs, execParserPure, info)
 import Proto.Xai.Api.V1.Chat qualified as PX
 import Proto.Xai.Api.V1.Sample qualified as SX
-import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
+import System.Directory (createDirectoryIfMissing, doesFileExist, getTemporaryDirectory, listDirectory, removeDirectoryRecursive)
 import System.FilePath ((</>))
 import System.IO (Handle, hClose, hFlush, hSetBinaryMode)
 import System.Process (createPipe)
@@ -1007,7 +1008,65 @@ section8Tests =
         r <- runLoopSeeded agent Nothing [userMessage "do the thing"] (const (pure ()))
         case r of
           Right msgs -> assertBool "plan seeded" (any ("Plan:\n- inspect main.rs" `T.isInfixOf`) [c | Message _ bs <- msgs, TextBlock c _ <- bs])
+          Left e -> assertFailure (show e),
+      testCase "a per-turn model override reaches the provider request" $ do
+        models <- newIORef []
+        let stub =
+              Provider
+                { providerStream = \req -> do
+                    modifyIORef' models (<> [crModel req])
+                    fmap Right (fromList [Right (Done EndTurn)]),
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+        agent <- mkAgent stub withBuiltins (defaultAgentConfig "base-model") Tn.noopTuner Nothing
+        est <- submit (agentHandle agent) (withModel "picked-model" (turnRequest "s" "hi"))
+        case est of
           Left e -> assertFailure (show e)
+          Right st -> void (drain st)
+        readIORef models >>= (@?= ["picked-model"]),
+      testCase "a denying tool gate blocks the call and the file is never written" $ withTmp "gate-deny" $ \dir -> do
+        calls <- newIORef (0 :: Int)
+        let path = T.pack (dir </> "g.txt")
+            arg = jsonArg (object ["path" .= path, "content" .= ("x" :: Text)])
+            stub =
+              Provider
+                { providerStream = \_ -> do
+                    n <- atomicModifyIORef' calls (\k -> (k + 1, k))
+                    fmap Right . fromList . map Right $
+                      if n == 0
+                        then [ToolUseStart "e1" "write_file", ToolUseDelta "e1" arg, ToolUseEnd "e1", Done ToolUse]
+                        else [TextDelta "done", Done EndTurn],
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+        agent0 <- mkAgent stub withBuiltins (defaultAgentConfig "m") Tn.noopTuner Nothing
+        let agent = withToolGate (ToolGate (\_ _ -> pure (Deny "nope"))) agent0
+        _ <- runLoopSeeded agent Nothing [userMessage "write it"] (const (pure ()))
+        -- The denied write never touched the filesystem…
+        exists <- doesFileExist (dir </> "g.txt")
+        assertBool "a denied write must not create the file" (not exists)
+        -- …and the denial was fed back as a tool result, so the model got a second turn.
+        readIORef calls >>= (@?= 2),
+      testCase "an allowing gate lets the write through" $ withTmp "gate-allow" $ \dir -> do
+        n <- newIORef (0 :: Int)
+        let path = T.pack (dir </> "g.txt")
+            arg = jsonArg (object ["path" .= path, "content" .= ("hello" :: Text)])
+            stub =
+              Provider
+                { providerStream = \_ -> do
+                    k <- atomicModifyIORef' n (\i -> (i + 1, i))
+                    fmap Right . fromList . map Right $
+                      if k == 0
+                        then [ToolUseStart "e1" "write_file", ToolUseDelta "e1" arg, ToolUseEnd "e1", Done ToolUse]
+                        else [Done EndTurn],
+                  providerCapabilities = noCapabilities,
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+        agent0 <- mkAgent stub withBuiltins (defaultAgentConfig "m") Tn.noopTuner Nothing
+        let agent = withToolGate (ToolGate (\_ _ -> pure Allow)) agent0
+        _ <- runLoopSeeded agent Nothing [userMessage "write it"] (const (pure ()))
+        readFile (dir </> "g.txt") >>= (@?= "hello")
     ]
   where
     jsonArg = decodeUtf8Lenient . BL.toStrict . encode
@@ -1716,8 +1775,38 @@ memoryTests =
         s2 <- newFileStore dir (Just 2)
         back <- loadSession s2 "sess/one"
         length back @?= 2
-        map msgRole back @?= [Assistant, User]
+        map msgRole back @?= [Assistant, User],
+      testCase "a corrupt session file is preserved, not silently wiped" $ withTmp "filestore-corrupt" $ \dir -> do
+        store <- newFileStore dir Nothing
+        -- Simulate a crash mid-write (pre-atomic behaviour): a truncated, unparseable file.
+        let path = dir </> sessionFileFor "!room:hs"
+        BS.writeFile path "[{\"role\":\"user\",\"con"
+        -- load must not throw or return garbage — it starts empty …
+        loadSession store "!room:hs" >>= \h -> length h @?= 0
+        -- … and must NOT have discarded the evidence: the bad file is set aside, the live path freed.
+        doesFileExist (path <> ".corrupt") >>= assertBool "corrupt file preserved as .corrupt"
+        doesFileExist path >>= \live -> assertBool "corrupt file moved off the live path" (not live)
+        -- A subsequent save writes a valid transcript and leaves the preserved evidence intact.
+        saveSession store "!room:hs" [userMessage "fresh"]
+        loadSession store "!room:hs" >>= \h -> length h @?= 1
+        doesFileExist (path <> ".corrupt") >>= assertBool "preserved evidence survives the next save",
+      testCase "an atomic save leaves no temp files behind" $ withTmp "filestore-atomic" $ \dir -> do
+        store <- newFileStore dir Nothing
+        saveSession store "s" [userMessage "hi"]
+        -- The temp file was renamed into place, not left behind.
+        entries <- listDirectory dir
+        filter (".tmp" `isSuffixOf`) entries @?= []
+        loadSession store "s" >>= \h -> length h @?= 1
     ]
+  where
+    -- Mirrors 'Lavoisier.Memory.sessionFile': the hex-encoded, filesystem-safe session filename.
+    sessionFileFor :: Text -> FilePath
+    sessionFileFor t = concatMap byteHex (BS.unpack (encodeUtf8 t)) <> ".json"
+    byteHex :: Word8 -> String
+    byteHex w = [hexDigit (w `div` 16), hexDigit (w `mod` 16)]
+    hexDigit n
+      | n < 10 = toEnum (fromEnum '0' + fromIntegral n)
+      | otherwise = toEnum (fromEnum 'a' + fromIntegral n - 10)
 
 -- --- Phase 12: Dhall config (offline; loads real Dhall from a temp file) --------------------------
 
@@ -2434,18 +2523,40 @@ scheduleTests =
         js <- either (assertFailure . show) pure =<< loadSched dir 0 0 "[ d // { jobId = \"j\", prompt = Some \"p\", retryMax = Some 1, retryWait = Some 60 } ]"
         let j = js !! 0
         reg <- Sch.newRegistry 0 js
-        Sch.recordOutcome reg 100 j (Left "boom") -- attempt 1, retry (1<=1)
+        r1 <- Sch.recordOutcome reg 100 j (Left "boom") -- attempt 1, retry (1<=1)
+        r1 @?= Sch.FireRecord 1 (Just 60) False
         s1 <- maybe (assertFailure "no state") pure =<< Sch.stateOf reg "j"
         (Sch.jsRuns s1, Sch.jsFailures s1, Sch.jsConsecutiveFailures s1) @?= (1, 1, 1)
         Sch.jsRetryAt s1 @?= Just 160
         Sch.jsNextDue s1 @?= Nothing -- cron slot suppressed during a retry chain
-        Sch.recordOutcome reg 200 j (Left "boom2") -- attempt 2, retries exhausted
+        r2 <- Sch.recordOutcome reg 200 j (Left "boom2") -- attempt 2, retries exhausted
+        r2 @?= Sch.FireRecord 2 Nothing True
         s2 <- maybe (assertFailure "no state") pure =<< Sch.stateOf reg "j"
         Sch.jsRetryAt s2 @?= Nothing
         assertBool "next cron slot rearmed" (Sch.jsNextDue s2 /= Nothing)
-        Sch.recordOutcome reg 300 j (Right "ok") -- success resets the streak
+        r3 <- Sch.recordOutcome reg 300 j (Right "ok") -- success resets the streak
+        r3 @?= Sch.FireRecord 1 Nothing False
         s3 <- maybe (assertFailure "no state") pure =<< Sch.stateOf reg "j"
         Sch.jsConsecutiveFailures s3 @?= 0,
+      testCase "reportBody keeps the failure structure outside the paraphrasable detail slot" $ withTmp "sch" $ \dir -> do
+        js <- either (assertFailure . show) pure =<< loadSched dir 0 0 "[ d // { jobId = \"w\", prompt = Some \"p\", retryMax = Some 3, retryWait = Some 60 } ]"
+        let j = js !! 0
+            -- The prose a `summarize` turn produced, standing in for the raw error.
+            prose = "The wake FAILED: the power call was refused."
+            failed = Sch.reportBody j False prose (Sch.FireRecord 1 (Just 60) False)
+        -- Verdict marker, attempt counter, and retry countdown are structural…
+        assertBool "marker" ("\10060" `T.isInfixOf` failed)
+        assertBool "attempt" ("attempt 1" `T.isInfixOf` failed)
+        assertBool "countdown" ("\8635 retry 1/3 in 60s" `T.isInfixOf` failed)
+        -- …and the room sees the prose in the detail slot.
+        assertBool "prose" (prose `T.isInfixOf` failed)
+        -- Exhausting the budget says so instead of counting down.
+        let gaveUp = Sch.reportBody j False prose (Sch.FireRecord 4 Nothing True)
+        assertBool "gave up" ("\9940 gave up after 3 retries" `T.isInfixOf` gaveUp)
+        assertBool "no countdown once exhausted" (not ("\8635" `T.isInfixOf` gaveUp))
+        -- A success that needed retries reports how many; a first-try success does not.
+        Sch.reportBody j True "all good" (Sch.FireRecord 1 Nothing False) @?= "\9989 `w` \183 all good"
+        Sch.reportBody j True "all good" (Sch.FireRecord 2 Nothing False) @?= "\9989 `w` (after 2 attempts) \183 all good",
       testCase "schedule_run queues a known job and errors on an unknown one" $ withTmp "sch" $ \dir -> do
         js <- either (assertFailure . show) pure =<< loadSched dir 0 0 "[ d // { jobId = \"j\", prompt = Some \"p\" } ]"
         reg <- Sch.newRegistry 0 js

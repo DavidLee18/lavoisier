@@ -13,10 +13,12 @@ module Lavoisier.Agent
     Agent (..),
     mkAgent,
     withFallbacks,
+    withToolGate,
     CircuitBreaker,
     newCircuitBreaker,
     defaultFallbackCooldown,
     runAgent,
+    applyModelOverride,
     runLoopSeeded,
     agentHandle,
     defaultSystemPrompt,
@@ -68,6 +70,7 @@ import Lavoisier.Protocol.Event
     usageCost,
   )
 import Lavoisier.Protocol.Event qualified as Ev
+import Lavoisier.Protocol.Gate (ToolDecision (..), ToolGate (..))
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider (Provider (..), ProviderError)
 import Lavoisier.Protocol.Stream (Producer (..))
@@ -205,14 +208,19 @@ data Agent = Agent
     -- turn); across turns 'agBreaker' demotes a failed position for a cooldown.
     agFallbacks :: [(Provider, Text)],
     -- | Cross-turn circuit breaker over the chain, sized @1 + length agFallbacks@.
-    agBreaker :: CircuitBreaker
+    agBreaker :: CircuitBreaker,
+    -- | Optional __tool-approval gate__ consulted immediately before each tool invocation. An
+    -- interactive frontend (the TUI) uses it to ask "allow this edit?"; a 'Deny' is fed back to the
+    -- model as an error result (never aborting the turn). 'Nothing' ⇒ every tool runs, byte-identical
+    -- to before.
+    agToolGate :: Maybe ToolGate
   }
 
 -- | Build an 'Agent' with no fallback chain (a healthy 1-slot breaker) — the default wiring.
 mkAgent :: Provider -> ToolRegistry -> AgentConfig -> Tuner -> Maybe Deliberator -> IO Agent
 mkAgent prov tools cfg tuner delib = do
   breaker <- newCircuitBreaker 1 defaultFallbackCooldown
-  pure (Agent prov tools cfg tuner delib [] breaker)
+  pure (Agent prov tools cfg tuner delib [] breaker Nothing)
 
 -- | Install an ordered fallback chain of @(provider, model)@ pairs with the given cooldown (seconds).
 -- Sizes a fresh 'CircuitBreaker' to @1 + length chain@. An empty chain leaves the agent unchanged in
@@ -221,6 +229,11 @@ withFallbacks :: [(Provider, Text)] -> Double -> Agent -> IO Agent
 withFallbacks chain cooldown agent = do
   breaker <- newCircuitBreaker (1 + length chain) cooldown
   pure agent {agFallbacks = chain, agBreaker = breaker}
+
+-- | Install a __tool-approval gate__ consulted before each tool call (see 'ToolGate'). Used by the
+-- interactive TUI for per-call approval prompts; other frontends leave it unset (no gate).
+withToolGate :: ToolGate -> Agent -> Agent
+withToolGate gate agent = agent {agToolGate = Just gate}
 
 -- | The default operating instructions layered above the user's task.
 defaultSystemPrompt :: Text
@@ -261,7 +274,15 @@ isContentEvent = \case
 runAgent :: Agent -> TurnRequest -> (Event -> IO ()) -> IO (Either AgentError ())
 runAgent agent turn emit =
   fmap (const ())
-    <$> runLoopSeeded agent (trAllowedTools turn) [userMessage (trInput turn)] emit
+    <$> runLoopSeeded (applyModelOverride (trModel turn) agent) (trAllowedTools turn) [userMessage (trInput turn)] emit
+
+-- | Apply a per-turn model override ('trModel'): it replaces the executor model and suppresses
+-- cheap-model-first for the turn, so the chosen model is used throughout. Within one provider (the
+-- primary); it does not select a different provider.
+applyModelOverride :: Maybe Text -> Agent -> Agent
+applyModelOverride Nothing agent = agent
+applyModelOverride (Just m) agent =
+  agent {agConfig = (agConfig agent) {acModel = m, acCheapModel = Nothing}}
 
 -- | The loop, seeded with an initial transcript (@initial@ already includes this turn's user
 -- message). Streams events to @emit@ and returns the **full transcript** — @initial@ plus every
@@ -505,13 +526,20 @@ runLoopSeeded agent allowed initial emit = do
           -- Apply the agent-enforced knobs to the call's args (skeleton-radius injection, batch-width
           -- cap), then truncate the result to the tuned byte budget and record the counterfactual.
           let args = applyKnobsToArgs knobs name (parseArgs jsonT)
-          r <- invokeTool name args (agTools agent)
-          case r of
-            Left err -> pure (i, "tool error: " <> tshow err, True, False)
-            Right out -> do
-              let (content, origBytes) = truncateToBytes (truncateBytes knobs) (toContent out)
-              modifyIORef' maxRef (max origBytes)
-              pure (i, content, toIsError out, toChanged out)
+          -- Interactive approval (e.g. the TUI's "allow this edit?"). A denial is fed back to the
+          -- model as a recoverable error result, exactly like a permission block — the turn continues
+          -- so the model can choose another path.
+          decision <- maybe (pure Allow) (\g -> review g name args) (agToolGate agent)
+          case decision of
+            Deny reason -> pure (i, "tool `" <> name <> "` denied: " <> reason, True, False)
+            Allow -> do
+              r <- invokeTool name args (agTools agent)
+              case r of
+                Left err -> pure (i, "tool error: " <> tshow err, True, False)
+                Right out -> do
+                  let (content, origBytes) = truncateToBytes (truncateBytes knobs) (toContent out)
+                  modifyIORef' maxRef (max origBytes)
+                  pure (i, content, toIsError out, toChanged out)
 
     callBlock (i, name, jsonT) = ToolUseBlock i name (parseArgs jsonT)
     resultBlock (i, content, err, _) = ToolResultBlock i content err

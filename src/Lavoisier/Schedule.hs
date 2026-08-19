@@ -22,6 +22,8 @@ module Lavoisier.Schedule
     takeRequested,
     dueJobs,
     recordOutcome,
+    FireRecord (..),
+    reportBody,
     scheduleTools,
   )
 where
@@ -219,21 +221,32 @@ dueJobs reg now = do
       Just r -> r <= now
       Nothing -> maybe False (<= now) (jsNextDue s)
 
+-- | What one fire's bookkeeping decided, for composing its room report. The retry structure lives
+-- here rather than in the posted prose so a @summarize@ paraphrase can never hide or soften it.
+data FireRecord = FireRecord
+  { -- | 1-based attempt number within the current retry chain.
+    frAttempt :: Int,
+    -- | Seconds until the queued retry, when this failure starts\/continues a chain.
+    frRetryIn :: Maybe Integer,
+    -- | Whether this failure exhausted a non-zero retry budget.
+    frGaveUp :: Bool
+  }
+  deriving stock (Eq, Show)
+
 -- | Record a fire's outcome against a job's state (mirrors the Rust @record@): bump counters + the
 -- failure streak, cap history, and set the follow-up — a pending retry suppresses the cron slot
 -- (@next_due = Nothing@) until the chain resolves, then the next slot is recomputed from @now@.
-recordOutcome :: ScheduleRegistry -> Integer -> ScheduleJob -> Either Text Text -> IO ()
-recordOutcome reg now job result = modifyIORef' (srState reg) (Map.alter (Just . upd) (sjId job))
-  where
-    ok = either (const False) (const True) result
-    detail = T.take detailCap (either id id result)
-    upd ms =
-      let s0 = fromMaybe emptyJobState ms
-          attempt = jsAttempt s0 + 1
-          h = jsHistory s0 <> [Outcome now ok detail attempt]
-          hist = drop (max 0 (length h - historyCap)) h
-          retrying = not ok && attempt <= sjRetryMax job
-       in s0
+-- Returns the retry bookkeeping so the report and the schedule agree on one decision.
+recordOutcome :: ScheduleRegistry -> Integer -> ScheduleJob -> Either Text Text -> IO FireRecord
+recordOutcome reg now job result =
+  atomicModifyIORef' (srState reg) $ \st ->
+    let s0 = Map.findWithDefault emptyJobState (sjId job) st
+        attempt = jsAttempt s0 + 1
+        h = jsHistory s0 <> [Outcome now ok detail attempt]
+        hist = drop (max 0 (length h - historyCap)) h
+        retrying = not ok && attempt <= sjRetryMax job
+        s1 =
+          s0
             { jsAttempt = if retrying then attempt else 0,
               jsRuns = jsRuns s0 + 1,
               jsLastFired = Just now,
@@ -244,6 +257,40 @@ recordOutcome reg now job result = modifyIORef' (srState reg) (Map.alter (Just .
               jsRetryAt = if retrying then Just (now + sjRetryWait job) else Nothing,
               jsNextDue = if retrying then Nothing else nextAfter (sjSchedule job) now
             }
+        rec =
+          FireRecord
+            { frAttempt = attempt,
+              frRetryIn = if retrying then Just (sjRetryWait job) else Nothing,
+              frGaveUp = not retrying && not ok && sjRetryMax job > 0
+            }
+     in (Map.insert (sjId job) s1 st, rec)
+  where
+    ok = either (const False) (const True) result
+    detail = T.take detailCap (either id id result)
+
+-- | The body of a fire's room report (mirrors the Rust @report_body@). @shown@ is the detail slot —
+-- the @summarize@ prose when a job has one, else the raw output. The verdict marker, the attempt
+-- counter, and the retry\/gave-up line are composed __around__ it, so they survive a paraphrase.
+reportBody :: ScheduleJob -> Bool -> Text -> FireRecord -> Text
+reportBody job ok shown FireRecord {..}
+  | ok =
+      let retried
+            | frAttempt > 1 = " (after " <> tshow frAttempt <> " attempt" <> plural frAttempt <> ")"
+            | otherwise = ""
+          d = T.strip shown
+       in "\9989 `" <> sjId job <> "`" <> retried <> (if T.null d then "" else " \183 " <> d)
+  | otherwise =
+      "\10060 `" <> sjId job <> "` failed (attempt " <> tshow frAttempt <> ")\n" <> T.strip shown <> retryLine
+  where
+    plural n = if n == (1 :: Int) then "" else "s"
+    retryLine = case frRetryIn of
+      Just wait -> "\n\8635 retry " <> tshow frAttempt <> "/" <> tshow (sjRetryMax job) <> " in " <> tshow wait <> "s"
+      Nothing
+        | frGaveUp ->
+            "\n\9940 gave up after "
+              <> tshow (sjRetryMax job)
+              <> (if sjRetryMax job == 1 then " retry" else " retries")
+        | otherwise -> ""
 
 -- --- the schedule_* chat tools ---------------------------------------------------------------------
 

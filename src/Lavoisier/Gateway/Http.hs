@@ -102,7 +102,7 @@ httpHandler cfg agent metrics limiter = \req respond ->
               case decode body of
                 Nothing -> respond (responseLBS status400 jsonHeader "{\"error\":\"invalid JSON body\"}")
                 Just dto -> do
-                  let turn = TurnRequest (dtoSession dto) (dtoInput dto) Nothing
+                  let turn = TurnRequest (dtoSession dto) (dtoInput dto) Nothing Nothing
                   estream <- submit agent turn
                   case estream of
                     Left e -> recordTurn metrics True >> respond (responseStream status200 sseHeader (sseError e))
@@ -169,7 +169,7 @@ wsLoop conn agent metrics = handle (\(_ :: WS.ConnectionException) -> pure ()) l
       case decode raw of
         Nothing -> WS.sendTextData conn (encode (object ["error" .= ("invalid JSON body" :: Text)])) >> loop
         Just dto -> do
-          let turn = TurnRequest (dtoSession dto) (dtoInput dto) Nothing
+          let turn = TurnRequest (dtoSession dto) (dtoInput dto) Nothing Nothing
           estream <- submit agent turn
           case estream of
             Left e -> recordTurn metrics True >> WS.sendTextData conn (encodeItem (Left e)) >> loop

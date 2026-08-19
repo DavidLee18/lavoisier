@@ -68,6 +68,7 @@ library
     Lavoisier.Protocol.Batch
     Lavoisier.Protocol.Deliberate
     Lavoisier.Protocol.Event
+    Lavoisier.Protocol.Gate
     Lavoisier.Protocol.Gateway
     Lavoisier.Protocol.Message
     Lavoisier.Protocol.Provider

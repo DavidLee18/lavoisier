@@ -4,6 +4,7 @@ module Lavoisier.Protocol.Agent
   ( TurnRequest (..),
     turnRequest,
     withAllowedTools,
+    withModel,
     AgentError (..),
     TurnStream,
     AgentHandle (..),
@@ -21,17 +22,27 @@ data TurnRequest = TurnRequest
     -- | The user input for this turn.
     trInput :: Text,
     -- | Restrict this turn to the given tool names. 'Nothing' = full tool set; @Just []@ = no tools.
-    trAllowedTools :: Maybe [Text]
+    trAllowedTools :: Maybe [Text],
+    -- | Optional per-turn __model override__. 'Nothing' ⇒ the agent's configured executor model
+    -- (the default). @Just name@ runs /this turn/ on that model instead — an interactive frontend
+    -- (the TUI's @\/model@) uses it to switch models mid-session. It replaces the executor model and
+    -- suppresses cheap-model-first for the turn, so the chosen model is used throughout. Within one
+    -- provider (the primary); it does not select a different provider.
+    trModel :: Maybe Text
   }
   deriving stock (Eq, Show)
 
 -- | A turn with the default (unrestricted) tool policy.
 turnRequest :: Text -> Text -> TurnRequest
-turnRequest session input = TurnRequest session input Nothing
+turnRequest session input = TurnRequest session input Nothing Nothing
 
 -- | Restrict a turn to the given tool names.
 withAllowedTools :: [Text] -> TurnRequest -> TurnRequest
 withAllowedTools ts tr = tr {trAllowedTools = Just ts}
+
+-- | Run this turn on a specific model instead of the agent's configured one (see 'trModel').
+withModel :: Text -> TurnRequest -> TurnRequest
+withModel m tr = tr {trModel = Just m}
 
 -- | Errors surfaced by the agent.
 data AgentError

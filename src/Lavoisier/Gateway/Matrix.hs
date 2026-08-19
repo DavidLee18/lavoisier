@@ -74,7 +74,7 @@ import Lavoisier.Protocol.Event (Event (..))
 import Lavoisier.Protocol.Gateway (Gateway (..), GatewayError (..))
 import Lavoisier.Protocol.Stream (Producer (..))
 import Lavoisier.Protocol.Tool (ToolError, ToolOutput, toContent, toIsError)
-import Lavoisier.Schedule (Action (..), ScheduleJob (..), ScheduleRegistry, dueJobs, recordOutcome, registryJobs, takeRequested)
+import Lavoisier.Schedule (Action (..), ScheduleJob (..), ScheduleRegistry, dueJobs, recordOutcome, registryJobs, reportBody, takeRequested)
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (QueryItem, urlEncode)
@@ -483,20 +483,21 @@ fireDueSchedule env agent recent ctx = do
 -- report. A job with @summarize@ rewrites __both__ outcomes as room prose via a tool-less turn,
 -- prefixing the raw output with a @SUCCESS@\/@FAILURE@ first line so the instruction can branch (the
 -- deployed broadcast jobs read it) — the raw still drives the verdict, and a failed summary degrades
--- to the raw output so a failure's cause + retry countdown always reach the room. No @summarize@ ⇒ the
--- raw output is posted verbatim.
+-- to the raw output so a failure's cause always reaches the room. The verdict marker, the attempt
+-- counter, and the retry countdown are composed __around__ the prose by 'reportBody', so a paraphrase
+-- can never hide or soften a genuine failure. No @summarize@ ⇒ the raw output is posted verbatim.
 fireScheduleJob :: MatrixEnv -> AgentHandle -> RecentIds -> ScheduleCtx -> ScheduleJob -> Integer -> IO ()
 fireScheduleJob env agent recent ctx job now = do
   result <- runScheduleAction agent ctx job
-  recordOutcome (scRegistry ctx) now job result
+  rec <- recordOutcome (scRegistry ctx) now job result
   let raw = either id id result
-  body <- case sjSummarize job of
+  shown <- case sjSummarize job of
     Just instr -> summariseForRoom agent job instr (outcomeLine result <> raw) raw
     Nothing -> pure raw
   -- Untruncated operator log per fire (respects the log level; every frontend gets it).
   logInfo "schedule" (sjId job <> " " <> either (const "FAIL") (const "ok") result <> ": " <> raw)
-  let marker = either (const ("\10060" :: Text)) (const "\9989") result
-      report = "\9200 schedule `" <> sjId job <> "` " <> marker <> "\n" <> body
+  let ok = either (const False) (const True) result
+      report = "\9200 schedule\n" <> reportBody job ok shown rec
   case sjRoom job of
     Just room -> sendText env room report >>= either (const (pure ())) (insertRecent recent)
     Nothing -> pure ()
