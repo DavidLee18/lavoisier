@@ -29,6 +29,7 @@ module Lavoisier.CLI
   )
 where
 
+import Control.Concurrent.Async (mapConcurrently)
 import Control.Exception (SomeException, try)
 import Control.Monad (when)
 import Data.Map.Strict (Map)
@@ -241,48 +242,21 @@ mainWith extra = do
     Left e -> errExit e
     Right (prov, defModel) -> do
       let model = fromMaybe defModel (optModel opts)
-          serveWith gw = withRegistryExtra opts model extra (serveGateway gw prov opts model)
-          fromEnvGateway build wrap = build >>= either (errExit . tshow) (serveWith . wrap)
-      if cronActive opts
-        then buildCronJobs opts >>= \jobs -> serveWith (cronGateway jobs)
-        else
-          if optServeMatrix opts
-            then do
-              -- Localise the gateway-authored shutdown notice via --lang/LANG (only ko_KR ⇒ Korean).
-              langRaw <- maybe (fmap (fromMaybe "") (lookupEnv "LANG")) pure (optLang opts)
-              let lg = MX.languageFromLocale (T.pack langRaw)
-              ecfg <- matrixFromEnv
-              case ecfg of
-                Left e -> errExit (tshow e)
-                Right cfg0 -> do
-                  let cfg =
-                        (MX.withLanguage lg cfg0)
-                          { MX.mcRoomTools = optMatrixRoomTools opts,
-                            MX.mcUserTools = optMatrixUserTools opts
-                          }
-                  -- Build the in-gateway schedule (if --schedule-file), register its schedule_* tools
-                  -- into the same registry the executor gets, and hand the gateway a direct invoker.
-                  msched <- buildScheduleReg opts
-                  withRegistryExtra opts model (extra <> maybe [] scheduleTools msched) $ \registry ->
-                    let mctx = fmap (\reg -> MX.ScheduleCtx reg (\n a -> invokeTool n a registry)) msched
-                        gw = maybe (matrixGateway cfg) (MX.matrixScheduleGateway cfg) mctx
-                     in serveGateway gw prov opts model registry
-            else
-              if optServeSlack opts
-                then fromEnvGateway slackFromEnv slackGateway
-                else case (optTui opts, optAcp opts, optServeA2a opts, optServe opts) of
-                  (True, _, _, _) -> withRegistryExtra opts model extra (serveTui prov opts model)
-                  (_, True, _, _) -> serveWith acpGateway
-                  (_, _, Just port, _) -> serveWith (a2aGateway port defaultA2aConfig)
-                  (_, _, _, Just port) -> serveWith (httpGateway port (GatewayConfig (optApiKey opts) (fmap (\n -> (fromIntegral n, 60)) (optRateLimit opts))))
-                  _ -> do
-                    prompt <- resolvePrompt (optWords opts)
-                    if T.null prompt
-                      then errExit "empty prompt (pass it as arguments or on stdin)"
-                      else
-                        if optAgent opts
-                          then withRegistryExtra opts model extra (runAgentMode prov opts model prompt)
-                          else runAskMode prov opts model prompt
+      -- Build the in-gateway schedule (if --schedule-file) first: its schedule_* tools go into the
+      -- same registry the executor gets, so "how's the disk job?" works in every frontend.
+      msched <- buildScheduleReg opts
+      withRegistryExtra opts model (extra <> maybe [] scheduleTools msched) $ \registry -> do
+        gws <- buildGateways opts msched registry
+        if null gws
+          then do
+            prompt <- resolvePrompt (optWords opts)
+            if T.null prompt
+              then errExit "empty prompt (pass it as arguments or on stdin)"
+              else
+                if optAgent opts
+                  then runAgentMode prov opts model prompt registry
+                  else runAskMode prov opts model prompt
+          else serveGateways gws prov opts model registry
   where
     pinfo =
       info
@@ -634,38 +608,74 @@ loadPersona opts = case (optPersona opts, optNoPersona opts) of
           when explicit $ logWarn "persona" ("could not read --persona " <> T.pack path <> ": " <> tshow e)
           pure Nothing
 
--- | Serve the agent through any 'Gateway', wrapped with a session store (durable if --session-dir).
-serveGateway :: Gateway -> Provider -> Options -> Text -> ToolRegistry -> IO ()
-serveGateway gw prov opts model registry = do
-  (tuner, _persist) <- buildTuner opts
-  delib <- buildLegion opts
-  agent <- assembleAgent prov opts model tuner delib registry
-  store <- maybe (newInMemoryStore (Just 200)) (`newFileStore` Just 200) (optSessionDir opts)
-  logInfo "gateway" (gatewayName gw <> " starting")
-  res <- gatewayServe gw (sessionAgentHandle store agent)
-  case res of
-    Left e -> errExit (tshow e)
-    Right () -> pure ()
+-- | Every gateway the flags asked for. An empty list means no serving mode was requested, so the CLI
+-- falls back to a one-shot @ask@\/@--agent@ turn. They all run concurrently over one shared agent
+-- (see 'serveGateways'), so @--serve-matrix --serve --cron-file …@ composes rather than picking one.
+buildGateways :: Options -> Maybe ScheduleRegistry -> ToolRegistry -> IO [Gateway]
+buildGateways opts msched registry = do
+  cron <- if cronActive opts then (\jobs -> [cronGateway jobs]) <$> buildCronJobs opts else pure []
+  matrix <- if optServeMatrix opts then pure <$> matrixGw else pure []
+  slack <- if optServeSlack opts then pure <$> fromEnv slackFromEnv slackGateway else pure []
+  pure $
+    concat
+      [ cron,
+        matrix,
+        slack,
+        [acpGateway | optAcp opts],
+        -- The TUI is built here for ordering, but its approval gate must reach the *agent*, so
+        -- 'serveGateways' rebuilds it with the gate's receiver once the agent exists.
+        [tuiGateway defaultTuiConfig | optTui opts],
+        maybe [] (\p -> [a2aGateway p defaultA2aConfig]) (optServeA2a opts),
+        maybe [] (\p -> [httpGateway p (GatewayConfig (optApiKey opts) (fmap (\n -> (fromIntegral n, 60)) (optRateLimit opts)))]) (optServe opts)
+      ]
+  where
+    fromEnv build wrap = build >>= either (errExit . tshow) (pure . wrap)
+    matrixGw = do
+      -- Localise the gateway-authored shutdown notice via --lang/LANG (only ko_KR ⇒ Korean).
+      langRaw <- maybe (fmap (fromMaybe "") (lookupEnv "LANG")) pure (optLang opts)
+      let lg = MX.languageFromLocale (T.pack langRaw)
+      ecfg <- matrixFromEnv
+      case ecfg of
+        Left e -> errExit (tshow e)
+        Right cfg0 -> do
+          let cfg =
+                (MX.withLanguage lg cfg0)
+                  { MX.mcRoomTools = optMatrixRoomTools opts,
+                    MX.mcUserTools = optMatrixUserTools opts
+                  }
+              -- Hand the gateway a direct invoker into the registry the executor also uses, so a
+              -- scheduled tool action fires deterministically with no model round-trip.
+              mctx = fmap (\reg -> MX.ScheduleCtx reg (\n a -> invokeTool n a registry)) msched
+          pure (maybe (matrixGateway cfg) (MX.matrixScheduleGateway cfg) mctx)
 
--- | Serve the inline TUI. Unlike the other gateways it wants an interactive __tool-approval gate__
--- installed on the agent (the Claude-Code default: read-only tools run unattended, mutating tools and
--- shells ask first), whose receiver the TUI drains — so it builds its agent here rather than going
--- through 'serveGateway'. @--tui-auto-approve@ waives the gate entirely.
-serveTui :: Provider -> Options -> Text -> ToolRegistry -> IO ()
-serveTui prov opts model registry = do
+-- | Serve every requested 'Gateway' __concurrently over one shared agent__, wrapped with a session
+-- store (durable if @--session-dir@). The first to fail takes the process down with its error; a
+-- clean return from all of them ends the run.
+--
+-- The interactive TUI is the one gateway that needs something installed on the agent — its
+-- tool-approval 'ToolGate' — so the gate is built here (unless @--tui-auto-approve@ waives it) and
+-- its receiver handed to the TUI's config.
+serveGateways :: [Gateway] -> Provider -> Options -> Text -> ToolRegistry -> IO ()
+serveGateways gws prov opts model registry = do
   (tuner, _persist) <- buildTuner opts
   delib <- buildLegion opts
   agent0 <- assembleAgent prov opts model tuner delib registry
   (agent, permits) <-
-    if optTuiAutoApprove opts
-      then pure (agent0, Nothing)
-      else do
+    if optTui opts && not (optTuiAutoApprove opts)
+      then do
         (gate, ps) <- newChannelGate
         pure (withToolGate gate agent0, Just ps)
+      else pure (agent0, Nothing)
   store <- maybe (newInMemoryStore (Just 200)) (`newFileStore` Just 200) (optSessionDir opts)
-  let gw = tuiGateway defaultTuiConfig {tuiSession = "tui", tuiModel = model, tuiPermits = permits}
-  logInfo "gateway" "tui starting"
-  gatewayServe gw (sessionAgentHandle store agent) >>= either (errExit . tshow) pure
+  let handle = sessionAgentHandle store agent
+      wired gw
+        | gatewayName gw == "tui" = tuiGateway defaultTuiConfig {tuiSession = "tui", tuiModel = model, tuiPermits = permits}
+        | otherwise = gw
+  mapM_ (\gw -> logInfo "gateway" (gatewayName gw <> " starting")) gws
+  results <- mapConcurrently (\gw -> gatewayServe (wired gw) handle) gws
+  case [e | Left e <- results] of
+    (e : _) -> errExit (tshow e)
+    [] -> pure ()
 
 runAgentMode :: Provider -> Options -> Text -> Text -> ToolRegistry -> IO ()
 runAgentMode prov opts model prompt registry = do
