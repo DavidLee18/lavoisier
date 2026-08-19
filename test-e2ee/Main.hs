@@ -1,13 +1,13 @@
 module Main (main) where
 
-import Crypto.Olm (ed25519Verify, newUtility)
+import Crypto.Olm (ed25519Verify, exportInboundGroupSession, newInboundGroupSession, newUtility)
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding (encodeUtf8)
+import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Lavoisier.Gateway.Matrix.E2ee
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -159,7 +159,112 @@ tests =
               Object o -> Object (KM.insert "keys" (object ["curve25519:BOTDEV" .= t "FORGED", "ed25519:BOTDEV" .= t "FORGED"]) o)
               v -> v
         okBad <- verifyDeviceKeys "@bot:hs" "BOTDEV" tampered
-        assertBool "a tampered key object is rejected" (not okBad)
+        assertBool "a tampered key object is rejected" (not okBad),
+      -- The production failure of 2026-08-19: a store migration preserves the device id but cannot
+      -- carry the Olm 1:1 sessions, so peers keep sending type-1 messages we have no session for.
+      -- Reproduced exactly — pickle the bot, drop the `olm` map, restore — then repaired end to end.
+      testCase "a bot that lost its Olm sessions unwedges itself with m.dummy" $ do
+        alice <- newCrypto "@alice:hs" "ALICEDEV"
+        bot0 <- newCrypto "@bot:hs" "BOTDEV"
+        (botCurve, _) <- cryptoIdentityKeys bot0
+        (aliceCurve, _) <- cryptoIdentityKeys alice
+        Just botOtk <- takeOneTimeKey bot0
+        -- Alice establishes a session with the bot and gets one message through.
+        (mt0, b0) <- olmEncryptTo alice botCurve botOtk (object ["type" .= t "m.dummy", "content" .= object []])
+        Right _ <- decryptOlm bot0 aliceCurve mt0 b0
+        -- The bot answers, which is what moves alice off PRE_KEY onto normal (type-1) messages — the
+        -- established steady state every long-lived peer of a deployed bot is already in.
+        (mtR, bR) <- olmEncryptTo bot0 aliceCurve "" (object ["type" .= t "m.dummy", "content" .= object []])
+        Right _ <- decryptOlm alice botCurve mtR bR
+        -- The migration: everything but the 1:1 Olm sessions survives.
+        pickled <- pickleStore bot0 "pw"
+        let stripped = case pickled of
+              Object o -> Object (KM.insert "olm" (object []) o)
+              v -> v
+        Just bot <- unpickleStore "@bot:hs" "BOTDEV" "pw" stripped
+        -- Alice, unaware, keeps using her session: a type-1 message the bot cannot read.
+        (mt1, b1) <- olmEncryptTo alice botCurve botOtk (object ["type" .= t "m.room_key", "content" .= object []])
+        mt1 @?= 1
+        wedged <- decryptOlm bot aliceCurve mt1 b1
+        assertBool "a type-1 message with no session is an error, not silence" (isLeft wedged)
+        -- Recovery: the bot resolves alice's device from her sender_key and sends her an m.dummy.
+        aliceDev <- deviceKeysPayload alice
+        Just aliceOtk <- takeOneTimeKey alice
+        let devResp = object ["device_keys" .= object ["@alice:hs" .= object ["ALICEDEV" .= aliceDev]]]
+            claimResp = object ["one_time_keys" .= object ["@alice:hs" .= object ["ALICEDEV" .= object ["signed_curve25519:AAAA" .= object ["key" .= aliceOtk]]]]]
+        cap <- newIORef Nothing
+        let rest _ path body
+              | "keys/query" `T.isInfixOf` path = pure (Right devResp)
+              | "keys/claim" `T.isInfixOf` path = pure (Right claimResp)
+              | "sendToDevice" `T.isInfixOf` path = writeIORef cap (Just body) >> pure (Right (object []))
+              | otherwise = pure (Left ("unexpected: " <> path))
+        found <- findDeviceByCurve rest "@alice:hs" aliceCurve
+        found @?= Right "ALICEDEV"
+        rd <- sendDummyTo bot rest "txn1" "@alice:hs" "ALICEDEV"
+        rd @?= Right ()
+        Just sent <- readIORef cap
+        let ctObj = lookK "messages" sent >>= lookK "@alice:hs" >>= lookK "ALICEDEV" >>= lookK "ciphertext" >>= lookK aliceCurve
+            dmt = maybe (-1) id (ctObj >>= lookK "type" >>= asInt)
+            dbody = maybe "" id (ctObj >>= lookK "body" >>= asStr)
+        assertBool "the unwedge must be a PRE_KEY message, or it repairs nothing" (dmt == 0)
+        -- Alice replaces her session on receiving it, and her next message reaches the bot.
+        Right dummy <- decryptOlm alice botCurve dmt dbody
+        typeOf dummy @?= Just "m.dummy"
+        (mt2, b2) <- olmEncryptTo alice botCurve botOtk (object ["type" .= t "m.room_key", "content" .= object []])
+        recovered <- decryptOlm bot aliceCurve mt2 b2
+        case recovered of
+          Right ev -> typeOf ev @?= Just "m.room_key"
+          Left e -> assertFailure ("still wedged after the m.dummy: " <> T.unpack e),
+      testCase "requestRoomKey/cancelRoomKeyRequest address every device of the sender" $ do
+        bot <- newCrypto "@bot:hs" "BOTDEV"
+        cap <- newIORef []
+        let rest _ path body = modifyIORef' cap ((path, body) :) >> pure (Right (object []))
+        Right () <- requestRoomKey bot rest "txn1" "@alice:hs" "!room:hs" "SENDERKEY" "SESS1"
+        Right () <- cancelRoomKeyRequest bot rest "txn2" "@alice:hs" "SESS1"
+        [(cancelPath, cancelBody), (reqPath, reqBody)] <- readIORef cap
+        assertBool "request is a room key request" ("sendToDevice/m.room_key_request/txn1" `T.isInfixOf` reqPath)
+        assertBool "cancellation is too" ("sendToDevice/m.room_key_request/txn2" `T.isInfixOf` cancelPath)
+        let content p = lookK "messages" p >>= lookK "@alice:hs" >>= lookK "*"
+        (content reqBody >>= lookK "action") @?= Just (String "request")
+        (content reqBody >>= lookK "request_id") @?= Just (String "SESS1")
+        (content reqBody >>= lookK "body" >>= lookK "session_id") @?= Just (String "SESS1")
+        (content reqBody >>= lookK "body" >>= lookK "room_id") @?= Just (String "!room:hs")
+        (content cancelBody >>= lookK "action") @?= Just (String "request_cancellation")
+        (content cancelBody >>= lookK "request_id") @?= Just (String "SESS1"),
+      testCase "a forwarded room key decrypts the session it was exported from" $ do
+        alice <- newCrypto "@alice:hs" "ALICEDEV"
+        bot <- newCrypto "@bot:hs" "BOTDEV"
+        (aliceCurve, _) <- cryptoIdentityKeys alice
+        -- Alice creates a session and a message; the bot never got the key over Olm.
+        rk <- roomKeyEvent alice "!room:hs"
+        ev <- encryptMegolm alice "!room:hs" (object ["type" .= t "m.room.message", "content" .= object ["body" .= t "hi"]])
+        missing <- decryptMegolm bot ev
+        assertBool "no session yet" (isLeft missing)
+        -- A forwarding peer sends the key it holds, which is an *exported* one — a different libolm
+        -- format from the `session_key` of an m.room_key, and the reason this needs its own importer.
+        let initKey = maybe "" id (lookK "content" rk >>= lookK "session_key" >>= asStr)
+        exported <- newInboundGroupSession (encodeUtf8 initKey) >>= exportInboundGroupSession
+        -- A peer answers the request with m.forwarded_room_key: keyed by the *content's* sender_key,
+        -- which is what the room's events carry.
+        let inner = maybe (object []) id (lookK "content" rk)
+            fwd =
+              object
+                [ "type" .= t "m.forwarded_room_key",
+                  "content"
+                    .= object
+                      [ "algorithm" .= t "m.megolm.v1.aes-sha2",
+                        "room_id" .= t "!room:hs",
+                        "sender_key" .= aliceCurve,
+                        "session_id" .= maybe Null id (lookK "session_id" inner),
+                        "session_key" .= decodeUtf8 exported,
+                        "forwarding_curve25519_key_chain" .= ([] :: [Text])
+                      ]
+                ]
+        Right () <- storeForwardedRoomKey bot fwd
+        edec <- decryptMegolm bot ev
+        case edec of
+          Right dec -> (lookK "content" dec >>= lookK "body") @?= Just (String "hi")
+          Left e -> assertFailure (T.unpack e)
     ]
   where
     t = id :: Text -> Text

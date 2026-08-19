@@ -67,6 +67,12 @@ posture is efficiency-first.
 - **Use a fresh `MATRIX_DEVICE_ID` for every live E2EE run.** Reusing one leaves stale one-time keys
   on the homeserver and peers fail with `BAD_MESSAGE_KEY_ID`. libolm exceptions are caught and
   converted to `Left` rather than escaping — keep it that way; an uncaught one kills the serve loop.
+- **An Olm/Megolm decryption failure must never be discarded.** To-device events are consumed from
+  `/sync` and never redelivered, so a swallowed failure loses a room key permanently and every later
+  event from that peer is undecryptable — and `extractMessages` then drops it, which is a gateway that
+  reads a room and answers nothing, silently. Since 0.13.4 both failures log at `warn` and drive
+  recovery (`m.dummy` unwedge, `m.room_key_request`). The two are **not** interchangeable: repairing
+  the Olm channel does not make a peer re-share the key for the session it believes it delivered.
 - Dhall record fields become top-level selectors, so they collide with same-named function
   parameters and lambdas. Hence `jobId`/`toolArgs` rather than `id`/`args`.
 - On Apple Silicon, `install_name_tool` invalidates the signature — re-sign ad hoc (`codesign -f -s -`)

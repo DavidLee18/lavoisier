@@ -202,6 +202,14 @@ plaintext and encrypted rooms:
   "bytes-to-tool" path (the model never sees the image, it just gets a path to hand to a tool, e.g. a
   custom upload tool). Unset ⇒ media messages are ignored, as before. Unencrypted rooms only for now
   (encrypted media, whose reference lives under `file` with decryption keys, isn't ingested yet).
+- **E2EE session recovery** — a peer that still holds an Olm session the bot no longer has (a restored
+  backup, a migrated or rolled-back crypto store) keeps sending normal — not pre-key — messages, which
+  are undecryptable and therefore invisible. The gateway repairs this rather than waiting it out: an
+  unreadable Olm message triggers an `m.dummy` over a fresh session (rate-limited per device, 5 min),
+  which makes the peer replace its own, and a Megolm event with no known session triggers an
+  `m.room_key_request` to the sender's devices — cancelled once the key arrives, since repairing the
+  channel alone does not make a peer re-share a key it believes it already delivered. Both failures are
+  logged at `warn` with the `sender_key`/`session_id` needed to identify the missing key.
 
 A worked example — a deny-by-default perimeter where the bot answers only Alice and Bob, only in the
 `!ops` and `!general` rooms, runs the shell only in `!ops`, treats `!general` as read-only, and limits
@@ -440,7 +448,7 @@ strArg _ _ = Nothing
 source-repository-package
   type: git
   location: https://github.com/DavidLee18/lavoisier
-  tag: hs-v0.13.3
+  tag: hs-v0.13.4
   subdir: . olm
 ```
 

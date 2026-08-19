@@ -43,7 +43,7 @@ packages: .
 source-repository-package
   type: git
   location: https://github.com/DavidLee18/lavoisier
-  tag: hs-v0.13.3            -- an hs-v* release tag (NOT the Rust v* tags)
+  tag: hs-v0.13.4            -- an hs-v* release tag (NOT the Rust v* tags)
   subdir: . olm              -- `olm` too: the engine's e2ee flag depends on it
 
 -- Native libs (adjust paths for your host; Homebrew / ~/.local shown).

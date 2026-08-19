@@ -68,7 +68,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Vector qualified as V
-import Lavoisier.Log (logInfo)
+import Lavoisier.Log (logDebug, logInfo, logWarn)
 import Lavoisier.Protocol.Agent (AgentHandle (..), TurnRequest (..), TurnStream, turnRequest)
 import Lavoisier.Protocol.Event (Event (..))
 import Lavoisier.Protocol.Gateway (Gateway (..), GatewayError (..))
@@ -86,6 +86,7 @@ import System.Posix.Signals (Handler (Catch), installHandler, sigINT, sigTERM)
 #ifdef E2EE
 import Control.Monad (forM_, unless)
 import Data.Scientific (toBoundedInteger)
+import Data.Time.Clock.POSIX (POSIXTime)
 import Lavoisier.Gateway.Matrix.E2ee qualified as E2
 #endif
 
@@ -234,7 +235,14 @@ data E2State = E2State
     esEnc :: IORef (Map Text Bool),
     -- | Set when the crypto state changed (a room key received, a session created), so the loop
     -- re-persists the pickled store; cleared after a successful write.
-    esDirty :: IORef Bool
+    esDirty :: IORef Bool,
+    -- | When each peer device (by curve25519 key) was last sent an unwedging @m.dummy@. A wedged peer
+    -- emits one undecryptable event per message and each unwedge costs a @\/keys\/claim@, so the
+    -- repair is rate-limited rather than driven per message.
+    esUnwedged :: IORef (Map Text POSIXTime),
+    -- | Outstanding @m.room_key_request@s as @session_id -> requested-from user@, so a missing Megolm
+    -- key is asked for once and the request is cancelled when it arrives.
+    esRequested :: IORef (Map Text Text)
   }
 
 #else
@@ -260,6 +268,7 @@ serveLoop cfg mctx agent = do
     Left e -> pure (Left e)
     Right (token, userId, deviceId) -> do
       txn <- newIORef (0 :: Int)
+      logInfo "matrix" (bootLine cfg mctx userId deviceId)
       env <- mkEnv cfg mgr token userId deviceId txn
       recent <- newRecentIds 256
       dmCache <- newIORef Map.empty
@@ -300,7 +309,34 @@ serveLoop cfg mctx agent = do
     dispatch env recent dmCache msg = do
       dm <- isDm env dmCache (imRoom msg)
       trigger <- messageTriggers dm (imMentions msg) (imReplyTo msg) recent
-      if trigger then handleMessage env agent recent msg else pure ()
+      -- Engagement at `info`, a pass at `debug`: in a busy group room most messages are not for us.
+      if trigger
+        then do
+          logInfo "matrix" ("engaging in " <> imRoom msg <> " for " <> imSender msg <> (if dm then " (dm)" else " (mention/reply)"))
+          handleMessage env agent recent msg
+        else logDebug "matrix" ("ignoring a message in " <> imRoom msg <> " from " <> imSender msg)
+
+-- | The one boot line an operator needs: who we are, which device id we kept (its stability is what
+-- keeps cross-signing valid), how wide the allowlists and tool maps are, and how many jobs registered.
+-- Absent, diagnosing a silent gateway means interrogating the homeserver from outside the process.
+bootLine :: MatrixConfig -> Maybe ScheduleCtx -> Text -> Text -> Text
+bootLine cfg mctx userId deviceId =
+  "connected as "
+    <> userId
+    <> " device="
+    <> deviceId
+    <> " allowed_users="
+    <> allow (mcAllowedUsers cfg)
+    <> " allowed_rooms="
+    <> allow (mcAllowedRooms cfg)
+    <> " room_tools="
+    <> tshow (Map.size (mcRoomTools cfg))
+    <> " user_tools="
+    <> tshow (Map.size (mcUserTools cfg))
+    <> " jobs="
+    <> tshow (maybe 0 (length . registryJobs . scRegistry) mctx)
+  where
+    allow = maybe "*" (tshow . Set.size)
 
 -- | Install SIGTERM\/SIGINT handlers that unblock the serve loop's shutdown race (idempotent fire).
 installShutdown :: MVar () -> IO ()
@@ -521,7 +557,20 @@ mkEnv cfg mgr token userId deviceId txn = do
   shared <- newIORef Set.empty
   encc <- newIORef Map.empty
   dirty <- newIORef False
-  let e2 = E2State c shared encc dirty
+  unwedged <- newIORef Map.empty
+  requested <- newIORef Map.empty
+  (curve, _ed) <- E2.cryptoIdentityKeys c
+  -- Restored-vs-fresh is the single most consequential fact at boot: a fresh identity cannot read
+  -- anything peers encrypted to the old one, and that is otherwise indistinguishable from silence.
+  logInfo "matrix" $
+    (if fresh then "created a fresh crypto identity" else "restored the crypto store")
+      <> " for "
+      <> userId
+      <> "/"
+      <> deviceId
+      <> " curve25519="
+      <> curve
+  let e2 = E2State c shared encc dirty unwedged requested
       env = MatrixEnv cfg mgr token userId txn e2
   -- A fresh identity publishes its keys and seeds the store; a restored one is already published.
   if fresh
@@ -573,11 +622,6 @@ restAdapter :: MatrixConfig -> Manager -> Text -> E2.Rest
 restAdapter cfg mgr token httpMethod path body =
   either (Left . geText) Right <$> httpSend cfg mgr (Just token) (BL.fromStrict (encodeUtf8 httpMethod)) path (Just body)
 
-geText :: GatewayError -> Text
-geText (GEIo m) = m
-geText (GEBind m) = m
-geText (GEProtocol m) = m
-
 -- | Under E2EE: consume to-device room keys, top up one-time keys, then decrypt the timeline in place
 -- so the existing plaintext extraction\/engagement logic runs post-decrypt.
 decryptedSync :: MatrixEnv -> Value -> IO Value
@@ -587,7 +631,12 @@ decryptedSync env sync = do
   decryptTimeline env sync
 
 -- | Receive Megolm room keys: for each @m.room.encrypted@ to-device event addressed to our
--- curve25519 key, Olm-decrypt it and, when it is an @m.room_key@, store the inbound session.
+-- curve25519 key, Olm-decrypt it and store the inbound session it carries.
+--
+-- A decryption failure is __not__ discarded. To-device events are consumed from @\/sync@ and never
+-- redelivered, so a swallowed failure loses the room key permanently and every later timeline event
+-- from that peer becomes undecryptable — silently. Each failure is therefore logged and answered with
+-- an unwedging @m.dummy@ ('unwedge').
 processToDevice :: MatrixEnv -> Value -> IO ()
 processToDevice env sync = do
   let c = esCrypto (meE2 env)
@@ -597,16 +646,114 @@ processToDevice env sync = do
     handleTd c ourCurve ev
       | lookStr "type" ev == Just "m.room.encrypted" =
           let content = fromMaybe Null (lookKey "content" ev)
+              sender = fromMaybe "" (lookStr "sender" ev)
            in case (lookStr "sender_key" content, olmCipherFor ourCurve content) of
                 (Just senderKey, Just (mtype, body)) -> do
                   r <- E2.decryptOlm c senderKey mtype body
                   case r of
-                    Right pt | lookStr "type" pt == Just "m.room_key" -> do
-                      _ <- E2.storeRoomKey c senderKey pt
-                      writeIORef (esDirty (meE2 env)) True
-                    _ -> pure ()
+                    Right pt -> acceptToDevice env c senderKey pt
+                    Left e -> do
+                      logWarn "matrix" $
+                        "olm decryption failed from "
+                          <> sender
+                          <> " sender_key="
+                          <> senderKey
+                          <> " msg_type="
+                          <> tshow mtype
+                          <> ": "
+                          <> e
+                      unwedge env sender senderKey
                 _ -> pure ()
       | otherwise = pure ()
+
+-- | Store the Megolm session carried by a decrypted to-device event: @m.room_key@ (shared directly by
+-- its creator) or @m.forwarded_room_key@ (a peer answering our 'E2.requestRoomKey'). Anything else —
+-- @m.dummy@ included, which exists only to repair the Olm channel — is legitimately ignored.
+acceptToDevice :: MatrixEnv -> E2.Crypto -> Text -> Value -> IO ()
+acceptToDevice env c senderKey pt = case lookStr "type" pt of
+  Just "m.room_key" -> store "m.room_key" (E2.storeRoomKey c senderKey pt)
+  Just "m.forwarded_room_key" -> store "m.forwarded_room_key" (E2.storeForwardedRoomKey c pt)
+  _ -> pure ()
+  where
+    sid = fromMaybe "" (lookKey "content" pt >>= lookStr "session_id")
+    store what act =
+      act >>= \case
+        Right () -> do
+          writeIORef (esDirty (meE2 env)) True
+          logInfo "matrix" ("stored a Megolm key from " <> what <> " session=" <> sid)
+          clearRoomKeyRequest env sid
+        Left e -> logWarn "matrix" (what <> " could not be stored: " <> e)
+
+-- | The Megolm key we asked for arrived: withdraw the outstanding @m.room_key_request@ and forget it.
+clearRoomKeyRequest :: MatrixEnv -> Text -> IO ()
+clearRoomKeyRequest env sid = do
+  pending <- readIORef (esRequested (meE2 env))
+  case Map.lookup sid pending of
+    Nothing -> pure ()
+    Just userId -> do
+      modifyIORef' (esRequested (meE2 env)) (Map.delete sid)
+      n <- nextTxn env
+      r <- E2.cancelRoomKeyRequest (esCrypto (meE2 env)) (restOf env) ("lvz" <> tshow n) userId sid
+      either (\e -> logWarn "matrix" ("m.room_key_request cancellation for session=" <> sid <> " failed: " <> e)) pure r
+
+-- | Repair an Olm channel we can no longer read: resolve the device behind @senderKey@ and send it an
+-- @m.dummy@ over a fresh session, which makes the peer replace the session it was using.
+--
+-- Rate-limited per device ('unwedgeCooldown') because the trigger — an undecryptable message — recurs
+-- with every message the wedged peer sends, and each repair costs a @\/keys\/query@ + @\/keys\/claim@.
+unwedge :: MatrixEnv -> Text -> Text -> IO ()
+unwedge env sender senderKey
+  | T.null sender = pure ()
+  | otherwise = do
+      now <- getPOSIXTime
+      seen <- readIORef (esUnwedged (meE2 env))
+      case Map.lookup senderKey seen of
+        Just t | now - t < unwedgeCooldown -> pure ()
+        _ -> do
+          modifyIORef' (esUnwedged (meE2 env)) (Map.insert senderKey now)
+          ed <- E2.findDeviceByCurve (restOf env) sender senderKey
+          case ed of
+            Left e -> logWarn "matrix" ("could not resolve the device behind sender_key=" <> senderKey <> ": " <> e)
+            Right deviceId -> do
+              n <- nextTxn env
+              r <- E2.sendDummyTo (esCrypto (meE2 env)) (restOf env) ("lvz" <> tshow n) sender deviceId
+              case r of
+                Right () -> do
+                  writeIORef (esDirty (meE2 env)) True
+                  logInfo "matrix" ("sent m.dummy to " <> sender <> "/" <> deviceId <> " to replace a stale Olm session")
+                Left e -> logWarn "matrix" ("m.dummy unwedge of " <> sender <> "/" <> deviceId <> " failed: " <> e)
+
+-- | How long a peer device is left alone after an unwedging @m.dummy@ — long enough that a burst of
+-- undecryptable messages costs one repair, short enough that a genuinely lost dummy is retried soon.
+unwedgeCooldown :: POSIXTime
+unwedgeCooldown = 300
+
+-- | We lack the Megolm key for an event: ask the sender's devices to re-send it, deduplicated by
+-- session id.
+--
+-- Unwedging the Olm channel does not cover this. The peer believes it already delivered the key for
+-- its __current__ session and has no reason to re-share it, so without an explicit request the gateway
+-- stays deaf to that room until the peer next rotates — by default up to a week.
+requestRoomKeyFor :: MatrixEnv -> Text -> Text -> Value -> IO ()
+requestRoomKeyFor env room sender content =
+  case (lookStr "sender_key" content, lookStr "session_id" content) of
+    (Just sk, Just sid) | not (T.null sender) -> do
+      pending <- readIORef (esRequested (meE2 env))
+      unless (Map.member sid pending) $ do
+        modifyIORef' (esRequested (meE2 env)) (Map.insert sid sender)
+        n <- nextTxn env
+        r <- E2.requestRoomKey (esCrypto (meE2 env)) (restOf env) ("lvz" <> tshow n) sender room sk sid
+        case r of
+          Right () -> logInfo "matrix" ("requested Megolm key session=" <> sid <> " from " <> sender)
+          Left e -> do
+            -- Forget it so the next event carrying this session tries again.
+            modifyIORef' (esRequested (meE2 env)) (Map.delete sid)
+            logWarn "matrix" ("m.room_key_request for session=" <> sid <> " failed: " <> e)
+    _ -> pure ()
+
+-- | This env's 'E2.Rest' hook.
+restOf :: MatrixEnv -> E2.Rest
+restOf env = restAdapter (meConfig env) (meManager env) (meToken env)
 
 -- | The @(message_type, body)@ of an Olm ciphertext addressed to our curve25519 key, if present.
 olmCipherFor :: Text -> Value -> Maybe (Int, Text)
@@ -626,34 +773,54 @@ replenishFromSync env sync = do
   pure ()
 
 -- | Rewrite a sync response so each encrypted joined-room timeline event is replaced by its decrypted
--- inner event (@type@\/@content@ spliced onto the outer envelope). Undecryptable events are left as-is.
+-- inner event (@type@\/@content@ spliced onto the outer envelope).
+--
+-- An event that stays encrypted is dropped downstream by 'extractMessages' (it only matches
+-- @m.room.message@), which is exactly the shape of a gateway that reads a room and answers nothing. So
+-- a failure is logged with the @(room, sender_key, session_id)@ needed to identify the missing key,
+-- and the key is requested back ('requestRoomKeyFor').
 decryptTimeline :: MatrixEnv -> Value -> IO Value
 decryptTimeline env sync = case lookKey "rooms" sync of
   Just (Object roomsObj) -> case KM.lookup "join" roomsObj of
     Just (Object joinObj) -> do
-      joinObj' <- KM.traverseWithKey (\_ room -> decryptRoom room) joinObj
+      joinObj' <- KM.traverseWithKey (\rid room -> decryptRoom (K.toText rid) room) joinObj
       let roomsObj' = KM.insert "join" (Object joinObj') roomsObj
       pure (setKey "rooms" (Object roomsObj') sync)
     _ -> pure sync
   _ -> pure sync
   where
     c = esCrypto (meE2 env)
-    decryptRoom (Object ro) = case KM.lookup "timeline" ro of
+    decryptRoom room (Object ro) = case KM.lookup "timeline" ro of
       Just (Object tl) -> case KM.lookup "events" tl of
         Just (Array evs) -> do
-          evs' <- V.mapM decryptEvent evs
+          evs' <- V.mapM (decryptEvent room) evs
           pure (Object (KM.insert "timeline" (Object (KM.insert "events" (Array evs') tl)) ro))
         _ -> pure (Object ro)
       _ -> pure (Object ro)
-    decryptRoom v = pure v
-    decryptEvent ev
+    decryptRoom _ v = pure v
+    decryptEvent room ev
       | lookStr "type" ev == Just "m.room.encrypted" = do
-          r <- E2.decryptMegolm c (fromMaybe Null (lookKey "content" ev))
-          pure $ case r of
-            Right inner -> case (lookKey "type" inner, lookKey "content" inner) of
+          let content = fromMaybe Null (lookKey "content" ev)
+              sender = fromMaybe "" (lookStr "sender" ev)
+          r <- E2.decryptMegolm c content
+          case r of
+            Right inner -> pure $ case (lookKey "type" inner, lookKey "content" inner) of
               (Just ty, Just ct) -> setKey "type" ty (setKey "content" ct ev)
               _ -> ev
-            Left _ -> ev
+            Left e -> do
+              logWarn "matrix" $
+                "megolm decryption failed in "
+                  <> room
+                  <> " from "
+                  <> sender
+                  <> " sender_key="
+                  <> fromMaybe "?" (lookStr "sender_key" content)
+                  <> " session="
+                  <> fromMaybe "?" (lookStr "session_id" content)
+                  <> ": "
+                  <> e
+              requestRoomKeyFor env room sender content
+              pure ev
       | otherwise = pure ev
 
 -- | Send a message body, Megolm-encrypting it when the room is encrypted (else plaintext).
@@ -692,7 +859,7 @@ sendEncrypted env room body = do
   n <- nextTxn env
   let path = "/_matrix/client/v3/rooms/" <> enc room <> "/send/m.room.encrypted/lvz" <> tshow n
   r <- httpSend (meConfig env) (meManager env) (Just (meToken env)) "PUT" path (Just content)
-  pure (r >>= \v -> maybe (Left (GEProtocol "send missing event_id")) Right (lookStr "event_id" v))
+  logSend room "encrypted" (r >>= \v -> maybe (Left (GEProtocol "send missing event_id")) Right (lookStr "event_id" v))
 
 -- | Ensure the current room key has been Olm-shared to every joined peer device (deduped in 'esShared').
 ensureRoomKeyShared :: MatrixEnv -> Text -> IO ()
@@ -711,7 +878,9 @@ shareToDevice env room userId deviceId = do
     r <- E2.shareRoomKeyWith (esCrypto (meE2 env)) (restAdapter (meConfig env) (meManager env) (meToken env)) ("lvz" <> tshow n) room userId deviceId
     case r of
       Right () -> modifyIORef' ref (Set.insert (room, userId, deviceId)) >> writeIORef (esDirty (meE2 env)) True
-      Left _ -> pure () -- best-effort; retried on the next send
+      -- Best-effort; retried on the next send. Logged because a peer that never gets the room key
+      -- sees our replies as undecryptable, which looks identical to the bot saying nothing.
+      Left e -> logWarn "matrix" ("sharing " <> room <> "'s room key with " <> userId <> "/" <> deviceId <> " failed: " <> e)
 
 -- | The joined members of a room (their user ids).
 joinedMembers :: MatrixEnv -> Text -> IO [Text]
@@ -864,7 +1033,22 @@ sendMessage env room body = do
   let path = "/_matrix/client/v3/rooms/" <> enc room <> "/send/m.room.message/lvz" <> T.pack (show n)
       payload = object ["msgtype" .= ("m.text" :: Text), "body" .= body]
   r <- httpSend (meConfig env) (meManager env) (Just (meToken env)) "PUT" path (Just payload)
-  pure (r >>= \v -> maybe (Left (GEProtocol "send missing event_id")) Right (lookStr "event_id" v))
+  logSend room "plaintext" (r >>= \v -> maybe (Left (GEProtocol "send missing event_id")) Right (lookStr "event_id" v))
+
+-- | Report the outcome of an outbound room send — @info@ on success, @warn@ with the cause on failure.
+-- The gateway's other failure mode is a reply that is composed but never lands; this is what shows it.
+logSend :: Text -> Text -> Either GatewayError Text -> IO (Either GatewayError Text)
+logSend room kind r = do
+  case r of
+    Right eid -> logInfo "matrix" ("sent " <> kind <> " to " <> room <> " event=" <> eid)
+    Left e -> logWarn "matrix" ("send to " <> room <> " (" <> kind <> ") failed: " <> geText e)
+  pure r
+
+-- | A 'GatewayError' as its message text (every constructor carries one).
+geText :: GatewayError -> Text
+geText (GEIo m) = m
+geText (GEBind m) = m
+geText (GEProtocol m) = m
 
 react :: MatrixEnv -> Text -> Text -> Text -> IO (Either GatewayError Text)
 react env room eventId emoji = do

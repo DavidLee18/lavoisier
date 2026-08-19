@@ -32,6 +32,7 @@ module Lavoisier.Gateway.Matrix.E2ee
     -- * Inbound (receiving)
     decryptOlm,
     storeRoomKey,
+    storeForwardedRoomKey,
     decryptMegolm,
 
     -- * Outbound (sending)
@@ -53,6 +54,12 @@ module Lavoisier.Gateway.Matrix.E2ee
     claimOtk,
     shareRoomKeyWith,
     olmEncryptedContent,
+
+    -- * Recovery (a lost or diverged session is repaired, never waited out)
+    findDeviceByCurve,
+    sendDummyTo,
+    requestRoomKey,
+    cancelRoomKeyRequest,
     parseDeviceKeys,
     parseClaimedOtk,
   )
@@ -264,23 +271,34 @@ catchOlm act = do
 
 -- | Decrypt a 1:1 Olm message from a peer (its curve25519 @senderKey@): reuse an existing session, or
 -- (a PRE_KEY message, type 0) establish an inbound one. Returns the decrypted plaintext JSON.
+--
+-- A type-1 message with no matching session is __unrecoverable here__ and is reported as such: the
+-- peer is talking over a session we no longer hold (a restored backup, a migrated store, a rolled-back
+-- state dir). The caller answers that 'Left' with 'sendDummyTo', which makes the peer replace it.
 decryptOlm :: Crypto -> Text -> Int -> Text -> IO (Either Text Value)
 decryptOlm c senderKey msgType body = catchOlm $ do
   sessions <- readIORef (crOlm c)
-  msess <- case Map.lookup senderKey sessions of
-    Just s -> pure (Just s)
-    Nothing
-      | msgType == 0 -> do
-          s <- createInboundSessionFrom (crAccount c) (encodeUtf8 senderKey) (encodeUtf8 body)
-          removeOneTimeKeys (crAccount c) s
-          modifyIORef' (crOlm c) (Map.insert senderKey s)
-          pure (Just s)
-      | otherwise -> pure Nothing
+  msess <- case (Map.lookup senderKey sessions, msgType) of
+    (Just s, 0) -> do
+      -- A PRE_KEY message our stored session does not match is the peer replacing a session it
+      -- considers lost — its own recovery, or its answer to our 'sendDummyTo'. Decrypting it with the
+      -- stale session would fail and wedge the channel in the other direction, so take the new one.
+      matches <- matchesInboundSession s (encodeUtf8 body)
+      if matches then pure (Just s) else Just <$> freshInbound
+    (Just s, _) -> pure (Just s)
+    (Nothing, 0) -> Just <$> freshInbound
+    (Nothing, _) -> pure Nothing
   case msess of
     Nothing -> pure (Left "no Olm session for a non-prekey message")
     Just s -> do
       pt <- decrypt s msgType (encodeUtf8 body)
       pure (maybe (Left "olm plaintext was not JSON") Right (decodeStrict pt))
+  where
+    freshInbound = do
+      s <- createInboundSessionFrom (crAccount c) (encodeUtf8 senderKey) (encodeUtf8 body)
+      removeOneTimeKeys (crAccount c) s
+      modifyIORef' (crOlm c) (Map.insert senderKey s)
+      pure s
 
 -- | Store a Megolm session shared in an @m.room_key@ event (as decrypted from an Olm message), keyed
 -- by @(senderKey, session_id)@ so 'decryptMegolm' can find it.
@@ -294,6 +312,22 @@ storeRoomKey c senderKey roomKey =
     _ -> pure (Left "m.room_key missing session_id/session_key")
   where
     content = maybe roomKey id (lookKey "content" roomKey)
+
+-- | Store a Megolm session delivered by an @m.forwarded_room_key@ (a peer answering our
+-- 'requestRoomKey'). Unlike 'storeRoomKey' the key is keyed by the __content's__ @sender_key@ — the
+-- device that originally created the session, not the one forwarding it — because that is what the
+-- room's events carry and therefore what 'decryptMegolm' looks up. The @session_key@ is in libolm's
+-- /export/ format, so it is imported rather than initialised.
+storeForwardedRoomKey :: Crypto -> Value -> IO (Either Text ())
+storeForwardedRoomKey c ev = catchOlm $
+  case (lookStr "sender_key" content, lookStr "session_id" content, lookStr "session_key" content) of
+    (Just sk, Just sid, Just skey) -> do
+      inb <- importInboundGroupSession (encodeUtf8 skey)
+      modifyIORef' (crInbound c) (Map.insert (sk, sid) inb)
+      pure (Right ())
+    _ -> pure (Left "m.forwarded_room_key missing sender_key/session_id/session_key")
+  where
+    content = fromMaybe ev (lookKey "content" ev)
 
 -- | Decrypt an @m.room.encrypted@ (Megolm) event content: look up the inbound session by
 -- @(sender_key, session_id)@, Megolm-decrypt the ciphertext, and parse the inner event JSON.
@@ -449,6 +483,105 @@ shareRoomKeyWith c rest txn room userId deviceId = do
           (mtype, ctBody) <- olmEncryptTo c curve otk (olmPlaintext c userId ed rk)
           let msg = object ["messages" .= object [K.fromText userId .= object [K.fromText deviceId .= olmEncryptedContent c curve mtype ctBody]]]
           fmap (const ()) <$> rest "PUT" ("/_matrix/client/v3/sendToDevice/m.room.encrypted/" <> txn) msg
+
+-- --- recovery -------------------------------------------------------------------------------------
+
+-- | Find which of @userId@'s devices advertises the curve25519 identity key @curve@. A to-device
+-- envelope names only the @sender_key@, but @\/keys\/claim@ and @\/sendToDevice@ are addressed by
+-- device id, so recovering from an unreadable message means resolving one to the other. The matched
+-- device's key object is signature-verified before it is trusted, exactly as in 'queryDevice'.
+findDeviceByCurve :: Rest -> Text -> Text -> IO (Either Text Text)
+findDeviceByCurve rest userId curve = do
+  r <- rest "POST" "/_matrix/client/v3/keys/query" (object ["device_keys" .= object [K.fromText userId .= ([] :: [Text])]])
+  case r of
+    Left e -> pure (Left e)
+    Right resp -> case lookKey "device_keys" resp >>= lookKey userId of
+      Just (Object o) ->
+        case [(K.toText k, dev) | (k, dev) <- KM.toList o, (lookKey "keys" dev >>= lookStr ("curve25519:" <> K.toText k)) == Just curve] of
+          ((deviceId, dev) : _) -> do
+            okSig <- verifyDeviceKeys userId deviceId dev
+            pure $
+              if okSig
+                then Right deviceId
+                else Left ("device key signature verification failed for " <> deviceId)
+          [] -> pure (Left ("no device of " <> userId <> " advertises curve25519 key " <> curve))
+      _ -> pure (Left ("no device_keys." <> userId))
+
+-- | Force a peer device to replace a stale Olm session by sending it an @m.dummy@ over a __fresh__
+-- one. Receiving a PRE_KEY message is what makes a peer discard the session it was using, so its next
+-- to-device message arrives on a channel we can read; without this, a peer that still holds a session
+-- we lost keeps sending type-1 messages forever and the gateway is permanently deaf to it.
+--
+-- Mechanically 'shareRoomKeyWith' with a different inner event, save for the fresh session: reusing
+-- the stored one would emit another type-1 message and repair nothing. Rate-limiting is the caller's
+-- (each call costs a @\/keys\/claim@).
+sendDummyTo :: Crypto -> Rest -> Text -> Text -> Text -> IO (Either Text ())
+sendDummyTo c rest txn userId deviceId = catchOlm $ do
+  ek <- queryDevice rest userId deviceId
+  case ek of
+    Left e -> pure (Left e)
+    Right (curve, ed) -> do
+      mo <- claimOtk rest userId deviceId
+      case mo of
+        Left e -> pure (Left e)
+        Right otk -> do
+          let dummy = object ["type" .= ("m.dummy" :: Text), "content" .= object []]
+          (mtype, ctBody) <- olmEncryptFresh c curve otk (olmPlaintext c userId ed dummy)
+          let msg = object ["messages" .= object [K.fromText userId .= object [K.fromText deviceId .= olmEncryptedContent c curve mtype ctBody]]]
+          fmap (const ()) <$> rest "PUT" ("/_matrix/client/v3/sendToDevice/m.room.encrypted/" <> txn) msg
+
+-- | Olm-encrypt @event@ over a __newly created__ outbound session, replacing any stored one for that
+-- peer. The deliberate opposite of 'olmEncryptTo': this is the unwedge path, where the stored session
+-- is precisely what is suspect.
+olmEncryptFresh :: Crypto -> Text -> Text -> Value -> IO (Int, Text)
+olmEncryptFresh c theirIdentityKey theirOtk event = do
+  s <- createOutboundSession (crAccount c) (encodeUtf8 theirIdentityKey) (encodeUtf8 theirOtk)
+  modifyIORef' (crOlm c) (Map.insert theirIdentityKey s)
+  (mtype, ct) <- encrypt s (BL.toStrict (encode event))
+  pure (mtype, decodeUtf8Lenient ct)
+
+-- | Ask every device of @userId@ to re-send the Megolm session @sessionId@ (created by @senderKey@ in
+-- @room@), as an unencrypted @m.room_key_request@ to-device event.
+--
+-- Repairing the Olm channel is __not sufficient__ on its own: the peer believes it already delivered
+-- the key for its current session and will not re-share it, so without a request the gateway stays
+-- deaf to that room until the peer happens to rotate — by default up to a week. The reply arrives as
+-- an @m.forwarded_room_key@ ('storeForwardedRoomKey'). The session id doubles as the @request_id@ so
+-- 'cancelRoomKeyRequest' needs no extra bookkeeping.
+requestRoomKey :: Crypto -> Rest -> Text -> Text -> Text -> Text -> Text -> IO (Either Text ())
+requestRoomKey c rest txn userId room senderKey sid =
+  sendToDeviceAll rest txn userId "m.room_key_request" $
+    object
+      [ "action" .= ("request" :: Text),
+        "requesting_device_id" .= crDeviceId c,
+        "request_id" .= sid,
+        "body"
+          .= object
+            [ "algorithm" .= megolmAlgorithm,
+              "room_id" .= room,
+              "sender_key" .= senderKey,
+              "session_id" .= sid
+            ]
+      ]
+
+-- | Withdraw an outstanding 'requestRoomKey' once the key has arrived, so peers stop being asked.
+cancelRoomKeyRequest :: Crypto -> Rest -> Text -> Text -> Text -> IO (Either Text ())
+cancelRoomKeyRequest c rest txn userId requestId =
+  sendToDeviceAll rest txn userId "m.room_key_request" $
+    object
+      [ "action" .= ("request_cancellation" :: Text),
+        "requesting_device_id" .= crDeviceId c,
+        "request_id" .= requestId
+      ]
+
+-- | @PUT \/sendToDevice\/{type}\/{txn}@ addressed to every device of @userId@ (the @"*"@ wildcard).
+sendToDeviceAll :: Rest -> Text -> Text -> Text -> Value -> IO (Either Text ())
+sendToDeviceAll rest txn userId evType content =
+  fmap (const ())
+    <$> rest
+      "PUT"
+      ("/_matrix/client/v3/sendToDevice/" <> evType <> "/" <> txn)
+      (object ["messages" .= object [K.fromText userId .= object ["*" .= content]]])
 
 -- | Wrap an inner to-device event (@{type, content}@) in the Matrix Olm plaintext envelope the spec
 -- requires: @sender@\/@sender_device@\/@keys@ (ours) and @recipient@\/@recipient_keys@ (the peer's).
