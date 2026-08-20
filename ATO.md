@@ -4,9 +4,9 @@ ATO is Lavoisier's **online, quality-gated knob-tuning loop** (§6.6). It learns
 per task context, which efficiency settings minimise the **total tokens a task costs** without
 letting task success drop. This document is the exact mechanism as implemented.
 
-- Contract: `crates/lvz-protocol/src/tune.rs` (`Tuner`, `TaskContext`, `Knobs`, `Outcome`).
-- Learner: `crates/lvz-tune/src/lib.rs` (`LearningTuner`).
-- Agent integration: `crates/lvz-agent/src/lib.rs` (`run_loop` → `select`/`observe`).
+- Contract: `src/Lavoisier/Protocol/Tune.hs` (`Tuner`, `TaskContext`, `Knobs`, `Outcome`).
+- Learner: `src/Lavoisier/Tune.hs` (`LearningTuner`).
+- Agent integration: `src/Lavoisier/Agent.hs` (`runLoop` → `select`/`observe`).
 - Enable it: CLI `--tune`, or `Agent::with_tuner(Arc::new(LearningTuner::new()))`.
 
 ---
@@ -17,7 +17,7 @@ The optimisation metric is **total task tokens across all round-trips** — neve
 (§6). Two loops drive the knobs toward that minimum:
 
 - **Offline (§6.5), the budget-fixture CI loop.** Committed per-archetype token ceilings in
-  `crates/lvz-context/tests/budget.rs` set good *static* defaults and a regression floor. This
+  `tests/budget/ceilings.txt` set good *static* defaults and a regression floor. This
   is where `Knobs::default()` comes from.
 - **Online (§6.6), ATO — this document.** At runtime, against real traffic, it nudges the knobs
   *below* the static defaults where the data shows it's safe, per context. It is seeded by the
@@ -235,7 +235,7 @@ quality signal, do not enable ATO."** For a coding agent the *right* signal is c
 — compile/tests pass, the diff is accepted, no correction turn was needed.
 
 **The real signal: a verify command.** `AgentConfig.verify_command` (CLI `--verify-cmd`) is a
-shell command run **after a task completes normally** — `cargo test --quiet`, a type-check, a
+shell command run **after a task completes normally** — `cabal test`, a type-check, a
 lint — in the agent's `repo_root`, stdio discarded. Its exit status *is* `Outcome.success`: exit
 0 ⇒ the change is good, non-zero ⇒ failed. This is the quality gate §6.6 demands. It runs **only
 on an otherwise-clean completion** (the model ended without tool calls); a provider error, budget
@@ -319,7 +319,7 @@ pair the two for a production-grade signal.
 
 ### 10.1 The Bayesian (Thompson-sampling) tuner
 
-`BayesTuner` (in `crates/lvz-tune/src/bayes.rs`, opt-in via `--tune-bayes`) keeps the same `Tuner`
+`BayesTuner` (in `src/Lavoisier/Tune/Bayes.hs`, opt-in via `--tune-bayes`) keeps the same `Tuner`
 contract, discrete knob grid, and baseline floor as the hill-climb, but replaces ε-greedy selection
 with **Thompson sampling**:
 

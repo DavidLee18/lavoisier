@@ -6,7 +6,7 @@ with **colima + nerdctl** (not Docker); secrets come from **AWS Secrets Manager*
 baked into the image or the task definition.
 
 ```
-client ──HTTP/WS──> ALB :80 ──> Fargate task (lavoisier --serve 0.0.0.0:8080, ARM64)
+client ──HTTP/WS──> ALB :80 ──> Fargate task (lav --serve 8080, ARM64)
                                   └ XAI_API_KEY, LVZ_API_KEYS  ← Secrets Manager (env)
                                   └ logs ─> CloudWatch  /ecs/lavoisier
 ```
@@ -18,7 +18,7 @@ The gateway runs **with API-key auth + a rate limit on** (it is internet-facing)
 
 - AWS account + credentials for **us-west-2** (`aws sts get-caller-identity` works).
 - **colima** (started: `colima start --arch aarch64`) with **nerdctl**, and **Terraform ≥ 1.5**.
-  (No local `protoc`/Rust needed — the build runs inside the image.)
+  (No local `protoc`/GHC needed — the build runs inside the image.)
 - An **`XAI_API_KEY`** (the gateway defaults to the xAI gRPC transport).
 
 ## 1. Create the secrets

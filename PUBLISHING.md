@@ -1,192 +1,69 @@
-# Publishing to crates.io + cargo-binstall
+# Releasing
 
-`lavoisier` is a Cargo workspace, so the binary crate (`lavoisier`) and its 15 library crates
-(`lvz-*`) are published to crates.io **in dependency order**. End users then install a prebuilt
-binary with `cargo binstall lavoisier` (no Rust toolchain needed) or build from source with
-`cargo install lavoisier` (no `protoc` needed — `lvz-xai`'s gRPC bindings are committed; see below).
+Lavoisier ships as **prebuilt binaries attached to a GitHub release**, built by
+`.github/workflows/release.yml`. There is no package-registry step: the project is not on Hackage,
+and the crates.io packages are frozen (see the last section).
 
-## Prerequisites (one-time)
+## Cutting a release
 
-- A crates.io account + token: `cargo login`.
-- **Confirm the crate names are available** on crates.io: `lavoisier` and every `lvz-*` below. If one
-  is taken, rename it (in its `Cargo.toml` and in `[workspace.dependencies]` in the root `Cargo.toml`).
-- `protoc` is **not** required to publish — `lvz-xai`'s generated bindings are committed
-  (`crates/lvz-xai/src/generated/xai_api.rs`), so `cargo publish`'s verify build (and docs.rs, and
-  `cargo install`) compiles them without invoking `protoc`. You only need `protoc` to *regenerate*
-  those bindings after bumping the vendored proto (`LVZ_XAI_REGEN=1 cargo build -p lvz-xai`).
-- A clean, committed tree on `main`; everything green (`cargo test`, `clippy`, `fmt`).
+1. Everything green on `main`: `cabal build` (`-Wall -Werror`), `cabal test`, `ormolu --mode check`.
+   CI gates all three, including the budget-ceiling step.
+2. Bump `version:` in `lavoisier.cabal`. Commit it.
+3. **Check the sdist actually carries what the build needs** before tagging — this has bitten a
+   release before (`hs-v0.13.1`, missing `cbits` headers):
 
-## 1. Publish the crates (in this order)
+   ```sh
+   cabal sdist all          # NOT `cabal sdist lavoisier` — that errors on the library component
+   tar tzf dist-newstyle/sdist/lavoisier-*.tar.gz | grep -E '\.h$|tests/budget'
+   ```
 
-Each crate must already be on crates.io before the crates that depend on it. Dry-run first:
+   Anything a build reads at compile time must be in `extra-source-files`: the `cbits/**/*.h`
+   shims and the `tests/budget/**` fixtures.
+4. Tag and push:
 
-```sh
-for c in lvz-protocol lvz-context lvz-anthropic lvz-google lvz-xai lvz-claude-cli \
-         lvz-tune lvz-legion lvz-tools lvz-schedule lvz-gw-http lvz-gw-matrix lvz-gw-cron lvz-gw-slack lvz-agent lvz-memory lavoisier; do
-  cargo publish -p "$c" --dry-run || break
-done
-```
+   ```sh
+   git tag v0.16.0 && git push origin v0.16.0
+   ```
 
-Then publish for real, **in this order**. Two limits to know:
-- `cargo publish` already waits for each version to index before returning, so deps resolve.
-- crates.io rate-limits **brand-new crate names** to ~1 per 10 minutes (after a small burst). On a
-  fresh workspace the first ~5 publish immediately, then you'll get `429 Too Many Requests` with a
-  "try again after" time. The loop below **waits out the 429 and retries**, so the whole set
-  (~14 new crates) completes hands-off in roughly 1.5 hours:
+5. The workflow builds three targets — `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`,
+   `aarch64-unknown-linux-gnu` — packages each with `scripts/package-haskell.sh`, and attaches
+   `lavoisier-<target>.tar.gz` to the release.
+6. **Verify the published artifact, not just the green run.** Download the tarball and run it:
 
-```sh
-for c in lvz-protocol lvz-context lvz-anthropic lvz-google lvz-xai lvz-claude-cli \
-         lvz-tune lvz-legion lvz-tools lvz-schedule lvz-gw-http lvz-gw-matrix lvz-gw-cron lvz-gw-slack lvz-agent lvz-memory lavoisier; do
-  until out=$(cargo publish -p "$c" 2>&1); do
-    echo "$out" | grep -qiE '429|Too Many Requests' || { echo "$out" | tail; echo "HARD FAIL: $c"; exit 1; }
-    echo "rate-limited on $c — sleeping 11m…"; sleep 660
-  done
-done
-```
+   ```sh
+   gh release download v0.16.0 -R DavidLee18/lavoisier -p 'lavoisier-aarch64-apple-darwin.tar.gz'
+   tar xzf lavoisier-aarch64-apple-darwin.tar.gz && ./lav --help
+   ```
 
-(Once published, *version bumps* are not new-crate publishes, so they are not subject to this
-limit — only the initial publish of each new name is. A higher limit can be requested from
-help@crates.io.)
+## Why packaging is not just "copy the binary"
 
-Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
-Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
-version requirement still resolves); leave the rest at their published version. Latest changed set
-(`v0.9.1`): **legion grounding fix** — the council was arguing in a vacuum (no persona, no tools), so a
-gateway bot with a `PERSONA.md` and real tools would deliberate, synthesise a *refusal* ("I'm not that
-bot / I can't do that"), and seed that into the executor — which then obeyed it instead of calling the
-tools. Fix: the agent now hands the council a `DeliberationContext` (the executor's system prompt + this
-turn's advertised tools) via a new **additive, backward-compatible** trait method
-`Deliberator::deliberate_with_context` (defaults to delegating to the bare `deliberate`, so pre-existing
-impls are untouched). `lvz-protocol` (0.1.2→**0.1.3** — new `DeliberationContext` + provided method;
-additive ⇒ patch, dependents' `^0.1` still resolve, so the unchanged crates need **no** republish);
-`lvz-legion` (0.1.0→**0.1.2** — `Panel` overrides `deliberate_with_context`, appending persona + tool
-catalogue to every phase's system prompt, and fires `ctx.progress` per phase); `lvz-agent`
-(0.1.2→**0.1.4** — calls `deliberate_with_context` with `config.system` + `tool_defs`, and streams the
-council's phase notices as `Event::Notice`); and `lavoisier` (0.9.0→**0.9.1** — picks up the fix; the CLI
-prints `Event::Notice` as `[notice] …`).
-This release also bundles a **Matrix "thinking" fix**: the typing indicator lapsed after the server's
-30 s timeout during the ~60 s+ silent deliberation, so the gateway now keeps it alive on a 20 s timer and
-renders `Event::Notice` progress lines as short messages. That adds a new **additive** `Event::Notice(String)`
-variant — additive under 0.x (every in-workspace `Event` consumer already has a wildcard arm, and staying
-in `0.1.x` means all crates resolve to the single `lvz-protocol 0.1.4`, so the unchanged crates need **no**
-republish — same reasoning as v0.6.0's `TurnRequest.allowed_tools`). So `lvz-protocol` is **0.1.2→0.1.4**
-(grounding context **and** `Event::Notice`) and `lvz-gw-matrix` is **0.5.0→0.5.1** (keep-alive + notice
-rendering). Publish order `lvz-protocol` → `lvz-legion` → `lvz-agent` → `lvz-gw-matrix` → `lavoisier`
-(`lvz-legion`/`lvz-agent`/`lvz-gw-matrix` all only need the new `lvz-protocol`, so their relative order is
-free). The other eleven crates stay put.
-Earlier changed set
-(`v0.9.0`): the **legion council** — a panel of provider+model debaters that draft, critique each other,
-and have a judge synthesise one agreed plan that seeds the executor before the loop (deliberate-then-act;
-supersedes the single advisor). New crate `lvz-legion` (**0.1.0** — the `Panel`/`Debater` council + the
-draft→critique→judge engine; claim the name); `lvz-protocol` (0.1.1→**0.1.2** — additive `Deliberator`
-contract + `Deliberation`/`DeliberateError`; additive ⇒ patch, dependents' `^0.1` still resolve, so the
-unchanged crates need **no** republish); `lvz-agent` (0.1.1→**0.1.2** — additive `Agent::with_legion` + the
-pre-pass branch in `run_loop` + a new `tracing` dep; additive ⇒ patch); and `lavoisier` (0.8.0→**0.9.0** —
-`--legion-debater`/`--legion-judge`/`--legion-rounds` + the `[legion]` config section). Publish order
-`lvz-protocol` → `lvz-legion` → `lvz-agent` → `lavoisier` (`lvz-legion` and `lvz-agent` both only need the
-new `lvz-protocol`, so their relative order is free). The other thirteen crates stay put.
-Earlier changed set
-(`v0.8.0`): **structured logging**. `--log-level`/`LVZ_LOG_LEVEL`/`[log] level` installs a `tracing`
-collector on stderr (RUST_LOG-style `EnvFilter` directives), and the 74 operator diagnostics moved from
-`eprintln!` to `tracing`. Each library crate gained a `tracing` dependency and its stderr output now
-flows through a filter, so all take a **minor** bump: `lvz-memory` (0.2.1→**0.3.0**), `lvz-schedule`
-(0.1.0→**0.2.0**), `lvz-gw-slack` (0.1.0→**0.2.0**), `lvz-gw-cron` (0.3.1→**0.4.0**), `lvz-gw-matrix`
-(0.4.0→**0.5.0**), and `lavoisier` (0.7.1→**0.8.0**, the new flag + `[log]` section). Under 0.x the
-minor slot is the incompatible one, and these bumps mean dependents' `^0.x` requirements no longer
-resolve — so the workspace pins move with them. Publish order `lvz-schedule` → `lvz-gw-matrix` →
-`lvz-gw-cron` → `lvz-gw-slack` → `lvz-memory` → `lavoisier` (`lvz-schedule` must precede the two
-gateways that depend on it). `lvz-tools` was untouched — its one `eprintln!` is `#[cfg(test)]`
-scaffolding, not a diagnostic — so it stays at 0.1.0, as do the other nine crates.
-Earlier changed set
-(`v0.7.0`): the **Matrix `schedule`** feature. `lvz-schedule` (**0.1.0 — new crate**, claim the name:
-the UTC cron engine moved out of `lvz-gw-cron`, plus the job/action model, the live job registry, and
-the `schedule_*` tools), `lvz-gw-cron` (0.3.1 — `mod cron` moved to `lvz-schedule` and re-exported;
-**public API identical**, so a patch), `lvz-gw-matrix` (**0.4.0** — new `with_schedule`/
-`with_schedule_room` builders and the in-loop scheduler; additive, but a feature ⇒ minor) and
-`lavoisier` (**0.7.0** — `--schedule-file`/`--schedule-room`/`--schedule-retry-*`, the `[gateway]`
-keys, and the `build_tool_registry` extraction so the agent and scheduler share one registry).
-Publish order `lvz-schedule` → `lvz-gw-matrix` → `lvz-gw-cron` → `lavoisier` (note `lvz-schedule`
-depends on `lvz-tools`, so it must follow it in the full-workspace order above). The other eleven
-crates stay put.
-Earlier changed set
-(`v0.6.6`): `lvz-gw-cron` (**0.3.0** — cron fires now **retry on failure** (a rejected submit or a
-mid-turn stream error) up to `retry_max` times with a fixed `retry_wait`; `parse_cli`/`parse_file`
-gained retry-default params, a **breaking** public-API change ⇒ a **minor** bump, not a patch) and
-`lavoisier` (0.6.6 — `--cron-retry-max`/`--cron-retry-wait` + `[gateway]` keys, and republish so the
-tagged binary picks up the new `lvz-gw-cron`). Publish order `lvz-gw-cron` → `lavoisier`; the workspace
-pin moved to `0.3.0` so `lavoisier` resolves the new minor. The other thirteen crates stay put.
-Earlier changed set
-(`v0.6.5`): `lvz-gw-matrix` (0.3.6 — the unencrypted-send **transaction counter is seeded from a
-per-process timestamp** (`process_seed`, nanos since epoch) instead of restarting at 0 each boot, so
-txn ids never collide with a prior run's and get silently deduped by the homeserver) and `lavoisier`
-(0.6.5 — republish so the tagged binary picks up the change). Both semver-compatible patches; publish
-order `lvz-gw-matrix` → `lavoisier`. The other thirteen crates stay put.
-Earlier changed set
-(`v0.6.4`): `lvz-gw-matrix` (0.3.5 — the 👀 ack reaction is **swapped for a ✅/❌ outcome reaction** when
-the turn resolves: `react` returns the reaction event id, new `redact` + `finish_reaction` retract the
-ack and react success/failure) and `lavoisier` (0.6.4 — republish so the tagged binary picks up the
-change). Both semver-compatible patches; publish order `lvz-gw-matrix` → `lavoisier`. The other
-thirteen crates stay put.
-Earlier changed set
-(`v0.6.3`): `lvz-gw-matrix` (0.3.4 — **addressable engagement** (mention/reply gate, DM-exempt) plus
-live **reaction / typing / per-tool-call notices**) and `lavoisier` (0.6.3 — republish so the tagged
-binary picks up the change). Both semver-compatible patches; publish order `lvz-gw-matrix` →
-`lavoisier`. The other thirteen crates stay put.
-Earlier changed set
-(`v0.6.2`): `lvz-gw-matrix` (0.3.3 — **cross-signing identity bootstrapped once on startup** under the
-`e2ee` feature, gated on `cross_signing_status().is_complete()`) and `lavoisier` (0.6.2 — republish so
-the tagged binary picks up the change).
-Earlier changed set
-(`v0.6.1`): `lvz-gw-matrix` (0.3.2 — Matrix gateway **startup retry with exponential backoff** on
-transient bind failures so a homeserver restart doesn't kill a fresh task) and `lavoisier` (0.6.1 —
-republish to ship the fix in the binary).
-Earlier changed set
-(`v0.6.0`): the Matrix room/member **tool permissions** feature. `lvz-protocol` (0.1.1 — additive
-`TurnRequest.allowed_tools` field; a constructor default keeps it semver-compatible, so dependents'
-`^0.1` requirements still resolve and the unchanged crates need **no** republish), `lvz-agent` (0.1.1
-— `run_seeded_with_tools` + per-turn tool gating in `run_loop`), `lvz-memory` (0.2.1 — forwards
-`allowed_tools`), `lvz-gw-matrix` (0.3.1 — allowed-rooms, per-room/member tool policy, home-room
-shutdown notice), and `lavoisier` (0.6.0 — the new `[gateway]` Matrix knobs + `select_all` graceful
-shutdown). All bumps are **semver-compatible** (patch/leaf), so only these five republish — the other
-nine `lvz-*` crates stay put. Publish order: `lvz-protocol` → `lvz-agent` → `lvz-memory` →
-`lvz-gw-matrix` → `lavoisier`.
-Earlier (`v0.5.0`): `lvz-gw-slack` (0.1.0 — **new crate**, claim the name), `lvz-gw-matrix` (0.3.0 —
-token/whoami auth + stable device id, persistent SQLite crypto store, sender allowlist), and
-`lavoisier` (0.5.0 — `--serve-slack` + the new Matrix/config knobs). `lvz-tools` changed test-only
-code (no functional change), so it stayed at 0.1.0.
-Earlier: `v0.4.0` bumped `lavoisier` only (0.4.0 — lib+bin `main_with` custom-tool entry point);
-`v0.3.1` bumped `lvz-gw-matrix` (0.2.2, auto-join) + `lavoisier`; `v0.3.0` bumped `lvz-memory`
-(0.2.0) + `lavoisier`; `v0.2.1` was a `lvz-gw-matrix` E2EE fix; `v0.2.0` bumped `lvz-gw-cron` (new),
-`lvz-gw-matrix`, and `lavoisier`. The remaining crates are still at `0.1.0`. (`examples/private-tools`
-is `publish = false` — never published.)
+`lav` links `libtree-sitter` and `libsnappy` **dynamically**, so a bare binary depends on the build
+machine's Homebrew or `/usr/local` copies. `scripts/package-haskell.sh` copies each non-system
+library next to the binary and rewrites the load paths to `@executable_path` (macOS) or `$ORIGIN`
+(Linux).
 
-## 2. Cut a release → prebuilt binaries → `cargo binstall`
+On Apple Silicon, `install_name_tool` **invalidates the code signature**, so the script re-signs ad
+hoc (`codesign -f -s -`). Skip that and the binary is killed on launch.
 
-`cargo binstall lavoisier` downloads a prebuilt binary from the GitHub release matching the crate
-version. Tag the version to trigger `.github/workflows/release.yml`, which builds and uploads
-`lavoisier-<target>.tar.gz` for macOS (arm64/Apple Silicon) and Linux (x64/arm64):
+## Tag namespaces
 
-```sh
-git tag v0.4.0
-git push origin v0.4.0
-```
+| Tags | What they are |
+|---|---|
+| `v0.7.1` .. `v0.15.0` | The retired **Rust** implementation. Preserved on the `rust` branch. |
+| `hs-v0.13.0` .. `hs-v0.15.0` | The Haskell tree while it was a port on its own branch. |
+| `v0.16.0` onwards | Haskell, from `main`. The version line continues; the `hs-` prefix is dropped. |
 
-Once the release assets are up, verify:
+## crates.io: frozen, deliberately
 
-```sh
-cargo binstall lavoisier      # fetches the prebuilt binary
-lavoisier --help
-```
+The Rust implementation published `lavoisier` plus 15 `lvz-*` library crates to crates.io. Those
+versions are **left exactly as they are** — a published version can be yanked but never deleted, and
+nothing is served from this tree.
 
-## Notes
+The consequence worth stating plainly: **`cargo install lavoisier` and `cargo binstall lavoisier`
+still install Rust v0.15.0**, not the current Haskell build. Anyone who wants the current binary
+takes a release tarball. If that divergence stops being acceptable, the options are to yank the
+published versions (reversible) or to publish a final version whose README points here; neither has
+been done.
 
-- **docs.rs**: builds fine for every crate — `lvz-xai`'s bindings are pre-generated and committed
-  (`src/generated/xai_api.rs`), so no `protoc` is needed at docs-build time. `lvz-gw-matrix` sets
-  `[package.metadata.docs.rs] features = ["e2ee"]` so its (default-off) crypto module documents too.
-- **Version bumps**: keep all crates at the same version. Bump together, re-run §1, then a new tag for §2.
-- **`e2ee` feature**: `lvz-gw-matrix` (and the `lavoisier` passthrough) gain an optional `e2ee` feature
-  pulling `matrix-sdk-crypto`/`ruma`. It's **off by default**, so it doesn't affect the standard publish
-  or the MSRV-1.88 default build — but a consumer enabling it needs Rust ≥ 1.93. Publishing is unaffected
-  (optional deps publish fine); just don't bump the workspace MSRV on its account.
-- The vendored xAI protos (Apache-2.0) ship inside `lvz-xai` (`crates/lvz-xai/proto/`, see its
-  `VENDOR.md`); the rest of the workspace is MIT.
+The old crates.io procedure — publish order, the new-crate rate limit, the `protoc`-free vendored
+gRPC bindings — is preserved in this file's history: `git show v0.15.0:PUBLISHING.md`.

@@ -4,10 +4,6 @@
 #
 # Conventions: arm64 (Fargate target), colima + nerdctl (not Docker).
 #
-# PORTED TO THE HASKELL TREE (2026-08-18). This file previously built the Rust workspace — it did
-# `COPY Cargo.toml Cargo.lock ./` + `COPY crates ./crates`, paths that do not exist on
-# `haskell-port`, so the build failed at the COPY before compiling anything.
-#
 # This is the SIMPLE stack: `infra/`'s HTTP/WS gateway on Fargate — no Matrix, no EFS. So the
 # `e2ee` flag stays OFF (its default) and **libolm is deliberately not built here**; only the Matrix
 # gateway needs it, and it is EOL upstream and expensive to build. The deployment that does need it

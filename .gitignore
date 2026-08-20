@@ -1,4 +1,5 @@
-# Rust build output (the Rust tree lives on `main`; a worktree here would drop a target/)
+# Rust build output — the retired implementation lives on the `rust` branch; a worktree of it here
+# would drop a target/
 /target
 **/*.rs.bk
 *.pdb

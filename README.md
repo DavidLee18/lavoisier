@@ -8,14 +8,16 @@ A modular, **token-efficient** CLI coding agent with a provider-agnostic core (*
 and Google Gemini — all native**). One agent brain drives the CLI and every gateway: HTTP/WebSocket,
 Matrix, Slack, cron, A2A, ACP, and an inline TUI.
 
-> **This branch (`haskell-port`) is the Haskell implementation** — a Cabal package at the repo root.
-> `main` carries the Rust workspace it was ported from, and is the parity reference.
+> **Lavoisier is written in Haskell** — a Cabal package at the repo root.
 >
-> Status: the port covers the same surface — providers, context engine, ATO, tools, and all gateways
-> including Matrix E2EE — and is live-verified on 7 of them against real `ANTHROPIC_API_KEY`,
-> `XAI_API_KEY`, and `GOOGLE_API_KEY` (Slack is offline-tested only, for want of tokens). Parity is
-> against the deployed Rust **v0.15.0**: the whole lineage, including the Zed-ACP rework and the
-> inline TUI, is ported and offline-tested. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design.
+> It was a Rust workspace through **v0.15.0**. That implementation is retired but preserved: the
+> `rust` branch and the `v0.7.1`..`v0.15.0` tags, and the 20 `lvz-*` crates still on crates.io, which
+> remain frozen at Rust v0.15.0. `cargo install lavoisier` therefore still gets you the *old* Rust
+> build; releases from **v0.16.0** on are Haskell binaries from this tree.
+>
+> Status: providers, context engine, ATO, tools, and all gateways including Matrix E2EE, live-verified
+> on 7 surfaces against real `ANTHROPIC_API_KEY`, `XAI_API_KEY`, and `GOOGLE_API_KEY` (Slack is
+> offline-tested only, for want of tokens). See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design.
 
 ## Why
 
@@ -60,23 +62,24 @@ round-trips. When you have a real test gate, opt into **accuracy-mode** (`--veri
 --require-edit --verify-and-fix`): the agent iterates until the tests pass. In the measured
 head-to-head this matches or beats the comparison agent on task completion *while costing less per
 completed task* — see [`bench/README.md`](bench/README.md) (cost + reproducible correctness via
-`bench/verify.zsh`). That benchmark was run against the Rust build; the port shares the design but
-has not been re-benchmarked. Tuner internals: [`ATO.md`](ATO.md).
+`bench/verify.zsh`). That benchmark was run against the Rust build at v0.15.0; this tree shares the
+design but has not been re-benchmarked. Tuner internals: [`ATO.md`](ATO.md).
 
 ## Architecture
 
-One Cabal package whose module tree mirrors the Rust crates (`lvz-protocol` → `Lavoisier.Protocol.*`,
-and so on), segmented so the agent core never depends on a wire protocol or a frontend. The keystone
-is `Lavoisier.Protocol.*`, which defines the `Event` stream and the `Provider`/`Tool`/`Gateway`/
-`Tuner`/`Deliberator` contracts; dependencies point inward only. Those contracts are **records of
-functions** held as ordinary values (the `Arc<dyn Trait>` analogue), and `EventStream` is a
-hand-rolled pull stream standing in for Rust's `BoxStream`. Plain `IO`, no effect framework. See
+One Cabal package whose module tree follows the old crate split (`lvz-protocol` →
+`Lavoisier.Protocol.*`, and so on), segmented so the agent core never depends on a wire protocol or a
+frontend. The keystone is `Lavoisier.Protocol.*`, which defines the `Event` stream and the
+`Provider`/`Tool`/`Gateway`/`Tuner`/`Deliberator` contracts; dependencies point inward only. Those
+contracts are **records of functions** held as ordinary values, and `EventStream` is a hand-rolled
+pull stream. Plain `IO`, no effect framework. See
 [`ARCHITECTURE.md`](ARCHITECTURE.md) for the module map, the invariants, and the key design decisions.
 
 ## Install
 
 The package is `lavoisier`; the built command is **`lav`**. It is **not on Hackage** — take a
-self-contained tarball from a `hs-v*` [release](https://github.com/DavidLee18/lavoisier/releases)
+self-contained tarball from a [release](https://github.com/DavidLee18/lavoisier/releases) —
+`hs-v0.15.0` today, `v0.16.0` onward once the prefix is dropped
 (macOS arm64, Linux x86_64/arm64), or build from source below.
 
 ## Quickstart (from source)
@@ -281,7 +284,7 @@ glance. (These behaviours are Matrix-only; the Slack gateway answers `message`/`
 
 **Matrix encryption.** The Matrix gateway targets unencrypted rooms by default; build with
 `-fe2ee` for Olm/Megolm end-to-end encryption, orchestrated here over the `olm/` FFI package against
-the system `libolm` (where the Rust tree delegates to `matrix-sdk-crypto`). With `MATRIX_STATE_DIR`
+the system `libolm`. With `MATRIX_STATE_DIR`
 set, the account and its sessions are **pickled** to that directory — optionally encrypted at rest
 with `MATRIX_CRYPTO_STORE_KEY` — so the bot keeps its keys and decrypts existing rooms after a
 restart, no re-verification. Use a **fresh `MATRIX_DEVICE_ID` for each new live run**: reusing one
@@ -297,7 +300,7 @@ thread), and can be restricted with `SLACK_ALLOWED_USERS`.
 ### Configuration file
 
 For long-running deployments, a **Dhall config** sets defaults for most flags so you don't pass a
-long command line. (Dhall here, TOML in the Rust tree.) `--config <PATH>` — or an auto-loaded
+long command line. (Dhall; the retired Rust tree used TOML.) `--config <PATH>` — or an auto-loaded
 `./lavoisier.dhall` — is one flat record whose keys are the flag names in camelCase; **an explicit
 CLI flag or env var always wins over the file**, which wins over the built-in default. Every field is
 optional: the file is merged over an all-`None` defaults record, so write only what you set, and
@@ -419,7 +422,7 @@ bounded — best with a real test gate) · `--in-loop-verify` (stop as soon as a
 Gateway: `--api-key <KEY>` (repeatable) · `--rate-limit <N per 60s>`.
 
 Logging: operator diagnostics go to **stderr** through `Lavoisier.Log`, the port's stand-in for the
-Rust `tracing` facade — one process-wide threshold rather than per-target filters.
+`tracing` facade the Rust tree used — one process-wide threshold rather than per-target filters.
 `--log-level <error|warn|info|debug>` (env `LVZ_LOG_LEVEL`) retunes it; the default is `info`. An
 unrecognised value falls back to `info`, so a typo can't silence a running daemon. Downstream
 `mainWith` binaries get `logError`/`logWarn`/`logInfo`/`logDebug` re-exported from `Lavoisier.CLI`,
@@ -481,11 +484,11 @@ strArg _ _ = Nothing
 ```
 
 ```cabal
--- your-private-package/cabal.project — pin an hs-v* tag; `olm` is needed for the e2ee flag.
+-- your-private-package/cabal.project — pin a release tag; `olm` is needed for the e2ee flag.
 source-repository-package
   type: git
   location: https://github.com/DavidLee18/lavoisier
-  tag: hs-v0.15.0
+  tag: hs-v0.15.0            -- latest Haskell tag today; v0.16.0 onward drops the prefix
   subdir: . olm
 ```
 
@@ -515,8 +518,7 @@ ormolu --mode inplace $(git ls-files '*.hs')   # formatting; run before every co
 ```
 
 `gen/` holds the committed xAI proto-lens bindings — generated code, so leave it out of the ormolu
-sweep. For the Rust reference, check out `main` (`git worktree add ../lavoisier-rust main`) and run
-`cargo test && cargo clippy --all-targets`.
+sweep. To read the retired Rust implementation, `git worktree add ../lavoisier-rust rust`.
 
 ## License
 

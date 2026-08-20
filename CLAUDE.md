@@ -3,10 +3,14 @@
 **Lavoisier** (binary `lav`) is a token-efficient, provider-agnostic CLI coding agent. One agent core
 drives the CLI and every gateway (HTTP/WS, Matrix, Slack, cron, A2A, ACP).
 
-**This branch (`haskell-port`) is the Haskell port**: Cabal package at the repo root (`src/`, `app/`,
-`test/`, `lavoisier.cabal`). `main` is the Rust implementation, at the root, and is the parity
-reference — read it (`git show v0.15.0:crates/…`, `git log main`) when porting or when behaviour is
-ambiguous. There is no in-tree Rust copy; the tags on `main` are the record.
+**Lavoisier is a Haskell project**: Cabal package at the repo root (`src/`, `app/`, `test/`,
+`lavoisier.cabal`), on `main`.
+
+It was Rust until v0.15.0. That implementation is retired, not deleted — it is preserved on the
+`rust` branch (`ea2b921`) and by the `v0.7.1`..`v0.15.0` tags, it remains in `main`'s ancestry, and
+`git show v0.15.0:crates/…` still reads it. Consult it when a behaviour's history is unclear; it is
+no longer a parity target, and the Haskell tree has moved past it. The 20 `lvz-*` crates on
+crates.io are frozen at Rust v0.15.0 and deliberately left published.
 
 Read before working in that area: [`ARCHITECTURE.md`](ARCHITECTURE.md) (crate/module map, dependency
 invariants, design decisions) · [`ATO.md`](ATO.md) (the adaptive-token-optimisation tuner) ·
@@ -42,26 +46,22 @@ posture is efficiency-first.
 
 - **Haskell**: GHC 9.10 / Cabal, `GHC2021`, `-Wall -Werror` kept clean, **ormolu** before every
   commit. Correctness via ADTs + exhaustive `case`. Tests are `tasty` — prefer QuickCheck properties.
-- **Rust** (`main`): edition 2021, MSRV 1.88; `cargo clippy --all-targets` and `cargo fmt --check`
-  kept green.
-- **Config is Dhall** in the port (`lavoisier.dhall.example`), TOML in Rust. `--cron-file` and
-  `--schedule-file` are Dhall record lists here, JSON/TOML there.
+- **Config is Dhall** (`lavoisier.dhall.example`); `--cron-file` and `--schedule-file` are Dhall
+  record lists. (The retired Rust tree used TOML and JSON — old issues and infra may still say so.)
 - Keep dependencies minimal: **no agent frameworks, no vendor SDKs** — hand-roll thin HTTP adapters
-  so prompt caching and thinking blocks stay reachable. (The stale Rust `anthropic*`/`clust`/
-  `misanthropy` crates are specifically not to be used.)
+  so prompt caching and thinking blocks stay reachable.
 - **Providers in scope: Anthropic, xAI, Google Gemini — native.** OpenAI and others are out of scope.
   A **Discord gateway is out of scope** — do not build it.
 - Scripts are **zsh**; local containers run on **colima + nerdctl** (not Docker, and no longer Podman).
 - Secrets come from env / AWS Secrets Manager at runtime; never commit keys.
 - **GitHub Actions are pinned to a full commit SHA**, never a tag (`uses: owner/repo@<sha> # vX.Y.Z`).
   Resolve with `gh api repos/<owner>/<repo>/commits/<tag> --jq .sha` and keep the version comment
-  accurate. `dtolnay/rust-toolchain` additionally needs an explicit `toolchain:` input, since pinning
-  discards the `@stable` ref-name signal.
-- License MIT. Release tags: `hs-v*` for the Haskell binaries, `v*` for the Rust crates.
+  accurate.
+- License MIT. Release tags are `v*` (`v0.16.0` onwards is Haskell). `v0.7.1`..`v0.15.0` are the Rust
+  releases and `hs-v0.13.0`..`hs-v0.15.0` the port's own line, both historical.
 
 ## Gotchas
 
-**Haskell port**
 - `runCli` forces UTF-8 on stdout/stderr. Without it the binary dies with `commitBuffer: invalid
   argument` under a C locale, because help text and notices contain ε and emoji.
 - **Use a fresh `MATRIX_DEVICE_ID` for every live E2EE run.** Reusing one leaves stale one-time keys
@@ -78,7 +78,7 @@ posture is efficiency-first.
 - **The Matrix txn counter must be seeded from process-start nanos**, not 0 — Matrix dedupes by
   `(device, txn id)` and answers a repeat with the *previous* response, so a counter restarting at 0
   makes the first sends after every restart vanish silently. The Rust `process_seed` says so in a
-  comment; the port had dropped it, and it swallowed room-key shares and the unwedge until 0.13.4.
+  comment; this tree had dropped it, and it swallowed room-key shares and the unwedge until 0.13.4.
 - Dhall record fields become top-level selectors, so they collide with same-named function
   parameters and lambdas. Hence `jobId`/`toolArgs` rather than `id`/`args`.
 - On Apple Silicon, `install_name_tool` invalidates the signature — re-sign ad hoc (`codesign -f -s -`)
@@ -88,45 +88,27 @@ posture is efficiency-first.
   that path is the repo's own Haskell FFI package.
 - Generated xAI proto-lens bindings are **committed** under `gen/` (isolated in the `xai-proto`
   library with warnings off), so an ordinary build needs no `protoc`.
-
-**Both trees**
+- `Lavoisier.Gateway.Tui` drives the terminal with **raw ANSI escapes**, not brick/vty. The TUI needs
+  an inline viewport (output stays in scrollback); brick and vty are alt-screen shaped, so there was
+  nothing to build on. Expect escape sequences, not a widget tree.
 - Gemini 3 attaches a `thoughtSignature` to each `functionCall` that must be echoed on resend, or the
   API 400s. It round-trips through the opaque tool-call id, contained to the Google adapter.
 - The tree-sitter grammar and core ABI versions are pinned together — bump them together.
-- The budget-fixture ceilings (`tests/budget/ceilings.txt`, gated by its own `haskell-ci` step) are
-  the committed context-token baseline, measured with no headroom. The fixtures are real snapshots
-  (`tests/budget/<name>/TARGET` + `src/`), and their **paths are part of the measurement** — that is
-  what the cross-file import ranking scores against. Update a number deliberately when skeleton
-  output legitimately changes and say why in the commit; never edit one to make a test pass.
+- The budget-fixture ceilings (`tests/budget/ceilings.txt`, gated by its own `ci` step) are the
+  committed context-token baseline, measured with no headroom. The fixtures are real snapshots
+  (`tests/budget/<name>/target.txt` + the tree beside it), and their **paths are part of the
+  measurement** — that is what the cross-file import ranking scores against. Update a number
+  deliberately when skeleton output legitimately changes and say why in the commit; never edit one
+  to make a test pass.
 
-**Rust tree**
-- `lvz-xai`'s tonic bindings are committed for the same protoc-free reason; `build.rs` regenerates
-  only under `LVZ_XAI_REGEN=1`. Procedure in `crates/lvz-xai/proto/VENDOR.md`.
-- Inside a `tracing` macro, fully qualify `serde_json::Value` — the expansion brings the
-  `tracing::field::Value` *trait* into scope, so a bare `Value::as_str` path fails to compile with
-  "expected a type, found a trait" even though the same expression compiles elsewhere in the file.
-- `EnvFilter` has no glob, so `DEFAULT_LOG_FILTER` is an explicit per-crate roll-call. **A new crate
-  must be added to it** or its `info!` events silently vanish. A unit test guards the list.
+## Status
 
-## Status and parity
+Complete: providers, context engine, ATO, tools, and all gateways including Matrix E2EE.
+Live-verified on 7 surfaces; Slack is offline-tested only, and the TUI and Zed ACP have never been
+driven by a real model turn.
 
-The Rust implementation is complete and live-verified against real API keys across all providers and
-gateways. The Haskell port covers the same surface — providers, context engine, ATO, tools, all
-gateways including Matrix E2EE — and is live-verified on 7 surfaces (Slack is offline-tested only).
-
-**Parity is against the deployed Rust v0.15.0.** The v0.13.1→v0.15.0 lineage — the atomic/corruption-
-surfacing `FileStore`, the structural schedule report body, the `ToolGate` + per-turn model override,
-the ACP rework (BeeAI REST → Zed stdio), and the inline TUI — is ported and offline-tested. The Rust
-lineage was diffed straight from `main` in this repo, which carries every tag; `reference-rust/` was
-only ever a v0.13.0 snapshot and has been removed. Read `git show v0.15.0:crates/…` (or any tag) when
-behaviour is ambiguous.
-
-The TUI is the one place the port deliberately diverges in **means**, not surface: the Rust builds on
-ratatui's inline viewport, which has no Haskell equivalent (brick/vty are alt-screen shaped), so
-`Lavoisier.Gateway.Tui` drives the terminal with ANSI escapes directly.
-
-**The port is ahead of Rust in two places**, both former deferrals, both closed here only — port them
-back before claiming parity in the other direction:
+It covers everything Rust v0.15.0 did and has since gone further. Two of those additions are worth
+knowing about because they change how the edit and context paths behave:
 - **Repeated edit targets are addressable.** `edit_anchored`/`edit_files` take an `after` landmark
   anchor and `str_replace` takes `after`/`before` snippets; the landmark must itself occur exactly
   once and the first match past it is edited. Deliberately *not* a line range or an occurrence index
@@ -134,25 +116,24 @@ back before claiming parity in the other direction:
   rather than guesses.
 - **Cross-file symbol edges are import-ranked.** `Symbols.fromFiles` scores candidate definers of a
   name by how much of their path the referencing file's imports mention, keeping only the best tier.
-  It ranks, it does not resolve: with no evidence it degrades to linking every definer (exactly the
-  old behaviour), because a wrong resolver drops a true edge and a missing edge is invisible.
+  It ranks, it does not resolve: with no evidence it degrades to linking every definer (the older
+  behaviour), because a wrong resolver drops a true edge and a missing edge is invisible.
   `narrowedCount` says whether evidence did anything. `outline_files --focus` now builds one graph
   across the given paths, which is where this pays.
 
-Still deferred in both trees: Matrix token streaming.
+Still deferred: Matrix token streaming.
 
 ## Commands
 
 ```sh
-# Haskell (this branch)
 cabal build && cabal test              # -Wall -Werror; tasty
 cabal build -fe2ee && cabal test lavoisier-e2ee-test
 ormolu --mode inplace $(git ls-files '*.hs')
 cabal run lav -- --agent "edit task"
 
-# Rust (on `main`; `git worktree add ../lavoisier-rust main` for a build tree)
-cargo test && cargo clippy --all-targets && cargo fmt --check
-cargo run -p lavoisier -- --agent "edit task"
+# The retired Rust tree, if you need to read it:
+#   git show v0.15.0:crates/lvz-agent/src/lib.rs
+#   git worktree add ../lavoisier-rust rust
 ```
 
 Providers are selected with `--provider anthropic|xai|google|claude-cli` and keyed from
@@ -163,8 +144,8 @@ run concurrently over one shared agent. Full flag list in `README.md`.
 ## Working here
 
 - **Never make live API calls without asking first** — they cost real money on the user's keys.
-- Develop on `haskell-port`, not `main`. Stage explicitly (`git add <paths>`); `git add -A` sweeps a
-  stray gitlink into the index.
+- Develop on `main`. Stage explicitly (`git add <paths>`); `git add -A` sweeps a stray gitlink into
+  the index.
 - Ask before publishing, tagging, or pushing a release.
 - Commit with a `Co-Authored-By: Claude <model> <noreply@anthropic.com>` trailer naming the model in
   use (past commits read `Claude Opus 4.8 (1M context)`).

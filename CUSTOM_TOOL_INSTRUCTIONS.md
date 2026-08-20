@@ -9,7 +9,7 @@ additionally available to the agent.
 > Tools are **compiled-in Haskell** — there is no dynamic/plugin loading. "Private" means the Haskell
 > code stays in your own repo; it never touches the public `lavoisier` source.
 
-This is the Haskell port (branch `haskell-port`). It is the analogue of the Rust engine's
+Lavoisier is a Haskell package. This is the analogue of the retired Rust engine's
 `main_with`; the entry point here is **`Lavoisier.CLI.mainWith :: [Tool] -> IO ()`**.
 
 ---
@@ -43,7 +43,8 @@ packages: .
 source-repository-package
   type: git
   location: https://github.com/DavidLee18/lavoisier
-  tag: hs-v0.15.0            -- an hs-v* release tag (NOT the Rust v* tags)
+  tag: hs-v0.15.0            -- latest Haskell tag today; v0.16.0 onward drops the prefix
+                             -- (v0.7.1..v0.15.0 are the retired Rust releases)
   subdir: . olm              -- `olm` too: the engine's e2ee flag depends on it
 
 -- Native libs (adjust paths for your host; Homebrew / ~/.local shown).
