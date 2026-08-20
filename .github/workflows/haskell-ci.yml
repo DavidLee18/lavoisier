@@ -96,6 +96,14 @@ jobs:
       - name: Test
         run: cabal test --project-file=cabal.project.ci lavoisier-test
 
+      # The token-effect gate. `tests/budget/ceilings.txt` pins the estimated context tokens each
+      # fixture costs at each radius, so any growth in what the context engine constructs — skeleton
+      # output, the radius BFS, or the cross-file import ranking — fails here with the numbers. It
+      # runs inside the full suite above too; this step exists so a breach is a labelled step in the
+      # job list instead of one line buried in 290-odd results.
+      - name: Budget ceilings (context-token regression gate)
+        run: cabal test --project-file=cabal.project.ci lavoisier-test --test-options='-p /budget/'
+
   e2ee:
     name: e2ee feature (libolm)
     runs-on: ubuntu-22.04

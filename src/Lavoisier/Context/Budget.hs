@@ -20,7 +20,6 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text.Encoding (decodeUtf8Lenient)
-import Lavoisier.Context.Lang (Lang)
 import Lavoisier.Context.Skeleton qualified as Skel
 import Lavoisier.Context.Symbols qualified as Sym
 import Lavoisier.Context.Tokens (estimateTokens)
@@ -34,11 +33,13 @@ data Archetype
   | Feature
   deriving stock (Show, Eq)
 
--- | A repo snapshot plus the symbol at the centre of the intended edit.
+-- | A repo snapshot plus the symbol at the centre of the intended edit. The files carry their paths,
+-- so cross-file resolution sees the same import evidence it would at runtime — a fixture measured
+-- without paths understates the skeleton the ranking actually produces.
 data Fixture = Fixture
   { fxName :: !Text,
     fxArchetype :: !Archetype,
-    fxFiles :: ![(Lang, ByteString)],
+    fxFiles :: ![Sym.SourceFile],
     fxTarget :: !Text
   }
 
@@ -54,9 +55,9 @@ data BudgetReport = BudgetReport
 -- symbols within @radius@ hops of the target across the snapshot) together with the per-file keep sets.
 buildContext :: Fixture -> Int -> IO (ByteString, [Set Text])
 buildContext fx radius = do
-  graph <- Sym.fromSources (fxFiles fx)
+  graph <- Sym.fromFiles (fxFiles fx)
   let keep = Sym.neighborsWithinByFile (fxTarget fx) radius graph
-  parts <- zipWithM (\(lang, source) k -> Skel.skeletonize lang k source) (fxFiles fx) keep
+  parts <- zipWithM (\sf k -> Skel.skeletonize (Sym.sfLang sf) k (Sym.sfSource sf)) (fxFiles fx) keep
   pure (BS.intercalate "\n" parts, keep)
 
 -- | The constructed context at @radius@.

@@ -16,7 +16,7 @@ import Data.ByteString.Char8 qualified as BS8
 import Data.ByteString.Lazy qualified as BL
 import Data.Char (isHexDigit)
 import Data.IORef
-import Data.List (find, isSuffixOf)
+import Data.List (find, isSuffixOf, sort)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, isNothing)
 import Data.ProtoLens (defMessage)
@@ -108,8 +108,8 @@ import Network.WebSockets qualified as WS
 import Options.Applicative (ParserResult (..), defaultPrefs, execParserPure, info)
 import Proto.Xai.Api.V1.Chat qualified as PX
 import Proto.Xai.Api.V1.Sample qualified as SX
-import System.Directory (createDirectoryIfMissing, doesFileExist, getTemporaryDirectory, listDirectory, removeDirectoryRecursive)
-import System.FilePath ((</>))
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getTemporaryDirectory, listDirectory, removeDirectoryRecursive)
+import System.FilePath (makeRelative, (</>))
 import System.IO (BufferMode (LineBuffering), Handle, hClose, hFlush, hSetBinaryMode, hSetBuffering, hSetEncoding, utf8)
 import System.Process (createPipe)
 import Test.QuickCheck (Arbitrary (..), Gen, NonNegative (..), Positive (..), choose, counterexample, elements, forAll, ioProperty, listOf, oneof, resize, (.&&.))
@@ -1716,9 +1716,10 @@ budgetTests =
                 { Bud.fxName = "big_dep",
                   Bud.fxArchetype = Bud.SingleFileEdit,
                   Bud.fxFiles =
-                    [ ( Rust,
-                        BS8.pack "fn target() -> i32 { big() }\nfn big() -> i32 {\n    let mut total = 0;\n    for i in 0..100 { total += i * i - 3 * i + 7; }\n    total\n}\n"
-                      )
+                    [ Sym.SourceFile
+                        "big_dep.rs"
+                        Rust
+                        (BS8.pack "fn target() -> i32 { big() }\nfn big() -> i32 {\n    let mut total = 0;\n    for i in 0..100 { total += i * i - 3 * i + 7; }\n    total\n}\n")
                     ],
                   Bud.fxTarget = "target"
                 }
@@ -1730,7 +1731,34 @@ budgetTests =
         k1 <- Bud.brKeptSymbols <$> Bud.measure demo 1
         k2 <- Bud.brKeptSymbols <$> Bud.measure demo 2
         k3 <- Bud.brKeptSymbols <$> Bud.measure demo 3
-        (k0, k1, k2, k3) @?= (1, 2, 3, 3)
+        (k0, k1, k2, k3) @?= (1, 2, 3, 3),
+      -- The committed token ceilings. These are a regression gate on the whole input-construction
+      -- lever: skeletonisation, the radius BFS, and the import ranking all show up here as tokens.
+      -- Raise a ceiling only when the skeleton legitimately grew, never to make this pass.
+      testCase "committed ceilings hold for every fixture and radius" $ do
+        ceilings <- readCeilings
+        assertBool "ceilings file is not empty" (not (null ceilings))
+        breaches <-
+          fmap concat
+            . mapM
+              ( \(name, radius, ceiling') -> do
+                  fx <- loadFixture name
+                  r <- Bud.measure fx radius
+                  pure
+                    [ name <> " @" <> tshowT radius <> ": " <> tshowT (Bud.brEstTokens r) <> " tokens > ceiling " <> tshowT ceiling'
+                    | Bud.brEstTokens r > ceiling'
+                    ]
+              )
+            $ ceilings
+        assertBool (T.unpack ("budget ceilings breached:\n  " <> T.intercalate "\n  " breaches)) (null breaches),
+      -- The behavioural half of the same gate: the fixture defines `render` twice, and only the
+      -- imported one may be pulled in. Losing the import ranking shows up here as a named body and
+      -- in the ceiling above as tokens.
+      testCase "import ranking keeps the imported definition and not its same-named decoy" $ do
+        fx <- loadFixture "cross_file_imports"
+        ctx <- decodeUtf8Lenient <$> Bud.contextAt fx 2
+        assertBool "the imported module's helper body is kept" ("&amp;" `T.isInfixOf` ctx)
+        assertBool "the unimported same-named decoy stays elided" (not ("\\x1b[1m" `T.isInfixOf` ctx))
     ]
   where
     demo =
@@ -1738,12 +1766,63 @@ budgetTests =
         { Bud.fxName = "demo",
           Bud.fxArchetype = Bud.SingleFileEdit,
           Bud.fxFiles =
-            [ ( Rust,
-                BS8.pack "fn a() -> i32 { b() + 1 }\nfn b() -> i32 { c() + 1 }\nfn c() -> i32 { 1 }\nfn unrelated() -> i32 { 99 }\n"
-              )
+            [ Sym.SourceFile
+                "demo.rs"
+                Rust
+                (BS8.pack "fn a() -> i32 { b() + 1 }\nfn b() -> i32 { c() + 1 }\nfn c() -> i32 { 1 }\nfn unrelated() -> i32 { 99 }\n")
             ],
           Bud.fxTarget = "a"
         }
+    tshowT :: (Show a) => a -> Text
+    tshowT = T.pack . show
+
+-- | The committed token ceilings: @fixture radius max-est-tokens@ per line, @#@ comments ignored.
+readCeilings :: IO [(Text, Int, Int)]
+readCeilings = do
+  raw <- TIO.readFile (budgetRoot </> "ceilings.txt")
+  pure
+    [ (name, read (T.unpack radius), read (T.unpack limit))
+    | l <- T.lines raw,
+      let stripped = T.strip l,
+      not (T.null stripped),
+      not ("#" `T.isPrefixOf` stripped),
+      [name, radius, limit] <- [T.words stripped]
+    ]
+
+-- | Load an on-disk fixture: @target.txt@ names the edit centre, @src/@ is the repo snapshot. The paths
+-- are part of the measurement — they are what the import ranking scores against.
+loadFixture :: Text -> IO Bud.Fixture
+loadFixture name = do
+  let dir = budgetRoot </> T.unpack name
+  target <- T.strip <$> TIO.readFile (dir </> "target.txt")
+  paths <- sort <$> listFilesRec (dir </> "src")
+  files <- mapM (\fp -> fmap ((,) fp) (BS.readFile fp)) paths
+  pure
+    Bud.Fixture
+      { Bud.fxName = name,
+        Bud.fxArchetype = Bud.SingleFileEdit,
+        Bud.fxFiles =
+          [ Sym.SourceFile (T.pack (makeRelative dir fp)) lang bytes
+          | (fp, bytes) <- files,
+            Just lang <- [langFromPath fp]
+          ],
+        Bud.fxTarget = target
+      }
+
+budgetRoot :: FilePath
+budgetRoot = "tests" </> "budget"
+
+listFilesRec :: FilePath -> IO [FilePath]
+listFilesRec dir = do
+  entries <- listDirectory dir
+  fmap concat
+    . mapM
+      ( \e -> do
+          let fp = dir </> e
+          isDir <- doesDirectoryExist fp
+          if isDir then listFilesRec fp else pure [fp]
+      )
+    $ entries
 
 -- --- Phase 6: the HTTP gateway (offline; WAI test harness, no socket or API) ----------------------
 

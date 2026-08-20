@@ -16,7 +16,10 @@ build-type:         Simple
 -- The C shim + vendored tree-sitter headers. `include-dirs` is only a compiler
 -- flag and `c-sources` cannot list headers, so without this they are absent from
 -- the sdist tarball cabal builds for `source-repository-package` consumers.
-extra-source-files: cbits/**/*.h
+extra-source-files:
+  cbits/**/*.h
+  tests/budget/**/*.txt
+  tests/budget/**/*.rs
 
 flag e2ee
   description: Matrix end-to-end encryption (Olm/Megolm via the olm/libolm FFI package).

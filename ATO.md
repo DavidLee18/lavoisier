@@ -344,13 +344,16 @@ but no longer in-memory-only.
 
 **Still deferred.**
 
-- Full **module-qualified** semantic resolution of the symbol-dependency graph. Cross-file
-  resolution is now scope-aware (a reference binds to a same-file definition before falling back to
-  a cross-file one by name, so same-named symbols no longer silently merge on the target side), but
-  two same-named *definitions* still share one out-edge key and there is no `use`/`import` path
-  resolution — the budget loop's deterministic name-based cross-file linking depends on that, and
-  full qualification would need module identity threaded through the public API + skeletoniser +
-  rebaselined §6.5 ceilings. (`fine for N`, per the design notes.)
+- Full **module-qualified** semantic resolution of the symbol-dependency graph. Two steps are done:
+  cross-file resolution is scope-aware (a reference binds to a same-file definition before falling
+  back), and the cross-file fallback is now **ranked by import evidence** — candidate definers score
+  on how much of their path the referencing file's imports name, and only the best tier is linked
+  (Haskell tree only; see `Lavoisier.Context.Symbols`). On the §6.5 `cross_file_imports` fixture that
+  is 456 → 347 tokens at radius 2. It deliberately stops short of resolution: with no evidence it
+  links every definer, exactly as before, because a resolver that is wrong drops a true edge and a
+  missing edge is invisible to the model. Real qualification would still need module identity
+  threaded through the public API + skeletoniser + rebaselined ceilings. (`fine for N`, per the
+  design notes.)
 
 ---
 

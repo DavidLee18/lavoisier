@@ -48,7 +48,10 @@ goal at every layer:
   executor) for long tasks.
 - A **budget-sweep test suite** over the context engine that pins the radius lever's behaviour — the
   kept set grows monotonically with radius and a wider radius really does cost more tokens — so a
-  regression in the size/relevance trade is a test failure, not a slow cost creep.
+  regression in the size/relevance trade is a test failure, not a slow cost creep. On top of it,
+  `tests/budget/ceilings.txt` commits the estimated context tokens each fixture costs at each
+  radius, with no headroom, and CI gates on it: any growth in what the engine constructs fails with
+  the numbers attached.
 
 **Two modes.** By default Lavoisier is **efficiency-first** — lean context, caching, minimal
 round-trips. When you have a real test gate, opt into **accuracy-mode** (`--verify-cmd <tests>

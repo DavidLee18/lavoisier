@@ -93,8 +93,11 @@ posture is efficiency-first.
 - Gemini 3 attaches a `thoughtSignature` to each `functionCall` that must be echoed on resend, or the
   API 400s. It round-trips through the opaque tool-call id, contained to the Google adapter.
 - The tree-sitter grammar and core ABI versions are pinned together — bump them together.
-- The budget-fixture ceilings (`tests/budget`) are the committed skeleton-size baseline; update them
-  deliberately when skeleton output legitimately changes, never to make a test pass.
+- The budget-fixture ceilings (`tests/budget/ceilings.txt`, gated by its own `haskell-ci` step) are
+  the committed context-token baseline, measured with no headroom. The fixtures are real snapshots
+  (`tests/budget/<name>/TARGET` + `src/`), and their **paths are part of the measurement** — that is
+  what the cross-file import ranking scores against. Update a number deliberately when skeleton
+  output legitimately changes and say why in the commit; never edit one to make a test pass.
 
 **Rust tree**
 - `lvz-xai`'s tonic bindings are committed for the same protoc-free reason; `build.rs` regenerates
