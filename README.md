@@ -79,7 +79,8 @@ pull stream. Plain `IO`, no effect framework. See
 
 The package is `lavoisier`; the built command is **`lav`**. It is **not on Hackage** — take a
 self-contained tarball from a [release](https://github.com/DavidLee18/lavoisier/releases)
-(macOS arm64, Linux x86_64/arm64), or build from source below.
+(macOS arm64, Linux x86_64/arm64), or build from source below. `lav --version` reports which build
+you have.
 
 ## Quickstart (from source)
 

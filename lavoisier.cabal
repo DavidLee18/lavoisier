@@ -101,6 +101,12 @@ library
     Lavoisier.Tool.Search
     Lavoisier.Tune
     Lavoisier.Tune.Bayes
+
+  -- Cabal generates this; it is what `lav --version` reports, so the flag can never drift from the
+  -- version field above the way a hand-written string would.
+  other-modules:    Paths_lavoisier
+  autogen-modules:  Paths_lavoisier
+
   build-depends:
     , base                  >=4.19 && <5
     , aeson                 >=2.1

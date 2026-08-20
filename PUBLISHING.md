@@ -37,9 +37,12 @@ and the crates.io packages are frozen (see the last section).
 6. **Verify the published artifact, not just the green run.** Download the tarball and run it:
 
    ```sh
-   gh release download v0.16.0 -R DavidLee18/lavoisier -p 'lavoisier-aarch64-apple-darwin.tar.gz'
-   tar xzf lavoisier-aarch64-apple-darwin.tar.gz && ./lav --help
+   gh release download v0.16.1 -R DavidLee18/lavoisier -p 'lavoisier-aarch64-apple-darwin.tar.gz'
+   tar xzf lavoisier-aarch64-apple-darwin.tar.gz && ./lav --version
    ```
+
+   `--version` reads Cabal's generated `Paths_lavoisier`, so it is the tag you just built, not a
+   hand-maintained string — a mismatch here means the wrong commit was tagged.
 
 ## Why packaging is not just "copy the binary"
 

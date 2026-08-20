@@ -39,6 +39,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Version (showVersion)
 import Data.Word (Word32, Word64)
 import Lavoisier.Agent
 import Lavoisier.Config (FileConfig (..), loadConfig)
@@ -77,6 +78,7 @@ import Lavoisier.Tool.Registry (ToolRegistry, invokeTool, registerTools, withBui
 import Lavoisier.Tune (LearningTuner, asTuner, defaultTuneConfig, learningTuner, loadTuner, saveTuner)
 import Lavoisier.Tune.Bayes (BayesTuner, asBayesTuner, bayesTuner, loadBayes, saveBayes)
 import Options.Applicative
+import Paths_lavoisier (version)
 import System.Directory (doesFileExist)
 import System.Environment (lookupEnv)
 import System.Exit (exitFailure)
@@ -258,9 +260,17 @@ mainWith extra = do
                   else runAskMode prov opts model prompt
           else serveGateways gws prov opts model registry
   where
+    -- `--version` is an infoOption, not an Options field: the parser is positional-applicative, so
+    -- adding a field here would mean threading it through the record and every call site for a flag
+    -- that only prints and exits.
+    versionOption =
+      infoOption
+        ("lav " <> showVersion version)
+        (long "version" <> help "Show the version and exit")
+
     pinfo =
       info
-        (optionsParser <**> helper)
+        (optionsParser <**> versionOption <**> helper)
         ( fullDesc
             <> progDesc "Token-efficient CLI coding agent (Haskell port): ask, --agent, or --serve*; Anthropic + Google + xAI + claude-cli."
             <> header "lav - lavoisier"
