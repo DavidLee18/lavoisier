@@ -1687,6 +1687,18 @@ symbolTests =
         let within2 = Sym.neighborsWithin "target" 2 g
         Sym.narrowedCount g @?= 0
         assertBool "both still reachable" (Set.member "only_left" within2 && Set.member "only_right" within2),
+      testCase "a hyphenated path matches an underscored import (crate dir vs use path)" $ do
+        -- The spelling mismatch that made this ranking almost inert on real Rust: the crate lives in
+        -- `lvz-html/` and is imported as `lvz_html`.
+        g <-
+          Sym.fromFiles
+            [ Sym.SourceFile "lvz-page/src/lib.rs" Rust "use lvz_html::render;\nfn target() -> i32 { render() }\n",
+              Sym.SourceFile "lvz-terminal/src/lib.rs" Rust "fn render() -> i32 { only_terminal() }\nfn only_terminal() -> i32 { 1 }\n",
+              Sym.SourceFile "lvz-html/src/lib.rs" Rust "fn render() -> i32 { only_html() }\nfn only_html() -> i32 { 2 }\n"
+            ]
+        let within2 = Sym.neighborsWithin "target" 2 g
+        assertBool "reaches the imported crate" (Set.member "only_html" within2)
+        assertBool "skips the other crate" (not (Set.member "only_terminal" within2)),
       testCase "Python imports rank by module name too" $ do
         g <-
           Sym.fromFiles

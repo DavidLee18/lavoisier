@@ -170,8 +170,14 @@ link perFile = SymbolGraph edges (length perFile) narrowed
 
 -- | A path's identifying components: directory names plus the basename stem (@src\/parser.rs@ →
 -- @{src, parser, rs}@). Extension noise is harmless — imports do not name it.
+--
+-- Hyphens are folded to underscores because the two sides spell the same module differently: a Rust
+-- crate directory @lvz-context\/@ is imported as @lvz_context@, and a JS module @foo-bar.ts@ as
+-- @\'.\/foo-bar\'@. Without the fold almost no real import matches anything — measured on the 60-file
+-- Rust workspace, folding took the number of narrowed cross-file references from 33 to 316.
 pathTokens :: Text -> Set Text
-pathTokens = Set.fromList . filter (not . T.null) . T.split (\c -> c == '/' || c == '.' || c == '\\')
+pathTokens =
+  Set.fromList . filter (not . T.null) . map (T.replace "-" "_") . T.split (\c -> c == '/' || c == '.' || c == '\\')
 
 -- | The module-path segments named by a file's imports: every identifier-ish run in an import
 -- declaration's raw text, minus the keywords every language sprinkles through them.
@@ -184,7 +190,8 @@ collectImportSegments spec source = go
     segmentsOf =
       Set.fromList
         . filter (\w -> not (T.null w) && not (Set.member w importKeywords))
-        . T.split (\c -> not (isAlphaNum c) && c /= '_')
+        . map (T.replace "-" "_")
+        . T.split (\c -> not (isAlphaNum c) && c /= '_' && c /= '-')
 
 -- | Import syntax that is never a module-path segment.
 importKeywords :: Set Text
