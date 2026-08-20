@@ -22,7 +22,7 @@ and the crates.io packages are frozen (see the last section).
 4. Tag and push:
 
    ```sh
-   git tag v0.16.0 && git push origin v0.16.0
+   git tag v0.16.2 && git push origin v0.16.2
    ```
 
 5. The workflow builds three targets — `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`,
@@ -37,7 +37,7 @@ and the crates.io packages are frozen (see the last section).
 6. **Verify the published artifact, not just the green run.** Download the tarball and run it:
 
    ```sh
-   gh release download v0.16.1 -R DavidLee18/lavoisier -p 'lavoisier-aarch64-apple-darwin.tar.gz'
+   gh release download v0.16.2 -R DavidLee18/lavoisier -p 'lavoisier-aarch64-apple-darwin.tar.gz'
    tar xzf lavoisier-aarch64-apple-darwin.tar.gz && ./lav --version
    ```
 
