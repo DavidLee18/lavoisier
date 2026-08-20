@@ -7,20 +7,26 @@
 # with no headroom, so any growth is caught. Raise one only when the skeleton legitimately grew, and
 # say why in the commit message — never edit a number to make the test pass.
 #
-# What `cross_file_imports` is pinning: src/page.rs imports `crate::html::render`, and `render` is
-# also defined in the unimported src/terminal.rs. Ranking cross-file candidates by import evidence
-# keeps the decoy out of the radius:
+# `crate_workspace` is shaped like a real Cargo workspace: hyphenated crate directories, snake_case
+# `use` paths (the two spellings the ranking has to reconcile), and ordinary-sized helpers rather
+# than padded ones. lvz-page imports lvz_html::render; lvz-terminal defines a same-named `render`
+# and `render_node` that must stay out of the radius.
 #
-#            radius 1   radius 2
-#   ranked      259        347     (4 symbols kept)
-#   unranked    309        456     (6 symbols kept)   <- link-every-definer, the pre-ranking behaviour
+#            radius 1   radius 2   radius 3
+#   ranked      495        590        678     (8 symbols kept at r3)
+#   unranked    536        678        800     (12 symbols kept at r3)
+#   saved        8%        13%        15%
 #
-# so a regression in Symbols.link shows up here as roughly a third more context tokens.
+# READ THIS BEFORE QUOTING THOSE PERCENTAGES. They are the effect on a 4-file snapshot, where almost
+# every token is inside the radius. On a whole repo the skeleton floor dominates instead: measured
+# over the 60-file Rust workspace at v0.15.0, the same ranking moves ~1% of the radius expansion and
+# ~0.1% of total context, even though it narrows 316 cross-file references. The ranking's real value
+# there is precision — the radius stops expanding the wrong same-named symbol — not token count.
 
-cross_file_imports 0 153
-cross_file_imports 1 259
-cross_file_imports 2 347
-cross_file_imports 3 347
+crate_workspace 0 369
+crate_workspace 1 495
+crate_workspace 2 590
+crate_workspace 3 678
 
 single_file_edit 0 48
 single_file_edit 1 80

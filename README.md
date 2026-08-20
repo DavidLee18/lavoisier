@@ -34,7 +34,9 @@ goal at every layer:
   much of their path the referencing file's imports name, and only the best-matching tier is linked.
   This ranks rather than resolves — with no evidence it links every definer, as before — so it can
   narrow the skeleton but never drop an edge a resolver would have got wrong. `outline_files` with
-  `focus` follows the graph across every path you pass.
+  `focus` follows the graph across every path you pass. It buys precision more than tokens: on a
+  whole repo the skeleton floor dominates, so the measured saving is small — the point is that the
+  radius stops expanding an unrelated symbol that merely shares a name.
 - **Hash-anchored edits** and **token-efficient diffs** instead of re-emitting whole files. Repeated
   lines and repeated snippets stay addressable *without* line numbers: both `edit_anchored`/
   `edit_files` and `str_replace` take an `after` landmark (and `str_replace` a `before` too) — itself

@@ -109,7 +109,7 @@ import Options.Applicative (ParserResult (..), defaultPrefs, execParserPure, inf
 import Proto.Xai.Api.V1.Chat qualified as PX
 import Proto.Xai.Api.V1.Sample qualified as SX
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getTemporaryDirectory, listDirectory, removeDirectoryRecursive)
-import System.FilePath (makeRelative, (</>))
+import System.FilePath (makeRelative, takeFileName, (</>))
 import System.IO (BufferMode (LineBuffering), Handle, hClose, hFlush, hSetBinaryMode, hSetBuffering, hSetEncoding, utf8)
 import System.Process (createPipe)
 import Test.QuickCheck (Arbitrary (..), Gen, NonNegative (..), Positive (..), choose, counterexample, elements, forAll, ioProperty, listOf, oneof, resize, (.&&.))
@@ -1763,14 +1763,14 @@ budgetTests =
               )
             $ ceilings
         assertBool (T.unpack ("budget ceilings breached:\n  " <> T.intercalate "\n  " breaches)) (null breaches),
-      -- The behavioural half of the same gate: the fixture defines `render` twice, and only the
-      -- imported one may be pulled in. Losing the import ranking shows up here as a named body and
-      -- in the ceiling above as tokens.
-      testCase "import ranking keeps the imported definition and not its same-named decoy" $ do
-        fx <- loadFixture "cross_file_imports"
-        ctx <- decodeUtf8Lenient <$> Bud.contextAt fx 2
-        assertBool "the imported module's helper body is kept" ("&amp;" `T.isInfixOf` ctx)
-        assertBool "the unimported same-named decoy stays elided" (not ("\\x1b[1m" `T.isInfixOf` ctx))
+      -- The behavioural half of the same gate: lvz-html and lvz-terminal both define `render` and
+      -- `render_node`, and only the imported crate's may be pulled in. Losing the import ranking
+      -- shows up here as a named body and in the ceiling above as tokens.
+      testCase "import ranking keeps the imported crate's definition, not its same-named twin" $ do
+        fx <- loadFixture "crate_workspace"
+        ctx <- decodeUtf8Lenient <$> Bud.contextAt fx 3
+        assertBool "the imported crate's renderer body is kept" ("&amp;" `T.isInfixOf` ctx)
+        assertBool "the unimported crate's same-named twin stays elided" (not ("\\x1b[1m" `T.isInfixOf` ctx))
     ]
   where
     demo =
@@ -1807,7 +1807,7 @@ loadFixture :: Text -> IO Bud.Fixture
 loadFixture name = do
   let dir = budgetRoot </> T.unpack name
   target <- T.strip <$> TIO.readFile (dir </> "target.txt")
-  paths <- sort <$> listFilesRec (dir </> "src")
+  paths <- sort . filter ((/= "target.txt") . takeFileName) <$> listFilesRec dir
   files <- mapM (\fp -> fmap ((,) fp) (BS.readFile fp)) paths
   pure
     Bud.Fixture
