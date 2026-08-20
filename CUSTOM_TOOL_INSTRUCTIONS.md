@@ -43,7 +43,7 @@ packages: .
 source-repository-package
   type: git
   location: https://github.com/DavidLee18/lavoisier
-  tag: v0.16.1               -- (v0.7.1..v0.15.0 are the retired Rust releases)
+  tag: v0.16.2               -- (v0.7.1..v0.15.0 are the retired Rust releases)
   subdir: . olm              -- `olm` too: the engine's e2ee flag depends on it
 
 -- Native libs (adjust paths for your host; Homebrew / ~/.local shown).
