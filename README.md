@@ -487,7 +487,7 @@ strArg _ _ = Nothing
 source-repository-package
   type: git
   location: https://github.com/DavidLee18/lavoisier
-  tag: v0.16.0
+  tag: v0.16.1
   subdir: . olm
 ```
 

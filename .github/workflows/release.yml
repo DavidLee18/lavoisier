@@ -103,14 +103,39 @@ jobs:
           tar czf "lavoisier-${{ matrix.target }}.tar.gz" -C pkg .
           ls -la "lavoisier-${{ matrix.target }}.tar.gz"
 
-      - name: Upload build artifact (always — lets a dispatch run be inspected)
+      - name: Upload build artifact (the publish job's input; also lets a dispatch run be inspected)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: lavoisier-${{ matrix.target }}
           path: lavoisier-${{ matrix.target }}.tar.gz
 
-      - name: Attach to the GitHub release (tag pushes only)
-        if: startsWith(github.ref, 'refs/tags/')
+  # The release is published ONCE, here, with every asset at the same time.
+  #
+  # It must not be done per-target. This repo has GitHub's *immutable releases* enabled: the first
+  # job to attach an asset also publishes the release, and every later upload is then refused with
+  # "Cannot upload asset ... to an immutable release". Worse, the tag name is burned permanently —
+  # deleting the half-finished release does not free it, so a botched release costs a version number
+  # (v0.16.0 was lost exactly this way). One publish step, all files, no race.
+  publish:
+    name: publish the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Collect every target's tarball
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          path: dist
+          pattern: lavoisier-*
+          merge-multiple: true
+
+      - name: List what will be published
+        run: ls -la dist
+
+      - name: Publish the GitHub release with all assets
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
-          files: lavoisier-${{ matrix.target }}.tar.gz
+          files: dist/*.tar.gz
+          fail_on_unmatched_files: true

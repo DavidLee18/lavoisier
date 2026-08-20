@@ -26,8 +26,14 @@ and the crates.io packages are frozen (see the last section).
    ```
 
 5. The workflow builds three targets — `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`,
-   `aarch64-unknown-linux-gnu` — packages each with `scripts/package-haskell.sh`, and attaches
-   `lavoisier-<target>.tar.gz` to the release.
+   `aarch64-unknown-linux-gnu` — packages each with `scripts/package-haskell.sh`, uploads them as
+   run artifacts, and then a **single `publish` job** attaches all three at once.
+
+   > **Do not make the build jobs attach their own asset.** This repo has GitHub's *immutable
+   > releases* enabled: the first attach publishes the release and every later one is refused
+   > (`Cannot upload asset … to an immutable release`). The tag name is then **burned permanently** —
+   > deleting the half-published release does not free it, and the version number is spent. `v0.16.0`
+   > was lost this way; `v0.16.1` is the first release under the corrected workflow.
 6. **Verify the published artifact, not just the green run.** Download the tarball and run it:
 
    ```sh
