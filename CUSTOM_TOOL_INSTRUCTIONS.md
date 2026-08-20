@@ -43,8 +43,7 @@ packages: .
 source-repository-package
   type: git
   location: https://github.com/DavidLee18/lavoisier
-  tag: hs-v0.15.0            -- latest Haskell tag today; v0.16.0 onward drops the prefix
-                             -- (v0.7.1..v0.15.0 are the retired Rust releases)
+  tag: v0.16.0               -- (v0.7.1..v0.15.0 are the retired Rust releases)
   subdir: . olm              -- `olm` too: the engine's e2ee flag depends on it
 
 -- Native libs (adjust paths for your host; Homebrew / ~/.local shown).

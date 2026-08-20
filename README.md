@@ -78,8 +78,7 @@ pull stream. Plain `IO`, no effect framework. See
 ## Install
 
 The package is `lavoisier`; the built command is **`lav`**. It is **not on Hackage** — take a
-self-contained tarball from a [release](https://github.com/DavidLee18/lavoisier/releases) —
-`hs-v0.15.0` today, `v0.16.0` onward once the prefix is dropped
+self-contained tarball from a [release](https://github.com/DavidLee18/lavoisier/releases)
 (macOS arm64, Linux x86_64/arm64), or build from source below.
 
 ## Quickstart (from source)
@@ -488,7 +487,7 @@ strArg _ _ = Nothing
 source-repository-package
   type: git
   location: https://github.com/DavidLee18/lavoisier
-  tag: hs-v0.15.0            -- latest Haskell tag today; v0.16.0 onward drops the prefix
+  tag: v0.16.0
   subdir: . olm
 ```
 
