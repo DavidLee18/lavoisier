@@ -1,0 +1,10 @@
+# CodeQL scope. See .github/workflows/codeql.yml for why each exclusion exists.
+name: lavoisier
+
+paths-ignore:
+  # Generated tree-sitter parsers and scanners, vendored verbatim (~430k lines). Not ours to fix.
+  - cbits/ts-*
+  # Committed proto-lens bindings for the xAI gRPC API, generated from the vendored .proto.
+  - gen
+  # Synthetic fixtures for the budget/skeleton tests — deliberately odd code, not shipped.
+  - tests/budget
