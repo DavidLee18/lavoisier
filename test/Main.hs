@@ -297,6 +297,24 @@ pureProperties =
         let a = Anc.anchorOf t in (T.length a === 8) .&&. counterexample (T.unpack a) (T.all isHexDigit a),
       testProperty "anchorOf is indentation-insensitive" $ \t ->
         Anc.anchorOf ("    " <> t) === Anc.anchorOf t,
+      -- The keystone safety property of the edit path: an anchored replace either refuses outright
+      -- or rewrites exactly the line it named, leaving every other line byte-identical. Nothing
+      -- positional can shift a target, so this holds however the surrounding lines repeat.
+      testProperty "applyEdits either fails or changes only the targeted line" $
+        forAll (resize 8 (listOf (elements ["a", "b", "  a", "dup", "dup", "zz"]))) $ \ls ->
+          forAll (choose (0, max 0 (length ls - 1))) $ \i ->
+            let src = T.unlines ls
+                target = ls !! i
+             in null ls || case Anc.applyEdits src [Anc.replaceEdit (Anc.anchorOf target) "REPLACED"] of
+                  Left _ -> True
+                  Right out ->
+                    let orig = T.lines src
+                        edited = T.lines out
+                     in length orig == length edited
+                          && and
+                            [ if Anc.anchorOf b == Anc.anchorOf target then a == "REPLACED" else a == b
+                            | (a, b) <- zip edited orig
+                            ],
       testProperty "stepWindow admits exactly min(n, cap) within one window" $
         forAll (choose (1, 20)) $ \mx ->
           forAll (choose (0, 40)) $ \n ->
@@ -772,6 +790,55 @@ editToolTests =
           Right o -> do
             toChanged o @?= True
             TIO.readFile f >>= (@?= "b b b\n")
+          Left e -> assertFailure (show e),
+      testCase "str_replace: `after` picks one of several matches by content" $ withTmp "sra" $ \dir -> do
+        let f = dir </> "w.txt"
+        TIO.writeFile f "x = 1\n-- marker\nx = 1\n"
+        r <- toolInvoke strReplaceTool (object ["path" .= T.pack f, "old" .= ("x = 1" :: Text), "new" .= ("x = 2" :: Text), "after" .= ("-- marker" :: Text)])
+        case r of
+          Right o -> do
+            toChanged o @?= True
+            c <- TIO.readFile f
+            c @?= "x = 1\n-- marker\nx = 2\n"
+          Left e -> assertFailure (show e),
+      testCase "str_replace: `before` bounds the window from the other side" $ withTmp "srb" $ \dir -> do
+        let f = dir </> "w.txt"
+        TIO.writeFile f "x = 1\n-- marker\nx = 1\n"
+        r <- toolInvoke strReplaceTool (object ["path" .= T.pack f, "old" .= ("x = 1" :: Text), "new" .= ("x = 2" :: Text), "before" .= ("-- marker" :: Text)])
+        case r of
+          Right _ -> do
+            c <- TIO.readFile f
+            c @?= "x = 2\n-- marker\nx = 1\n"
+          Left e -> assertFailure (show e),
+      testCase "str_replace: a repeated `after` snippet is refused, not guessed" $ withTmp "srd" $ \dir -> do
+        let f = dir </> "w.txt"
+        TIO.writeFile f "m\nx = 1\nm\nx = 1\n"
+        r <- toolInvoke strReplaceTool (object ["path" .= T.pack f, "old" .= ("x = 1" :: Text), "new" .= ("x = 2" :: Text), "after" .= ("m" :: Text)])
+        case r of
+          Right o -> do
+            toChanged o @?= False
+            assertBool "explains the rule" ("must match exactly once" `T.isInfixOf` toContent o)
+            c <- TIO.readFile f
+            c @?= "m\nx = 1\nm\nx = 1\n"
+          Left e -> assertFailure (show e),
+      testCase "str_replace: an ambiguous match names the disambiguating arguments" $ withTmp "sre" $ \dir -> do
+        let f = dir </> "w.txt"
+        TIO.writeFile f "x = 1\nx = 1\n"
+        r <- toolInvoke strReplaceTool (object ["path" .= T.pack f, "old" .= ("x = 1" :: Text), "new" .= ("x = 2" :: Text)])
+        case r of
+          Right o -> do
+            toChanged o @?= False
+            assertBool "suggests after/before" ("`after`/`before`" `T.isInfixOf` toContent o)
+            assertBool "still mentions replace_all" ("replace_all" `T.isInfixOf` toContent o)
+          Left e -> assertFailure (show e),
+      testCase "str_replace: replace_all is scoped to the window when one is given" $ withTmp "srf" $ \dir -> do
+        let f = dir </> "w.txt"
+        TIO.writeFile f "x\n-- marker\nx\nx\n"
+        r <- toolInvoke strReplaceTool (object ["path" .= T.pack f, "old" .= ("x" :: Text), "new" .= ("y" :: Text), "after" .= ("-- marker" :: Text), "replace_all" .= True])
+        case r of
+          Right _ -> do
+            c <- TIO.readFile f
+            c @?= "x\n-- marker\ny\ny\n"
           Left e -> assertFailure (show e),
       testCase "edit_files applies an anchored replace" $ withTmp "ef" $ \dir -> do
         let f = dir </> "d.txt"
@@ -1356,6 +1423,34 @@ contextTests =
         case Anc.applyEdits "dup\ndup\n" [Anc.replaceEdit (Anc.anchorOf "dup") "x"] of
           Left (Anc.Ambiguous _ 2) -> pure ()
           other -> assertFailure ("expected Ambiguous _ 2, got " <> show other),
+      testCase "an `after` landmark picks the first identical line below it" $ do
+        let dupSrc = "dup\nalpha\ndup\nbeta\ndup\n"
+            edit = Anc.after (Anc.anchorOf "beta") (Anc.replaceEdit (Anc.anchorOf "dup") "PICKED")
+        out <- expectRight (Anc.applyEdits dupSrc [edit])
+        T.lines out @?= ["dup", "alpha", "dup", "beta", "PICKED"],
+      testCase "an earlier landmark reaches an earlier copy" $ do
+        let dupSrc = "dup\nalpha\ndup\nbeta\ndup\n"
+            edit = Anc.after (Anc.anchorOf "alpha") (Anc.replaceEdit (Anc.anchorOf "dup") "PICKED")
+        out <- expectRight (Anc.applyEdits dupSrc [edit])
+        T.lines out @?= ["dup", "alpha", "PICKED", "beta", "dup"],
+      testCase "a landmark below every copy is refused, not wrapped around" $
+        case Anc.applyEdits "dup\ndup\ntail\n" [Anc.after (Anc.anchorOf "tail") (Anc.replaceEdit (Anc.anchorOf "dup") "x")] of
+          Left (Anc.NoneAfter _ _) -> pure ()
+          other -> assertFailure ("expected NoneAfter, got " <> show other),
+      testCase "a repeated `after` landmark pins nothing and is rejected" $
+        case Anc.applyEdits "n\ndup\nn\ndup\n" [Anc.after (Anc.anchorOf "n") (Anc.replaceEdit (Anc.anchorOf "dup") "x")] of
+          Left (Anc.AfterAmbiguous _ 2) -> pure ()
+          other -> assertFailure ("expected AfterAmbiguous _ 2, got " <> show other),
+      testCase "a missing `after` landmark is rejected" $
+        case Anc.applyEdits "dup\ndup\n" [Anc.after "deadbeef" (Anc.replaceEdit (Anc.anchorOf "dup") "x")] of
+          Left (Anc.AfterNotFound _) -> pure ()
+          other -> assertFailure ("expected AfterNotFound, got " <> show other),
+      testCase "anchor errors name the fix, not just the fault" $ do
+        let amb = Anc.renderAnchorError (Anc.Ambiguous "abc12345" 3)
+        assertBool "says how many" ("3 identical lines" `T.isInfixOf` amb)
+        assertBool "suggests after" ("\"after\"" `T.isInfixOf` amb)
+        assertBool "stale anchor points at read_anchored" $
+          "read_anchored" `T.isInfixOf` Anc.renderAnchorError (Anc.NotFound "abc12345"),
       testCase "renderAnchored has an anchor gutter" $ do
         let r = Anc.renderAnchored "hello"
         assertBool "starts with the anchor" (Anc.anchorOf "hello" `T.isPrefixOf` r)

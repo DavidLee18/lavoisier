@@ -30,7 +30,12 @@ goal at every layer:
 - **AST-resolved symbol-dependency graph** drives the skeleton-radius knob `N` ("include full
   bodies for symbols within `N` hops of the edit target") — references resolved from identifier
   nodes, scope-aware (string/comment mentions and shadowing locals don't create edges).
-- **Hash-anchored edits** and **token-efficient diffs** instead of re-emitting whole files.
+- **Hash-anchored edits** and **token-efficient diffs** instead of re-emitting whole files. Repeated
+  lines and repeated snippets stay addressable *without* line numbers: both `edit_anchored`/
+  `edit_files` and `str_replace` take an `after` landmark (and `str_replace` a `before` too) — itself
+  a verbatim snippet or anchor that must occur exactly once — and edit the first match past it. An
+  edit that cannot be pinned to exactly one target is refused with a message naming the fix, never
+  applied to a guess.
 - **Multi-file batching** — `read_files`/`outline_files` fetch several files in one round-trip.
 - **Adaptive Token Optimisation (ATO)** — an online tuner that learns per-archetype knob settings
   from realised outcomes (ε-greedy hill-climb or Thompson sampling), gated by a real success signal.

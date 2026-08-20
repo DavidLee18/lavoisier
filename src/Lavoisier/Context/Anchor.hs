@@ -17,7 +17,9 @@ module Lavoisier.Context.Anchor
     insertAfterEdit,
     insertBeforeEdit,
     deleteEdit,
+    after,
     AnchorError (..),
+    renderAnchorError,
     applyEdits,
   )
 where
@@ -77,36 +79,87 @@ data EditOp
     Delete
   deriving stock (Eq, Show)
 
--- | A single anchored edit: the anchor of the line to act on, and what to do there.
+-- | A single anchored edit: the anchor of the line to act on, an optional /landmark/ anchor that
+-- disambiguates when several lines share that content, and what to do there.
+--
+-- 'editAfter' is what makes a repeated line addressable without ever becoming positional: the target
+-- stays content-addressed, and the landmark only says which side of a unique nearby line the meant
+-- copy sits on — the __first__ matching line strictly after it. A line number would silently hit the
+-- wrong line once the file shifts; this cannot. It matches @str_replace@'s @after@ argument, so one
+-- rule covers both edit tools.
 data Edit = Edit
   { editAnchor :: Text,
+    editAfter :: Maybe Text,
     editOp :: EditOp
   }
   deriving stock (Eq, Show)
 
 -- | Replace the anchored line with @text@.
 replaceEdit :: Text -> Text -> Edit
-replaceEdit a t = Edit a (Replace t)
+replaceEdit a t = Edit a Nothing (Replace t)
 
 -- | Insert @text@ immediately after the anchored line.
 insertAfterEdit :: Text -> Text -> Edit
-insertAfterEdit a t = Edit a (InsertAfter t)
+insertAfterEdit a t = Edit a Nothing (InsertAfter t)
 
 -- | Insert @text@ immediately before the anchored line.
 insertBeforeEdit :: Text -> Text -> Edit
-insertBeforeEdit a t = Edit a (InsertBefore t)
+insertBeforeEdit a t = Edit a Nothing (InsertBefore t)
 
 -- | Delete the anchored line.
 deleteEdit :: Text -> Edit
-deleteEdit a = Edit a Delete
+deleteEdit a = Edit a Nothing Delete
 
--- | Why an anchored edit could not be applied.
+-- | Qualify an edit with the anchor of a unique landmark line: the target becomes the first matching
+-- line after it. Disambiguates a repeated target without naming a position.
+after :: Text -> Edit -> Edit
+after n e = e {editAfter = Just n}
+
+-- | Why an anchored edit could not be applied. Every case is a refusal, never a guess: an edit that
+-- cannot be pinned to exactly one line is rejected rather than applied somewhere plausible.
 data AnchorError
   = -- | No line matched the anchor — the file changed under the edit.
     NotFound Text
-  | -- | More than one line matched the anchor (with the match count) — the target is ambiguous.
+  | -- | More than one line matched the anchor (with the match count) and no @after@ was given.
     Ambiguous Text Int
+  | -- | An @after@ landmark was given but matched no line.
+    AfterNotFound Text
+  | -- | An @after@ landmark is itself repeated (with the match count), so it pins nothing.
+    AfterAmbiguous Text Int
+  | -- | No line matched the anchor after the landmark (target anchor, landmark anchor).
+    NoneAfter Text Text
   deriving stock (Eq, Show)
+
+-- | A model-facing rendering of an 'AnchorError' that names the fix, not just the fault. The
+-- @read_anchored@ gutter already shows every neighbouring anchor, so the suggested @after@ landmark
+-- can be supplied without re-reading the file.
+renderAnchorError :: AnchorError -> Text
+renderAnchorError = \case
+  NotFound a ->
+    "anchor \"" <> a <> "\" matched no line — the file changed since it was read; re-read it with read_anchored"
+  Ambiguous a n ->
+    "anchor \""
+      <> a
+      <> "\" matches "
+      <> tshow n
+      <> " identical lines — add \"after\": the anchor of a unique line just above the one you mean"
+  AfterNotFound a ->
+    "after-anchor \"" <> a <> "\" matched no line — re-read the file with read_anchored"
+  AfterAmbiguous a n ->
+    "after-anchor \""
+      <> a
+      <> "\" is itself repeated ("
+      <> tshow n
+      <> " lines) — \"after\" must be unique; pick a distinctive line above the target"
+  NoneAfter a n ->
+    "no line matching anchor \""
+      <> a
+      <> "\" follows after-anchor \""
+      <> n
+      <> "\" — \"after\" must name a line above the target"
+  where
+    tshow :: Int -> Text
+    tshow = T.pack . show
 
 -- | Apply a batch of anchored edits to @source@, preserving a trailing newline if present.
 --
@@ -127,14 +180,21 @@ applyEdits source edits = do
       case [i | (i, l) <- indexed, anchorOf l == editAnchor e] of
         [i] -> Right (i, editOp e)
         [] -> Left (NotFound (editAnchor e))
-        many -> Left (Ambiguous (editAnchor e) (length many))
+        cands -> case editAfter e of
+          Nothing -> Left (Ambiguous (editAnchor e) (length cands))
+          Just n -> case [i | (i, l) <- indexed, anchorOf l == n] of
+            [] -> Left (AfterNotFound n)
+            [ni] -> case [i | i <- cands, i > ni] of
+              (i : _) -> Right (i, editOp e)
+              [] -> Left (NoneAfter (editAnchor e) n)
+            ns -> Left (AfterAmbiguous n (length ns))
 
     -- The output lines for one original line: inserts-before, then the line (replaced/deleted/kept),
     -- then inserts-after — mirroring the Rust ordering.
-    emit ops line = before <> middle <> after
+    emit ops line = pre <> middle <> post
       where
-        before = concat [T.lines t | InsertBefore t <- ops]
-        after = concat [T.lines t | InsertAfter t <- ops]
+        pre = concat [T.lines t | InsertBefore t <- ops]
+        post = concat [T.lines t | InsertAfter t <- ops]
         replaced = concat [T.lines t | Replace t <- ops]
         removedOrReplaced = any isReplaceOrDelete ops
         middle = if removedOrReplaced then replaced else [line]
