@@ -1,0 +1,251 @@
+cabal-version:      3.0
+name:               lavoisier
+version:            0.15.0
+synopsis:           Token-efficient CLI coding agent — a Haskell port of the Rust `lavoisier`.
+description:
+  A modular, token-efficient CLI coding agent with a provider-agnostic core.
+  This is the Haskell port; the original Rust workspace lives on the `main` branch.
+license:            MIT
+license-file:       LICENSE
+author:             Jaehyun Lee
+maintainer:         djwodus@gmail.com
+homepage:           https://github.com/DavidLee18/lavoisier
+category:           Development
+build-type:         Simple
+
+-- The C shim + vendored tree-sitter headers. `include-dirs` is only a compiler
+-- flag and `c-sources` cannot list headers, so without this they are absent from
+-- the sdist tarball cabal builds for `source-repository-package` consumers.
+extra-source-files:
+  cbits/**/*.h
+  tests/budget/**/*.txt
+  tests/budget/**/*.rs
+
+flag e2ee
+  description: Matrix end-to-end encryption (Olm/Megolm via the olm/libolm FFI package).
+  default:     False
+  manual:      True
+
+common lang
+  default-language:   GHC2021
+  default-extensions:
+    OverloadedStrings
+    LambdaCase
+    RecordWildCards
+    DerivingStrategies
+    StrictData
+    ImportQualifiedPost
+    DeriveGeneric
+  ghc-options:
+    -Wall -Werror
+    -Wincomplete-patterns -Wincomplete-uni-patterns
+    -Wincomplete-record-updates
+
+library
+  import:           lang
+  hs-source-dirs:   src
+  exposed-modules:
+    Lavoisier.Agent
+    Lavoisier.CLI
+    Lavoisier.Config
+    Lavoisier.Context.Anchor
+    Lavoisier.Context.Budget
+    Lavoisier.Context.Diff
+    Lavoisier.Context.Lang
+    Lavoisier.Context.Skeleton
+    Lavoisier.Context.Symbols
+    Lavoisier.Context.Tokens
+    Lavoisier.Context.TreeSitter
+    Lavoisier.Gateway.A2A
+    Lavoisier.Gateway.Acp
+    Lavoisier.Gateway.Cron
+    Lavoisier.Gateway.Http
+    Lavoisier.Gateway.Matrix
+    Lavoisier.Gateway.Slack
+    Lavoisier.Gateway.Tui
+    Lavoisier.Gateway.Tui.Gate
+    Lavoisier.Gateway.Tui.Md
+    Lavoisier.Gateway.Tui.Price
+    Lavoisier.Legion
+    Lavoisier.Log
+    Lavoisier.Mcp
+    Lavoisier.Memory
+    Lavoisier.Protocol
+    Lavoisier.Protocol.Agent
+    Lavoisier.Protocol.Batch
+    Lavoisier.Protocol.Deliberate
+    Lavoisier.Protocol.Event
+    Lavoisier.Protocol.Gate
+    Lavoisier.Protocol.Gateway
+    Lavoisier.Protocol.Message
+    Lavoisier.Protocol.Provider
+    Lavoisier.Protocol.Stream
+    Lavoisier.Protocol.Tool
+    Lavoisier.Protocol.Tune
+    Lavoisier.Schedule
+    Lavoisier.Schedule.Cron
+    Lavoisier.Provider.Anthropic
+    Lavoisier.Provider.Anthropic.Batch
+    Lavoisier.Provider.Anthropic.Sse
+    Lavoisier.Provider.ClaudeCli
+    Lavoisier.Provider.Google
+    Lavoisier.Provider.Google.Batch
+    Lavoisier.Provider.Google.Sse
+    Lavoisier.Provider.Xai
+    Lavoisier.Provider.Xai.Grpc
+    Lavoisier.Provider.Xai.Sse
+    Lavoisier.Tool.Batch
+    Lavoisier.Tool.Builtins
+    Lavoisier.Tool.Edit
+    Lavoisier.Tool.Registry
+    Lavoisier.Tool.Search
+    Lavoisier.Tune
+    Lavoisier.Tune.Bayes
+  build-depends:
+    , base                  >=4.19 && <5
+    , aeson                 >=2.1
+    , async
+    , bytestring
+    , containers
+    , dhall
+    , Diff
+    , directory
+    , filepath
+    , http-client
+    , http-client-tls
+    , http-types
+    , network
+    , network-uri
+    , optparse-applicative
+    , scientific
+    , terminal-size
+    , text
+    , time
+    , typed-process
+    , unix
+    , unordered-containers
+    , vector
+    , wai
+    , wai-websockets
+    , warp
+    , websockets
+    , wuss
+    -- xAI native gRPC transport (Lavoisier.Provider.Xai.Grpc): grapesy is the gRPC client,
+    -- proto-lens the message codec; the generated bindings live in the internal `xai-proto` lib.
+    , grapesy
+    , lens-family
+    , proto-lens
+    , xai-proto
+  -- The tree-sitter context engine (Lavoisier.Context.{Lang,TreeSitter,…}). We link
+  -- against the system libtree-sitter runtime (pkg-config) and compile the vendored
+  -- grammar C sources (cbits/ts-*/) plus a small pointer-based shim (cbits/lvz_ts_shim.c)
+  -- that wraps tree-sitter's by-value TSNode API — the Haskell FFI cannot pass structs
+  -- by value. `include-dirs` carries lvz_ts_shim.h (cbits) and each grammar's bundled
+  -- tree_sitter/*.h headers (cbits/ts-<lang>).
+  pkgconfig-depends: tree-sitter
+  include-dirs:
+    cbits
+    cbits/ts-rust
+    cbits/ts-python
+    cbits/ts-javascript
+    cbits/ts-typescript/typescript/src
+  c-sources:
+    cbits/lvz_ts_shim.c
+    cbits/ts-rust/parser.c
+    cbits/ts-rust/scanner.c
+    cbits/ts-python/parser.c
+    cbits/ts-python/scanner.c
+    cbits/ts-javascript/parser.c
+    cbits/ts-javascript/scanner.c
+    cbits/ts-typescript/typescript/src/parser.c
+    cbits/ts-typescript/typescript/src/scanner.c
+
+  if flag(e2ee)
+    exposed-modules: Lavoisier.Gateway.Matrix.E2ee
+    build-depends:   olm, scientific
+    -- -DE2EE turns on the CPP-gated E2EE serve-loop wiring in Lavoisier.Gateway.Matrix
+    -- (to-device room-key receive, inbound Megolm decrypt, outbound Megolm encrypt).
+    cpp-options:     -DE2EE
+
+-- Generated proto-lens bindings for the xAI gRPC chat service, committed under gen/ (like the
+-- Rust side commits its tonic bindings — no protoc at build time). Isolated in its own library
+-- with warnings off, since generated code is not -Wall/-Werror clean.
+library xai-proto
+  hs-source-dirs:   gen
+  default-language: Haskell2010
+  ghc-options:      -w
+  build-depends:
+    , base
+    , proto-lens-runtime
+    , proto-lens-protobuf-types
+  exposed-modules:
+    Proto.Xai.Api.V1.Chat
+    Proto.Xai.Api.V1.Chat_Fields
+    Proto.Xai.Api.V1.Deferred
+    Proto.Xai.Api.V1.Deferred_Fields
+    Proto.Xai.Api.V1.Documents
+    Proto.Xai.Api.V1.Documents_Fields
+    Proto.Xai.Api.V1.Image
+    Proto.Xai.Api.V1.Image_Fields
+    Proto.Xai.Api.V1.Sample
+    Proto.Xai.Api.V1.Sample_Fields
+    Proto.Xai.Api.V1.Usage
+    Proto.Xai.Api.V1.Usage_Fields
+
+executable lav
+  import:           lang
+  hs-source-dirs:   app
+  main-is:          Main.hs
+  -- warp needs the threaded runtime (its timer manager); -N uses all cores.
+  ghc-options:      -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+    , base
+    , lavoisier
+    , text
+
+test-suite lavoisier-test
+  import:           lang
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Main.hs
+  build-depends:
+    , base
+    , aeson
+    , bytestring
+    , containers
+    , directory
+    , filepath
+    , http-types
+    , lavoisier
+    , lens-family
+    , optparse-applicative
+    , process
+    , proto-lens
+    , scientific
+    , xai-proto
+    , QuickCheck
+    , tasty
+    , tasty-hunit
+    , tasty-quickcheck
+    , text
+    , vector
+    , wai
+    , wai-extra
+    , websockets
+
+test-suite lavoisier-e2ee-test
+  import:           lang
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test-e2ee
+  main-is:          Main.hs
+  if !flag(e2ee)
+    buildable: False
+  build-depends:
+    , base
+    , aeson
+    , bytestring
+    , lavoisier
+    , olm
+    , tasty
+    , tasty-hunit
+    , text

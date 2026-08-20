@@ -2,7 +2,7 @@
 
 Deploys the `lavoisier` HTTP/WebSocket gateway to **AWS Fargate, arm64, us-west-2** behind an
 ALB — §9 M10's "validate the shared core on Fargate behind gateways". The image is built
-with **Podman** (not Docker); secrets come from **AWS Secrets Manager**; nothing sensitive is
+with **colima + nerdctl** (not Docker); secrets come from **AWS Secrets Manager**; nothing sensitive is
 baked into the image or the task definition.
 
 ```
@@ -17,8 +17,8 @@ The gateway runs **with API-key auth + a rate limit on** (it is internet-facing)
 ## Prerequisites
 
 - AWS account + credentials for **us-west-2** (`aws sts get-caller-identity` works).
-- **Podman** and **Terraform ≥ 1.5**. (No local `protoc`/Rust needed — the build runs inside
-  the image.)
+- **colima** (started: `colima start --arch aarch64`) with **nerdctl**, and **Terraform ≥ 1.5**.
+  (No local `protoc`/Rust needed — the build runs inside the image.)
 - An **`XAI_API_KEY`** (the gateway defaults to the xAI gRPC transport).
 
 ## 1. Create the secrets
@@ -40,7 +40,7 @@ The repo must exist before the first push, so create it on its own, then push:
 ```sh
 terraform -chdir=infra/terraform init
 terraform -chdir=infra/terraform apply -target=aws_ecr_repository.app
-./infra/scripts/build-and-push.zsh dev          # podman build --platform linux/arm64 + push
+./infra/scripts/build-and-push.zsh dev          # nerdctl build --platform linux/arm64 + push
 ```
 
 ## 3. Deploy the stack

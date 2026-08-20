@@ -1,0 +1,176 @@
+name: haskell-ci
+
+# CI for the Haskell port (branch `haskell-port`). The Rust `ci.yml` gates `main`; this gates the
+# Haskell tree: ormolu (format), build, and the test suite — plus a parallel job that builds and
+# tests the opt-in `e2ee` feature (libolm). Native libraries the dev machine gets from Homebrew/~/.local
+# are here built from source or apt-installed to standard prefixes, selected by `cabal.project.ci`.
+#
+# Third-party actions are pinned to a full commit SHA per CLAUDE.md; the trailing comment records the
+# version. The vendored tree-sitter grammars are ABI version 15, which needs libtree-sitter >= 0.25 —
+# newer than any apt package — so the core runtime is built from source at a pinned tag.
+
+on:
+  push:
+    branches: [haskell-port]
+  pull_request:
+    branches: [haskell-port]
+
+permissions:
+  contents: read
+
+env:
+  GHC_VERSION: "9.10.3"
+  CABAL_VERSION: "3.16.1.0"
+  TREE_SITTER_VERSION: "0.26.12"
+  OLM_REF: "3.2.16"
+
+jobs:
+  build-test:
+    name: ormolu / build / test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # proto-lens-protobuf-types (pulled in by the xai-proto codec) runs protoc at build time even
+      # though the xAI bindings are committed — same pinned download as the Rust ci.yml.
+      - name: Install protoc
+        shell: bash
+        env:
+          PROTOC_VERSION: "29.3"
+        run: |
+          set -euo pipefail
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sha=3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a
+          curl -fsSL -o protoc.zip "$url"
+          echo "${sha}  protoc.zip" | sha256sum -c -
+          unzip -q protoc.zip -d "$HOME/.protoc"
+          echo "$HOME/.protoc/bin" >> "$GITHUB_PATH"
+          "$HOME/.protoc/bin/protoc" --version
+
+      - name: Install system libraries (snappy + tree-sitter build tools)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsnappy-dev pkg-config build-essential
+
+      # The context engine links libtree-sitter via pkg-config; the vendored grammars are ABI 15, so
+      # apt's core (too old) will not do — build a supporting version from source into /usr/local.
+      - name: Build libtree-sitter from source
+        run: |
+          set -euo pipefail
+          curl -fsSL -o ts.tar.gz "https://github.com/tree-sitter/tree-sitter/archive/refs/tags/v${TREE_SITTER_VERSION}.tar.gz"
+          tar xzf ts.tar.gz
+          make -C "tree-sitter-${TREE_SITTER_VERSION}" -j"$(nproc)"
+          sudo make -C "tree-sitter-${TREE_SITTER_VERSION}" install PREFIX=/usr/local
+          sudo ldconfig
+          pkg-config --modversion tree-sitter
+
+      - name: Set up GHC and cabal
+        uses: haskell-actions/setup@6037f33647c3f17758a2356c80fc4a53d7e0685d # v2.12.0
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
+
+      - name: Cache cabal store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cabal/store
+            dist-newstyle
+          key: ${{ runner.os }}-cabal-${{ hashFiles('lavoisier.cabal', 'cabal.project.ci') }}
+          restore-keys: ${{ runner.os }}-cabal-
+
+      - name: Format (ormolu)
+        uses: haskell-actions/run-ormolu@f15613427428a49a241fa0331881dcf4cc118121 # v21
+        with:
+          version: "0.8.2.0"
+          pattern: |
+            src/**/*.hs
+            app/**/*.hs
+            test/**/*.hs
+            test-e2ee/**/*.hs
+
+      - name: Build
+        run: cabal build --project-file=cabal.project.ci lavoisier
+
+      - name: Test
+        run: cabal test --project-file=cabal.project.ci lavoisier-test
+
+      # The token-effect gate. `tests/budget/ceilings.txt` pins the estimated context tokens each
+      # fixture costs at each radius, so any growth in what the context engine constructs — skeleton
+      # output, the radius BFS, or the cross-file import ranking — fails here with the numbers. It
+      # runs inside the full suite above too; this step exists so a breach is a labelled step in the
+      # job list instead of one line buried in 290-odd results.
+      - name: Budget ceilings (context-token regression gate)
+        run: cabal test --project-file=cabal.project.ci lavoisier-test --test-options='-p /budget/'
+
+  e2ee:
+    name: e2ee feature (libolm)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install protoc
+        shell: bash
+        env:
+          PROTOC_VERSION: "29.3"
+        run: |
+          set -euo pipefail
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sha=3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a
+          curl -fsSL -o protoc.zip "$url"
+          echo "${sha}  protoc.zip" | sha256sum -c -
+          unzip -q protoc.zip -d "$HOME/.protoc"
+          echo "$HOME/.protoc/bin" >> "$GITHUB_PATH"
+          "$HOME/.protoc/bin/protoc" --version
+
+      - name: Install system libraries
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsnappy-dev pkg-config build-essential cmake git
+
+      - name: Build libtree-sitter from source
+        run: |
+          set -euo pipefail
+          curl -fsSL -o ts.tar.gz "https://github.com/tree-sitter/tree-sitter/archive/refs/tags/v${TREE_SITTER_VERSION}.tar.gz"
+          tar xzf ts.tar.gz
+          make -C "tree-sitter-${TREE_SITTER_VERSION}" -j"$(nproc)"
+          sudo make -C "tree-sitter-${TREE_SITTER_VERSION}" install PREFIX=/usr/local
+
+      # libolm is EOL (dropped from apt/Homebrew), so build the reference C library from source. Its
+      # old C++ needs two fixes under a modern toolchain: a const-correctness patch in list.hh and a
+      # cmake minimum-policy override.
+      - name: Build libolm from source
+        run: |
+          set -euo pipefail
+          # Clone into libolm-src, NOT ./olm — the repo already has a top-level olm/ (the Haskell FFI
+          # package), so cloning into ./olm would collide.
+          git clone --depth 1 --branch "${OLM_REF}" https://gitlab.matrix.org/matrix-org/olm.git libolm-src
+          # Modern-toolchain fix: a const-correctness bug clang/gcc reject.
+          sed -i 's/T \* const other_pos/T * other_pos/' libolm-src/include/olm/list.hh
+          cmake -S libolm-src -B libolm-src/build -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON
+          cmake --build libolm-src/build -j"$(nproc)"
+          sudo cmake --install libolm-src/build
+          sudo ldconfig
+
+      - name: Set up GHC and cabal
+        uses: haskell-actions/setup@6037f33647c3f17758a2356c80fc4a53d7e0685d # v2.12.0
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
+
+      - name: Cache cabal store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cabal/store
+            dist-newstyle
+          key: ${{ runner.os }}-cabal-e2ee-${{ hashFiles('lavoisier.cabal', 'cabal.project.ci') }}
+          restore-keys: ${{ runner.os }}-cabal-e2ee-
+
+      - name: Build (e2ee)
+        run: cabal build --project-file=cabal.project.ci --flags=e2ee lavoisier
+
+      - name: Test (e2ee — both suites)
+        run: cabal test --project-file=cabal.project.ci --flags=e2ee

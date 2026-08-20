@@ -1,0 +1,4 @@
+-- Release/packaging project file: no machine-specific paths. The release workflow passes the
+-- correct --extra-lib-dirs / --extra-include-dirs per runner (Homebrew on macOS; /usr/local + apt on
+-- Linux) so a single file works across all targets.
+packages: . olm/

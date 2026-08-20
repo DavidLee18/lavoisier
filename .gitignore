@@ -1,6 +1,18 @@
+# Rust build output (the Rust tree lives on `main`; a worktree here would drop a target/)
 /target
 **/*.rs.bk
 *.pdb
+
+# Unrelated project directory that lives alongside this repo (never track it)
+/42_webserv/
+
+# Haskell / Cabal build output
+dist-newstyle/
+*.hi
+*.o
+# Per-machine / per-runner cabal overrides (the release workflow generates cabal.project.dist.local)
+cabal.project.local
+cabal.project.*.local
 
 # Secrets — never commit keys (RECIPE.md §10)
 .env
@@ -12,5 +24,5 @@
 bench/results/
 bench/*.out
 
-# Unrelated project directory that lives alongside this repo (never track it)
-/42_webserv/
+# proto-lens-protoc plugin (installed into ~/.cabal/store; regenerate gen/ with it)
+.protoc-plugins/

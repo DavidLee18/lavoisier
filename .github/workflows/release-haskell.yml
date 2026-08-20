@@ -1,0 +1,115 @@
+name: release-haskell
+
+# Haskell-port release/packaging. Tag `hs-v*` (e.g. `git tag hs-v0.13.0 && git push origin hs-v0.13.0`)
+# → build the `lav` binary for the common targets, bundle its non-system shared libraries into a
+# self-contained tarball (lavoisier-hs-<target>.tar.gz, files at the archive root), and attach them to
+# the GitHub release. The tag pattern is `hs-v*` (not the Rust `v*`) so the two release pipelines never
+# collide on one tag. `workflow_dispatch` builds and packages without uploading, for validation.
+#
+# Unlike the self-contained Rust binary, `lav` links libtree-sitter and libsnappy dynamically, so
+# scripts/package-haskell.sh carries those beside the binary and rewrites its load paths.
+
+on:
+  push:
+    tags: ["hs-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+    env:
+      GHC_VERSION: "9.10.3"
+      CABAL_VERSION: "3.16.1.0"
+      TREE_SITTER_VERSION: "0.26.12"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # proto-lens-protobuf-types (via the xai-proto codec) runs protoc at build time — same pinned
+      # download as the Rust release.yml (no Node action, SHA-256 verified).
+      - name: Install protoc
+        shell: bash
+        env:
+          PROTOC_VERSION: "29.3"
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)   asset=linux-x86_64;   sha=3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a ;;
+            Linux-ARM64) asset=linux-aarch_64; sha=6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32 ;;
+            macOS-ARM64) asset=osx-aarch_64;   sha=2b8a3403cd097f95f3ba656e14b76c732b6b26d7f183330b11e36ef2bc028765 ;;
+            *) echo "unsupported runner ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+          esac
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${asset}.zip"
+          curl -fsSL -o protoc.zip "$url"
+          echo "${sha}  protoc.zip" | shasum -a 256 -c -
+          unzip -q protoc.zip -d "$HOME/.protoc"
+          echo "$HOME/.protoc/bin" >> "$GITHUB_PATH"
+          "$HOME/.protoc/bin/protoc" --version
+
+      # Provision libtree-sitter (ABI 15 → needs >= 0.25) and libsnappy, and write the per-OS
+      # cabal.project.dist.local so snappy-c's C-library detection finds libsnappy.
+      - name: Native libraries (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          brew install tree-sitter snappy
+          B="$(brew --prefix)"
+          printf 'package snappy-c\n  extra-lib-dirs: %s/lib\n  extra-include-dirs: %s/include\n' "$B" "$B" > cabal.project.dist.local
+
+      - name: Native libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsnappy-dev pkg-config build-essential patchelf
+          curl -fsSL -o ts.tar.gz "https://github.com/tree-sitter/tree-sitter/archive/refs/tags/v${TREE_SITTER_VERSION}.tar.gz"
+          tar xzf ts.tar.gz
+          make -C "tree-sitter-${TREE_SITTER_VERSION}" -j"$(nproc)"
+          sudo make -C "tree-sitter-${TREE_SITTER_VERSION}" install PREFIX=/usr/local
+          sudo ldconfig
+          MA="$(gcc -print-multiarch)"
+          printf 'package snappy-c\n  extra-lib-dirs: /usr/lib/%s\n  extra-include-dirs: /usr/include\n' "$MA" > cabal.project.dist.local
+
+      - name: Set up GHC and cabal
+        uses: haskell-actions/setup@6037f33647c3f17758a2356c80fc4a53d7e0685d # v2.12.0
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
+
+      - name: Build
+        run: cabal build --project-file=cabal.project.dist exe:lav
+
+      - name: Package (bundle non-system shared libraries)
+        run: |
+          set -euo pipefail
+          # list-bin must use the same project/flags as the build so it reports the built path.
+          BIN="$(cabal list-bin --project-file=cabal.project.dist exe:lav)"
+          if [ ! -f "$BIN" ]; then
+            BIN="$(find dist-newstyle -type f -path '*x/lav/build/lav/lav' | head -1)"
+          fi
+          echo "binary: $BIN"
+          scripts/package-haskell.sh "$BIN" pkg
+          tar czf "lavoisier-hs-${{ matrix.target }}.tar.gz" -C pkg .
+          ls -la "lavoisier-hs-${{ matrix.target }}.tar.gz"
+
+      - name: Upload build artifact (always — lets a dispatch run be inspected)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: lavoisier-hs-${{ matrix.target }}
+          path: lavoisier-hs-${{ matrix.target }}.tar.gz
+
+      - name: Attach to the GitHub release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          files: lavoisier-hs-${{ matrix.target }}.tar.gz
