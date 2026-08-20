@@ -27,7 +27,7 @@ This is what lets one agent brain serve the CLI today and a multi-gateway "Herme
 | `lvz-anthropic` | Anthropic provider: native Messages API over SSE, prompt caching, extended thinking. |
 | `lvz-google` | Google Gemini provider: native Generative Language API over SSE, configurable thinking effort. |
 | `lvz-claude-cli` | Optional provider shelling out to `claude -p` (subscription; no caching). Off by default. |
-| `lvz-context` | Token engine: tree-sitter skeletons, AST symbol-dependency graph (radius `N`), hash-anchored edits, diffs, budget-fixture loop. |
+| `lvz-context` | Token engine: tree-sitter skeletons, AST symbol-dependency graph (radius `N`, cross-file edges ranked by import evidence), hash-anchored edits (landmark-disambiguated), diffs, budget-fixture loop. |
 | `lvz-tools` | Tool registry + built-ins: `read_file(s)`, `write_file`, `list_dir`, `shell`, `outline_file(s)`, `read_anchored`, **`str_replace`** (primary exact-string edit), `edit_anchored`, `edit_files`, `find_references`, `batch_edit`. |
 | `lvz-agent` | The plan→act→observe loop: tool dispatch, capability-gated caching, compaction, model routing, per-task budget, telemetry. |
 | `lvz-memory` | Session continuity: a `SessionStore` + `SessionAgent` so each session keeps its own transcript. |

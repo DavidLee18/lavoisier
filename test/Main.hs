@@ -654,6 +654,19 @@ toolTests =
             assertBool "header a" (T.pack a `T.isInfixOf` toContent o)
             assertBool "header b" (T.pack b `T.isInfixOf` toContent o)
             assertBool "both signatures" ("fn one() -> i32" `T.isInfixOf` toContent o && "fn two() -> i32" `T.isInfixOf` toContent o)
+          Left e -> assertFailure ("outline_files failed: " <> show e),
+      testCase "outline_files focus follows dependencies across the given files" $ withTmp "outlinefocus" $ \dir -> do
+        let a = dir </> "caller.rs"
+            b = dir </> "dep.rs"
+        TIO.writeFile a "fn target() -> i32 { callee() }\n"
+        TIO.writeFile b "fn callee() -> i32 {\n    let mut t = 0;\n    t += 41;\n    t\n}\nfn unrelated() -> i32 {\n    let mut u = 0;\n    u += 7;\n    u\n}\n"
+        r <- toolInvoke outlineFilesTool (object ["paths" .= [T.pack a, T.pack b], "focus" .= ("target" :: Text), "radius" .= (1 :: Int)])
+        case r of
+          Right o -> do
+            -- The callee lives in the *other* file: its body survives only because the graph spans
+            -- both, which a per-file skeleton could never do.
+            assertBool "callee body kept" ("t += 41" `T.isInfixOf` toContent o)
+            assertBool "unrelated body elided" (not ("u += 7" `T.isInfixOf` toContent o))
           Left e -> assertFailure ("outline_files failed: " <> show e)
     ]
 
@@ -1642,7 +1655,48 @@ symbolTests =
         let perFile = Sym.neighborsWithinByFile "target" 1 g
         length perFile @?= 2
         assertBool "file 0 has target not repo" (Set.member "target" (perFile !! 0) && not (Set.member "repo" (perFile !! 0)))
-        assertBool "file 1 has repo not target" (Set.member "repo" (perFile !! 1) && not (Set.member "target" (perFile !! 1)))
+        assertBool "file 1 has repo not target" (Set.member "repo" (perFile !! 1) && not (Set.member "target" (perFile !! 1))),
+      testCase "with no import evidence every cross-file definer is linked" $ do
+        g <-
+          Sym.fromFiles
+            [ Sym.SourceFile "src/caller.rs" Rust "fn target() -> i32 { shared() }\n",
+              Sym.SourceFile "src/left.rs" Rust "fn shared() -> i32 { only_left() }\nfn only_left() -> i32 { 1 }\n",
+              Sym.SourceFile "src/right.rs" Rust "fn shared() -> i32 { only_right() }\nfn only_right() -> i32 { 2 }\n"
+            ]
+        let within2 = Sym.neighborsWithin "target" 2 g
+        Sym.narrowedCount g @?= 0
+        assertBool "reaches both definitions" (Set.member "only_left" within2 && Set.member "only_right" within2),
+      testCase "an import ranks one same-named definer above the other" $ do
+        g <-
+          Sym.fromFiles
+            [ Sym.SourceFile "src/caller.rs" Rust "use crate::right::shared;\nfn target() -> i32 { shared() }\n",
+              Sym.SourceFile "src/left.rs" Rust "fn shared() -> i32 { only_left() }\nfn only_left() -> i32 { 1 }\n",
+              Sym.SourceFile "src/right.rs" Rust "fn shared() -> i32 { only_right() }\nfn only_right() -> i32 { 2 }\n"
+            ]
+        let within2 = Sym.neighborsWithin "target" 2 g
+        assertBool "the ranking recorded a narrowing" (Sym.narrowedCount g > 0)
+        assertBool "reaches the imported file" (Set.member "only_right" within2)
+        assertBool "does not drag in the unimported one" (not (Set.member "only_left" within2)),
+      testCase "an import naming neither candidate narrows nothing (evidence, not resolution)" $ do
+        g <-
+          Sym.fromFiles
+            [ Sym.SourceFile "src/caller.rs" Rust "use crate::elsewhere::thing;\nfn target() -> i32 { shared() }\n",
+              Sym.SourceFile "src/left.rs" Rust "fn shared() -> i32 { only_left() }\nfn only_left() -> i32 { 1 }\n",
+              Sym.SourceFile "src/right.rs" Rust "fn shared() -> i32 { only_right() }\nfn only_right() -> i32 { 2 }\n"
+            ]
+        let within2 = Sym.neighborsWithin "target" 2 g
+        Sym.narrowedCount g @?= 0
+        assertBool "both still reachable" (Set.member "only_left" within2 && Set.member "only_right" within2),
+      testCase "Python imports rank by module name too" $ do
+        g <-
+          Sym.fromFiles
+            [ Sym.SourceFile "app/main.py" Python "from pkg.right import shared\ndef target():\n    return shared()\n",
+              Sym.SourceFile "pkg/left.py" Python "def shared():\n    return only_left()\ndef only_left():\n    return 1\n",
+              Sym.SourceFile "pkg/right.py" Python "def shared():\n    return only_right()\ndef only_right():\n    return 2\n"
+            ]
+        let within2 = Sym.neighborsWithin "target" 2 g
+        assertBool "reaches the imported module" (Set.member "only_right" within2)
+        assertBool "skips the other" (not (Set.member "only_left" within2))
     ]
   where
     src = "fn helper(x: i32) -> i32 {\n    x + 1\n}\n\nfn target() -> i32 {\n    helper(41)\n}\n\nfn unrelated() -> i32 {\n    7\n}\n"

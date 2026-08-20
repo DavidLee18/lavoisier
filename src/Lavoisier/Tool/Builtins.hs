@@ -21,7 +21,9 @@ import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.List (sort)
+import Data.Map.Strict qualified as Map
 import Data.Scientific (toBoundedInteger)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
@@ -232,8 +234,10 @@ outlineFilesTool =
     { toolName = "outline_files",
       toolDescription =
         "Skeletonise several source files at once (signatures kept, bodies elided), concatenated "
-          <> "under per-file headers. Prefer this over multiple outline_file calls. Optional "
-          <> "`focus`/`radius` apply to each file. Unsupported file types are returned unchanged.",
+          <> "under per-file headers. Prefer this over multiple outline_file calls. With `focus`, "
+          <> "bodies are kept for symbols within `radius` dependency hops of it — followed ACROSS the "
+          <> "given files, so pass every file that might be involved. Unsupported file types are "
+          <> "returned unchanged.",
       toolSchema =
         object
           [ "type" .= sv "object",
@@ -258,21 +262,41 @@ outlineFilesTool =
       toolInvoke = \args -> withArg (argStrList "paths" args) $ \paths -> do
         let mfocus = either (const Nothing) Just (argStr "focus" args)
             radius = max 0 (argIntOr "radius" 1 args)
-        sections <- mapM (outlineOne mfocus radius) paths
-        pure (Right (toolOk (T.intercalate "\n\n" sections)))
+        entries <- mapM (\p -> (,) p <$> load p) paths
+        bodies <- renderAll mfocus radius entries
+        pure (Right (toolOk (T.intercalate "\n\n" (zipWith section paths bodies))))
     }
   where
-    outlineOne mfocus radius path = do
+    -- Read a path into what the skeletoniser needs, or the text to print in its place.
+    load path = do
       r <- tryIO (BS.readFile (T.unpack path))
-      body <- case r of
-        Left e -> pure ("[error: " <> tshow e <> "]")
+      pure $ case r of
+        Left e -> Left ("[error: " <> tshow e <> "]")
         Right bytes -> case langFromPath (T.unpack path) of
-          Nothing -> pure (decodeUtf8Lenient bytes)
-          Just lang ->
-            decodeUtf8Lenient <$> case mfocus of
-              Just focus -> Sym.skeletonWithRadius lang focus radius bytes
-              Nothing -> Skel.skeleton lang bytes
-      pure ("===== " <> path <> " =====\n" <> body)
+          Nothing -> Left (decodeUtf8Lenient bytes)
+          Just lang -> Right (lang, bytes)
+
+    -- Without a focus each file is skeletonised on its own. With one, the dependency graph spans the
+    -- whole set, so a caller in one file keeps the body of the callee it reaches in another — which
+    -- is the point of passing several paths, and where the import-ranked cross-file edges earn their
+    -- keep.
+    renderAll Nothing _ entries =
+      mapM (either pure (\(lang, bytes) -> decodeUtf8Lenient <$> Skel.skeleton lang bytes) . snd) entries
+    renderAll (Just focus) radius entries = do
+      let parsable = [(i, path, lang, bytes) | (i, (path, Right (lang, bytes))) <- zip [0 :: Int ..] entries]
+      graph <- Sym.fromFiles [Sym.SourceFile p l b | (_, p, l, b) <- parsable]
+      let byIndex =
+            Map.fromList
+              (zip [i | (i, _, _, _) <- parsable] (Sym.neighborsWithinByFile focus radius graph))
+      mapM
+        ( \(i, (_, e)) -> case e of
+            Left msg -> pure msg
+            Right (lang, bytes) ->
+              decodeUtf8Lenient <$> Skel.skeletonize lang (Map.findWithDefault Set.empty i byIndex) bytes
+        )
+        (zip [0 :: Int ..] entries)
+
+    section path body = "===== " <> path <> " =====\n" <> body
 
 -- --- argument parsing + small helpers -------------------------------------------------------------
 

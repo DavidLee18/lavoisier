@@ -9,13 +9,22 @@
 -- creates no edge, and a local that shadows a top-level symbol no longer links to it.
 --
 -- Resolution is scope-aware across files: a reference links to a same-file definition when one
--- exists, falling back to a cross-file definition (by name) only when the name is not defined
--- locally. Name-keyed on the source side (no @use@\/@import@ path resolution) — all the radius knob
--- needs, and fully deterministic.
+-- exists, falling back to a cross-file definition only when the name is not defined locally.
+--
+-- The cross-file fallback is /ranked, not resolved/. Import and @use@ declarations are mined for
+-- module-path segments, and a candidate definer scores by how many of them its own path matches;
+-- only the best-scoring tier survives. This is deliberately not a name resolver: a real one drops a
+-- true edge whenever it is wrong, and a missing edge is invisible — the model silently never sees the
+-- body it needed. Ranking can only narrow where positive evidence exists and degrades exactly to the
+-- old link-every-definer behaviour where it does not ('narrowedCount' says which happened). Fully
+-- deterministic either way.
 module Lavoisier.Context.Symbols
   ( SymbolGraph,
+    SourceFile (..),
     fromSource,
     fromSources,
+    fromFiles,
+    narrowedCount,
     neighborsWithin,
     neighborsWithinByFile,
     symbolNames,
@@ -27,6 +36,7 @@ where
 import Control.Applicative ((<|>))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.Char (isAlphaNum)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
@@ -51,57 +61,136 @@ type Sym = (Int, Text)
 -- | A directed reference graph over file-scoped symbols: @(file, name)@ → the symbols it references.
 data SymbolGraph = SymbolGraph
   { sgEdges :: !(Map Sym (Set Sym)),
-    sgFileCount :: !Int
+    sgFileCount :: !Int,
+    sgNarrowed :: !Int
   }
   deriving stock (Show, Eq)
 
+-- | One file of a multi-file snapshot. The path is evidence, not identity — it is matched against
+-- other files' import segments to rank cross-file candidates; @""@ simply means "no evidence".
+data SourceFile = SourceFile
+  { sfPath :: !Text,
+    sfLang :: !Lang,
+    sfSource :: !ByteString
+  }
+
+-- | How many cross-file references import evidence actually narrowed. Zero on a snapshot whose files
+-- carry no paths or no imports — that is the honest reading of "the ranking did nothing here", and
+-- the first thing to check when a body is unexpectedly missing from a focused skeleton.
+narrowedCount :: SymbolGraph -> Int
+narrowedCount = sgNarrowed
+
 -- | Build a graph from a single source file.
 fromSource :: Lang -> ByteString -> IO SymbolGraph
-fromSource lang source = do
-  defs <- collectDefs lang source
-  pure (link [defs])
+fromSource lang source = fromFiles [SourceFile "" lang source]
 
--- | Build a graph spanning several files. A reference resolves to a same-file definition first; a
--- cross-file edge (by name) forms only when the name is not defined in the referencing file.
+-- | Build a graph spanning several files, without path evidence (every cross-file definer of a name
+-- is linked). Prefer 'fromFiles' when the paths are known.
 fromSources :: [(Lang, ByteString)] -> IO SymbolGraph
-fromSources srcs = link <$> mapM (uncurry collectDefs) srcs
+fromSources = fromFiles . map (\(l, src) -> SourceFile "" l src)
 
--- | Parse a file and collect @(name, referenced names)@ for every symbol-kind node ([] if unparsed).
-collectDefs :: Lang -> ByteString -> IO [(Text, Set Text)]
-collectDefs lang source = do
-  mtree <- parse lang source
+-- | Build a graph spanning several paths-and-sources. A reference resolves to a same-file definition
+-- first; otherwise to the cross-file definers whose paths best match this file's imports.
+fromFiles :: [SourceFile] -> IO SymbolGraph
+fromFiles files = link <$> mapM collectFile files
+
+-- | Parse a file into the pieces 'link' needs ('emptyInfo' if it does not parse).
+collectFile :: SourceFile -> IO FileInfo
+collectFile sf = do
+  mtree <- parse (sfLang sf) (sfSource sf)
   pure $ case mtree of
-    Nothing -> []
-    Just root -> collectSymbolRefs (langSpec lang) source root
+    Nothing -> emptyInfo
+    Just root ->
+      let spec = langSpec (sfLang sf)
+       in FileInfo
+            { fiPathTokens = pathTokens (sfPath sf),
+              fiImports = collectImportSegments spec (sfSource sf) root,
+              fiDefs = collectSymbolRefs spec (sfSource sf) root
+            }
+
+-- | A file's definitions plus the evidence used to rank it as a cross-file target.
+data FileInfo = FileInfo
+  { -- | Path components of this file (directories plus the basename stem).
+    fiPathTokens :: Set Text,
+    -- | Module-path segments mentioned by this file's imports.
+    fiImports :: Set Text,
+    -- | @(name, referenced names)@ for each symbol defined here.
+    fiDefs :: [(Text, Set Text)]
+  }
+
+emptyInfo :: FileInfo
+emptyInfo = FileInfo Set.empty Set.empty []
 
 -- | Resolve each symbol's referenced names to file-scoped target symbols, preferring the same file.
 -- A name defined nowhere is dropped. Every definition gets an edge entry (possibly empty), so a
 -- symbol with no out-edges is still a known node.
-link :: [[(Text, Set Text)]] -> SymbolGraph
-link perFile = SymbolGraph edges (length perFile)
+link :: [FileInfo] -> SymbolGraph
+link perFile = SymbolGraph edges (length perFile) narrowed
   where
     indexed = zip [0 :: Int ..] perFile
+    infoAt = Map.fromList indexed
     -- name → the files that define it, for cross-file fallback resolution.
     definedIn :: Map Text [Int]
-    definedIn = Map.fromListWith (++) [(name, [fi]) | (fi, defs) <- indexed, (name, _) <- defs]
+    definedIn = Map.fromListWith (++) [(name, [fi]) | (fi, info) <- indexed, (name, _) <- fiDefs info]
+    -- One entry per resolved reference: source symbol, referenced name, whether it stayed in-file,
+    -- and the target files it linked to.
+    resolutions =
+      [ ((fi, name), r, isLocal, cands)
+      | (fi, info) <- indexed,
+        let local = Set.fromList (map fst (fiDefs info)),
+        (name, refs) <- fiDefs info,
+        r <- Set.toList refs,
+        r /= name,
+        let isLocal = Set.member r local,
+        let cands = if isLocal then [fi] else ranked info (Map.findWithDefault [] r definedIn)
+      ]
     edges =
       Map.fromListWith
         Set.union
-        [ ((fi, name), targets)
-        | (fi, defs) <- indexed,
-          let local = Set.fromList (map fst defs),
-          (name, refs) <- defs,
-          let targets =
-                Set.fromList
-                  [ tgt
-                  | r <- Set.toList refs,
-                    r /= name,
-                    tgt <-
-                      if Set.member r local
-                        then [(fi, r)]
-                        else maybe [] (map (\tf -> (tf, r))) (Map.lookup r definedIn)
-                  ]
+        ( [((fi, name), Set.empty) | (fi, info) <- indexed, (name, _) <- fiDefs info]
+            <> [(src, Set.fromList [(tf, r) | tf <- cands]) | (src, r, _, cands) <- resolutions]
+        )
+    -- References whose candidate set import evidence actually shrank.
+    narrowed =
+      length
+        [ ()
+        | (_, r, False, cands) <- resolutions,
+          length cands < length (Map.findWithDefault [] r definedIn)
         ]
+
+    -- The best-scoring definers of a name, where a definer scores by how much of its path the
+    -- referencing file's imports mention. With no evidence every candidate ties at zero, which is
+    -- exactly the unranked behaviour.
+    ranked info cands =
+      let scored = [(score info c, c) | c <- cands]
+          best = maximum (0 : map fst scored)
+       in [c | (sc, c) <- scored, sc == best]
+    score info c =
+      Set.size (Set.intersection (fiImports info) (fiPathTokens (Map.findWithDefault emptyInfo c infoAt)))
+
+-- | A path's identifying components: directory names plus the basename stem (@src\/parser.rs@ →
+-- @{src, parser, rs}@). Extension noise is harmless — imports do not name it.
+pathTokens :: Text -> Set Text
+pathTokens = Set.fromList . filter (not . T.null) . T.split (\c -> c == '/' || c == '.' || c == '\\')
+
+-- | The module-path segments named by a file's imports: every identifier-ish run in an import
+-- declaration's raw text, minus the keywords every language sprinkles through them.
+collectImportSegments :: LangSpec -> ByteString -> Syntax -> Set Text
+collectImportSegments spec source = go
+  where
+    go node
+      | synType node `elem` importKinds spec = segmentsOf (textOf source node)
+      | otherwise = foldMap go (kids node)
+    segmentsOf =
+      Set.fromList
+        . filter (\w -> not (T.null w) && not (Set.member w importKeywords))
+        . T.split (\c -> not (isAlphaNum c) && c /= '_')
+
+-- | Import syntax that is never a module-path segment.
+importKeywords :: Set Text
+importKeywords =
+  Set.fromList
+    ["use", "pub", "crate", "self", "super", "as", "mod", "import", "from", "require", "type", "default"]
 
 -- | The set of symbol names within @radius@ reference-hops of @target@ (inclusive), across all files.
 neighborsWithin :: Text -> Int -> SymbolGraph -> Set Text

@@ -29,7 +29,12 @@ goal at every layer:
   and elide bodies (doc comments kept), so structure costs a fraction of the source.
 - **AST-resolved symbol-dependency graph** drives the skeleton-radius knob `N` ("include full
   bodies for symbols within `N` hops of the edit target") — references resolved from identifier
-  nodes, scope-aware (string/comment mentions and shadowing locals don't create edges).
+  nodes, scope-aware (string/comment mentions and shadowing locals don't create edges). Across files
+  a same-named symbol is disambiguated by **import evidence**: candidate definers are ranked by how
+  much of their path the referencing file's imports name, and only the best-matching tier is linked.
+  This ranks rather than resolves — with no evidence it links every definer, as before — so it can
+  narrow the skeleton but never drop an edge a resolver would have got wrong. `outline_files` with
+  `focus` follows the graph across every path you pass.
 - **Hash-anchored edits** and **token-efficient diffs** instead of re-emitting whole files. Repeated
   lines and repeated snippets stay addressable *without* line numbers: both `edit_anchored`/
   `edit_files` and `str_replace` take an `after` landmark (and `str_replace` a `before` too) — itself

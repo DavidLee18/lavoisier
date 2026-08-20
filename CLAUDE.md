@@ -122,9 +122,21 @@ The TUI is the one place the port deliberately diverges in **means**, not surfac
 ratatui's inline viewport, which has no Haskell equivalent (brick/vty are alt-screen shaped), so
 `Lavoisier.Gateway.Tui` drives the terminal with ANSI escapes directly.
 
-Deferred in both trees: module-qualified symbol resolution in the cross-file graph; an unambiguous
-line-range/occurrence edit path (weak models are steered to `sed` for repeated-symbol renames);
-Matrix token streaming.
+**The port is ahead of Rust in two places**, both former deferrals, both closed here only — port them
+back before claiming parity in the other direction:
+- **Repeated edit targets are addressable.** `edit_anchored`/`edit_files` take an `after` landmark
+  anchor and `str_replace` takes `after`/`before` snippets; the landmark must itself occur exactly
+  once and the first match past it is edited. Deliberately *not* a line range or an occurrence index
+  — those fail silently against a shifted file, and the whole edit path's value is that it refuses
+  rather than guesses.
+- **Cross-file symbol edges are import-ranked.** `Symbols.fromFiles` scores candidate definers of a
+  name by how much of their path the referencing file's imports mention, keeping only the best tier.
+  It ranks, it does not resolve: with no evidence it degrades to linking every definer (exactly the
+  old behaviour), because a wrong resolver drops a true edge and a missing edge is invisible.
+  `narrowedCount` says whether evidence did anything. `outline_files --focus` now builds one graph
+  across the given paths, which is where this pays.
+
+Still deferred in both trees: Matrix token streaming.
 
 ## Commands
 

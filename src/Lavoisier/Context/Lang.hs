@@ -55,7 +55,10 @@ data LangSpec = LangSpec
     refIdentKinds :: [Text],
     -- | Node kinds that introduce local bindings (parameters, @let@\/variable declarations);
     -- identifiers in their binding position are locals, excluded from references.
-    binderKinds :: [Text]
+    binderKinds :: [Text],
+    -- | Import\/@use@ declaration kinds. Their raw text is mined for module-path segments, which
+    -- /rank/ cross-file definitions of a name — never resolve them (see "Lavoisier.Context.Symbols").
+    importKinds :: [Text]
   }
   deriving stock (Show, Eq)
 
@@ -77,7 +80,8 @@ langSpec = \case
           ],
         keepsDocstring = False,
         refIdentKinds = ["identifier", "type_identifier"],
-        binderKinds = ["parameter", "let_declaration", "closure_parameters"]
+        binderKinds = ["parameter", "let_declaration", "closure_parameters"],
+        importKinds = ["use_declaration"]
       }
   Python ->
     LangSpec
@@ -86,7 +90,8 @@ langSpec = \case
         symbolKinds = ["function_definition", "class_definition"],
         keepsDocstring = True,
         refIdentKinds = ["identifier"],
-        binderKinds = ["parameters", "lambda_parameters"]
+        binderKinds = ["parameters", "lambda_parameters"],
+        importKinds = ["import_statement", "import_from_statement"]
       }
   JavaScript ->
     LangSpec
@@ -95,7 +100,8 @@ langSpec = \case
         symbolKinds = ["function_declaration", "method_definition", "class_declaration"],
         keepsDocstring = False,
         refIdentKinds = ["identifier"],
-        binderKinds = ["formal_parameters", "variable_declarator"]
+        binderKinds = ["formal_parameters", "variable_declarator"],
+        importKinds = ["import_statement"]
       }
   TypeScript ->
     LangSpec
@@ -115,5 +121,6 @@ langSpec = \case
             "variable_declarator",
             "required_parameter",
             "optional_parameter"
-          ]
+          ],
+        importKinds = ["import_statement"]
       }
