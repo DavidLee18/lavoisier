@@ -87,7 +87,14 @@ posture is efficiency-first.
   `protoc` at build time for `proto-lens-protobuf-types`. Clone libolm somewhere other than `./olm` —
   that path is the repo's own Haskell FFI package.
 - Generated xAI proto-lens bindings are **committed** under `gen/` (isolated in the `xai-proto`
-  library with warnings off), so an ordinary build needs no `protoc`.
+  library with warnings off), so an ordinary build needs no `protoc`. They cannot be git-ignored and
+  regenerated at build time: there are **no `.proto` files in this repo** (the source is the external
+  `xai-org/xai-proto`), and downstream pins this repo as a `source-repository-package`, where cabal
+  clones a tag and builds it with no chance to run codegen. Same reasoning protects `cbits/ts-*`.
+- `.gitattributes` marks `gen/` generated, `cbits/ts-*` vendored, and `tests/budget/` undetectable.
+  Presentation only — nothing moves. Without it the 716k lines of vendored parsers made GitHub report
+  Lavoisier as a **C project at 89.8%**; with it, Haskell 94.2%. Keep new vendored or generated trees
+  listed there, or the same distortion returns.
 - `Lavoisier.Gateway.Tui` drives the terminal with **raw ANSI escapes**, not brick/vty. The TUI needs
   an inline viewport (output stays in scrollback); brick and vty are alt-screen shaped, so there was
   nothing to build on. Expect escape sequences, not a widget tree.
