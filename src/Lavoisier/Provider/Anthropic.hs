@@ -1,3 +1,5 @@
+{-# LANGUAGE DataKinds #-}
+
 -- | The Anthropic Messages-API provider — the first concrete 'Provider'. Ported from Rust
 -- @lvz-anthropic@ @lib.rs@: build the request JSON from a normalised 'ChatRequest' (system,
 -- messages, tools, @cache_control@ on the stable prefix + rolling tail, @thinking@ per
@@ -27,6 +29,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Data.Vector qualified as V
 import Data.Word (Word32, Word64)
+import Lavoisier.Domain (ModelId (..))
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider
 import Lavoisier.Protocol.Stream (Producer (..))
@@ -74,7 +77,7 @@ anthropicProvider :: AnthropicConfig -> Provider
 anthropicProvider cfg =
   Provider
     { providerStream = anthropicStream cfg,
-      providerCapabilities = Capabilities True True True True True,
+      providerCapabilities = declare @'[ 'PromptCaching, 'ExtendedThinking, 'ParallelToolUse, 'ServerSideTools, 'Vision],
       providerCountTokens = anthropicCountTokens cfg
     }
 
@@ -176,12 +179,12 @@ buildBody :: Bool -> ChatRequest -> Value
 buildBody ttl req =
   Object
     . markConversationTail
-    . applyThinking (crThinking req) (crModel req) (crMaxTokens req)
+    . applyThinking (crThinking req) (unModelId (crModel req)) (crMaxTokens req)
     $ kmap pairs
   where
     pairs =
       concat
-        [ [ ("model", String (crModel req)),
+        [ [ ("model", String (unModelId (crModel req))),
             ("max_tokens", toJSON (crMaxTokens req)),
             ("messages", buildMessages ttl (crMessages req)),
             ("stream", Bool True)
@@ -203,7 +206,7 @@ buildBody ttl req =
           <> mapMaybe serverToolJson (crServerTools req)
           <> map builtinToolJson (crBuiltinTools req)
     samplingPairs
-      | rejectsSampling (crModel req) = []
+      | rejectsSampling (unModelId (crModel req)) = []
       | otherwise =
           concat
             [ [("temperature", toJSON t) | Just t <- [crTemperature req]],
@@ -217,7 +220,7 @@ buildCountBody :: ChatRequest -> Value
 buildCountBody req =
   kobj $
     concat
-      [ [("model", String (crModel req)), ("messages", buildMessages False (crMessages req))],
+      [ [("model", String (unModelId (crModel req))), ("messages", buildMessages False (crMessages req))],
         [("system", buildSystem False sp) | Just sp <- [crSystem req]],
         [("tools", Array (V.fromList (map (toolJson False) (crTools req)))) | not (null (crTools req))],
         [("tool_choice", buildToolChoice (crDisableParallelToolUse req) tc) | Just tc <- [crToolChoice req]]

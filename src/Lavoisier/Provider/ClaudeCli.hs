@@ -1,3 +1,5 @@
+{-# LANGUAGE DataKinds #-}
+
 -- | @Lavoisier.Provider.ClaudeCli@ — an __optional__ 'Provider' that rides Claude Code's
 -- @claude -p@ (subscription OAuth) instead of the Anthropic API. Ported from Rust @lvz-claude-cli@.
 --
@@ -39,9 +41,10 @@ import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Data.Vector qualified as V
 import Data.Word (Word64)
+import Lavoisier.Domain (ModelId (..))
 import Lavoisier.Protocol.Event (Event (..), StopReason (..), Usage (..))
 import Lavoisier.Protocol.Message (ChatRequest (..), Role (..), SystemPrompt (..), messageText, msgRole)
-import Lavoisier.Protocol.Provider (Capabilities (..), EventStream, Provider (..), ProviderError (..))
+import Lavoisier.Protocol.Provider (EventStream, Provider (..), ProviderError (..), noCapabilities)
 import Lavoisier.Protocol.Stream (Producer (..))
 import System.Environment (lookupEnv)
 import System.IO (Handle)
@@ -80,7 +83,7 @@ claudeCliProvider :: ClaudeCliConfig -> Provider
 claudeCliProvider cfg =
   Provider
     { providerStream = claudeCliStream cfg,
-      providerCapabilities = Capabilities False False False False False,
+      providerCapabilities = noCapabilities,
       providerCountTokens = \_ -> pure (Right Nothing)
     }
 
@@ -97,7 +100,7 @@ claudeCliStream cfg req = do
           "--verbose",
           "--include-partial-messages",
           "--model",
-          T.unpack (crModel req)
+          T.unpack (unModelId (crModel req))
         ]
           <> sysArgs
       pc =

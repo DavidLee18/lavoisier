@@ -46,8 +46,18 @@ posture is efficiency-first.
 
 - **Haskell**: GHC 9.10 / Cabal, `GHC2021`, `-Wall -Werror` kept clean, **ormolu** before every
   commit. Correctness via ADTs + exhaustive `case`. Tests are `tasty` — prefer QuickCheck properties.
-- **Config is Dhall** (`lavoisier.dhall.example`); `--cron-file` and `--schedule-file` are Dhall
-  record lists. (The retired Rust tree used TOML and JSON — old issues and infra may still say so.)
+- **Config is Dhall** (`schema.dhall` + `lavoisier.dhall.example`); `--cron-file` and
+  `--schedule-file` are Dhall record lists. (The retired Rust tree used TOML and JSON — old issues
+  and infra may still say so.)
+- **Enumerable config fields are Dhall unions, not `Text`** (since 0.17.0). The user's file does
+  `let L = ./schema.dhall in L.Config::{ … }`, and `loadConfig` uses `Dhall.inputFile` so that
+  relative import resolves against the *config file's* directory. Adding a config field means
+  editing `schema.dhall`, `FileConfig`, `fileConfigDecoder`, and `applyConfig` — the decoder is
+  written out rather than derived because most fields need a checked decoder.
+- **The domain vocabulary lives in `Lavoisier.Domain`** (`ProviderId`, `Port`, `ModelId`,
+  `ToolName`, `RoomId`, `Language`, `ModelRef`, `CronExpr`, …). It is at the protocol layer and
+  depends on nothing — deliberately including Dhall, which is why `Config.hs` declares plain
+  `Decoder`s instead of `FromDhall` instances (they would also be orphans, which `-Werror` rejects).
 - Keep dependencies minimal: **no agent frameworks, no vendor SDKs** — hand-roll thin HTTP adapters
   so prompt caching and thinking blocks stay reachable.
 - **Providers in scope: Anthropic, xAI, Google Gemini — native.** OpenAI and others are out of scope.
@@ -81,6 +91,19 @@ posture is efficiency-first.
   comment; this tree had dropped it, and it swallowed room-key shares and the unwedge until 0.13.4.
 - Dhall record fields become top-level selectors, so they collide with same-named function
   parameters and lambdas. Hence `jobId`/`toolArgs` rather than `id`/`args`.
+- **Dhall's `assert` cannot refine a function argument.** It type-checks a lambda body with the
+  argument still abstract, so a `mkPort : Natural -> Port` rejecting 0 and >65535 fails at
+  *definition* time, not on a bad call. Range checks therefore live in `Config.hs`'s `refine`
+  combinator and report as load errors naming the field. Anything Dhall's type system genuinely
+  cannot state belongs there — never as a silent coercion or a default.
+- **`Domain` types deliberately have no `IsString`** where the value is checked (`Port`, `RoomId`,
+  `MatrixUserId`, `Url`): a literal must go through `mkRoomId`/`mkPort`/… so the sigil or range is
+  verified once. `ModelId`/`ToolName`/`SessionId` *do* derive it — they are open identifiers with
+  nothing to check.
+- **Provider capabilities are declared at the type level**: `declare @'[ 'PromptCaching, … ]`.
+  They used to be five positional `Bool`s (`Capabilities True True True True True`), where
+  reordering the record silently re-labelled every provider. Note the space in `@'[ '` — `@'['` is
+  a lex error.
 - On Apple Silicon, `install_name_tool` invalidates the signature — re-sign ad hoc (`codesign -f -s -`)
   or the binary is killed on launch. `scripts/package-haskell.sh` does this.
 - CI builds native deps from source (tree-sitter 0.26.12 for grammar ABI 15, libolm 3.2.16) and needs

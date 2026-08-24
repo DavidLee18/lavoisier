@@ -40,6 +40,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Data.Word (Word32, Word64)
 import GHC.Clock (getMonotonicTime)
+import Lavoisier.Domain (Port, unPort)
 import Lavoisier.Protocol.Agent (AgentError, AgentHandle (..), TurnRequest (..), TurnStream)
 import Lavoisier.Protocol.Event (Event (Usage), Usage (..))
 import Lavoisier.Protocol.Gateway (Gateway (..), GatewayError (..))
@@ -63,13 +64,13 @@ defaultGatewayConfig = GatewayConfig [] Nothing
 
 -- | The 'Gateway' record: bind and serve on @port@ with @warp@. A bind failure maps to
 -- 'GEBind'. (Serves until the process is stopped; graceful shutdown lands with the CLI wiring.)
-httpGateway :: Int -> GatewayConfig -> Gateway
+httpGateway :: Port -> GatewayConfig -> Gateway
 httpGateway port cfg =
   Gateway
     { gatewayName = "http",
       gatewayServe = \agent -> do
         app <- newHttpApp cfg agent
-        r <- try (run port app) :: IO (Either SomeException ())
+        r <- try (run (fromIntegral (unPort port)) app) :: IO (Either SomeException ())
         pure $ case r of
           Left e -> Left (GEBind (T.pack (show e)))
           Right () -> Right ()

@@ -46,6 +46,7 @@ import Data.Aeson.Types (Parser)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word32)
+import Lavoisier.Domain (ModelId (..))
 
 -- | Normalised extended-thinking effort, mapped per-provider by each adapter. A cost dial:
 -- 'ThinkOff'\/'ThinkLow' cheapest, 'ThinkHigh' the most. 'Ord' matters (the agent dials it down for
@@ -182,7 +183,7 @@ data ServerTool
 
 -- | A full chat-completion request in provider-agnostic form.
 data ChatRequest = ChatRequest
-  { crModel :: Text,
+  { crModel :: ModelId,
     crSystem :: Maybe SystemPrompt,
     crMessages :: [Message],
     crTools :: [ToolDef],
@@ -202,7 +203,7 @@ data ChatRequest = ChatRequest
   deriving stock (Eq, Show)
 
 -- | A request with sane defaults: no system prompt, no tools, @max_tokens = 1024@.
-chatRequest :: Text -> ChatRequest
+chatRequest :: ModelId -> ChatRequest
 chatRequest model =
   ChatRequest
     { crModel = model,

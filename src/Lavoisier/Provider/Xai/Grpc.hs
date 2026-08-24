@@ -41,6 +41,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Data.Word (Word64)
+import Lavoisier.Domain (ModelId (..))
 import Lavoisier.Protocol.Event
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider
@@ -85,7 +86,7 @@ xaiGrpcProvider apiKey host =
     { providerStream = grpcStream apiKey host,
       -- xAI caches server-side (no request markers); it exposes provider-side tools + vision, and
       -- supports parallel tool use.
-      providerCapabilities = Capabilities False False True True True,
+      providerCapabilities = declare @'[ 'ParallelToolUse, 'ServerSideTools, 'Vision],
       providerCountTokens = \_ -> pure (Right Nothing)
     }
 
@@ -211,7 +212,7 @@ buildRequest req =
         ]
     )
     ( defMessage
-        & #model .~ crModel req
+        & #model .~ unModelId (crModel req)
         & #messages .~ buildMessages req
         & #maxTokens .~ fromIntegral (crMaxTokens req)
     )

@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               lavoisier
-version:            0.16.2
+version:            0.17.0
 synopsis:           Token-efficient CLI coding agent — a Haskell port of the Rust `lavoisier`.
 description:
   A modular, token-efficient CLI coding agent with a provider-agnostic core.
@@ -17,6 +17,7 @@ build-type:         Simple
 -- flag and `c-sources` cannot list headers, so without this they are absent from
 -- the sdist tarball cabal builds for `source-repository-package` consumers.
 extra-source-files:
+  schema.dhall
   cbits/**/*.h
   tests/budget/**/*.txt
   tests/budget/**/*.rs
@@ -49,6 +50,7 @@ library
     Lavoisier.CLI
     Lavoisier.Config
     Lavoisier.Context.Anchor
+    Lavoisier.Domain
     Lavoisier.Context.Budget
     Lavoisier.Context.Diff
     Lavoisier.Context.Lang
@@ -114,6 +116,7 @@ library
     , bytestring
     , containers
     , dhall
+    , either
     , Diff
     , directory
     , filepath

@@ -43,6 +43,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Dhall qualified
 import GHC.Generics (Generic)
+import Lavoisier.Domain (ToolName (..))
 import Lavoisier.Protocol.Tool
 import Lavoisier.Schedule.Cron (CronError, CronSchedule, nextAfter, parseCron)
 import Numeric.Natural (Natural)
@@ -58,14 +59,14 @@ detailCap = 600
 -- | What a job does when it fires.
 data Action
   = -- | Invoke a tool directly through the shared registry — deterministic, no model round-trip.
-    ActTool Text Value
+    ActTool ToolName Value
   | -- | Fire a prompt into the agent and let it decide which tools to call.
     ActPrompt Text
   deriving stock (Show, Eq)
 
 -- | One-line description for listings and reports.
 actionSummary :: Action -> Text
-actionSummary (ActTool n _) = "tool `" <> n <> "`"
+actionSummary (ActTool n _) = "tool `" <> unToolName n <> "`"
 actionSummary (ActPrompt t) = "prompt " <> T.pack (show (T.take 60 t))
 
 -- | A single scheduled job.
@@ -126,7 +127,7 @@ loadScheduleFile path defRetryMax defRetryWait = do
       | Set.member (jobId s) seen = Left (SceDuplicateId (jobId s))
       | otherwise = do
           action <- case (tool s, prompt s) of
-            (Just n, Nothing) -> Right (ActTool n (argsValue (toolArgs s)))
+            (Just n, Nothing) -> Right (ActTool (ToolName n) (argsValue (toolArgs s)))
             (Nothing, Just t) -> Right (ActPrompt t)
             _ -> Left (SceAction (jobId s))
           sched <- either (Left . SceCron (jobId s)) Right (parseCron (schedule s))

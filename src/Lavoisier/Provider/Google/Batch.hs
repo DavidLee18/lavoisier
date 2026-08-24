@@ -24,6 +24,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Vector qualified as V
 import Data.Word (Word64)
+import Lavoisier.Domain (ModelId (..))
 import Lavoisier.Protocol.Batch
 import Lavoisier.Protocol.Event (Usage (..), emptyUsage)
 import Lavoisier.Protocol.Message (crModel)
@@ -47,7 +48,7 @@ runGoogleBatch :: GoogleConfig -> [BatchTask] -> IO (Either BatchError [BatchIte
 runGoogleBatch _ [] = pure (Left (BatchError "run_batch: no tasks"))
 runGoogleBatch cfg tasks@(t0 : _) = do
   -- All tasks in a Gemini batch share the URL's model; take it from the first request.
-  let model = crModel (btRequest t0)
+  let model = unModelId (crModel (btRequest t0))
   created <- batchPost cfg ("models/" <> T.unpack model <> ":batchGenerateContent") (batchBody cfg tasks)
   case created of
     Left e -> pure (Left e)

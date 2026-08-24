@@ -43,18 +43,19 @@ import Data.Version (showVersion)
 import Data.Word (Word32, Word64)
 import Lavoisier.Agent
 import Lavoisier.Config (FileConfig (..), loadConfig)
+import Lavoisier.Domain
 import Lavoisier.Gateway.A2A (a2aGateway, defaultA2aConfig)
 import Lavoisier.Gateway.Acp (acpGateway)
-import Lavoisier.Gateway.Cron (CronJob, cronGateway, loadFileJobs, parseCliJob)
+import Lavoisier.Gateway.Cron (CronJob, cronGateway, jobFromSpec, loadFileJobs)
 import Lavoisier.Gateway.Http (GatewayConfig (..), httpGateway)
 import Lavoisier.Gateway.Matrix (matrixFromEnv, matrixGateway)
 import Lavoisier.Gateway.Matrix qualified as MX
 import Lavoisier.Gateway.Slack (slackFromEnv, slackGateway)
 import Lavoisier.Gateway.Tui (TuiConfig (..), defaultTuiConfig, tuiGateway)
 import Lavoisier.Gateway.Tui.Gate (newChannelGate)
-import Lavoisier.Legion (Debater, languageFromLocale, mkDebater, newPanel, panelDeliberator, renderLegionError, withLanguage)
+import Lavoisier.Legion (Debater, mkDebater, newPanel, panelDeliberator, renderLegionError, withLanguage)
 import Lavoisier.Log (LogLevel (..), fileLogSink, logDebug, logError, logInfo, logWarn, nullLogSink, parseLogLevel, setLogLevel, setLogSink)
-import Lavoisier.Mcp (connectTools, mssLabel, parseServerSpec, renderMcpError)
+import Lavoisier.Mcp (connectTools, mssLabel, renderMcpError, serverSpecOf)
 import Lavoisier.Memory (newFileStore, newInMemoryStore, sessionAgentHandle)
 import Lavoisier.Protocol.Agent (turnRequest)
 import Lavoisier.Protocol.Deliberate (Deliberator)
@@ -87,22 +88,22 @@ import System.IO (hFlush, hSetEncoding, stderr, stdout, utf8)
 -- | Parsed command-line options.
 data Options = Options
   { optAgent :: Bool,
-    optProvider :: Maybe String,
-    optModel :: Maybe Text,
+    optProvider :: Maybe ProviderId,
+    optModel :: Maybe ModelId,
     optThinking :: Maybe ThinkingLevel,
     optMaxTokens :: Maybe Word32,
     optMaxSteps :: Maybe Int,
     optContextLimit :: Maybe Int,
-    optCheapModel :: Maybe Text,
+    optCheapModel :: Maybe ModelId,
     optEscalateAfter :: Maybe Int,
-    optAdvisorModel :: Maybe Text,
+    optAdvisorModel :: Maybe ModelId,
     optBudget :: Maybe Word64,
     optNoProgressLimit :: Maybe Int,
     optVerifyCmd :: Maybe Text,
     optRequireEdit :: Bool,
     optVerifyAndFix :: Bool,
     optInLoopVerify :: Bool,
-    optSummaryModel :: Maybe Text,
+    optSummaryModel :: Maybe ModelId,
     optPersona :: Maybe FilePath,
     optNoPersona :: Bool,
     optSystem :: Maybe Text,
@@ -111,8 +112,8 @@ data Options = Options
     optNoBatchEdit :: Bool,
     optApiKey :: [Text],
     optRateLimit :: Maybe Int,
-    optServe :: Maybe Int,
-    optServeA2a :: Maybe Int,
+    optServe :: Maybe Port,
+    optServeA2a :: Maybe Port,
     optAcp :: Bool,
     optTui :: Bool,
     optTuiAutoApprove :: Bool,
@@ -120,28 +121,28 @@ data Options = Options
     optServeMatrix :: Bool,
     -- | Per-room\/per-member Matrix tool permissions. Config-file only (they are nested maps);
     -- empty ⇒ unconstrained, which is why the file has to be able to set them.
-    optMatrixRoomTools :: Map Text [Text],
-    optMatrixUserTools :: Map Text [Text],
+    optMatrixRoomTools :: [ToolGrant RoomId],
+    optMatrixUserTools :: [ToolGrant MatrixUserId],
     optSessionDir :: Maybe FilePath,
     optConfig :: Maybe FilePath,
-    optMcpServers :: [String],
+    optMcpServers :: [McpSpec],
     optTune :: Bool,
     optTuneBayes :: Bool,
     optTuneState :: Maybe FilePath,
-    optLegionDebaters :: [String],
-    optLegionJudge :: Maybe String,
+    optLegionDebaters :: [ModelRef],
+    optLegionJudge :: Maybe ModelRef,
     optLegionRounds :: Maybe Int,
-    optLang :: Maybe String,
-    optCron :: [String],
+    optLang :: Maybe Locale,
+    optCron :: [CronJobSpec],
     optCronFile :: Maybe FilePath,
-    optCronRetryMax :: Maybe Int,
-    optCronRetryWait :: Maybe Int,
+    optCronRetryMax :: Maybe RetryCount,
+    optCronRetryWait :: Maybe Seconds,
     optScheduleFile :: Maybe FilePath,
-    optScheduleRetryMax :: Maybe Int,
-    optScheduleRetryWait :: Maybe Int,
-    optFallback :: [String],
-    optFallbackCooldown :: Maybe Int,
-    optLogLevel :: Maybe String,
+    optScheduleRetryMax :: Maybe RetryCount,
+    optScheduleRetryWait :: Maybe Seconds,
+    optFallback :: [ModelRef],
+    optFallbackCooldown :: Maybe Seconds,
+    optLogLevel :: Maybe LogLevel,
     optWords :: [String]
   }
 
@@ -149,22 +150,22 @@ optionsParser :: Parser Options
 optionsParser =
   Options
     <$> switch (long "agent" <> help "Run the plan->act->observe tool loop instead of a single ask")
-    <*> optional (strOption (long "provider" <> metavar "PROVIDER" <> help "Model provider (anthropic|google|xai|xai-grpc|claude-cli; default anthropic)"))
-    <*> optional (strOption (long "model" <> metavar "MODEL" <> help "Model id"))
+    <*> optional (option providerReader (long "provider" <> metavar "PROVIDER" <> help ("Model provider (" <> providerIdList <> "; default anthropic)")))
+    <*> optional (ModelId <$> strOption (long "model" <> metavar "MODEL" <> help "Model id"))
     <*> optional (option thinkingReader (long "thinking" <> metavar "LEVEL" <> help "off|low|medium|high"))
     <*> optional (option auto (long "max-tokens" <> metavar "N" <> help "Generated-token ceiling"))
     <*> optional (option auto (long "max-steps" <> metavar "N" <> help "Agent tool-loop step budget"))
     <*> optional (option auto (long "context-limit" <> metavar "N" <> help "Per-request token ceiling; evict oldest tool output when exceeded after compaction"))
-    <*> optional (strOption (long "cheap-model" <> metavar "MODEL" <> help "Cheaper model for the first --escalate-after round-trips, then escalate to --model"))
+    <*> optional (ModelId <$> strOption (long "cheap-model" <> metavar "MODEL" <> help "Cheaper model for the first --escalate-after round-trips, then escalate to --model"))
     <*> optional (option auto (long "escalate-after" <> metavar "N" <> help "Round-trips on --cheap-model before escalating (default 2)"))
-    <*> optional (strOption (long "advisor-model" <> metavar "MODEL" <> help "Smarter model for a one-shot planning pre-pass that seeds the executor"))
+    <*> optional (ModelId <$> strOption (long "advisor-model" <> metavar "MODEL" <> help "Smarter model for a one-shot planning pre-pass that seeds the executor"))
     <*> optional (option auto (long "budget" <> metavar "N" <> help "Whole-task cost-weighted token budget; the turn stops when exceeded"))
     <*> optional (option auto (long "no-progress-limit" <> metavar "N" <> help "Hard-stop after 2N edit-free round-trips (nudge at N)"))
     <*> optional (strOption (long "verify-cmd" <> metavar "CMD" <> help "Shell command that verifies the task (exit 0 = pass); drives the ATO success signal and verify levers"))
     <*> switch (long "require-edit" <> help "Nudge a finish that edited nothing to actually edit (bounded)")
     <*> switch (long "verify-and-fix" <> help "On a would-be finish, if --verify-cmd fails, feed the output back and keep working (bounded)")
     <*> switch (long "in-loop-verify" <> help "Stop as soon as an edit turn makes --verify-cmd pass")
-    <*> optional (strOption (long "summary-model" <> metavar "MODEL" <> help "Cheaper model for history-compaction summaries (defaults to --model)"))
+    <*> optional (ModelId <$> strOption (long "summary-model" <> metavar "MODEL" <> help "Cheaper model for history-compaction summaries (defaults to --model)"))
     <*> optional (strOption (long "persona" <> metavar "PATH" <> help "Persona/standing-instructions file layered above the operating instructions (default ./PERSONA.md if present)"))
     <*> switch (long "no-persona" <> help "Don't auto-load ./PERSONA.md (an explicit --persona still loads)")
     <*> optional (strOption (long "system" <> metavar "PROMPT" <> help "Replace the built-in operating instructions (the persona still layers above whatever this leaves)"))
@@ -173,37 +174,84 @@ optionsParser =
     <*> switch (long "no-batch-edit" <> help "Don't offer the batch_edit fan-out tool (only offered with a batch-capable provider)")
     <*> many (strOption (long "api-key" <> metavar "KEY" <> help "Bearer API key gating the HTTP gateway's /v1/turns (repeatable); empty = open"))
     <*> optional (option auto (long "rate-limit" <> metavar "N" <> help "HTTP gateway per-key request cap over a 60s window"))
-    <*> optional (option auto (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
-    <*> optional (option auto (long "serve-a2a" <> metavar "PORT" <> help "Serve the agent as an A2A (Agent-to-Agent) gateway on this port"))
+    <*> optional (option portReader (long "serve" <> metavar "PORT" <> help "Serve the agent as an HTTP gateway on this port instead of a one-shot turn"))
+    <*> optional (option portReader (long "serve-a2a" <> metavar "PORT" <> help "Serve the agent as an A2A (Agent-to-Agent) gateway on this port"))
     <*> switch (long "acp" <> help "Run as a Zed Agent Client Protocol (ACP) agent over stdio (JSON-RPC 2.0), so an ACP-capable editor can launch `lav --acp` as a subprocess and drive the full tool loop from its agent panel. Takes over stdin/stdout; no bind address. For agent-to-agent interop use --serve-a2a instead.")
     <*> switch (long "tui" <> help "Launch the interactive inline terminal UI - a scrollback-native REPL that drives the agent with streaming output, tool-call cards, and Claude-Code-style tool-approval prompts. Takes over the terminal (logs go to $LVZ_LOG_FILE, or are suppressed, so they cannot corrupt the display).")
     <*> switch (long "tui-auto-approve" <> help "With --tui, skip the tool-approval prompts and run every tool unattended (the default is Claude-Code-style: read-only tools run, mutating tools and shells ask first).")
     <*> switch (long "serve-slack" <> help "Serve the agent as a Slack gateway over Socket Mode (needs SLACK_APP_TOKEN + SLACK_BOT_TOKEN)")
     <*> switch (long "serve-matrix" <> help "Serve the agent as a Matrix gateway (needs MATRIX_HOMESERVER + MATRIX_USER + token/password)")
     -- matrixRoomTools / matrixUserTools: config-file only (nested maps), so no flag — see applyConfig.
-    <*> pure Map.empty
-    <*> pure Map.empty
+    <*> pure []
+    <*> pure []
     <*> optional (strOption (long "session-dir" <> metavar "DIR" <> help "Persist gateway session transcripts under DIR (durable file store; default in-memory)"))
     <*> optional (strOption (long "config" <> metavar "PATH" <> help "Dhall config file (default ./lavoisier.dhall if present)"))
-    <*> many (strOption (long "mcp-server" <> metavar "LABEL:TARGET" <> help "Connect to an MCP server and expose its tools (stdio command or http(s):// URL); repeatable"))
+    <*> many (option mcpReader (long "mcp-server" <> metavar "LABEL:TARGET" <> help "Connect to an MCP server and expose its tools (stdio command or http(s):// URL); repeatable"))
     <*> switch (long "tune" <> help "Enable the ATO learner (ε-greedy knob tuning); off ⇒ static baseline knobs")
     <*> switch (long "tune-bayes" <> help "Use the Bayesian (Thompson-sampling) ATO learner instead of ε-greedy")
     <*> optional (strOption (long "tune-state" <> metavar "PATH" <> help "Load/persist learned ATO profiles at PATH (implies --tune; saved after an --agent turn)"))
-    <*> many (strOption (long "legion-debater" <> metavar "PROVIDER:MODEL" <> help "Add a legion council debater (repeatable; ≥2 enables the council pre-pass)"))
-    <*> optional (strOption (long "legion-judge" <> metavar "PROVIDER:MODEL" <> help "The legion judge that synthesises the verdict (default: the first debater)"))
+    <*> many (option modelRefReader (long "legion-debater" <> metavar "PROVIDER:MODEL" <> help "Add a legion council debater (repeatable; ≥2 enables the council pre-pass)"))
+    <*> optional (option modelRefReader (long "legion-judge" <> metavar "PROVIDER:MODEL" <> help "The legion judge that synthesises the verdict (default: the first debater)"))
     <*> optional (option auto (long "legion-rounds" <> metavar "N" <> help "Number of critique rounds after the draft (default 1)"))
-    <*> optional (strOption (long "lang" <> metavar "LOCALE" <> help "Locale for council progress notices (only ko_KR selects Korean; default English/LANG)"))
-    <*> many (strOption (long "cron" <> metavar "SPEC" <> help "A cron job: 5 schedule fields then a prompt (repeatable), e.g. '*/30 9-17 * * 1-5 check CI'"))
+    <*> optional (Locale <$> strOption (long "lang" <> metavar "LOCALE" <> help "Locale for council progress notices (only ko_KR selects Korean; default English/LANG)"))
+    <*> many (option cronReader (long "cron" <> metavar "SPEC" <> help "A cron job: 5 schedule fields then a prompt (repeatable), e.g. '*/30 9-17 * * 1-5 check CI'"))
     <*> optional (strOption (long "cron-file" <> metavar "PATH" <> help "A Dhall file of cron jobs: a list of {schedule,session,prompt,retryMax,retryWait}"))
-    <*> optional (option auto (long "cron-retry-max" <> metavar "N" <> help "Global default retries after a failed cron fire (default 0)"))
-    <*> optional (option auto (long "cron-retry-wait" <> metavar "SECS" <> help "Global default seconds between cron retries (default 0)"))
+    <*> optional (option retryReader (long "cron-retry-max" <> metavar "N" <> help "Global default retries after a failed cron fire (default 0)"))
+    <*> optional (option secondsReader (long "cron-retry-wait" <> metavar "SECS" <> help "Global default seconds between cron retries (default 0)"))
     <*> optional (strOption (long "schedule-file" <> metavar "PATH" <> help "A Dhall file of Matrix schedule jobs: jobs fire inside --serve-matrix and report to a room"))
-    <*> optional (option auto (long "schedule-retry-max" <> metavar "N" <> help "Global default retries after a failed schedule fire (default 0)"))
-    <*> optional (option auto (long "schedule-retry-wait" <> metavar "SECS" <> help "Global default seconds between schedule retries (default 0)"))
-    <*> many (strOption (long "fallback" <> metavar "PROVIDER:MODEL" <> help "A fallback model (repeatable, ordered): rerouted to when the primary is unresponsive/errors before streaming any output"))
-    <*> optional (option auto (long "fallback-cooldown" <> metavar "SECS" <> help "Seconds a failed fallback-chain model stays demoted before it's re-probed (circuit breaker; default 60)"))
-    <*> optional (strOption (long "log-level" <> metavar "FILTER" <> help "Operator-log threshold: error|warn|info|debug (also LVZ_LOG_LEVEL; default info)"))
+    <*> optional (option retryReader (long "schedule-retry-max" <> metavar "N" <> help "Global default retries after a failed schedule fire (default 0)"))
+    <*> optional (option secondsReader (long "schedule-retry-wait" <> metavar "SECS" <> help "Global default seconds between schedule retries (default 0)"))
+    <*> many (option modelRefReader (long "fallback" <> metavar "PROVIDER:MODEL" <> help "A fallback model (repeatable, ordered): rerouted to when the primary is unresponsive/errors before streaming any output"))
+    <*> optional (option secondsReader (long "fallback-cooldown" <> metavar "SECS" <> help "Seconds a failed fallback-chain model stays demoted before it's re-probed (circuit breaker; default 60)"))
+    <*> optional (option logLevelReader (long "log-level" <> metavar "FILTER" <> help "Operator-log threshold: error|warn|info|debug (also LVZ_LOG_LEVEL; default info)"))
     <*> many (argument str (metavar "PROMPT..."))
+
+-- | Every @option@ reader below turns a command-line string into a domain value at the edge, so
+-- the rest of the program never sees the string form. A rejected value is an optparse error naming
+-- the flag, which is the same failure mode the Dhall config now has.
+providerReader :: ReadM ProviderId
+providerReader = maybeReader (parseProviderId . T.pack)
+
+portReader :: ReadM Port
+portReader = maybeReader (parsePort . T.pack)
+
+logLevelReader :: ReadM LogLevel
+logLevelReader = maybeReader $ \s -> case s of
+  "error" -> Just LogError
+  "warn" -> Just LogWarn
+  "info" -> Just LogInfo
+  "debug" -> Just LogDebug
+  _ -> Nothing
+
+modelRefReader :: ReadM ModelRef
+modelRefReader = eitherReader (either (Left . T.unpack) Right . parseModelRef . T.pack)
+
+mcpReader :: ReadM McpSpec
+mcpReader = eitherReader (either (Left . T.unpack) Right . parseMcpSpec . T.pack)
+
+retryReader :: ReadM RetryCount
+retryReader = RetryCount <$> auto
+
+secondsReader :: ReadM Seconds
+secondsReader = Seconds <$> auto
+
+-- | @--cron \'*/30 9-17 * * 1-5 check CI\'@: the five schedule fields, then the prompt. The config
+-- file no longer packs these together ('CronExpr' names each field), but the flag keeps the
+-- familiar crontab spelling, so the split happens here — once, at the edge.
+cronReader :: ReadM CronJobSpec
+cronReader = eitherReader $ \raw ->
+  case T.words (T.pack raw) of
+    (mi : h : dom : mo : dow : rest)
+      | not (null rest) ->
+          Right
+            CronJobSpec
+              { csSchedule = CronExpr mi h dom mo dow,
+                csPrompt = T.unwords rest,
+                csSession = Nothing,
+                csRetryMax = Nothing,
+                csRetryWait = Nothing
+              }
+    _ -> Left "expected 5 schedule fields then a prompt, e.g. '*/30 9-17 * * 1-5 check CI'"
 
 thinkingReader :: ReadM ThinkingLevel
 thinkingReader = maybeReader $ \s -> case s of
@@ -231,15 +279,17 @@ mainWith extra = do
   opts0 <- execParser pinfo
   opts <- mergeConfig opts0
   -- Operator-log threshold: --log-level > LVZ_LOG_LEVEL > default info.
-  levelRaw <- maybe (lookupEnv "LVZ_LOG_LEVEL") (pure . Just) (optLogLevel opts)
-  maybe (pure ()) (setLogLevel . parseLogLevel . T.pack) levelRaw
+  -- --log-level is already a LogLevel (the reader rejected anything else); only the env var is
+  -- still text, and parseLogLevel keeps its RUST_LOG-style tolerance for deployment filter strings.
+  envLevel <- fmap (parseLogLevel . T.pack) <$> lookupEnv "LVZ_LOG_LEVEL"
+  mapM_ setLogLevel (optLogLevel opts <|> envLevel)
   -- The inline TUI owns the terminal: stderr writes would corrupt its viewport, so route logs to
   -- \$LVZ_LOG_FILE when set, else drop them. Every other frontend keeps stderr as usual.
   when (optTui opts) $ do
     mpath <- lookupEnv "LVZ_LOG_FILE"
     msink <- maybe (pure Nothing) fileLogSink mpath
     setLogSink (fromMaybe nullLogSink msink)
-  eprov <- selectProvider (fromMaybe "anthropic" (optProvider opts))
+  eprov <- selectProvider (providerOf opts)
   case eprov of
     Left e -> errExit e
     Right (prov, defModel) -> do
@@ -297,9 +347,9 @@ mergeConfig opts = do
 applyConfig :: FileConfig -> Options -> Options
 applyConfig fc o =
   o
-    { optProvider = optProvider o <|> fmap T.unpack (provider fc),
+    { optProvider = optProvider o <|> provider fc,
       optModel = optModel o <|> model fc,
-      optThinking = optThinking o <|> (thinking fc >>= parseThinking),
+      optThinking = optThinking o <|> thinking fc,
       optMaxTokens = optMaxTokens o <|> fmap fromIntegral (maxTokens fc),
       optMaxSteps = optMaxSteps o <|> fmap fromIntegral (maxSteps fc),
       optContextLimit = optContextLimit o <|> fmap fromIntegral (contextLimit fc),
@@ -313,77 +363,105 @@ applyConfig fc o =
       optVerifyAndFix = optVerifyAndFix o || fromMaybe False (verifyAndFix fc),
       optInLoopVerify = optInLoopVerify o || fromMaybe False (inLoopVerify fc),
       optSummaryModel = optSummaryModel o <|> summaryModel fc,
-      optPersona = optPersona o <|> fmap T.unpack (persona fc),
+      optPersona = optPersona o <|> persona fc,
       optSystem = optSystem o <|> system fc,
       optBudgetAwareness = optBudgetAwareness o || fromMaybe False (budgetAwareness fc),
-      optServe = optServe o <|> fmap fromIntegral (serve fc),
-      optServeA2a = optServeA2a o <|> fmap fromIntegral (serveA2a fc),
+      optServe = optServe o <|> serve fc,
+      optServeA2a = optServeA2a o <|> serveA2a fc,
       optAcp = optAcp o || fromMaybe False (acp fc),
       optTui = optTui o || fromMaybe False (tui fc),
       optTuiAutoApprove = optTuiAutoApprove o || fromMaybe False (tuiAutoApprove fc),
       optServeSlack = optServeSlack o || fromMaybe False (serveSlack fc),
       optServeMatrix = optServeMatrix o || fromMaybe False (serveMatrix fc),
       -- No flag sets these, so the file is the only source: take it as-is.
-      optMatrixRoomTools = fromMaybe Map.empty (matrixRoomTools fc),
-      optMatrixUserTools = fromMaybe Map.empty (matrixUserTools fc),
-      optSessionDir = optSessionDir o <|> fmap T.unpack (sessionDir fc),
+      optMatrixRoomTools = fromMaybe [] (matrixRoomTools fc),
+      optMatrixUserTools = fromMaybe [] (matrixUserTools fc),
+      optSessionDir = optSessionDir o <|> sessionDir fc,
       -- A CLI --mcp-server (non-empty) wins wholesale; otherwise take the file's list.
       optMcpServers = case optMcpServers o of
-        [] -> maybe [] (map T.unpack) (mcpServers fc)
+        [] -> fromMaybe [] (mcpServers fc)
         given -> given,
       -- --tune is a flag (default False); the file can turn it on when the flag was absent.
       optTune = optTune o || fromMaybe False (tune fc),
       optTuneBayes = optTuneBayes o || fromMaybe False (tuneBayes fc),
-      optTuneState = optTuneState o <|> fmap T.unpack (tuneState fc),
+      optTuneState = optTuneState o <|> tuneState fc,
       optLegionDebaters = case optLegionDebaters o of
-        [] -> maybe [] (map T.unpack) (legionDebaters fc)
+        [] -> fromMaybe [] (legionDebaters fc)
         given -> given,
-      optLegionJudge = optLegionJudge o <|> fmap T.unpack (legionJudge fc),
+      optLegionJudge = optLegionJudge o <|> legionJudge fc,
       optLegionRounds = optLegionRounds o <|> fmap fromIntegral (legionRounds fc),
-      optLang = optLang o <|> fmap T.unpack (lang fc),
+      optLang = optLang o <|> fmap localeOfLanguage (lang fc),
       optCron = case optCron o of
-        [] -> maybe [] (map T.unpack) (cron fc)
+        [] -> fromMaybe [] (cron fc)
         given -> given,
-      optCronFile = optCronFile o <|> fmap T.unpack (cronFile fc),
-      optCronRetryMax = optCronRetryMax o <|> fmap fromIntegral (cronRetryMax fc),
-      optCronRetryWait = optCronRetryWait o <|> fmap fromIntegral (cronRetryWait fc),
-      optScheduleRetryMax = optScheduleRetryMax o <|> fmap fromIntegral (scheduleRetryMax fc),
-      optScheduleRetryWait = optScheduleRetryWait o <|> fmap fromIntegral (scheduleRetryWait fc),
+      optCronFile = optCronFile o <|> cronFile fc,
+      optCronRetryMax = optCronRetryMax o <|> cronRetryMax fc,
+      optCronRetryWait = optCronRetryWait o <|> cronRetryWait fc,
+      optScheduleRetryMax = optScheduleRetryMax o <|> scheduleRetryMax fc,
+      optScheduleRetryWait = optScheduleRetryWait o <|> scheduleRetryWait fc,
       optFallback = case optFallback o of
-        [] -> maybe [] (map T.unpack) (fallback fc)
+        [] -> fromMaybe [] (fallback fc)
         given -> given,
-      optFallbackCooldown = optFallbackCooldown o <|> fmap fromIntegral (fallbackCooldown fc)
+      optFallbackCooldown = optFallbackCooldown o <|> fallbackCooldown fc,
+      optScheduleFile = optScheduleFile o <|> scheduleFile fc,
+      optLogLevel = optLogLevel o <|> logLevel fc
     }
 
-parseThinking :: Text -> Maybe ThinkingLevel
-parseThinking = \case
-  "off" -> Just ThinkOff
-  "low" -> Just ThinkLow
-  "medium" -> Just ThinkMedium
-  "high" -> Just ThinkHigh
-  _ -> Nothing
+-- | The config states a 'Language' directly; @--lang@ takes a POSIX locale. Round-trip the former
+-- into the latter so the single downstream resolver ('languageFromLocale') stays the only place
+-- that decides what a locale means.
+localeOfLanguage :: Language -> Locale
+localeOfLanguage = \case
+  English -> Locale "en_US"
+  Korean -> Locale "ko_KR"
+
+-- | Collapse a grant list into the lookup map the Matrix gateway indexes by. A repeated subject
+-- keeps the last grant, matching the config file reading top-to-bottom.
+grantMap :: (Ord s) => [ToolGrant s] -> Map s [ToolName]
+grantMap gs = Map.fromList [(tgSubject g, tgTools g) | g <- gs]
+
+-- | The effective provider: the flag, else the config, else Anthropic. One definition, so no call
+-- site can disagree about what the default is.
+providerOf :: Options -> ProviderId
+providerOf = fromMaybe Anthropic . optProvider
+
+-- | The model a provider is driven with when neither @--model@ nor the config names one.
+-- An exhaustive @case@ on 'ProviderId': adding a provider is a compile error here until it has a
+-- default, which is the property the old string dispatch could not give.
+defaultModelFor :: ProviderId -> ModelId
+defaultModelFor = \case
+  Anthropic -> "claude-sonnet-4-5"
+  Google -> "gemini-2.5-flash"
+  Xai -> "grok-4"
+  XaiGrpc -> "grok-4"
+  ClaudeCli -> "sonnet"
 
 -- | Build the requested provider and its default model, or an error message.
-selectProvider :: String -> IO (Either Text (Provider, Text))
-selectProvider name = case name of
-  "anthropic" -> tag "claude-sonnet-4-5" <$> anthropicFromEnv
-  "google" -> tag "gemini-2.5-flash" <$> googleFromEnv
-  "xai" -> tag "grok-4" <$> xaiFromEnv
-  "xai-grpc" -> do
+--
+-- This used to take a 'String' and match literals, with a second, independent literal match in
+-- 'batchEditTools' deciding which providers had a batch API. Nothing connected the two, so adding
+-- a provider silently skipped the batch question. Both are now exhaustive 'ProviderId' cases.
+selectProvider :: ProviderId -> IO (Either Text (Provider, ModelId))
+selectProvider pid = case pid of
+  Anthropic -> tag <$> anthropicFromEnv
+  Google -> tag <$> googleFromEnv
+  Xai -> tag <$> xaiFromEnv
+  XaiGrpc -> do
     mkey <- lookupEnv "XAI_API_KEY"
     pure $ case mkey of
-      Just k | not (null k) -> Right (xaiGrpcProvider (T.pack k) defaultXaiGrpcEndpoint, "grok-4")
+      Just k
+        | not (null k) ->
+            Right (xaiGrpcProvider (T.pack k) defaultXaiGrpcEndpoint, defaultModelFor pid)
       _ -> Left "XAI_API_KEY is not set"
-  "claude-cli" -> tag "sonnet" <$> claudeCliFromEnv
-  other -> pure (Left ("unsupported provider: " <> T.pack other <> " (anthropic|google|xai|xai-grpc|claude-cli)"))
+  ClaudeCli -> tag <$> claudeCliFromEnv
   where
-    tag def = either (Left . tshow) (\p -> Right (p, def))
+    tag = either (Left . tshow) (\p -> Right (p, defaultModelFor pid))
 
 resolvePrompt :: [String] -> IO Text
 resolvePrompt [] = T.strip <$> TIO.getContents
 resolvePrompt ws = pure (T.strip (T.pack (unwords ws)))
 
-runAskMode :: Provider -> Options -> Text -> Text -> IO ()
+runAskMode :: Provider -> Options -> ModelId -> Text -> IO ()
 runAskMode prov opts model prompt = do
   let req =
         (chatRequest model)
@@ -403,7 +481,7 @@ runAskMode prov opts model prompt = do
 -- | Build the tool registry (MCP + batch_edit + built-ins) plus any @extra@ tools registered after
 -- the built-ins (the caller's 'mainWith' tools, and\/or the @schedule_*@ tools), and run the
 -- continuation with it.
-withRegistryExtra :: Options -> Text -> [Tool] -> (ToolRegistry -> IO ()) -> IO ()
+withRegistryExtra :: Options -> ModelId -> [Tool] -> (ToolRegistry -> IO ()) -> IO ()
 withRegistryExtra opts model extra k = do
   toolss <- mapM connectOne (optMcpServers opts)
   batch <- batchEditTools opts model
@@ -415,9 +493,9 @@ buildScheduleReg :: Options -> IO (Maybe ScheduleRegistry)
 buildScheduleReg opts = case optScheduleFile opts of
   Nothing -> pure Nothing
   Just path -> do
-    let rmax = fromMaybe 0 (optScheduleRetryMax opts)
-        rwait = fromMaybe 0 (optScheduleRetryWait opts)
-    ejobs <- loadScheduleFile path rmax (fromIntegral rwait)
+    let rmax = fromIntegral (unRetryCount (fromMaybe (RetryCount 0) (optScheduleRetryMax opts)))
+        rwait = fromIntegral (unSeconds (fromMaybe (Seconds 0) (optScheduleRetryWait opts)))
+    ejobs <- loadScheduleFile path rmax rwait
     case ejobs of
       Left e -> errExit ("schedule: " <> tshow e)
       Right jobs -> do
@@ -426,32 +504,35 @@ buildScheduleReg opts = case optScheduleFile opts of
 
 -- | Offer @batch_edit@ when the provider has a discounted batch API (Anthropic today) and it wasn't
 -- disabled. A missing key just omits the tool.
-batchEditTools :: Options -> Text -> IO [Tool]
+batchEditTools :: Options -> ModelId -> IO [Tool]
 batchEditTools opts model
   | optNoBatchEdit opts = pure []
-  | provider == "anthropic" = do
-      mkey <- lookupEnv "ANTHROPIC_API_KEY"
-      case mkey of
-        Just key -> do
-          base <- maybe "https://api.anthropic.com" T.pack <$> lookupEnv "ANTHROPIC_BASE_URL"
-          cfg <- newAnthropicConfig (T.pack key) base
+  | otherwise = case providerOf opts of
+      Anthropic -> withKey "ANTHROPIC_API_KEY" "ANTHROPIC_BASE_URL" "https://api.anthropic.com" $
+        \key base -> do
+          cfg <- newAnthropicConfig key base
           pure [batchEditTool model (anthropicBatch cfg)]
-        Nothing -> pure []
-  | provider == "google" = do
-      mkey <- lookupEnv "GOOGLE_API_KEY"
-      case mkey of
-        Just key -> do
-          base <- maybe "https://generativelanguage.googleapis.com" T.pack <$> lookupEnv "GOOGLE_BASE_URL"
-          cfg <- newGoogleConfig (T.pack key) base
-          pure [batchEditTool model (googleBatch cfg)]
-        Nothing -> pure []
-  | otherwise = pure []
+      Google ->
+        withKey "GOOGLE_API_KEY" "GOOGLE_BASE_URL" "https://generativelanguage.googleapis.com" $
+          \key base -> do
+            cfg <- newGoogleConfig key base
+            pure [batchEditTool model (googleBatch cfg)]
+      -- Neither has a discounted batch API; a missing arm here is a compile error, not a silent no.
+      Xai -> pure []
+      XaiGrpc -> pure []
+      ClaudeCli -> pure []
   where
-    provider = fromMaybe "anthropic" (optProvider opts)
+    withKey keyVar baseVar defBase k = do
+      mkey <- lookupEnv keyVar
+      case mkey of
+        Nothing -> pure []
+        Just key -> do
+          base <- maybe defBase T.pack <$> lookupEnv baseVar
+          k (T.pack key) base
 
 -- | Connect one @label:target@ MCP server, failing fast with the offending label.
-connectOne :: String -> IO [Tool]
-connectOne raw = case parseServerSpec (T.pack raw) of
+connectOne :: McpSpec -> IO [Tool]
+connectOne dspec = case serverSpecOf dspec of
   Left e -> errExit ("mcp: " <> renderMcpError e)
   Right spec -> do
     r <- connectTools spec
@@ -494,8 +575,8 @@ buildLegion opts
         (Just js, _) -> buildDebater js
         (Nothing, d : _) -> pure d
         (Nothing, []) -> errExit "legion: no debaters configured"
-      langRaw <- maybe (fmap (fromMaybe "") (lookupEnv "LANG")) pure (optLang opts)
-      let lg = languageFromLocale (T.pack langRaw)
+      lc <- maybe (Locale . maybe "" T.pack <$> lookupEnv "LANG") pure (optLang opts)
+      let lg = languageFromLocale lc
       case newPanel debs judge (fromMaybe 1 (optLegionRounds opts)) of
         Left e -> errExit ("legion: " <> renderLegionError e)
         Right panel -> pure (Just (panelDeliberator (withLanguage lg panel)))
@@ -508,49 +589,47 @@ cronActive opts = not (null (optCron opts)) || isJust (optCronFile opts)
 -- a bad spec\/schedule\/file fails fast.
 buildCronJobs :: Options -> IO [CronJob]
 buildCronJobs opts = do
-  let rmax = fromMaybe 0 (optCronRetryMax opts)
-      rwait = fromMaybe 0 (optCronRetryWait opts)
+  let rmax = fromMaybe (RetryCount 0) (optCronRetryMax opts)
+      rwait = fromMaybe (Seconds 0) (optCronRetryWait opts)
   cliJobs <-
     mapM
-      (\(i, spec) -> either (errExit . cronErr) pure (parseCliJob (T.pack spec) i rmax rwait))
+      (\(i, spec) -> either (errExit . cronErr) pure (jobFromSpec spec i rmax rwait))
       (zip [0 ..] (optCron opts))
   fileJobs <- case optCronFile opts of
     Nothing -> pure []
-    Just path -> loadFileJobs path rmax rwait >>= either (errExit . cronErr) pure
+    Just path ->
+      loadFileJobs path (fromIntegral (unRetryCount rmax)) (fromIntegral (unSeconds rwait))
+        >>= either (errExit . cronErr) pure
   pure (cliJobs <> fileJobs)
   where
     cronErr e = "cron: " <> tshow e
 
 -- | Build one council debater from a @provider:model@ spec, its provider from env.
-buildDebater :: String -> IO Debater
-buildDebater spec = case break (== ':') spec of
-  (_, "") -> errExit ("legion: bad debater spec (want provider:model): " <> T.pack spec)
-  (provName, _ : modelPart)
-    | null modelPart -> errExit ("legion: empty model in spec: " <> T.pack spec)
-    | otherwise -> do
-        ep <- selectProvider provName
-        case ep of
-          Left e -> errExit ("legion: " <> e)
-          Right (p, _def) -> pure (mkDebater (T.pack spec) p (T.pack modelPart) Nothing)
+-- The @provider:model@ split is the option reader's job now; this had its own third copy of it.
+buildDebater :: ModelRef -> IO Debater
+buildDebater ref = do
+  ep <- selectProvider (mrProvider ref)
+  case ep of
+    Left e -> errExit ("legion: " <> e)
+    Right (p, _def) -> pure (mkDebater (renderModelRef ref) p (mrModel ref) Nothing)
 
 -- | Build the ordered @--fallback provider:model@ chain, each provider built fresh from env via
 -- 'selectProvider'; a bad spec or missing key fails fast with the offending spec.
-buildFallbacks :: Options -> IO [(Provider, Text)]
+-- The @provider:model@ split happened in the option reader, so what is left is building each
+-- provider from env. The old version re-implemented the split here, differently from the legion
+-- council's copy of the same parse.
+buildFallbacks :: Options -> IO [(Provider, ModelId)]
 buildFallbacks opts = mapM one (optFallback opts)
   where
-    one spec = case break (== ':') spec of
-      (_, "") -> errExit ("fallback: bad spec (want provider:model): " <> T.pack spec)
-      (provName, _ : modelPart)
-        | null modelPart -> errExit ("fallback: empty model in spec: " <> T.pack spec)
-        | otherwise -> do
-            ep <- selectProvider provName
-            case ep of
-              Left e -> errExit ("fallback " <> T.pack spec <> ": " <> e)
-              Right (p, _def) -> pure (p, T.pack modelPart)
+    one ref = do
+      ep <- selectProvider (mrProvider ref)
+      case ep of
+        Left e -> errExit ("fallback " <> renderModelRef ref <> ": " <> e)
+        Right (p, _def) -> pure (p, mrModel ref)
 
 -- | Assemble the shared 'Agent': base config + tuner + legion council, then install the fallback
 -- chain (and its cross-turn circuit breaker) if @--fallback@ was given.
-assembleAgent :: Provider -> Options -> Text -> Tuner -> Maybe Deliberator -> ToolRegistry -> IO Agent
+assembleAgent :: Provider -> Options -> ModelId -> Tuner -> Maybe Deliberator -> ToolRegistry -> IO Agent
 assembleAgent prov opts model tuner delib registry = do
   sys <- systemPromptFor opts
   let base = defaultAgentConfig model
@@ -578,7 +657,7 @@ assembleAgent prov opts model tuner delib registry = do
   fallbacks <- buildFallbacks opts
   if null fallbacks
     then pure agent0
-    else withFallbacks fallbacks (fromIntegral (fromMaybe 60 (optFallbackCooldown opts))) agent0
+    else withFallbacks fallbacks (fromIntegral (unSeconds (fromMaybe (Seconds 60) (optFallbackCooldown opts)))) agent0
 
 -- | The agent's system prompt: the operating instructions (@--system@, else the built-in default)
 -- with the persona layered __above__ them, mirroring the Rust @lvz-cli@ composition. The persona
@@ -642,16 +721,16 @@ buildGateways opts msched registry = do
     fromEnv build wrap = build >>= either (errExit . tshow) (pure . wrap)
     matrixGw = do
       -- Localise the gateway-authored shutdown notice via --lang/LANG (only ko_KR ⇒ Korean).
-      langRaw <- maybe (fmap (fromMaybe "") (lookupEnv "LANG")) pure (optLang opts)
-      let lg = MX.languageFromLocale (T.pack langRaw)
+      lc <- maybe (Locale . maybe "" T.pack <$> lookupEnv "LANG") pure (optLang opts)
+      let lg = languageFromLocale lc
       ecfg <- matrixFromEnv
       case ecfg of
         Left e -> errExit (tshow e)
         Right cfg0 -> do
           let cfg =
                 (MX.withLanguage lg cfg0)
-                  { MX.mcRoomTools = optMatrixRoomTools opts,
-                    MX.mcUserTools = optMatrixUserTools opts
+                  { MX.mcRoomTools = grantMap (optMatrixRoomTools opts),
+                    MX.mcUserTools = grantMap (optMatrixUserTools opts)
                   }
               -- Hand the gateway a direct invoker into the registry the executor also uses, so a
               -- scheduled tool action fires deterministically with no model round-trip.
@@ -665,7 +744,7 @@ buildGateways opts msched registry = do
 -- The interactive TUI is the one gateway that needs something installed on the agent — its
 -- tool-approval 'ToolGate' — so the gate is built here (unless @--tui-auto-approve@ waives it) and
 -- its receiver handed to the TUI's config.
-serveGateways :: [Gateway] -> Provider -> Options -> Text -> ToolRegistry -> IO ()
+serveGateways :: [Gateway] -> Provider -> Options -> ModelId -> ToolRegistry -> IO ()
 serveGateways gws prov opts model registry = do
   (tuner, _persist) <- buildTuner opts
   delib <- buildLegion opts
@@ -687,7 +766,7 @@ serveGateways gws prov opts model registry = do
     (e : _) -> errExit (tshow e)
     [] -> pure ()
 
-runAgentMode :: Provider -> Options -> Text -> Text -> ToolRegistry -> IO ()
+runAgentMode :: Provider -> Options -> ModelId -> Text -> ToolRegistry -> IO ()
 runAgentMode prov opts model prompt registry = do
   (tuner, persist) <- buildTuner opts
   delib <- buildLegion opts

@@ -15,7 +15,7 @@ where
 
 import Data.Aeson (Value)
 import Data.List (find)
-import Data.Text (Text)
+import Lavoisier.Domain (ToolName (..))
 import Lavoisier.Protocol.Message (ToolDef (..))
 import Lavoisier.Protocol.Tool
 import Lavoisier.Tool.Builtins (builtinTools)
@@ -48,11 +48,11 @@ registryTools (ToolRegistry ts) = ts
 -- | The tool definitions advertised to the model, in registration order.
 registryDefs :: ToolRegistry -> [ToolDef]
 registryDefs (ToolRegistry ts) =
-  [ToolDef (toolName t) (toolDescription t) (toolSchema t) False False | t <- ts]
+  [ToolDef (unToolName (toolName t)) (toolDescription t) (toolSchema t) False False | t <- ts]
 
 -- | Dispatch a call by name (last-registered wins); an unknown name is a hard 'TEUnknown'.
-invokeTool :: Text -> Value -> ToolRegistry -> IO (Either ToolError ToolOutput)
+invokeTool :: ToolName -> Value -> ToolRegistry -> IO (Either ToolError ToolOutput)
 invokeTool name args (ToolRegistry ts) =
   case find ((== name) . toolName) (reverse ts) of
     Just t -> toolInvoke t args
-    Nothing -> pure (Left (TEUnknown name))
+    Nothing -> pure (Left (TEUnknown (unToolName name)))

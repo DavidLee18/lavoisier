@@ -1,3 +1,5 @@
+{-# LANGUAGE DataKinds #-}
+
 -- | @Lavoisier.Provider.Xai@ — the xAI (Grok) provider over its __OpenAI-compatible HTTP__ endpoint
 -- (@https:\/\/api.x.ai\/v1\/chat\/completions@, @stream:true@). Ported from Rust @lvz-xai@ @http.rs@.
 --
@@ -33,6 +35,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Data.Vector qualified as V
+import Lavoisier.Domain (ModelId (..))
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider
 import Lavoisier.Protocol.Stream (Producer (..))
@@ -74,7 +77,7 @@ xaiProvider :: XaiConfig -> Provider
 xaiProvider cfg =
   Provider
     { providerStream = xaiStream cfg,
-      providerCapabilities = Capabilities False False True False True,
+      providerCapabilities = declare @'[ 'ParallelToolUse, 'Vision],
       providerCountTokens = \_ -> pure (Right Nothing)
     }
 
@@ -148,7 +151,7 @@ buildBody :: ChatRequest -> Value
 buildBody req =
   Object . kmap $
     concat
-      [ [ ("model", String (crModel req)),
+      [ [ ("model", String (unModelId (crModel req))),
           ("messages", Array (V.fromList (buildMessages req))),
           ("max_tokens", toJSON (crMaxTokens req)),
           ("stream", Bool True),

@@ -245,18 +245,21 @@ ANTHROPIC_API_KEY=… lav --serve-matrix --config lavoisier.dhall
 
 ```dhall
 -- lavoisier.dhall — per-room / per-member tool permissions (no env equivalent).
--- Absent from a map ⇒ unconstrained; when a room AND a member both apply, the effective
+-- Absent from the list ⇒ unconstrained; when a room AND a member both apply, the effective
 -- set is their INTERSECTION (a tool must be permitted by the room *and* the member).
--- `toMap` turns a record into the assoc list the decoder reads.
-{ matrixRoomTools = Some (toMap
-    { `!ops:hs`     = [ "shell", "read_file", "write_file", "str_replace" ]
-    , `!general:hs` = [ "read_file", "read_files", "outline_file" ]   -- read-only room
-    })
-, matrixUserTools = Some (toMap
-    { `@alice:hs` = [ "shell", "read_file", "write_file", "str_replace" ]
-    , `@bob:hs`   = [ "read_file", "read_files" ]                     -- bob: reads only
-    })
-}
+-- Subjects are sigil-checked at load: `ops:hs` without the `!` is a config error.
+let L = ./schema.dhall
+
+in  L.Config::{
+    , matrixRoomTools = Some
+      [ { subject = "!ops:hs", tools = [ "shell", "read_file", "write_file", "str_replace" ] }
+      , { subject = "!general:hs", tools = [ "read_file", "read_files", "outline_file" ] }
+      ]
+    , matrixUserTools = Some
+      [ { subject = "@alice:hs", tools = [ "shell", "read_file", "write_file" ] }
+      , { subject = "@bob:hs", tools = [ "read_file", "read_files" ] }
+      ]
+    }
 ```
 
 **Leaving these unset means no restriction at all** — every allowed sender is offered the whole tool
@@ -300,12 +303,21 @@ thread), and can be restricted with `SLACK_ALLOWED_USERS`.
 ### Configuration file
 
 For long-running deployments, a **Dhall config** sets defaults for most flags so you don't pass a
-long command line. (Dhall; the retired Rust tree used TOML.) `--config <PATH>` — or an auto-loaded
-`./lavoisier.dhall` — is one flat record whose keys are the flag names in camelCase; **an explicit
-CLI flag or env var always wins over the file**, which wins over the built-in default. Every field is
-optional: the file is merged over an all-`None` defaults record, so write only what you set, and
-Dhall type-checks it at load, making a typo or a wrong type a clear error rather than a silent
-default. See [`lavoisier.dhall.example`](lavoisier.dhall.example) for the annotated full schema.
+long command line. `--config <PATH>` — or an auto-loaded `./lavoisier.dhall` — is a record built
+from [`schema.dhall`](schema.dhall); **an explicit CLI flag or env var always wins over the file**,
+which wins over the built-in default. Every field is optional: `L.Config::{ … }` fills the rest with
+`None`, so write only what you set.
+
+Since **0.17.0** every enumerable field is a Dhall **union**, not a `Text`. `provider = Some
+L.Provider.Anthropi` is a type error at load that names the missing constructor, and a bare
+`provider = Some "anthropic"` is a type error that names the expected union — where before, Dhall
+only checked that the value was *a* `Text` and the typo travelled to the provider factory. Ports are
+range-checked by the decoder (Dhall's `assert` can't refine a `Natural` inside a function), and
+`provider:model` / `label: target` / cron specs are records rather than packed strings.
+
+**This is a breaking change to the config format.** See
+[`lavoisier.dhall.example`](lavoisier.dhall.example) for the annotated full schema, and
+[`schema.dhall`](schema.dhall) for the types.
 
 The Matrix per-room/per-member tool maps (above) have **no flag and no env var** — the config file is
 the only way to set them. Sessions are durable when `sessionDir` is set (a file store under that
@@ -313,13 +325,17 @@ directory) and in-memory otherwise, capped at the most recent 200 messages per s
 
 ```dhall
 -- lavoisier.dhall
-{ provider = Some "anthropic"
-, contextLimit = Some 120000        -- evict oldest tool output to fit
-, summaryModel = Some "claude-haiku-4-5-20251001"
-, sessionDir = Some "./.lavoisier/sessions"   -- durable; survives restarts
-, persona = Some "/etc/lavoisier/PERSONA.md"
-, serve = Some 8080
-}
+let L = ./schema.dhall
+
+in  L.Config::{
+    , provider = Some L.Provider.Anthropic
+    , contextLimit = Some 120000       -- evict oldest tool output to fit
+    , summaryModel = Some "claude-haiku-4-5-20251001"
+    , sessionDir = Some "./.lavoisier/sessions"   -- durable; survives restarts
+    , persona = Some "/etc/lavoisier/PERSONA.md"
+    , serve = Some 8080
+    , logLevel = Some L.LogLevel.Info
+    }
 ```
 
 ### Flags

@@ -18,13 +18,13 @@ import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as BS
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
 import Data.Vector qualified as V
 import Data.Word (Word32)
+import Lavoisier.Domain (ModelId (..))
 import Lavoisier.Protocol.Batch
 import Lavoisier.Protocol.Event (Usage (..), accumulateUsage, emptyUsage)
 import Lavoisier.Protocol.Message
@@ -56,7 +56,7 @@ editorUserPrompt path content instruction =
   "File `" <> path <> "`:\n```\n" <> content <> "\n```\n\nApply this change to the file above:\n" <> instruction
 
 -- | @batch_edit@, bound to a default model + a 'Batch' runner.
-batchEditTool :: Text -> Batch -> Tool
+batchEditTool :: ModelId -> Batch -> Tool
 batchEditTool defaultModel batch =
   Tool
     { toolName = "batch_edit",
@@ -97,11 +97,11 @@ batchEditTool defaultModel batch =
 -- | One file to edit: its index (the batch @custom_id@), path, and instruction.
 data Edit = Edit !Int !Text !Text
 
-batchEdit :: Text -> Batch -> Value -> IO (Either ToolError ToolOutput)
+batchEdit :: ModelId -> Batch -> Value -> IO (Either ToolError ToolOutput)
 batchEdit defaultModel batch args = case parseEdits args of
   Left e -> pure (Left e)
   Right edits -> do
-    let model = fromMaybe defaultModel (strArg "model" args)
+    let model = maybe defaultModel ModelId (strArg "model" args)
     prepared <- forM edits $ \(Edit i path instruction) -> do
       r <- tryText path
       pure (i, path, instruction, r)
@@ -151,7 +151,7 @@ applyItem byId i path orig = case Map.lookup (tshow i) byId of
                   Left e -> ((path <> ": write failed (" <> e <> ")", False), biUsage item)
                   Right () -> ((path <> ": edited (" <> tshow (nbytes orig) <> " -> " <> tshow (nbytes new) <> " bytes)", True), biUsage item)
 
-editorReq :: Text -> Text -> Text -> Text -> ChatRequest
+editorReq :: ModelId -> Text -> Text -> Text -> ChatRequest
 editorReq model path content instruction =
   (chatRequest model)
     { crSystem = Just (SystemPrompt editorSystem True),

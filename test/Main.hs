@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedLabels #-}
 -- Orphan Arbitrary instances for the library's types are the idiomatic place for test generators.
 {-# OPTIONS_GHC -Wno-orphans #-}
@@ -5,7 +6,7 @@
 module Main (main) where
 
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (IOException, try)
+import Control.Exception (IOException, SomeException, try)
 import Control.Monad (replicateM, replicateM_, void)
 import Data.Aeson (Value (..), decode, encode, object, toJSON, (.=))
 import Data.Aeson.Key qualified as K
@@ -18,7 +19,7 @@ import Data.Char (isHexDigit)
 import Data.IORef
 import Data.List (find, isSuffixOf, sort)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (isJust, isNothing)
+import Data.Maybe (fromJust, isJust, isNothing)
 import Data.ProtoLens (defMessage)
 import Data.ProtoLens.Labels ()
 import Data.Scientific (toBoundedInteger)
@@ -40,6 +41,7 @@ import Lavoisier.Context.Skeleton qualified as Skel
 import Lavoisier.Context.Symbols qualified as Sym
 import Lavoisier.Context.Tokens (estimateTokens)
 import Lavoisier.Context.TreeSitter qualified as TS
+import Lavoisier.Domain
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
 import Lavoisier.Gateway.Acp qualified as Acp
 import Lavoisier.Gateway.Cron (CronConfigError (..), CronJob (..), loadFileJobs, parseCliJob)
@@ -50,7 +52,7 @@ import Lavoisier.Gateway.Tui qualified as Tui
 import Lavoisier.Gateway.Tui.Gate qualified as TG
 import Lavoisier.Gateway.Tui.Md qualified as Md
 import Lavoisier.Gateway.Tui.Price qualified as Price
-import Lavoisier.Legion (Debater, Language (..), LegionError (..), languageFromLocale, mkDebater, newPanel, panelDeliberator, withLanguage)
+import Lavoisier.Legion (Debater, LegionError (..), mkDebater, newPanel, panelDeliberator, withLanguage)
 import Lavoisier.Log (LogLevel (..), parseLogLevel)
 import Lavoisier.Mcp
   ( CallResult (..),
@@ -108,7 +110,7 @@ import Network.WebSockets qualified as WS
 import Options.Applicative (ParserResult (..), defaultPrefs, execParserPure, info)
 import Proto.Xai.Api.V1.Chat qualified as PX
 import Proto.Xai.Api.V1.Sample qualified as SX
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getTemporaryDirectory, listDirectory, removeDirectoryRecursive)
+import System.Directory (copyFile, createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getTemporaryDirectory, listDirectory, removeDirectoryRecursive)
 import System.FilePath (makeRelative, takeFileName, (</>))
 import System.IO (BufferMode (LineBuffering), Handle, hClose, hFlush, hSetBinaryMode, hSetBuffering, hSetEncoding, utf8)
 import System.Process (createPipe)
@@ -150,6 +152,7 @@ tests =
       acpTests,
       tuiTests,
       memoryTests,
+      domainTests,
       configTests,
       logTests,
       mcpTests,
@@ -344,20 +347,26 @@ pureProperties =
       testProperty "roomAllowed: no allowlist admits everywhere" $ \r ->
         MX.roomAllowed Nothing r === True,
       testCase "toolsFor: a room absent from the map is unconstrained, one present is restricted" $ do
-        let cfg = (MX.defaultMatrixConfig "hs" "@b:hs") {MX.mcRoomTools = Map.singleton "!ops" ["obs_start", "schedule_list"]}
+        let cfg = (MX.defaultMatrixConfig "hs" "@b:hs") {MX.mcRoomTools = Map.singleton (rid "!ops") ["obs_start", "schedule_list"]}
         MX.toolsFor cfg "!dev" "@a:hs" @?= Nothing
         MX.toolsFor cfg "!ops" "@a:hs" @?= Just ["obs_start", "schedule_list"],
       testCase "toolsFor: room ∩ user, so a member cannot exceed the room's grant" $ do
         let cfg =
               (MX.defaultMatrixConfig "hs" "@b:hs")
-                { MX.mcRoomTools = Map.singleton "!bcast" ["obs_start", "server_shutdown"],
-                  MX.mcUserTools = Map.singleton "@rian:hs" ["obs_start", "schedule_list"]
+                { MX.mcRoomTools = Map.singleton (rid "!bcast") ["obs_start", "server_shutdown"],
+                  MX.mcUserTools = Map.singleton (uid "@rian:hs") ["obs_start", "schedule_list"]
                 }
         MX.toolsFor cfg "!bcast" "@rian:hs" @?= Just ["obs_start"]
         MX.toolsFor cfg "!bcast" "@david:hs" @?= Just ["obs_start", "server_shutdown"],
-      testProperty "toolsFor returns the room∩user intersection, a subset of both" $ \rs us ->
-        let cfg = (MX.defaultMatrixConfig "hs" "@b:hs") {MX.mcRoomTools = Map.singleton "r" rs, MX.mcUserTools = Map.singleton "u" us}
-         in case MX.toolsFor cfg "r" "u" of
+      testProperty "toolsFor returns the room∩user intersection, a subset of both" $ \rs0 us0 ->
+        let rs = map ToolName rs0
+            us = map ToolName us0
+            cfg =
+              (MX.defaultMatrixConfig "hs" "@b:hs")
+                { MX.mcRoomTools = Map.singleton (rid "!r:hs") rs,
+                  MX.mcUserTools = Map.singleton (uid "@u:hs") us
+                }
+         in case MX.toolsFor cfg "!r:hs" "@u:hs" of
               Just ts -> counterexample (show ts) (all (`elem` rs) ts && all (`elem` us) ts && ts == filter (`elem` us) rs)
               Nothing -> counterexample "expected Just" False
     ]
@@ -2309,56 +2318,174 @@ logTests =
         assertBool "info < debug, error < info" (LogError < LogInfo && LogInfo < LogDebug)
     ]
 
+-- | The domain vocabulary: the parsers are the only way these values enter the program, so their
+-- totality and round-trips are worth pinning down.
+domainTests :: TestTree
+domainTests =
+  testGroup
+    "domain vocabulary"
+    [ testProperty "every ProviderId round-trips through its wire spelling" $
+        forAll (elements allProviders) $ \p ->
+          parseProviderId (renderProviderId p) === Just p,
+      testProperty "provider parsing is case- and space-insensitive" $
+        forAll (elements allProviders) $ \p ->
+          parseProviderId ("  " <> T.toUpper (renderProviderId p) <> " ") === Just p,
+      testCase "an unknown provider is Nothing, never a default" $ do
+        parseProviderId "anthropi" @?= Nothing
+        parseProviderId "" @?= Nothing
+        parseProviderId "openai" @?= Nothing,
+      testCase "the help string is generated from the type, so it cannot drift" $
+        providerIdList @?= "anthropic|google|xai|xai-grpc|claude-cli",
+      testProperty "mkPort accepts exactly 1..65535" $ \(n :: Integer) ->
+        isJust (mkPort n) === (n > 0 && n <= 65535),
+      testProperty "a port round-trips through its rendering" $
+        forAll (choose (1, 65535 :: Integer)) $ \n ->
+          (mkPort n >>= parsePort . renderPort) === mkPort n,
+      testCase "parsePort rejects non-numeric and out-of-range text" $ do
+        parsePort "8080x" @?= Nothing
+        parsePort "-1" @?= Nothing
+        parsePort "65536" @?= Nothing
+        parsePort "0" @?= Nothing,
+      testProperty "ModelRef round-trips through provider:model" $
+        forAll (elements allProviders) $ \p ->
+          parseModelRef (renderModelRef (ModelRef p "m-1")) === Right (ModelRef p "m-1"),
+      testCase "a ModelRef without a colon or model is an error, not a guess" $ do
+        assertBool "no colon" (isLeft (parseModelRef "anthropic"))
+        assertBool "empty model" (isLeft (parseModelRef "anthropic:"))
+        assertBool "bad provider" (isLeft (parseModelRef "openai:gpt")),
+      testCase "an MCP target classifies once, at parse time" $ do
+        fmap msTarget (parseMcpSpec "fs: npx -y srv .") @?= Right (McpStdio "npx -y srv .")
+        fmap msTarget (parseMcpSpec "d: https://m.example/sse")
+          @?= Right (McpHttp (fromJust (mkUrl "https://m.example/sse")))
+        assertBool "no separator" (isLeft (parseMcpSpec "nolabel")),
+      testCase "Matrix identifiers require their sigil" $ do
+        fmap unRoomId (mkRoomId "!ops:hs") @?= Just "!ops:hs"
+        fmap unRoomId (mkRoomId "#alias:hs") @?= Just "#alias:hs"
+        mkRoomId "ops:hs" @?= Nothing
+        fmap unMatrixUserId (mkMatrixUserId "@bob:hs") @?= Just "@bob:hs"
+        mkMatrixUserId "bob:hs" @?= Nothing,
+      testCase "a cron expression renders back to the five-field form" $
+        renderCronExpr (everyMinute {ceMinute = "*/30", ceHour = "9-17", ceDayOfWeek = "1-5"})
+          @?= "*/30 9-17 * * 1-5",
+      -- Capabilities were five positional Bools; the type-level declaration is the fix.
+      testCase "type-level capability declaration matches the value-level set" $ do
+        declare @'[ 'PromptCaching, 'Vision] @?= capabilitySet [PromptCaching, Vision]
+        declare @'[] @?= noCapabilities
+        allCapabilities @?= capabilitySet [minBound .. maxBound],
+      testCase "capability predicates read off the declared set" $ do
+        let caps = declare @'[ 'PromptCaching, 'ExtendedThinking]
+        promptCaching caps @?= True
+        extendedThinking caps @?= True
+        vision caps @?= False
+    ]
+
 configTests :: TestTree
 configTests =
   testGroup
     "Dhall config"
-    [ testCase "a partial config merges over all-None defaults" $ withTmp "config" $ \dir -> do
-        let f = dir </> "c.dhall"
-        TIO.writeFile f "{ provider = Some \"google\", serve = Some 8080 }"
+    [ testCase "a partial config merges over the schema's defaults" $ withSchema "config" $ \dir -> do
+        f <- writeCfg dir "{ provider = Some L.Provider.Google, serve = Some 8080 }"
         fc <- loadConfig f
-        provider fc @?= Just "google"
-        serve fc @?= Just 8080
+        provider fc @?= Just Google
+        serve fc @?= mkPort 8080
         model fc @?= Nothing
         maxTokens fc @?= Nothing,
-      testCase "an empty config is all defaults" $ withTmp "config2" $ \dir -> do
-        let f = dir </> "c.dhall"
-        TIO.writeFile f "{=}"
+      testCase "an empty config is all defaults" $ withSchema "config2" $ \dir -> do
+        f <- writeCfg dir "{=}"
         fc <- loadConfig f
         fc @?= defaultConfig,
-      -- The Matrix permission maps are the reason the file has to be able to reach the gateway at
-      -- all: with them unset every sender gets the whole registry in every room, silently.
-      testCase "the Matrix tool maps decode from Dhall's assoc-list encoding" $ withTmp "config3" $ \dir -> do
-        let f = dir </> "c.dhall"
-        TIO.writeFile
-          f
-          "{ matrixRoomTools = Some (toMap { `!ops:hs` = [\"obs_start\", \"schedule_list\"] })\n\
-          \, matrixUserTools = Some (toMap { `@rian:hs` = [\"obs_start\"] })\n\
-          \, persona = Some \"/etc/lavoisier/PERSONA.md\"\n\
-          \, scheduleRetryMax = Some 3, scheduleRetryWait = Some 60 }"
+      -- The whole point of the union: a misspelled provider is caught by Dhall at load, with the
+      -- valid alternatives named, instead of travelling to the provider factory as a Text.
+      testCase "a misspelled provider is a load error, not a runtime one" $ withSchema "config3" $ \dir -> do
+        f <- writeCfg dir "{ provider = Some L.Provider.Anthropi }"
+        r <- try (loadConfig f) :: IO (Either SomeException FileConfig)
+        assertBool "typo must fail at load" (isLeft r),
+      testCase "a bare string where a union is expected is a load error" $ withSchema "config4" $ \dir -> do
+        f <- writeCfg dir "{ provider = Some \"anthropic\" }"
+        r <- try (loadConfig f) :: IO (Either SomeException FileConfig)
+        assertBool "stringly config must fail at load" (isLeft r),
+      -- Dhall cannot express this bound (assert type-checks a lambda body with the argument still
+      -- abstract), so the decoder enforces it. It must still fail at load, not at bind time.
+      testCase "an out-of-range port is rejected by the decoder" $ withSchema "config5" $ \dir -> do
+        f <- writeCfg dir "{ serve = Some 99999 }"
+        r <- try (loadConfig f) :: IO (Either SomeException FileConfig)
+        assertBool "port > 65535 must fail at load" (isLeft r),
+      testCase "port 0 is rejected too" $ withSchema "config6" $ \dir -> do
+        f <- writeCfg dir "{ serve = Some 0 }"
+        r <- try (loadConfig f) :: IO (Either SomeException FileConfig)
+        assertBool "port 0 must fail at load" (isLeft r),
+      -- provider:model used to be a packed string re-parsed in three places.
+      testCase "legion debaters decode as provider-qualified models" $ withSchema "config7" $ \dir -> do
+        f <-
+          writeCfg
+            dir
+            "{ legionDebaters = Some [ L.ModelRef::{ provider = L.Provider.Anthropic, model = \"claude-sonnet-4-5\" }\n\
+            \                        , L.ModelRef::{ provider = L.Provider.Google, model = \"gemini-2.5-flash\" } ] }"
         fc <- loadConfig f
-        matrixRoomTools fc @?= Just (Map.fromList [("!ops:hs", ["obs_start", "schedule_list"])])
-        matrixUserTools fc @?= Just (Map.fromList [("@rian:hs", ["obs_start"])])
+        legionDebaters fc
+          @?= Just [ModelRef Anthropic "claude-sonnet-4-5", ModelRef Google "gemini-2.5-flash"],
+      -- The stdio/HTTP choice is stated in the config now, not sniffed at connect time.
+      testCase "mcp targets carry their transport" $ withSchema "config8" $ \dir -> do
+        f <-
+          writeCfg
+            dir
+            "{ mcpServers = Some [ L.Mcp::{ label = \"fs\", target = L.McpTarget.Stdio \"npx -y srv .\" }\n\
+            \                    , L.Mcp::{ label = \"d\", target = L.McpTarget.Http \"https://m.example/sse\" } ] }"
+        fc <- loadConfig f
+        fmap (map msTarget) (mcpServers fc)
+          @?= Just [McpStdio "npx -y srv .", McpHttp (fromJust (mkUrl "https://m.example/sse"))],
+      testCase "an http target that isn't a URL is a load error" $ withSchema "config9" $ \dir -> do
+        f <- writeCfg dir "{ mcpServers = Some [ L.Mcp::{ label = \"d\", target = L.McpTarget.Http \"nope\" } ] }"
+        r <- try (loadConfig f) :: IO (Either SomeException FileConfig)
+        assertBool "non-URL http target must fail at load" (isLeft r),
+      -- The cron schedule and the prompt are separate fields now; no whitespace split to misjudge.
+      testCase "cron jobs keep the schedule and the prompt apart" $ withSchema "configA" $ \dir -> do
+        f <-
+          writeCfg
+            dir
+            "{ cron = Some [ L.CronJob::{ schedule = L.Schedule::{ minute = \"*/30\", hour = \"9-17\" }\n\
+            \                          , prompt = \"2 checks then report\" } ] }"
+        fc <- loadConfig f
+        fmap (map (renderCronExpr . csSchedule)) (cron fc) @?= Just ["*/30 9-17 * * *"]
+        -- A prompt starting with a digit used to be able to shift the field boundary.
+        fmap (map csPrompt) (cron fc) @?= Just ["2 checks then report"],
+      testCase "the Matrix tool grants decode with checked subjects" $ withSchema "configB" $ \dir -> do
+        f <-
+          writeCfg
+            dir
+            "{ matrixRoomTools = Some [ { subject = \"!ops:hs\", tools = [\"obs_start\", \"schedule_list\"] } ]\n\
+            \, matrixUserTools = Some [ { subject = \"@rian:hs\", tools = [\"obs_start\"] } ]\n\
+            \, persona = Some \"/etc/lavoisier/PERSONA.md\"\n\
+            \, scheduleRetryMax = Some 3, scheduleRetryWait = Some 60 }"
+        fc <- loadConfig f
+        fmap (map (unRoomId . tgSubject)) (matrixRoomTools fc) @?= Just ["!ops:hs"]
+        fmap (map tgTools) (matrixRoomTools fc) @?= Just [["obs_start", "schedule_list"]]
+        fmap (map (unMatrixUserId . tgSubject)) (matrixUserTools fc) @?= Just ["@rian:hs"]
         persona fc @?= Just "/etc/lavoisier/PERSONA.md"
-        scheduleRetryMax fc @?= Just 3
-        scheduleRetryWait fc @?= Just 60,
+        scheduleRetryMax fc @?= Just (RetryCount 3)
+        scheduleRetryWait fc @?= Just (Seconds 60),
+      -- A room id without its sigil is not a room id.
+      testCase "a malformed Matrix subject is a load error" $ withSchema "configC" $ \dir -> do
+        f <- writeCfg dir "{ matrixRoomTools = Some [ { subject = \"ops:hs\", tools = [\"x\"] } ] }"
+        r <- try (loadConfig f) :: IO (Either SomeException FileConfig)
+        assertBool "sigil-less room id must fail at load" (isLeft r),
       testCase "applyConfig writes them onto Options (the file is their only source)" $ do
         let fc =
               defaultConfig
-                { matrixRoomTools = Just (Map.fromList [("!ops:hs", ["obs_start"])]),
-                  matrixUserTools = Just (Map.fromList [("@rian:hs", ["obs_start"])]),
+                { matrixRoomTools = Just [ToolGrant (fromJust (mkRoomId "!ops:hs")) ["obs_start"]],
+                  matrixUserTools = Just [ToolGrant (fromJust (mkMatrixUserId "@rian:hs")) ["obs_start"]],
                   persona = Just "/etc/lavoisier/PERSONA.md",
                   system = Just "custom",
-                  scheduleRetryMax = Just 3,
-                  scheduleRetryWait = Just 60
+                  scheduleRetryMax = Just (RetryCount 3),
+                  scheduleRetryWait = Just (Seconds 60)
                 }
             o = CLI.applyConfig fc bareOptions
-        CLI.optMatrixRoomTools o @?= Map.fromList [("!ops:hs", ["obs_start"])]
-        CLI.optMatrixUserTools o @?= Map.fromList [("@rian:hs", ["obs_start"])]
+        map tgTools (CLI.optMatrixRoomTools o) @?= [["obs_start"]]
+        map tgTools (CLI.optMatrixUserTools o) @?= [["obs_start"]]
         CLI.optPersona o @?= Just "/etc/lavoisier/PERSONA.md"
         CLI.optSystem o @?= Just "custom"
-        CLI.optScheduleRetryMax o @?= Just 3
-        CLI.optScheduleRetryWait o @?= Just 60,
+        CLI.optScheduleRetryMax o @?= Just (RetryCount 3)
+        CLI.optScheduleRetryWait o @?= Just (Seconds 60),
       testCase "a CLI --persona wins over the file" $ do
         let o = CLI.applyConfig defaultConfig {persona = Just "from-file"} bareOptions {CLI.optPersona = Just "from-flag"}
         CLI.optPersona o @?= Just "from-flag",
@@ -2587,8 +2714,8 @@ tuneTests =
           assertBool "batch" (Tn.batchWidth k >= 1 && Tn.batchWidth k <= 8),
       testCase "profiles are isolated by the caching confounder" $ do
         t <- learningTuner (TuneConfig {epsilon = 0, successTarget = 0.9, minTrials = 2, decay = 1})
-        let cached = tnCtx {Tn.tcCaps = noCapabilities {promptCaching = True}}
-            uncached = tnCtx {Tn.tcCaps = noCapabilities {promptCaching = False}}
+        let cached = tnCtx {Tn.tcCaps = capabilitySet [PromptCaching]}
+            uncached = tnCtx {Tn.tcCaps = noCapabilities}
             cheaper = Tn.defaultKnobs {Tn.batchWidth = 8}
         replicateM_ 2 (Tn.tunerObserve t cached cheaper (outc 500 True))
         Tn.tunerSelect t uncached >>= (@?= Tn.defaultKnobs)
@@ -2786,11 +2913,11 @@ scriptedProv reply usage failing =
 
 -- A debater whose every call yields `reply` and 10 output tokens.
 debaterD :: Text -> Text -> Debater
-debaterD name reply = mkDebater name (scriptedProv reply (MkUsage 0 10 0 0) False) (name <> "-model") Nothing
+debaterD name reply = mkDebater name (scriptedProv reply (MkUsage 0 10 0 0) False) (ModelId (name <> "-model")) Nothing
 
 -- A debater whose every call errors.
 failingD :: Text -> Debater
-failingD name = mkDebater name (scriptedProv "" emptyUsage True) (name <> "-model") Nothing
+failingD name = mkDebater name (scriptedProv "" emptyUsage True) (ModelId (name <> "-model")) Nothing
 
 -- A provider that records every system prompt it streams under, then replies with a fixed text.
 capturingProv :: IORef [Text] -> Text -> Provider
@@ -3341,8 +3468,8 @@ matrixTests =
       testCase "toolsFor intersects room and user permissions" $ do
         let cfg =
               (MX.defaultMatrixConfig "https://hs" "@bot:hs")
-                { MX.mcRoomTools = Map.fromList [("!r:hs", ["read_file", "shell", "write_file"])],
-                  MX.mcUserTools = Map.fromList [("@alice:hs", ["read_file", "shell"])]
+                { MX.mcRoomTools = Map.fromList [(rid "!r:hs", ["read_file", "shell", "write_file"])],
+                  MX.mcUserTools = Map.fromList [(uid "@alice:hs", ["read_file", "shell"])]
                 }
         MX.toolsFor cfg "!r:hs" "@alice:hs" @?= Just ["read_file", "shell"] -- intersection
         MX.toolsFor cfg "!r:hs" "@bob:hs" @?= Just ["read_file", "shell", "write_file"] -- room only
@@ -3354,16 +3481,40 @@ matrixTests =
         MX.parseNextBatch sync @?= Right "tok"
         assertBool "no next_batch is an error" (isLeftE (MX.parseNextBatch (object []))),
       testCase "languageFromLocale selects Korean only for ko_KR" $ do
-        MX.languageFromLocale "ko_KR.UTF-8" @?= MX.Korean
-        MX.languageFromLocale "KO_kr" @?= MX.Korean
-        MX.languageFromLocale "en_US.UTF-8" @?= MX.English
-        MX.languageFromLocale "" @?= MX.English
+        languageFromLocale "ko_KR.UTF-8" @?= Korean
+        languageFromLocale "KO_kr" @?= Korean
+        languageFromLocale "en_US.UTF-8" @?= English
+        languageFromLocale "" @?= English
     ]
   where
     t = id :: Text -> Text
     isLeftE = either (const True) (const False)
 
 -- Run an action in a fresh temp directory, cleaned up afterwards.
+
+-- | A temp dir with the repo's @schema.dhall@ copied in, so a config written there can
+-- @let L = ./schema.dhall@ exactly the way a user's does. 'loadConfig' resolves relative imports
+-- against the config file's own directory, which is what makes that work.
+-- | Checked-identifier shorthands for tests. There is no 'IsString' for 'RoomId' on purpose: the
+-- sigil is checked once, in 'mkRoomId', so a literal cannot smuggle a malformed id in.
+rid :: Text -> RoomId
+rid = fromJust . mkRoomId
+
+uid :: Text -> MatrixUserId
+uid = fromJust . mkMatrixUserId
+
+withSchema :: String -> (FilePath -> IO a) -> IO a
+withSchema name k = withTmp name $ \dir -> do
+  copyFile "schema.dhall" (dir </> "schema.dhall")
+  k dir
+
+-- | Write a config body that imports the schema, and return its path.
+writeCfg :: FilePath -> Text -> IO FilePath
+writeCfg dir body = do
+  let f = dir </> "c.dhall"
+  TIO.writeFile f ("let L = ./schema.dhall in L.Config::" <> body)
+  pure f
+
 withTmp :: String -> (FilePath -> IO a) -> IO a
 withTmp name k = do
   base <- getTemporaryDirectory

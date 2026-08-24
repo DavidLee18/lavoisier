@@ -1,66 +1,77 @@
--- Example Dhall config for `lav` (the Haskell port uses Dhall, not TOML).
---
--- Copy to `lavoisier.dhall` (auto-loaded from the working dir) or pass `--config <PATH>`.
--- Every field is optional: this record is merged over an all-`None` defaults record, so you only
--- need to write the fields you want to set. An explicit CLI flag always wins over the file.
--- Dhall type-checks the file at load, so a typo or wrong type is a clear error.
+{-  Example Dhall config for `lav`.
 
-{ provider = Some "anthropic" -- "anthropic" | "google"
-, model = None Text -- e.g. Some "claude-sonnet-4-5" / Some "gemini-2.5-flash"
-, thinking = None Text -- "off" | "low" | "medium" | "high"
-, maxTokens = None Natural -- generated-token ceiling
-, maxSteps = Some 12 -- agent tool-loop step budget
-, contextLimit = None Natural -- per-request token ceiling; evict oldest tool output when exceeded
-, cheapModel = None Text -- cheaper model for the first escalateAfter round-trips
-, escalateAfter = None Natural -- round-trips on cheapModel before escalating (default 2)
-, advisorModel = None Text -- smarter model for a one-shot planning pre-pass
-, budget = None Natural -- whole-task cost-weighted token budget; stop when exceeded
-, noProgressLimit = None Natural -- hard-stop after 2N edit-free round-trips (nudge at N)
-, verifyCmd = None Text -- shell command that verifies the task (exit 0 = pass)
-, requireEdit = None Bool -- nudge a finish that edited nothing
-, verifyAndFix = None Bool -- on a would-be finish, if verifyCmd fails, feed it back and keep working
-, inLoopVerify = None Bool -- stop as soon as an edit turn makes verifyCmd pass
-, summaryModel = None Text -- cheaper model for history-compaction summaries
-, budgetAwareness = None Bool -- append a progress/token note to each turn
-, persona = None Text -- Some "/etc/lavoisier/PERSONA.md": persona/standing instructions layered
-    -- ABOVE the operating instructions (it does not replace them), and inside the cached prefix.
-    -- Unset ⇒ ./PERSONA.md is auto-loaded when present (--no-persona opts out).
-, system = None Text -- replace the built-in operating instructions outright (persona still layers above)
-, serve = None Natural -- HTTP gateway port (POST /v1/turns, GET /health)
-, serveA2a = None Natural -- A2A gateway port
-, acp = None Bool -- Zed Agent Client Protocol agent over stdio (run `lav --acp` from an editor)
-, tui = None Bool -- Some True launches the interactive inline terminal UI (scrollback-native REPL)
-, tuiAutoApprove = None Bool -- Some True skips the TUI tool-approval prompts (default: reads auto, mutations ask)
-, serveSlack = None Bool -- Some True serves over Slack Socket Mode (needs SLACK_APP_TOKEN + SLACK_BOT_TOKEN)
-, serveMatrix = None Bool -- Some True serves over Matrix (needs MATRIX_HOMESERVER + MATRIX_USER + token/password)
--- Per-room / per-member Matrix tool permissions. No env equivalent — this file is the only way to
--- set them, and leaving them unset means every allowed sender gets the WHOLE tool registry in every
--- room they can reach. A room/user absent from a map is unconstrained; when both apply the effective
--- set is their INTERSECTION. `toMap` turns a record into the assoc list the decoder wants.
-, matrixRoomTools =
-    None (List { mapKey : Text, mapValue : List Text })
-    -- e.g. Some (toMap { `!ops:hs` = [ "shell", "read_file" ], `!general:hs` = [ "read_file" ] })
-, matrixUserTools =
-    None (List { mapKey : Text, mapValue : List Text })
-    -- e.g. Some (toMap { `@bob:hs` = [ "read_file", "read_files" ] })
-, sessionDir = None Text -- durable session store dir (else in-memory)
-, mcpServers = -- external MCP servers whose tools are exposed to the agent (--agent / --serve*)
-    Some [ "fs: npx -y @modelcontextprotocol/server-filesystem ." ]
-    -- each entry is "label: target"; target is a stdio command or an http(s):// URL.
-    -- tools are namespaced <label>_<tool>. None (List Text) to set none.
-, tune = None Bool -- Some True enables the ATO learner (ε-greedy knob tuning)
-, tuneBayes = None Bool -- Some True uses the Bayesian (Thompson) learner instead of ε-greedy
-, tuneState = None Text -- Some "path" to load/persist learned ATO profiles as JSON
-, legionDebaters = -- the council pre-pass: ≥2 "provider:model" debaters draft→critique→judge a plan
-    None (List Text) -- e.g. Some [ "anthropic:claude-sonnet-4-5", "google:gemini-2.5-flash" ]
-, legionJudge = None Text -- Some "provider:model" for the judge (default: the first debater)
-, legionRounds = None Natural -- critique rounds after the draft (default 1; 0 = draft then judge)
-, lang = None Text -- locale for council progress notices (only ko_KR selects Korean)
-, cron = -- cron jobs: 5 schedule fields then a prompt (fires TurnRequests on a UTC schedule)
-    None (List Text) -- e.g. Some [ "*/30 9-17 * * 1-5 check CI and report failures" ]
-, cronFile = None Text -- Some "path" to a JSON file of {schedule,session?,prompt,retry_max?,retry_wait?}
-, cronRetryMax = None Natural -- global default retries after a failed cron fire (default 0)
-, cronRetryWait = None Natural -- global default seconds between cron retries (default 0)
-, scheduleRetryMax = None Natural -- global default retries after a failed --schedule-file fire (default 0)
-, scheduleRetryWait = None Natural -- global default seconds between schedule retries (default 0)
-}
+    Copy to `lavoisier.dhall` (auto-loaded from the working dir) or pass `--config <PATH>`.
+    Every field is optional — `Config::{ … }` fills the rest with `None`, so write only what you
+    want to set. An explicit CLI flag always wins over the file.
+
+    Everything enumerable is a union, so `provider = Some L.Provider.Anthropi` is a type error at
+    load listing the valid alternatives, rather than a runtime failure inside the provider factory.
+-}
+let L = ./schema.dhall
+
+in  L.Config::{
+    , provider = Some L.Provider.Anthropic
+    , model = Some "claude-sonnet-4-5"
+    , thinking = Some L.Thinking.Medium
+    , maxSteps = Some 12
+
+    -- Cost controls. `budget` is the whole-task cost-weighted token ceiling.
+    , budget = Some 400000
+    , cheapModel = Some "claude-haiku-4-5"
+    , escalateAfter = Some 2
+
+    -- Accuracy levers are opt-in; the default posture is efficiency-first.
+    , requireEdit = Some True
+    , verifyCmd = Some "cabal build && cabal test"
+    , verifyAndFix = Some True
+
+    -- Gateways. Ports are Naturals; the decoder rejects 0 and >65535 by name.
+    , serve = Some 8080
+    , serveA2a = Some 8081
+    , logLevel = Some L.LogLevel.Info
+
+    -- MCP servers: the stdio-vs-HTTP choice is stated, not sniffed from the string.
+    , mcpServers = Some
+      [ L.Mcp::{
+        , label = "fs"
+        , target = L.McpTarget.Stdio "npx -y @modelcontextprotocol/server-filesystem ."
+        }
+      , L.Mcp::{ label = "docs", target = L.McpTarget.Http "https://mcp.example.org/sse" }
+      ]
+
+    -- The council pre-pass: >=2 debaters draft -> critique -> judge a plan.
+    , legionDebaters = Some
+      [ L.ModelRef::{ provider = L.Provider.Anthropic, model = "claude-sonnet-4-5" }
+      , L.ModelRef::{ provider = L.Provider.Google, model = "gemini-2.5-flash" }
+      ]
+    , legionJudge = Some L.ModelRef::{
+      , provider = L.Provider.Anthropic
+      , model = "claude-sonnet-4-5"
+      }
+    , legionRounds = Some 1
+    , lang = Some L.Language.Korean
+
+    -- Fallback chain: rerouted to when the primary errors before streaming any output.
+    , fallback = Some
+      [ L.ModelRef::{ provider = L.Provider.Google, model = "gemini-2.5-flash" } ]
+    , fallbackCooldown = Some 60
+
+    -- Cron: the schedule fields are named, and the prompt is its own field.
+    , cron = Some
+      [ L.CronJob::{
+        , schedule = L.Schedule::{ minute = "*/30", hour = "9-17", dayOfWeek = "1-5" }
+        , prompt = "check CI and report failures"
+        }
+      , L.CronJob::{ schedule = L.dailyAt 9, prompt = "summarise yesterday's commits" }
+      ]
+
+    -- Matrix per-room / per-member tool permissions. Absent = unconstrained; when both apply the
+    -- effective set is their INTERSECTION.
+    , serveMatrix = Some True
+    , matrixRoomTools = Some
+      [ { subject = "!ops:hs", tools = [ "shell", "read_file" ] }
+      , { subject = "!general:hs", tools = [ "read_file" ] }
+      ]
+    , matrixUserTools = Some
+      [ { subject = "@bob:hs", tools = [ "read_file", "read_files" ] } ]
+    }

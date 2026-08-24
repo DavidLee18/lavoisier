@@ -14,7 +14,6 @@ module Lavoisier.Legion
   ( Debater (..),
     mkDebater,
     Language (..),
-    languageFromLocale,
     LegionError (..),
     renderLegionError,
     Panel,
@@ -32,6 +31,7 @@ import Data.Maybe (isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word32)
+import Lavoisier.Domain (Language (..), ModelId (..))
 import Lavoisier.Protocol.Deliberate
 import Lavoisier.Protocol.Event (Event (..), Usage, accumulateUsage, emptyUsage)
 import Lavoisier.Protocol.Message
@@ -83,24 +83,17 @@ legionJudgeSystem =
 data Debater = Debater
   { debName :: Text,
     debProvider :: Provider,
-    debModel :: Text,
+    debModel :: ModelId,
     debThinking :: Maybe ThinkingLevel
   }
 
 -- | Construct a debater from its parts.
-mkDebater :: Text -> Provider -> Text -> Maybe ThinkingLevel -> Debater
+mkDebater :: Text -> Provider -> ModelId -> Maybe ThinkingLevel -> Debater
 mkDebater = Debater
 
--- | The natural language the council's user-visible progress notices render in. Only the phase
--- notices localize — the debate transcript and the executor's answer are unaffected.
-data Language = English | Korean
-  deriving stock (Eq, Show)
-
--- | Resolve a POSIX locale string (a @LANG@ value like @ko_KR.UTF-8@, or a @--lang@ flag) to a
--- 'Language'. Only @KO_KR@ (case-insensitive, any @.encoding@ suffix ignored) selects Korean.
-languageFromLocale :: Text -> Language
-languageFromLocale raw =
-  if T.toUpper (T.takeWhile (/= '.') raw) == "KO_KR" then Korean else English
+-- 'Language' and 'languageFromLocale' now live in "Lavoisier.Domain": this module and
+-- "Lavoisier.Gateway.Matrix" each used to declare an identical copy of both, so a change to the
+-- locale rule had to be made twice and nothing checked that it was.
 
 councilConvened :: Language -> Int -> Text
 councilConvened English n = "🧠 council convened — " <> tshow n <> " debaters drafting…"
@@ -245,7 +238,7 @@ ask deb system user maxTok = do
 renderPositions :: [Debater] -> [Maybe Text] -> Text
 renderPositions debs positions =
   T.concat
-    ["### " <> debName d <> " (" <> debModel d <> ")\n" <> T.strip t <> "\n\n" | (d, Just t) <- zip debs positions]
+    ["### " <> debName d <> " (" <> unModelId (debModel d) <> ")\n" <> T.strip t <> "\n\n" | (d, Just t) <- zip debs positions]
 
 -- | Render the executor's context into a grounding block appended to every phase's system prompt —
 -- the fix for a council that argues in a vacuum: it tells the debaters __who they are__ (the agent's

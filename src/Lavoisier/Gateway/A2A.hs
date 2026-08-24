@@ -26,6 +26,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient)
 import Data.Vector qualified as V
+import Lavoisier.Domain (Port, unPort)
 import Lavoisier.Protocol.Agent (AgentError, AgentHandle (..), TurnStream, turnRequest)
 import Lavoisier.Protocol.Event (Event (..))
 import Lavoisier.Protocol.Gateway (Gateway (..), GatewayError (..))
@@ -70,13 +71,13 @@ newA2aApp cfg agent = do
   pure (a2aApp st)
 
 -- | The 'Gateway' record: bind and serve with warp.
-a2aGateway :: Int -> A2aConfig -> Gateway
+a2aGateway :: Port -> A2aConfig -> Gateway
 a2aGateway port cfg =
   Gateway
     { gatewayName = "a2a",
       gatewayServe = \agent -> do
         app <- newA2aApp cfg agent
-        r <- try (run port app) :: IO (Either SomeException ())
+        r <- try (run (fromIntegral (unPort port)) app) :: IO (Either SomeException ())
         pure $ case r of
           Left e -> Left (GEBind (T.pack (show e)))
           Right () -> Right ()

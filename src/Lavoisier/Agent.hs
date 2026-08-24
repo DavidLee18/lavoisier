@@ -53,6 +53,7 @@ import Data.Vector qualified as V
 import Data.Word (Word32, Word64)
 import GHC.Clock (getMonotonicTime)
 import Lavoisier.Context.Tokens (estimateTokens)
+import Lavoisier.Domain (ModelId (..), ToolName (..))
 import Lavoisier.Protocol.Agent
 import Lavoisier.Protocol.Deliberate
   ( Deliberation (..),
@@ -82,7 +83,7 @@ import System.Process.Typed (nullStream, proc, readProcess, runProcess, setStder
 
 -- | The tool-loop configuration.
 data AgentConfig = AgentConfig
-  { acModel :: Text,
+  { acModel :: ModelId,
     acMaxSteps :: Int,
     acMaxTokens :: Word32,
     acThinking :: Maybe ThinkingLevel,
@@ -93,12 +94,12 @@ data AgentConfig = AgentConfig
     acContextLimit :: Maybe Int,
     -- | Cheaper model for the first 'acEscalateAfter' round-trips before escalating to 'acModel'
     -- (§8 cheap-model-first). 'Nothing' ⇒ every round-trip runs on 'acModel'. Primary only.
-    acCheapModel :: Maybe Text,
+    acCheapModel :: Maybe ModelId,
     -- | Round-trips to run on 'acCheapModel' before escalating (ignored when it is 'Nothing').
     acEscalateAfter :: Int,
     -- | Smarter model for a one-shot tool-less planning pre-pass that seeds the executor (§8).
     -- 'Nothing' ⇒ no advisor. Superseded by a legion council when one is installed.
-    acAdvisorModel :: Maybe Text,
+    acAdvisorModel :: Maybe ModelId,
     -- | Whole-task cost-weighted token budget (§6.4). When the running total exceeds it the turn
     -- ends with 'AEBudgetExceeded'. 'Nothing' ⇒ unbounded.
     acTokenBudget :: Maybe Word64,
@@ -116,7 +117,7 @@ data AgentConfig = AgentConfig
     -- | Stop as soon as an edit turn makes 'acVerifyCommand' pass (don't wait for the model).
     acInLoopVerify :: Bool,
     -- | Cheaper model for history-compaction summaries (§6.3 model tiering). 'Nothing' ⇒ 'acModel'.
-    acSummaryModel :: Maybe Text,
+    acSummaryModel :: Maybe ModelId,
     -- | Append a "[progress: turn X\/Y, ~Nk tokens]" note to each turn's tool results, so the model
     -- can see how close it is to the step\/budget ceilings.
     acBudgetAwareness :: Bool,
@@ -128,7 +129,7 @@ data AgentConfig = AgentConfig
 -- | Sensible defaults: 12 steps, 4096 max tokens, no forced thinking, the default system prompt, no
 -- context-eviction ceiling, no cheap\/advisor model (escalate-after 2), unbounded budget, no
 -- no-progress breaker.
-defaultAgentConfig :: Text -> AgentConfig
+defaultAgentConfig :: ModelId -> AgentConfig
 defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing Nothing Nothing 2 Nothing Nothing Nothing Nothing False False False Nothing False False
 
 -- | A per-position __circuit breaker__ for the fallback chain, shared across turns so a dead model
@@ -206,7 +207,7 @@ data Agent = Agent
     -- | Ordered @(provider, model)@ fallback chain for an unresponsive\/erroring primary. Empty by
     -- default. Within a turn the cursor only advances (a failed model is skipped for the rest of the
     -- turn); across turns 'agBreaker' demotes a failed position for a cooldown.
-    agFallbacks :: [(Provider, Text)],
+    agFallbacks :: [(Provider, ModelId)],
     -- | Cross-turn circuit breaker over the chain, sized @1 + length agFallbacks@.
     agBreaker :: CircuitBreaker,
     -- | Optional __tool-approval gate__ consulted immediately before each tool invocation. An
@@ -225,7 +226,7 @@ mkAgent prov tools cfg tuner delib = do
 -- | Install an ordered fallback chain of @(provider, model)@ pairs with the given cooldown (seconds).
 -- Sizes a fresh 'CircuitBreaker' to @1 + length chain@. An empty chain leaves the agent unchanged in
 -- effect (the breaker's extra slots are simply unused).
-withFallbacks :: [(Provider, Text)] -> Double -> Agent -> IO Agent
+withFallbacks :: [(Provider, ModelId)] -> Double -> Agent -> IO Agent
 withFallbacks chain cooldown agent = do
   breaker <- newCircuitBreaker (1 + length chain) cooldown
   pure agent {agFallbacks = chain, agBreaker = breaker}
@@ -279,7 +280,7 @@ runAgent agent turn emit =
 -- | Apply a per-turn model override ('trModel'): it replaces the executor model and suppresses
 -- cheap-model-first for the turn, so the chosen model is used throughout. Within one provider (the
 -- primary); it does not select a different provider.
-applyModelOverride :: Maybe Text -> Agent -> Agent
+applyModelOverride :: Maybe ModelId -> Agent -> Agent
 applyModelOverride Nothing agent = agent
 applyModelOverride (Just m) agent =
   agent {agConfig = (agConfig agent) {acModel = m, acCheapModel = Nothing}}
@@ -290,7 +291,7 @@ applyModelOverride (Just m) agent =
 -- "Lavoisier.Memory").
 runLoopSeeded ::
   Agent ->
-  Maybe [Text] ->
+  Maybe [ToolName] ->
   [Message] ->
   (Event -> IO ()) ->
   IO (Either AgentError [Message])
@@ -364,7 +365,7 @@ runLoopSeeded agent allowed initial emit = do
 
     -- Cheap-model-first (§8) applies to the primary only: run 'acCheapModel' for the first
     -- 'acEscalateAfter' round-trips, then escalate to 'acModel'. Fallbacks name their model.
-    candidatesAt :: Int -> [(Provider, Text)]
+    candidatesAt :: Int -> [(Provider, ModelId)]
     candidatesAt step = (agProvider agent, primary) : agFallbacks agent
       where
         primary = case acCheapModel cfg of
@@ -470,8 +471,8 @@ runLoopSeeded agent allowed initial emit = do
     -- pre-token failure trips the breaker (demote for a cooldown) and a success resets it. Returns the
     -- (settled) cursor so it stays sticky across the turn's round-trips.
     attempt ::
-      [(Provider, Text)] ->
-      (Text -> ChatRequest) ->
+      [(Provider, ModelId)] ->
+      (ModelId -> ChatRequest) ->
       Int ->
       IO (Either AgentError (Text, [PendingCall], StopReason, Usage, Int))
     attempt cands buildReq = tryCursor
@@ -533,7 +534,7 @@ runLoopSeeded agent allowed initial emit = do
           case decision of
             Deny reason -> pure (i, "tool `" <> name <> "` denied: " <> reason, True, False)
             Allow -> do
-              r <- invokeTool name args (agTools agent)
+              r <- invokeTool (ToolName name) args (agTools agent)
               case r of
                 Left err -> pure (i, "tool error: " <> tshow err, True, False)
                 Right out -> do
@@ -569,8 +570,8 @@ taskContextFor agent task =
     { tcArchetype = classifyArchetype task,
       tcRepo = defaultRepoProfile,
       tcCaps = providerCapabilities (agProvider agent),
-      tcModel = tierOf (acModel (agConfig agent)),
-      tcModelId = acModel (agConfig agent),
+      tcModel = tierOf (unModelId (acModel (agConfig agent))),
+      tcModelId = unModelId (acModel (agConfig agent)),
       tcRepoId = ""
     }
 
@@ -587,13 +588,13 @@ tierOf m
   | any (`T.isInfixOf` m) ["opus", "heavy", "ultra"] = Deep
   | otherwise = Balanced
 
-filterDefs :: Maybe [Text] -> [ToolDef] -> [ToolDef]
+filterDefs :: Maybe [ToolName] -> [ToolDef] -> [ToolDef]
 filterDefs Nothing ds = ds
-filterDefs (Just names) ds = [d | d <- ds, tdName d `elem` names]
+filterDefs (Just names) ds = [d | d <- ds, ToolName (tdName d) `elem` names]
 
-isAllowed :: Maybe [Text] -> Text -> Bool
+isAllowed :: Maybe [ToolName] -> Text -> Bool
 isAllowed Nothing _ = True
-isAllowed (Just names) n = n `elem` names
+isAllowed (Just names) n = ToolName n `elem` names
 
 appendJson :: Text -> Text -> [PendingCall] -> [PendingCall]
 appendJson i j = map (\(ci, cn, cj) -> if ci == i then (ci, cn, cj <> j) else (ci, cn, cj))

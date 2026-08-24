@@ -14,6 +14,7 @@ module Lavoisier.Gateway.Cron
   ( CronJob (..),
     CronConfigError (..),
     parseCliJob,
+    jobFromSpec,
     loadFileJobs,
     cronGateway,
   )
@@ -28,6 +29,7 @@ import Data.Text qualified as T
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Dhall qualified
 import GHC.Generics (Generic)
+import Lavoisier.Domain qualified as D
 import Lavoisier.Protocol.Agent (AgentHandle (..), turnRequest)
 import Lavoisier.Protocol.Gateway (Gateway (..), GatewayError)
 import Lavoisier.Protocol.Stream (Producer (..))
@@ -61,6 +63,23 @@ data CronConfigError
 -- | Parse a quick CLI spec: the first __five__ whitespace-separated tokens are the cron schedule, the
 -- remainder is the prompt. @index@ seeds the default session id (@cron-\<index\>@). @retryMax@\/
 -- @retryWait@ are the global retry defaults (a quick spec carries no inline retry policy).
+-- | Build a job from an already-structured 'D.CronJobSpec'. The schedule fields and the prompt
+-- arrive separately, so there is no whitespace split to get wrong — the flag reader and the Dhall
+-- config both produce this shape.
+jobFromSpec :: D.CronJobSpec -> Int -> D.RetryCount -> D.Seconds -> Either CronConfigError CronJob
+jobFromSpec spec index rmax rwait =
+  case parseCron (D.renderCronExpr (D.csSchedule spec)) of
+    Left e -> Left (CCECron e)
+    Right sched ->
+      Right
+        CronJob
+          { cjSchedule = sched,
+            cjSession = maybe ("cron-" <> tshow index) D.unSessionId (D.csSession spec),
+            cjPrompt = D.csPrompt spec,
+            cjRetryMax = fromIntegral (D.unRetryCount (fromMaybe rmax (D.csRetryMax spec))),
+            cjRetryWait = fromIntegral (D.unSeconds (fromMaybe rwait (D.csRetryWait spec)))
+          }
+
 parseCliJob :: Text -> Int -> Int -> Int -> Either CronConfigError CronJob
 parseCliJob spec index retryMax retryWait =
   case T.words spec of

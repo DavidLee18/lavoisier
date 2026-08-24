@@ -1,3 +1,6 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE DataKinds #-}
+
 -- | The 'Provider' contract: stream a chat turn as normalised 'Event's, declare 'Capabilities', and
 -- optionally count tokens. Ported from Rust @lvz-protocol@ @provider.rs@.
 --
@@ -5,34 +8,107 @@
 -- value — the idiomatic Haskell equivalent of a trait object. Each adapter (Anthropic, xAI, Google,
 -- claude-cli) constructs one.
 module Lavoisier.Protocol.Provider
-  ( Capabilities (..),
+  ( Capability (..),
+    Capabilities,
+    Declares,
+    declare,
+    capabilitySet,
+    supports,
+    allCapabilities,
     noCapabilities,
+    promptCaching,
+    extendedThinking,
+    parallelToolUse,
+    serverSideTools,
+    vision,
     ProviderError (..),
     EventStream,
     Provider (..),
   )
 where
 
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Word (Word64)
 import Lavoisier.Protocol.Event (Event)
 import Lavoisier.Protocol.Message (ChatRequest)
 import Lavoisier.Protocol.Stream (Producer)
 
--- | Optional features a provider may support. The agent conditions behaviour on these — e.g. it
--- only attaches cache markers when 'promptCaching' is true.
-data Capabilities = Capabilities
-  { promptCaching :: Bool,
-    extendedThinking :: Bool,
-    parallelToolUse :: Bool,
-    serverSideTools :: Bool,
-    vision :: Bool
-  }
+-- | An optional feature a provider may support. The agent conditions behaviour on these — e.g. it
+-- only attaches cache markers when 'promptCaching' holds.
+data Capability
+  = PromptCaching
+  | ExtendedThinking
+  | ParallelToolUse
+  | ServerSideTools
+  | Vision
+  deriving stock (Eq, Ord, Show, Enum, Bounded)
+
+-- | What a provider supports. A /set/ of 'Capability', not a record of 'Bool': the record version
+-- was built positionally at every adapter (@Capabilities True True True True True@), so inserting
+-- or reordering a field silently re-labelled every provider\'s advertised features, and nothing in
+-- the type could catch it. The constructor is hidden — build one with 'declare' or 'capabilitySet'.
+newtype Capabilities = Capabilities (Set Capability)
   deriving stock (Eq, Show)
+
+-- | Declare capabilities at the __type level__, so the list is part of the adapter\'s signature and
+-- the value can only be derived from it:
+--
+-- > providerCapabilities = declare @'[ 'PromptCaching, 'ExtendedThinking, 'Vision]
+--
+-- There is no positional argument left to get wrong, and an unknown name is a type error naming
+-- the 'Capability' promoted constructor.
+class Declares (cs :: [Capability]) where
+  -- | The value-level set for the declared type-level list.
+  declare :: Capabilities
+
+instance Declares '[] where
+  declare = Capabilities Set.empty
+
+instance (KnownCapability c, Declares cs) => Declares (c ': cs) where
+  declare = insertCap (capabilityVal @c) (declare @cs)
+
+-- | Reflect one promoted 'Capability' constructor down to its value.
+class KnownCapability (c :: Capability) where
+  capabilityVal :: Capability
+
+instance KnownCapability 'PromptCaching where capabilityVal = PromptCaching
+
+instance KnownCapability 'ExtendedThinking where capabilityVal = ExtendedThinking
+
+instance KnownCapability 'ParallelToolUse where capabilityVal = ParallelToolUse
+
+instance KnownCapability 'ServerSideTools where capabilityVal = ServerSideTools
+
+instance KnownCapability 'Vision where capabilityVal = Vision
+
+insertCap :: Capability -> Capabilities -> Capabilities
+insertCap c (Capabilities s) = Capabilities (Set.insert c s)
+
+-- | Build capabilities from a value-level list (for tests and dynamic sources).
+capabilitySet :: [Capability] -> Capabilities
+capabilitySet = Capabilities . Set.fromList
+
+-- | Does the provider support this feature?
+supports :: Capability -> Capabilities -> Bool
+supports c (Capabilities s) = Set.member c s
 
 -- | No optional features (Rust @Capabilities::default()@).
 noCapabilities :: Capabilities
-noCapabilities = Capabilities False False False False False
+noCapabilities = Capabilities Set.empty
+
+-- | Every feature — derived from 'Bounded', so a new 'Capability' joins it automatically.
+allCapabilities :: Capabilities
+allCapabilities = Capabilities (Set.fromList [minBound .. maxBound])
+
+-- | Named predicates, kept so call sites read as before.
+promptCaching, extendedThinking, parallelToolUse, serverSideTools, vision :: Capabilities -> Bool
+promptCaching = supports PromptCaching
+extendedThinking = supports ExtendedThinking
+parallelToolUse = supports ParallelToolUse
+serverSideTools = supports ServerSideTools
+vision = supports Vision
 
 -- | Errors surfaced by a provider. Adapters map their transport\/API failures onto these.
 data ProviderError

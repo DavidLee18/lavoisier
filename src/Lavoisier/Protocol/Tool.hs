@@ -13,6 +13,7 @@ where
 
 import Data.Aeson (Value)
 import Data.Text (Text)
+import Lavoisier.Domain (ToolName)
 
 -- | The successful result of a tool invocation. 'toIsError' lets a tool report a recoverable,
 -- model-visible failure without aborting the turn; 'toChanged' records whether the workspace was
@@ -48,7 +49,7 @@ data ToolError
 
 -- | A capability the model can invoke, as a record of functions.
 data Tool = Tool
-  { toolName :: Text,
+  { toolName :: ToolName,
     toolDescription :: Text,
     toolSchema :: Value,
     toolInvoke :: Value -> IO (Either ToolError ToolOutput)

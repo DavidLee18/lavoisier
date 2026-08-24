@@ -1,3 +1,5 @@
+{-# LANGUAGE DataKinds #-}
+
 -- | The Google (Gemini) provider — the second concrete 'Provider', proving the abstraction
 -- generalises to a quite different API. Ported from Rust @lvz-google@ @lib.rs@: build the
 -- @generateContent@ request JSON from a normalised 'ChatRequest' (contents from messages incl.
@@ -27,6 +29,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Data.Vector qualified as V
 import Data.Word (Word32)
+import Lavoisier.Domain (ModelId (..))
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider
 import Lavoisier.Protocol.Stream (Producer (..))
@@ -71,7 +74,7 @@ googleProvider :: GoogleConfig -> Provider
 googleProvider cfg =
   Provider
     { providerStream = googleStream cfg,
-      providerCapabilities = Capabilities False True True True True,
+      providerCapabilities = declare @'[ 'ExtendedThinking, 'ParallelToolUse, 'ServerSideTools, 'Vision],
       -- Native countTokens exists but is deferred; the agent falls back to its own estimate.
       providerCountTokens = \_ -> pure (Right Nothing)
     }
@@ -82,7 +85,7 @@ googleStream :: GoogleConfig -> ChatRequest -> IO (Either ProviderError EventStr
 googleStream cfg req = do
   let body = encode (buildBody (gcReasoningFloor cfg) req)
       base = T.unpack (T.dropWhileEnd (== '/') (gcBaseUrl cfg))
-      url = base <> "/v1beta/models/" <> T.unpack (crModel req) <> ":streamGenerateContent?alt=sse"
+      url = base <> "/v1beta/models/" <> T.unpack (unModelId (crModel req)) <> ":streamGenerateContent?alt=sse"
   ereq0 <- try (parseRequest url) :: IO (Either SomeException Request)
   case ereq0 of
     Left e -> pure (Left (PConfig (T.pack (show e))))
@@ -160,7 +163,7 @@ buildBody reasoningFloor req =
     generation =
       kobj $
         concat
-          [ [("maxOutputTokens", toJSON (effectiveMaxOutput (crModel req) (crMaxTokens req) reasoningFloor))],
+          [ [("maxOutputTokens", toJSON (effectiveMaxOutput (unModelId (crModel req)) (crMaxTokens req) reasoningFloor))],
             [("temperature", toJSON x) | Just x <- [crTemperature req]],
             [("topP", toJSON x) | Just x <- [crTopP req]],
             [("topK", toJSON x) | Just x <- [crTopK req]],

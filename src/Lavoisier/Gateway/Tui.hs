@@ -52,6 +52,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
 import Data.Word (Word64)
+import Lavoisier.Domain (ModelId (..))
 import Lavoisier.Gateway.Tui.Gate
 import Lavoisier.Gateway.Tui.Md
 import Lavoisier.Gateway.Tui.Price (estimateUsd, fmtTokens, fmtUsd)
@@ -73,7 +74,7 @@ data TuiConfig = TuiConfig
   { -- | Session id conversations run under (so memory accrues across turns).
     tuiSession :: Text,
     -- | Model label shown in the footer, and the baseline @\/model@ resets to.
-    tuiModel :: Text,
+    tuiModel :: ModelId,
     -- | The approval-prompt receiver paired with a gate installed on the agent. Without it, no
     -- prompts appear (every tool runs unattended).
     tuiPermits :: Maybe Permits
@@ -135,7 +136,7 @@ data UiMsg
 -- | The interactive state: the input buffer, the current turn, streaming buffers, and running totals.
 data App = App
   { appSession :: Text,
-    appModel :: Text,
+    appModel :: ModelId,
     -- | The input buffer and the cursor's index into it (in characters).
     appInput :: Text,
     appCursor :: Int,
@@ -165,10 +166,10 @@ data App = App
     -- | Monotonic counter backing @\/new@ fresh-session ids (no clock\/rng needed).
     appSessionSeq :: Int,
     -- | The @\/model@ override for this session, if any (else the configured model is used).
-    appModelOverride :: Maybe Text
+    appModelOverride :: Maybe ModelId
   }
 
-newApp :: Text -> Text -> App
+newApp :: Text -> ModelId -> App
 newApp session model =
   App
     { appSession = session,
@@ -191,7 +192,7 @@ newApp session model =
     }
 
 -- | The model this session's turns run on: the @\/model@ override if set, else the configured one.
-activeModel :: App -> Text
+activeModel :: App -> ModelId
 activeModel app = fromMaybe (appModel app) (appModelOverride app)
 
 -- --- slash commands -------------------------------------------------------------------------------
@@ -349,14 +350,14 @@ dispatchCommand appRef app cmd = case parseCommand cmd of
     keep app {appSessionSeq = n, appSession = sid}
   CmdSession "" -> emitNotice ("session: " <> appSession app) >> keep app
   CmdSession sid -> emitNotice ("switched to session: " <> sid) >> keep app {appSession = sid}
-  CmdModel "" -> emitNotice ("model: " <> activeModel app) >> keep app
+  CmdModel "" -> emitNotice ("model: " <> unModelId (activeModel app)) >> keep app
   CmdModel m
     | m `elem` ["reset", "default"] -> do
-        emitNotice ("model reset to " <> appModel app)
+        emitNotice ("model reset to " <> unModelId (appModel app))
         keep app {appModelOverride = Nothing}
   CmdModel name -> do
     emitNotice ("model set to " <> name <> " (next turn)")
-    keep app {appModelOverride = Just name}
+    keep app {appModelOverride = Just (ModelId name)}
   CmdUnknown c -> emitNotice ("unknown command: /" <> c <> " (try /help)") >> keep app
   where
     keep a = writeIORef appRef a >> pure False
@@ -812,7 +813,7 @@ footerLine app =
   T.intercalate
     " · "
     [ appSession app,
-      model,
+      unModelId model,
       "↑" <> fmtTokens (inputTokens u) <> " ↓" <> fmtTokens (outputTokens u) <> cacheNote,
       spend
     ]

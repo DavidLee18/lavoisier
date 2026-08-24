@@ -58,7 +58,7 @@ import Data.Text (Text)
 import Data.Word (Word64)
 import GHC.Generics (Generic)
 import Lavoisier.Protocol.Message (ThinkingLevel (..))
-import Lavoisier.Protocol.Provider (Capabilities (..))
+import Lavoisier.Protocol.Provider (promptCaching)
 import Lavoisier.Protocol.Tune
 import System.Directory (doesFileExist)
 

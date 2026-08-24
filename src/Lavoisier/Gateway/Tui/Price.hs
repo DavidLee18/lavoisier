@@ -15,6 +15,7 @@ where
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word64)
+import Lavoisier.Domain (ModelId (..))
 import Lavoisier.Protocol.Event (Usage (..))
 import Numeric (showFFloat)
 
@@ -45,8 +46,8 @@ lookupPrice model
     has needle = needle `T.isInfixOf` m
 
 -- | Estimate the USD spent for @usage@ on @model@, or 'Nothing' if the model isn't in the table.
-estimateUsd :: Text -> Usage -> Maybe Double
-estimateUsd model usage = do
+estimateUsd :: ModelId -> Usage -> Maybe Double
+estimateUsd (ModelId model) usage = do
   p <- lookupPrice model
   pure $
     ( fromIntegral (inputTokens usage) * pInput p

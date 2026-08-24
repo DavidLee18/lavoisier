@@ -23,6 +23,7 @@ module Lavoisier.Mcp
     TransportSpec (..),
     McpServerSpec (..),
     parseServerSpec,
+    serverSpecOf,
     advertisedName,
 
     -- * Connecting
@@ -62,6 +63,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Data.Vector qualified as V
+import Lavoisier.Domain qualified as D
 import Lavoisier.Protocol.Tool
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS (tlsManagerSettings)
@@ -137,30 +139,26 @@ data McpServerSpec = McpServerSpec
   }
   deriving stock (Eq, Show)
 
--- | Parse a @label: target@ spec. The target is an @http(s):\/\/@ URL ⇒ 'HttpSpec', otherwise a
--- command line split on whitespace ⇒ 'StdioSpec'. Splitting on the __first__ @:@ keeps a @:\/\/@ URL
--- intact.
+-- | Build a transport spec from an already-parsed 'D.McpSpec'. The @label: target@ split and the
+-- stdio-vs-HTTP classification are 'D.parseMcpSpec'\'s job; all that is left here is splitting a
+-- stdio command line into argv, which is this module\'s business.
+serverSpecOf :: D.McpSpec -> Either McpError McpServerSpec
+serverSpecOf (D.McpSpec label target) = case target of
+  D.McpHttp url -> Right (McpServerSpec (D.unMcpLabel label) (HttpSpec (D.unUrl url)))
+  D.McpStdio cmd -> case T.words cmd of
+    [] -> Left (BadSpec (tshow cmd <> ": empty command"))
+    argv -> Right (McpServerSpec (D.unMcpLabel label) (StdioSpec argv))
+
+-- | Parse a @label: target@ spec. Kept as the text entry point; the split itself is shared with
+-- the config loader via 'D.parseMcpSpec' so the two cannot disagree about what a spec means.
 --
 -- >>> parseServerSpec "fs: npx -y server-filesystem ."
 -- >>> parseServerSpec "remote: https://mcp.example.com/"
 parseServerSpec :: Text -> Either McpError McpServerSpec
 parseServerSpec spec =
-  case T.breakOn ":" spec of
-    (_, "") -> Left (BadSpec (tshow spec <> ": expected `label: target`"))
-    (label0, rest) ->
-      let label = T.strip label0
-          target = T.strip (T.drop 1 rest)
-       in if T.null label
-            then Left (BadSpec (tshow spec <> ": empty label"))
-            else
-              if T.null target
-                then Left (BadSpec (tshow spec <> ": empty target"))
-                else
-                  if "http://" `T.isPrefixOf` target || "https://" `T.isPrefixOf` target
-                    then Right (McpServerSpec label (HttpSpec target))
-                    else case T.words target of
-                      [] -> Left (BadSpec (tshow spec <> ": empty command"))
-                      argv -> Right (McpServerSpec label (StdioSpec argv))
+  case D.parseMcpSpec spec of
+    Left e -> Left (BadSpec e)
+    Right d -> serverSpecOf d
 
 -- | Namespace a remote tool name under its server label (@\<label\>_\<tool\>@) so MCP tools never
 -- silently shadow a built-in, coercing it into the provider tool-name charset @^[A-Za-z0-9_-]{1,64}$@.
@@ -203,7 +201,7 @@ toTool :: McpClient -> Text -> RemoteTool -> Tool
 toTool client label rt =
   let advertised = advertisedName label (rtName rt)
    in Tool
-        { toolName = advertised,
+        { toolName = D.ToolName advertised,
           toolDescription = fromMaybe "" (rtDescription rt),
           toolSchema = fromMaybe (object ["type" .= ("object" :: Text)]) (rtSchema rt),
           toolInvoke = \args -> do

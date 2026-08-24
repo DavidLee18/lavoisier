@@ -24,7 +24,6 @@ module Lavoisier.Gateway.Matrix
     matrixScheduleGateway,
     ScheduleCtx (..),
     Language (..),
-    languageFromLocale,
     withLanguage,
 
     -- * Pure logic (exposed for testing)
@@ -68,6 +67,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8Lenient, encodeUtf8)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Vector qualified as V
+import Lavoisier.Domain (Language (..), MatrixUserId, RoomId, ToolName, mkMatrixUserId, mkRoomId)
 import Lavoisier.Log (logDebug, logInfo, logWarn)
 import Lavoisier.Protocol.Agent (AgentHandle (..), TurnRequest (..), TurnStream, turnRequest)
 import Lavoisier.Protocol.Event (Event (..))
@@ -105,9 +105,9 @@ data MatrixConfig = MatrixConfig
     -- | If set, only act in these rooms (conjunction with the sender allowlist).
     mcAllowedRooms :: Maybe (Set Text),
     -- | Per-room tool permission map (a room absent from the map is unconstrained).
-    mcRoomTools :: Map Text [Text],
+    mcRoomTools :: Map RoomId [ToolName],
     -- | Per-member tool permission map (intersected with the room's when both apply).
-    mcUserTools :: Map Text [Text],
+    mcUserTools :: Map MatrixUserId [ToolName],
     -- | Auto-accept room invites (@\/join@ each invited room).
     mcAutoJoin :: Bool,
     -- | Directory persisting @session.json@ (token + device id, so the device id is stable across
@@ -123,16 +123,8 @@ data MatrixConfig = MatrixConfig
     mcLanguage :: Language
   }
 
--- | UI language for notices this gateway authors itself — currently just the graceful-shutdown
--- notice. Inbound turns and the agent's replies are unaffected. Mirrors @lvz_gw_matrix::Language@.
-data Language = English | Korean
-  deriving stock (Eq, Show)
-
--- | Resolve a POSIX locale to a 'Language': only @ko_KR@ (case-insensitive, any @.encoding@ suffix
--- ignored) selects Korean; everything else is English.
-languageFromLocale :: Text -> Language
-languageFromLocale raw =
-  if T.toUpper (T.takeWhile (/= '.') raw) == "KO_KR" then Korean else English
+-- 'Language' and 'languageFromLocale' come from "Lavoisier.Domain"; this module used to declare
+-- its own identical copy of both.
 
 -- | Set the language for gateway-authored notices.
 withLanguage :: Language -> MatrixConfig -> MatrixConfig
@@ -208,7 +200,7 @@ matrixScheduleGateway cfg ctx =
 -- deterministically with no model round-trip).
 data ScheduleCtx = ScheduleCtx
   { scRegistry :: ScheduleRegistry,
-    scInvoke :: Text -> Value -> IO (Either ToolError ToolOutput)
+    scInvoke :: ToolName -> Value -> IO (Either ToolError ToolOutput)
   }
 
 -- --- runtime environment ---------------------------------------------------------------------------
@@ -1277,9 +1269,11 @@ roomAllowed (Just s) r = Set.member r s
 
 -- | The tool allowlist for a turn: the room's permissions ∩ the member's (a party absent from its
 -- map is unconstrained; 'Nothing' ⇒ no restriction).
-toolsFor :: MatrixConfig -> Text -> Text -> Maybe [Text]
+toolsFor :: MatrixConfig -> Text -> Text -> Maybe [ToolName]
 toolsFor cfg room sender =
-  case (Map.lookup room (mcRoomTools cfg), Map.lookup sender (mcUserTools cfg)) of
+  case ( mkRoomId room >>= (`Map.lookup` mcRoomTools cfg),
+         mkMatrixUserId sender >>= (`Map.lookup` mcUserTools cfg)
+       ) of
     (Nothing, Nothing) -> Nothing
     (Just r, Nothing) -> Just r
     (Nothing, Just u) -> Just u
