@@ -62,32 +62,80 @@ let Mcp/Type
 
 let Mcp = { Type = Mcp/Type, default = {=} }
 
-{-| The five cron fields, named. They used to share one string with the prompt, so
-    "*/30 9-17 * * 1-5 check CI" had to be split on whitespace and the split had to guess
-    where the schedule stopped and the prompt began.
+{-| One term of a cron field, before any step: `*`, a single value, or a range.
+
+    `Exactly` means two things depending on whether a step follows it, which is crontab's own
+    convention: `5` is the value 5, while `5/10` is 5 through the field's maximum in tens.
+-}
+let CronBase
+    : Type
+    = < Every | Exactly : Natural | Between : { from : Natural, to : Natural } >
+
+{-| One comma-separated term of a cron field. The step hangs off the base rather than wrapping
+    another term, so `*/2/3` cannot be written.
+-}
+let CronTerm/Type
+    : Type
+    = { base : CronBase, step : Optional Natural }
+
+let CronTerm =
+      { Type = CronTerm/Type
+      , default = { base = CronBase.Every, step = None Natural }
+      }
+
+-- | A whole cron field: one or more terms. `lav` range-checks each against the field it is in.
+let CronField
+    : Type
+    = List CronTerm/Type
+
+let every = CronTerm::{=}
+
+let everyN = \(n : Natural) -> CronTerm::{ step = Some n }
+
+let at = \(n : Natural) -> CronTerm::{ base = CronBase.Exactly n }
+
+let between =
+      \(a : Natural) ->
+      \(b : Natural) ->
+        CronTerm::{ base = CronBase.Between { from = a, to = b } }
+
+let from =
+      \(n : Natural) ->
+      \(step : Natural) ->
+        CronTerm::{ base = CronBase.Exactly n, step = Some step }
+
+{-| The five cron fields, named and typed. They used to share one string with the prompt, so
+    "*/30 9-17 * * 1-5 check CI" had to be split on whitespace and the split had to guess where
+    the schedule stopped and the prompt began. Naming the fields removed that guess; typing them
+    removes what was left, which was that each field was an unchecked string whose errors only
+    surfaced once a gateway started.
+
+    `*/30 9-17 * * 1-5` reads:
+      Schedule::{ minute = [ everyN 30 ], hour = [ between 9 17 ], dayOfWeek = [ between 1 5 ] }
 -}
 let Schedule/Type
     : Type
-    = { minute : Text
-      , hour : Text
-      , dayOfMonth : Text
-      , month : Text
-      , dayOfWeek : Text
+    = { minute : CronField
+      , hour : CronField
+      , dayOfMonth : CronField
+      , month : CronField
+      , dayOfWeek : CronField
       }
 
 let Schedule/default =
-      { minute = "*"
-      , hour = "*"
-      , dayOfMonth = "*"
-      , month = "*"
-      , dayOfWeek = "*"
+      { minute = [ every ]
+      , hour = [ every ]
+      , dayOfMonth = [ every ]
+      , month = [ every ]
+      , dayOfWeek = [ every ]
       }
 
 let Schedule = { Type = Schedule/Type, default = Schedule/default }
 
-let everyMinutes = \(n : Natural) -> Schedule/default // { minute = "*/${Natural/show n}" }
+let everyMinutes = \(n : Natural) -> Schedule/default // { minute = [ everyN n ] }
 
-let dailyAt = \(h : Natural) -> Schedule/default // { minute = "0", hour = Natural/show h }
+let dailyAt =
+      \(h : Natural) -> Schedule/default // { minute = [ at 0 ], hour = [ at h ] }
 
 let CronJob/Type
     : Type
@@ -153,6 +201,42 @@ let xSearch =
 {-| Per-room / per-member Matrix tool permissions. A room or user absent from the list is
     unconstrained; when both apply the effective set is their INTERSECTION.
 -}
+{-| What a scheduled job does when it fires. Was `tool` and `prompt` as two `Optional Text`
+    fields with a runtime check that exactly one was set; as a union, "both" and "neither" are
+    unrepresentable.
+
+    `args` stays a JSON object *string* deliberately: cron has a fixed grammar worth typing, but
+    tool arguments have no schema except the invoked tool's own.
+-}
+let Action
+    : Type
+    = < Prompt : Text | Tool : { name : Text, args : Optional Text } >
+
+-- | One entry of a `--schedule-file`: when, what, where to report, and the retry overrides.
+let ScheduleJob/Type
+    : Type
+    = { jobId : Text
+      , schedule : Schedule/Type
+      , action : Action
+      , room : Optional Text
+      , session : Optional Text
+      , summarize : Optional Text
+      , retryMax : Optional Natural
+      , retryWait : Optional Natural
+      }
+
+let ScheduleJob =
+      { Type = ScheduleJob/Type
+      , default =
+        { schedule = Schedule/default
+        , room = None Text
+        , session = None Text
+        , summarize = None Text
+        , retryMax = None Natural
+        , retryWait = None Natural
+        }
+      }
+
 let ToolGrant/Type
     : Type
     = { subject : Text, tools : List Text }
@@ -275,6 +359,15 @@ in  { Provider
     , McpTarget
     , Mcp
     , Mcp/Type
+    , CronBase
+    , CronTerm
+    , CronTerm/Type
+    , CronField
+    , every
+    , everyN
+    , at
+    , between
+    , from
     , Schedule
     , Schedule/Type
     , Schedule/default
@@ -282,6 +375,9 @@ in  { Provider
     , dailyAt
     , CronJob
     , CronJob/Type
+    , Action
+    , ScheduleJob
+    , ScheduleJob/Type
     , ToolGrant
     , ToolGrant/Type
     , Config

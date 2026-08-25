@@ -10,6 +10,9 @@ matches if __either__ matches (the Vixie-cron convention).
 module Lavoisier.Schedule.Cron (
     CronSchedule,
     CronError (..),
+    cronErrorText,
+    compileCron,
+    parseCronExpr,
     parseCron,
     nextAfter,
     nextAfterNow,
@@ -25,7 +28,20 @@ import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word64)
 import Text.Read (readMaybe)
 
+import Data.List.NonEmpty qualified as NE
 import Data.Text qualified as T
+
+import Lavoisier.Domain (
+    CronBase (..),
+    CronExpr,
+    CronFieldKind (..),
+    CronTerm (..),
+    cfKind,
+    cfTerms,
+    cronFieldBounds,
+    cronFields,
+    mkCronExpr,
+ )
 
 {- | A parsed cron schedule: five fields, each a bitset of permitted values plus a @star@ flag
 recording whether the field was an unrestricted @*@ (needed for the dom\/dow OR rule).
@@ -67,18 +83,89 @@ data Civil = Civil
     }
     deriving stock (Eq, Show)
 
--- | Parse a standard 5-field cron expression.
-parseCron ∷ Text → Either CronError CronSchedule
-parseCron expr =
+-- | A 'CronError' as the message a user sees, rather than its 'Show' output.
+cronErrorText ∷ CronError → Text
+cronErrorText = \case
+    CronFieldCount n →
+        "expected 5 whitespace-separated schedule fields, got " <> T.pack (show n)
+    CronFieldError field reason → field <> ": " <> reason
+
+{- | Compile a checked 'CronExpr' into the matching bitsets.
+
+__Total.__ Every value in a 'Lavoisier.Domain.CronField' was range-checked when the field was
+built, so there is nothing left here that can fail. That is the point of the ADT: a bad schedule
+is now a /config load/ error naming its field, and by the time a gateway starts there is no
+deferred failure left to report.
+-}
+compileCron ∷ CronExpr → CronSchedule
+compileCron e = case map field (cronFields e) of
+    [mi, ho, dm, mo, dw] → CronSchedule mi ho dm mo dw
+    -- 'cronFields' returns exactly five; this arm exists only to keep the match exhaustive.
+    _ → CronSchedule (star Minute) (star Hour) (star DayOfMonth) (star Month) (star DayOfWeek)
+    where
+        star k = compileField k [CronTerm EveryValue Nothing]
+        field f = compileField (cfKind f) (NE.toList (cfTerms f))
+
+-- | One field's terms → a bitset, plus the @*@ flag the dom\/dow OR rule needs.
+compileField ∷ CronFieldKind → [CronTerm] → Field
+compileField kind terms = Field (foldr ((.|.) . termMask) 0 terms) isStar
+    where
+        (lo0, hi0) = cronFieldBounds kind
+        isStar = case terms of
+            [CronTerm EveryValue Nothing] → True
+            _ → False
+
+        termMask t =
+            let step = maybe 1 id (ctStep t)
+                (lo, hi) = case ctBase t of
+                    EveryValue → (lo0, hi0)
+                    -- `N/step` means N through the maximum; a bare `N` is just N.
+                    Exactly n → (n, if ctStep t == Nothing then n else hi0)
+                    Between a b → (a, b)
+             in foldr ((.|.) . bit . fold) 0 [lo, lo + step .. hi]
+
+        -- Day-of-week accepts 7 for Sunday; fold it so the bitset stays 0-6.
+        fold v = if kind == DayOfWeek && v == 7 then 0 else v
+
+{- | Parse a standard 5-field cron string into a checked 'CronExpr'. This is the __string__ surface
+— the @--cron@ flag, and the crontab spelling people paste in from an existing crontab. The config
+file builds a 'CronExpr' directly from its named fields and never comes through here.
+-}
+parseCronExpr ∷ Text → Either CronError CronExpr
+parseCronExpr expr =
     case T.words expr of
-        [mi, ho, dm, mo, dw] →
-            CronSchedule
-                <$> parseField mi 0 59 False
-                <*> parseField ho 0 23 False
-                <*> parseField dm 1 31 False
-                <*> parseField mo 1 12 False
-                <*> parseField dw 0 6 True
+        [mi, ho, dm, mo, dw] → do
+            terms ← traverse parseTerms [mi, ho, dm, mo, dw]
+            case terms of
+                [a, b, c, d, e] →
+                    either (Left . CronFieldError expr) Right (mkCronExpr a b c d e)
+                _ → Left (CronFieldCount (length terms))
         fields → Left (CronFieldCount (length fields))
+
+-- | Parse one field's text into terms. Range checking is 'mkCronExpr'\'s job, not this one\'s.
+parseTerms ∷ Text → Either CronError [CronTerm]
+parseTerms field = traverse parsePart (T.splitOn "," field)
+    where
+        bad reason = Left (CronFieldError field reason)
+        num s reason = maybe (bad reason) Right (readMaybe (T.unpack s))
+
+        parsePart part = do
+            (range, step) ← case T.splitOn "/" part of
+                [r] → Right (r, Nothing)
+                [r, st] → (\n → (r, Just n)) <$> num st "step is not a number"
+                _ → bad "malformed step"
+            base ←
+                if range == "*"
+                    then Right EveryValue
+                    else case T.splitOn "-" range of
+                        [a, b] → Between <$> num a "range start is not a number" <*> num b "range end is not a number"
+                        [v] → Exactly <$> num v "value is not a number"
+                        _ → bad "malformed range"
+            Right (CronTerm base step)
+
+-- | Parse a cron string straight to a schedule — 'parseCronExpr' then 'compileCron'.
+parseCron ∷ Text → Either CronError CronSchedule
+parseCron = fmap compileCron . parseCronExpr
 
 {- | The next fire time (Unix seconds, aligned to a minute boundary) strictly __after__ @after@.
 'Nothing' if the schedule has no fire within ~4 years (e.g. Feb 30), so the caller can disable the
@@ -113,47 +200,6 @@ matchesSched s c =
             (True, False) → fMatches (csDow s) (cvDow c)
             -- Both restricted ⇒ OR (Vixie convention).
             (False, False) → fMatches (csDom s) (cvDom c) || fMatches (csDow s) (cvDow c)
-
--- | Parse one cron field into a bitset over @[lo0, hi0]@. @dow@ enables the @7 == Sunday@ alias.
-parseField ∷ Text → Int → Int → Bool → Either CronError Field
-parseField field lo0 hi0 dow = do
-    masks ← traverse parsePart (T.splitOn "," field)
-    pure (Field (foldr (.|.) 0 masks) (T.strip field == "*"))
-    where
-        bad reason = Left (CronFieldError field reason)
-        num s reason = maybe (bad reason) Right (readMaybe (T.unpack s))
-
-        parsePart part = do
-            (range, step, hasSlash) ← case T.splitOn "/" part of
-                [r] → Right (r, 1, False)
-                [r, s] → do
-                    st ← num s "step is not a number"
-                    if st <= 0 then bad "step must be >= 1" else Right (r, st, True)
-                _ → bad "malformed step"
-            (lo, hi) ←
-                if range == "*"
-                    then Right (lo0, hi0)
-                    else case T.splitOn "-" range of
-                        [a, b] → (,) <$> num a "range start is not a number" <*> num b "range end is not a number"
-                        [v] → do
-                            n ← num v "value is not a number"
-                            -- `N/step` means N through max; a bare `N` is just N.
-                            Right (if hasSlash then (n, hi0) else (n, n))
-                        _ → bad "malformed range"
-            if lo > hi
-                then bad "range start is greater than range end"
-                else buildMask lo hi step
-
-        buildMask lo hi step = go lo 0
-            where
-                go v acc
-                    | v > hi = Right acc
-                    | otherwise =
-                        -- dow allows 7 as an alias for Sunday (0); folding it makes 7 in-range.
-                        let val = if dow && v == 7 then 0 else v
-                         in if val < lo0 || val > hi0
-                                then bad "value out of range"
-                                else go (v + step) (acc .|. bit val)
 
 {- | Decompose a Unix-second instant into UTC wall-clock components (Howard Hinnant's days→civil
 algorithm — exact, no external date library). Valid for non-negative instants.

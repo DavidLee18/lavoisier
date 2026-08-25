@@ -345,12 +345,11 @@ in  L.Config::{
 `--agent` (tool loop) · `--serve <PORT>` (HTTP/WS gateway, all interfaces) · `--serve-matrix` (Matrix) ·
 `--serve-slack` (Slack Socket Mode) ·
 `--cron "<min hour dom month dow> <prompt>"` (in-process scheduler, UTC; repeatable) ·
-`--cron-file <path>` (a Dhall list of `{schedule, session, prompt, retryMax, retryWait}` — the
-`Optional` fields must still be present as `None`) ·
+`--cron-file <path>` (a Dhall `List L.CronJob/Type` — the same type the config's own `cron` field
+uses, so `L.CronJob::{ … }` fills in what you leave out) ·
 `--cron-retry-max <N>` / `--cron-retry-wait <SECS>` (retry a failed cron fire; per-job overridable) ·
-`--schedule-file <path>` (Matrix schedules: a Dhall list of
-`{jobId, schedule, room, session, tool, toolArgs, prompt, summarize, retryMax, retryWait}`, as
-above; requires `--serve-matrix`) ·
+`--schedule-file <path>` (Matrix schedules: a Dhall `List L.ScheduleJob/Type`, whose `action` is
+`L.Action.Prompt "…"` or `L.Action.Tool { name, args }`; requires `--serve-matrix`) ·
 `--schedule-retry-max <N>` / `--schedule-retry-wait <SECS>` (per-job overridable) ·
 `--provider anthropic|google|xai|xai-grpc|xai-responses|claude-cli` · `--model` · `--max-tokens` · `--max-steps` ·
 `--system` · `--persona <PATH>` / `--no-persona` (persona layered above the operating instructions;

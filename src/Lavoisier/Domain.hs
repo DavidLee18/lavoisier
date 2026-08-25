@@ -57,10 +57,24 @@ module Lavoisier.Domain (
     parseMcpSpec,
 
     -- * Cron
-    CronExpr (..),
+    CronFieldKind (..),
+    cronFieldName,
+    cronFieldBounds,
+    CronBase (..),
+    CronTerm (..),
+    CronField (cfKind, cfTerms),
+    mkCronField,
+    CronExpr (ceMinute, ceHour, ceDayOfMonth, ceMonth, ceDayOfWeek),
+    mkCronExpr,
     everyMinute,
+    cronFields,
     renderCronExpr,
+    renderCronField,
     CronJobSpec (..),
+
+    -- * Schedules
+    ScheduleAction (..),
+    ScheduleJobSpec (..),
 
     -- * Permissions
     ToolGrant (..),
@@ -73,11 +87,13 @@ where
 
 import Data.Char (isDigit)
 import Data.List (intercalate)
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.String (IsString)
 import Data.Text (Text)
 import Data.Word (Word16, Word32)
 import GHC.Generics (Generic)
 
+import Data.List.NonEmpty qualified as NE
 import Data.Text qualified as T
 
 -- ---------------------------------------------------------------------------
@@ -340,28 +356,164 @@ newtype RetryCount = RetryCount {unRetryCount ∷ Word32}
 -- Cron
 -- ---------------------------------------------------------------------------
 
-{- | The five cron fields, named. They used to share a single string with the prompt
-(@"*\/30 9-17 * * 1-5 check CI"@), so loading a job meant splitting on whitespace and /guessing/
-where the schedule stopped and the prose began — a prompt beginning with a digit was enough to
-shift the boundary. Separating them removes the guess.
+{- | Which of the five cron fields a term belongs to. It fixes the field's permitted range and
+names the field in load errors, and it travels /with/ the field so a field can never be built
+against the wrong bounds.
 -}
-data CronExpr = CronExpr
-    { ceMinute ∷ Text
-    , ceHour ∷ Text
-    , ceDayOfMonth ∷ Text
-    , ceMonth ∷ Text
-    , ceDayOfWeek ∷ Text
+data CronFieldKind
+    = Minute
+    | Hour
+    | DayOfMonth
+    | Month
+    | DayOfWeek
+    deriving stock (Bounded, Enum, Eq, Generic, Ord, Show)
+
+-- | The field's name as the config spells it, for load errors.
+cronFieldName ∷ CronFieldKind → Text
+cronFieldName = \case
+    Minute → "minute"
+    Hour → "hour"
+    DayOfMonth → "dayOfMonth"
+    Month → "month"
+    DayOfWeek → "dayOfWeek"
+
+{- | The inclusive range a field's values must fall in. Day-of-week admits @7@ as an alias for
+Sunday (@0@); the fold to @0@ happens when the expression is compiled, so a config that writes @7@
+still renders back as @7@.
+-}
+cronFieldBounds ∷ CronFieldKind → (Int, Int)
+cronFieldBounds = \case
+    Minute → (0, 59)
+    Hour → (0, 23)
+    DayOfMonth → (1, 31)
+    Month → (1, 12)
+    DayOfWeek → (0, 7)
+
+{- | The base of one term, before any step is applied.
+
+'Exactly' means two different things depending on whether a step follows it, which is crontab's
+convention rather than a wart of this encoding: @5@ is the single value 5, while @5\/10@ is 5
+through the field maximum in steps of ten.
+-}
+data CronBase
+    = -- | @*@
+      EveryValue
+    | -- | @N@ — or, under a step, @N@ through the field maximum.
+      Exactly Int
+    | -- | @A-B@
+      Between Int Int
+    deriving stock (Eq, Generic, Ord, Show)
+
+{- | One comma-separated term: a base, optionally stepped. The step hangs off the base rather than
+wrapping another term, so @*\/2\/3@ is unrepresentable.
+-}
+data CronTerm = CronTerm
+    { ctBase ∷ CronBase
+    , ctStep ∷ Maybe Int
+    }
+    deriving stock (Eq, Generic, Ord, Show)
+
+{- | One whole cron field: its kind, and a non-empty list of terms whose every value has been
+checked against that kind's range.
+
+The constructor is hidden and 'mkCronExpr' is the only thing that calls it, so a 'CronField' is
+evidence that its contents are in range — which is what lets
+'Lavoisier.Schedule.Cron.compileCron' be total.
+-}
+data CronField = CronField
+    { cfKind ∷ CronFieldKind
+    , cfTerms ∷ NonEmpty CronTerm
     }
     deriving stock (Eq, Generic, Show)
 
+{- | Check a list of terms against a kind's range. 'Left' names the field and the offending value,
+ready to be reported as a config load error.
+-}
+mkCronField ∷ CronFieldKind → [CronTerm] → Either Text CronField
+mkCronField kind terms = case NE.nonEmpty terms of
+    Nothing → Left (label <> ": a cron field needs at least one term")
+    Just ne → CronField kind <$> traverse checkTerm ne
+    where
+        (lo, hi) = cronFieldBounds kind
+        label = cronFieldName kind
+
+        inRange v
+            | v < lo || v > hi =
+                Left (label <> ": " <> tshow v <> " is out of range " <> tshow lo <> "-" <> tshow hi)
+            | otherwise = Right v
+
+        checkTerm t = do
+            base ← case ctBase t of
+                EveryValue → Right EveryValue
+                Exactly n → Exactly <$> inRange n
+                Between a b → do
+                    a' ← inRange a
+                    b' ← inRange b
+                    if a' > b'
+                        then Left (label <> ": range start " <> tshow a' <> " is greater than its end " <> tshow b')
+                        else Right (Between a' b')
+            step ← case ctStep t of
+                Nothing → Right Nothing
+                Just s
+                    | s < 1 → Left (label <> ": a step must be at least 1, not " <> tshow s)
+                    | otherwise → Right (Just s)
+            Right (CronTerm base step)
+
+{- | The five cron fields, named and range-checked.
+
+They used to share a single string with the prompt (@"*\/30 9-17 * * 1-5 check CI"@), so loading a
+job meant splitting on whitespace and /guessing/ where the schedule stopped and the prose began — a
+prompt beginning with a digit was enough to shift the boundary. Naming the fields removed that
+guess; typing them removes what was left, which was that each field was still an unchecked 'Text'
+whose errors surfaced when the /gateway started/ rather than when the config loaded.
+
+The constructor is hidden: 'mkCronExpr' takes the terms slot by slot and applies the right
+'CronFieldKind' to each, so a field cannot be built against the wrong bounds in the first place.
+-}
+data CronExpr = CronExpr
+    { ceMinute ∷ CronField
+    , ceHour ∷ CronField
+    , ceDayOfMonth ∷ CronField
+    , ceMonth ∷ CronField
+    , ceDayOfWeek ∷ CronField
+    }
+    deriving stock (Eq, Generic, Show)
+
+{- | Build an expression from the terms of each field, in cron's own order. Every field is checked
+against its own bounds and the __first__ failure is returned, naming that field.
+-}
+mkCronExpr ∷ [CronTerm] → [CronTerm] → [CronTerm] → [CronTerm] → [CronTerm] → Either Text CronExpr
+mkCronExpr mi ho dom mo dow =
+    CronExpr
+        <$> mkCronField Minute mi
+        <*> mkCronField Hour ho
+        <*> mkCronField DayOfMonth dom
+        <*> mkCronField Month mo
+        <*> mkCronField DayOfWeek dow
+
 -- | @* * * * *@ — every minute; the base the other fields are overridden onto.
 everyMinute ∷ CronExpr
-everyMinute = CronExpr "*" "*" "*" "*" "*"
+everyMinute = CronExpr (star Minute) (star Hour) (star DayOfMonth) (star Month) (star DayOfWeek)
+    where
+        star k = CronField k (CronTerm EveryValue Nothing :| [])
 
--- | Render back to the space-separated five-field form the schedule engine parses.
+-- | The five fields in cron's order.
+cronFields ∷ CronExpr → [CronField]
+cronFields e = [ceMinute e, ceHour e, ceDayOfMonth e, ceMonth e, ceDayOfWeek e]
+
+-- | Render back to the space-separated five-field crontab form, which round-trips.
 renderCronExpr ∷ CronExpr → Text
-renderCronExpr CronExpr {..} =
-    T.unwords [ceMinute, ceHour, ceDayOfMonth, ceMonth, ceDayOfWeek]
+renderCronExpr = T.unwords . map renderCronField . cronFields
+
+-- | Render one field: its terms, comma-separated.
+renderCronField ∷ CronField → Text
+renderCronField = T.intercalate "," . map term . NE.toList . cfTerms
+    where
+        term t = base (ctBase t) <> maybe "" (\s → "/" <> tshow s) (ctStep t)
+        base = \case
+            EveryValue → "*"
+            Exactly n → tshow n
+            Between a b → tshow a <> "-" <> tshow b
 
 -- | A cron job: when, what, and the optional per-job session and retry overrides.
 data CronJobSpec = CronJobSpec
@@ -370,6 +522,38 @@ data CronJobSpec = CronJobSpec
     , csSession ∷ Maybe SessionId
     , csRetryMax ∷ Maybe RetryCount
     , csRetryWait ∷ Maybe Seconds
+    }
+    deriving stock (Eq, Generic, Show)
+
+-- ---------------------------------------------------------------------------
+-- Schedules
+-- ---------------------------------------------------------------------------
+
+{- | What a scheduled job does when it fires. Was a pair of @Optional Text@ fields (@tool@ and
+@prompt@) with a runtime check that exactly one was set; as a union, "both" and "neither" are
+unrepresentable.
+
+The tool arguments stay a JSON object /string/ deliberately. Cron has a fixed grammar worth
+typing; tool arguments have no schema but the invoked tool's own, so a union here would be
+inventing one.
+-}
+data ScheduleAction
+    = -- | Fire a prompt and let the agent choose its tools.
+      SAPrompt Text
+    | -- | Invoke one tool directly, with its arguments as a JSON object string.
+      SATool ToolName (Maybe Text)
+    deriving stock (Eq, Generic, Show)
+
+-- | One entry of a @--schedule-file@: when, what, where to report, and the retry overrides.
+data ScheduleJobSpec = ScheduleJobSpec
+    { sjsId ∷ Text
+    , sjsSchedule ∷ CronExpr
+    , sjsAction ∷ ScheduleAction
+    , sjsRoom ∷ Maybe RoomId
+    , sjsSession ∷ Maybe SessionId
+    , sjsSummarize ∷ Maybe Text
+    , sjsRetryMax ∷ Maybe RetryCount
+    , sjsRetryWait ∷ Maybe Seconds
     }
     deriving stock (Eq, Generic, Show)
 
@@ -385,3 +569,7 @@ data ToolGrant subject = ToolGrant
     , tgTools ∷ [ToolName]
     }
     deriving stock (Eq, Generic, Show)
+
+-- | @show@ into 'Text', for the error messages above.
+tshow ∷ Show a ⇒ a → Text
+tshow = T.pack . show

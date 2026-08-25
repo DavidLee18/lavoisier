@@ -52,7 +52,7 @@ import Lavoisier.Context.Lang (Lang (..), LangSpec (..), langFromPath, langSpec)
 import Lavoisier.Context.Tokens (estimateTokens)
 import Lavoisier.Domain
 import Lavoisier.Gateway.A2A (defaultA2aConfig, newA2aApp)
-import Lavoisier.Gateway.Cron (CronConfigError (..), CronJob (..), loadFileJobs, parseCliJob)
+import Lavoisier.Gateway.Cron (CronConfigError (..), CronJob (..), jobFromSpec, parseCliJob)
 import Lavoisier.Gateway.Http (GatewayConfig (..), defaultGatewayConfig, httpApp, newHttpApp, stepWindow, wsAuthorized, wsPrincipal)
 import Lavoisier.Gateway.Slack (SlackMessage (..), parseEvent, senderAllowed, slackSession)
 import Lavoisier.Legion (Debater, LegionError (..), mkDebater, newPanel, panelDeliberator, withLanguage)
@@ -92,7 +92,7 @@ import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
 import Lavoisier.Provider.ClaudeCli (eofDecoder, initDecoder, pushLine, renderPrompt)
 import Lavoisier.Provider.Xai (buildMessages)
 import Lavoisier.Provider.Xai.ResponsesSse (initResp, respEof, respPush, serverToolItemName)
-import Lavoisier.Schedule.Cron (Civil (..), CronError (..), civilFromUnix, nextAfter, parseCron)
+import Lavoisier.Schedule.Cron (Civil (..), CronError (..), civilFromUnix, compileCron, nextAfter, parseCron, parseCronExpr)
 import Lavoisier.Tool.Batch (applyResponse, batchEditTool, stripCodeFence)
 import Lavoisier.Tool.Builtins
 import Lavoisier.Tool.Edit
@@ -102,6 +102,7 @@ import Lavoisier.Tune
 import Lavoisier.Tune.Bayes (asBayesTuner, bayesTuner, loadBayes, newBayesTuner, sampleBeta, saveBayes)
 
 import Lavoisier.CLI qualified as CLI
+import Lavoisier.Config qualified as Cfg
 import Lavoisier.Context.Anchor qualified as Anc
 import Lavoisier.Context.Budget qualified as Bud
 import Lavoisier.Context.Diff qualified as Dff
@@ -415,10 +416,10 @@ monadicProperties =
                     forAll (choose (0, 9)) $ \(rmax ∷ Int) →
                         forAll (choose (0, 300)) $ \(rwait ∷ Int) →
                             ioProperty $
-                                withTmp "cronqc" $ \dir → do
+                                withSchema "cronqc" $ \dir → do
                                     r ←
                                         loadCron dir 0 0 $
-                                            "[ c // { schedule = \"* * * * *\", session = Some \"" <> sess <> "\", prompt = \"" <> prm <> "\", retryMax = Some " <> tshow' rmax <> ", retryWait = Some " <> tshow' rwait <> " } ]"
+                                            "[ L.CronJob::{ session = Some \"" <> sess <> "\", prompt = \"" <> prm <> "\", retryMax = Some " <> tshow' rmax <> ", retryWait = Some " <> tshow' rwait <> " } ]"
                                     pure $ case r of
                                         Right [j] → (cjSession j === sess) .&&. (cjPrompt j === prm) .&&. (cjRetryMax j === rmax) .&&. (cjRetryWait j === rwait)
                                         other → counterexample (show (fmap (map cjSession) other)) False
@@ -2425,9 +2426,31 @@ domainTests =
             mkRoomId "ops:hs" @?= Nothing
             fmap unMatrixUserId (mkMatrixUserId "@bob:hs") @?= Just "@bob:hs"
             mkMatrixUserId "bob:hs" @?= Nothing
-        , testCase "a cron expression renders back to the five-field form" $
-            renderCronExpr (everyMinute {ceMinute = "*/30", ceHour = "9-17", ceDayOfWeek = "1-5"})
-                @?= "*/30 9-17 * * 1-5"
+        , testCase "a cron expression renders back to the five-field form" $ do
+            e ←
+                either (assertFailure . T.unpack) pure $
+                    mkCronExpr
+                        [CronTerm EveryValue (Just 30)]
+                        [CronTerm (Between 9 17) Nothing]
+                        [CronTerm EveryValue Nothing]
+                        [CronTerm EveryValue Nothing]
+                        [CronTerm (Between 1 5) Nothing]
+            renderCronExpr e @?= "*/30 9-17 * * 1-5"
+        , -- Each field carries its own bounds, so the error can name the field and the value.
+          testCase "a cron field is range-checked against the field it is in" $ do
+            let bad mi ho = mkCronExpr mi ho [] [] []
+            mkCronField Hour [CronTerm (Exactly 24) Nothing]
+                @?= Left "hour: 24 is out of range 0-23"
+            assertBool "minute 24" (isRight (mkCronField Minute [CronTerm (Exactly 24) Nothing]))
+            mkCronField Minute [] @?= Left "minute: a cron field needs at least one term"
+            mkCronField Minute [CronTerm EveryValue (Just 0)]
+                @?= Left "minute: a step must be at least 1, not 0"
+            mkCronField DayOfWeek [CronTerm (Between 5 1) Nothing]
+                @?= Left "dayOfWeek: range start 5 is greater than its end 1"
+            -- 7 is Sunday: in range for dayOfWeek, out of range for month.
+            assertBool "dow 7" (isRight (mkCronField DayOfWeek [CronTerm (Exactly 7) Nothing]))
+            assertBool "month 0" (isLeft (mkCronField Month [CronTerm (Exactly 0) Nothing]))
+            assertBool "empty minute" (isLeft (bad [] [CronTerm EveryValue Nothing]))
         , -- Capabilities were five positional Bools; the type-level declaration is the fix.
           testCase "type-level capability declaration matches the value-level set" $ do
             declare @'[ 'PromptCaching, 'Vision] @?= capabilitySet [PromptCaching, Vision]
@@ -2890,7 +2913,7 @@ configTests =
             f ←
                 writeCfg
                     dir
-                    "{ cron = Some [ L.CronJob::{ schedule = L.Schedule::{ minute = \"*/30\", hour = \"9-17\" }\n\
+                    "{ cron = Some [ L.CronJob::{ schedule = L.Schedule::{ minute = [ L.everyN 30 ], hour = [ L.between 9 17 ] }\n\
                     \                          , prompt = \"2 checks then report\" } ] }"
             fc ← loadConfig f
             fmap (map (renderCronExpr . csSchedule)) (cron fc) @?= Just ["*/30 9-17 * * *"]
@@ -3106,6 +3129,9 @@ argText msg = case objLookup "params" msg >>= objLookup "arguments" >>= objLooku
 isLeft ∷ Either a b → Bool
 isLeft (Left _) = True
 isLeft (Right _) = False
+
+isRight ∷ Either a b → Bool
+isRight = not . isLeft
 
 -- --- Phase 14: ATO tuner (offline; ε-greedy learner, ports lvz-tune tests) ------------------------
 
@@ -3527,39 +3553,38 @@ slackTests =
 
 -- --- Phase 18: cron engine + gateway (offline; ports lvz-schedule cron.rs + lvz-gw-cron) ----------
 
--- | Write a cron Dhall file (type @C@ + default record @c@ to merge over) and load it.
-loadCron ∷ FilePath → Int → Int → Text → IO (Either CronConfigError [CronJob])
+{- | Write a @--cron-file@ and load it the way the CLI does: the schema's own @CronJob@ type
+through the config decoder, then 'jobFromSpec'. Before 0.17.1 this file had its own flat shape
+with the schedule as a packed crontab string — the last one the typing pass had missed.
+-}
+loadCron ∷ FilePath → Int → Int → Text → IO (Either Text [CronJob])
 loadCron dir rmax rwait body = do
     let path = dir </> "cron.dhall"
-        preamble =
-            "let C = { schedule : Text, session : Optional Text, prompt : Text, retryMax : Optional Natural, retryWait : Optional Natural }\n"
-                <> "let c : C = { schedule = \"* * * * *\", session = None Text, prompt = \"\", retryMax = None Natural, retryWait = None Natural }\n"
-                <> "in "
-    TIO.writeFile path (preamble <> body)
-    loadFileJobs path rmax rwait
+    TIO.writeFile path ("let L = ./schema.dhall in " <> body)
+    especs ← Cfg.loadCronFile path
+    let dflt f n = f (fromIntegral n)
+    pure (map (\(i, spec) → jobFromSpec spec i (dflt RetryCount rmax) (dflt Seconds rwait)) . zip [0 ..] <$> especs)
 
-{- | Write a schedule Dhall file (with a type @J@ and an all-@None@ default record @d@ to merge over
-with @//@) and load it through the real Dhall loader.
+{- | Write a @--schedule-file@ and load it the way the CLI does: the schema's @ScheduleJob@ type
+through the config decoder, then 'Sch.jobsFromSpecs'.
 -}
 loadSched ∷ FilePath → Int → Integer → Text → IO (Either Sch.ScheduleConfigError [Sch.ScheduleJob])
 loadSched dir rmax rwait body = do
     let path = dir </> "sched.dhall"
-        preamble =
-            "let J = { jobId : Text, schedule : Text, room : Optional Text, session : Optional Text, tool : Optional Text, toolArgs : Optional Text, prompt : Optional Text, summarize : Optional Text, retryMax : Optional Natural, retryWait : Optional Natural }\n"
-                <> "let d : J = { jobId = \"\", schedule = \"* * * * *\", room = None Text, session = None Text, tool = None Text, toolArgs = None Text, prompt = None Text, summarize = None Text, retryMax = None Natural, retryWait = None Natural }\n"
-                <> "in "
-    TIO.writeFile path (preamble <> body)
-    Sch.loadScheduleFile path rmax rwait
+    TIO.writeFile path ("let L = ./schema.dhall in " <> body)
+    especs ← Cfg.loadScheduleFile path
+    specs ← either (assertFailure . T.unpack) pure especs
+    pure (Sch.jobsFromSpecs specs rmax rwait)
 
 scheduleTests ∷ TestTree
 scheduleTests =
     testGroup
         "schedule (jobs + registry + tools)"
-        [ testCase "loadScheduleFile builds tool + prompt jobs with defaults (Dhall)" $ withTmp "sch" $ \dir → do
+        [ testCase "loadScheduleFile builds tool + prompt jobs with defaults (Dhall)" $ withSchema "sch" $ \dir → do
             js ←
                 loadSched dir 2 30 $
-                    "[ d // { jobId = \"disk\", schedule = \"0 * * * *\", tool = Some \"shell\", toolArgs = Some \"{\\\"command\\\":\\\"df\\\"}\" }"
-                        <> ", d // { jobId = \"digest\", schedule = \"0 9 * * *\", prompt = Some \"summarize\" } ]"
+                    "[ L.ScheduleJob::{ jobId = \"disk\", schedule = L.Schedule::{ minute = [ L.at 0 ] }, action = L.Action.Tool { name = \"shell\", args = Some \"{\\\"command\\\":\\\"df\\\"}\" } }"
+                        <> ", L.ScheduleJob::{ jobId = \"digest\", schedule = L.dailyAt 9, action = L.Action.Prompt \"summarize\" } ]"
             js2 ← either (assertFailure . show) pure js
             map Sch.sjId js2 @?= ["disk", "digest"]
             case js2 of
@@ -3569,16 +3594,19 @@ scheduleTests =
                     Sch.sjRetryMax a @?= 2 -- global default applied
                     Sch.sjAction b @?= Sch.ActPrompt "summarize"
                 _ → assertFailure "expected two jobs"
-        , testCase "loadScheduleFile rejects ambiguous action / duplicate id / bad cron (Dhall)" $ withTmp "sch" $ \dir → do
-            let bad e body = loadSched dir 0 0 body >>= \r → case r of Left err | err == e → pure (); other → assertFailure ("expected " <> show e <> ", got " <> show (fmap (map Sch.sjId) other))
-            bad (Sch.SceAction "x") "[ d // { jobId = \"x\" } ]"
-            bad (Sch.SceDuplicateId "x") "[ d // { jobId = \"x\", tool = Some \"t\" }, d // { jobId = \"x\", prompt = Some \"p\" } ]"
-            r ← loadSched dir 0 0 "[ d // { jobId = \"x\", schedule = \"nonsense\", prompt = Some \"p\" } ]"
+        , {- A duplicate id is the *only* failure left. "Neither tool nor prompt" and "both" are
+          unrepresentable now the action is a union, and a bad schedule cannot reach here — it is
+          rejected when the file loads, by field name. -}
+          testCase "loadScheduleFile rejects a duplicate id (the only failure left)" $ withSchema "sch" $ \dir → do
+            r ←
+                loadSched dir 0 0 $
+                    "[ L.ScheduleJob::{ jobId = \"x\", action = L.Action.Prompt \"a\" }"
+                        <> ", L.ScheduleJob::{ jobId = \"x\", action = L.Action.Prompt \"b\" } ]"
             case r of
-                Left (Sch.SceCron "x" _) → pure ()
-                other → assertFailure ("expected SceCron, got " <> show (fmap (map Sch.sjId) other))
-        , testCase "recordOutcome tracks runs/failures/streak and retry scheduling" $ withTmp "sch" $ \dir → do
-            js ← either (assertFailure . show) pure =<< loadSched dir 0 0 "[ d // { jobId = \"j\", prompt = Some \"p\", retryMax = Some 1, retryWait = Some 60 } ]"
+                Left e → e @?= Sch.SceDuplicateId "x"
+                Right js → assertFailure ("expected a duplicate-id error, got " <> show (map Sch.sjId js))
+        , testCase "recordOutcome tracks runs/failures/streak and retry scheduling" $ withSchema "sch" $ \dir → do
+            js ← either (assertFailure . show) pure =<< loadSched dir 0 0 "[ L.ScheduleJob::{ jobId = \"j\", action = L.Action.Prompt \"p\", retryMax = Some 1, retryWait = Some 60 } ]"
             let j = js !! 0
             reg ← Sch.newRegistry 0 js
             r1 ← Sch.recordOutcome reg 100 j (Left "boom") -- attempt 1, retry (1<=1)
@@ -3596,8 +3624,8 @@ scheduleTests =
             r3 @?= Sch.FireRecord 1 Nothing False
             s3 ← maybe (assertFailure "no state") pure =<< Sch.stateOf reg "j"
             Sch.jsConsecutiveFailures s3 @?= 0
-        , testCase "reportBody keeps the failure structure outside the paraphrasable detail slot" $ withTmp "sch" $ \dir → do
-            js ← either (assertFailure . show) pure =<< loadSched dir 0 0 "[ d // { jobId = \"w\", prompt = Some \"p\", retryMax = Some 3, retryWait = Some 60 } ]"
+        , testCase "reportBody keeps the failure structure outside the paraphrasable detail slot" $ withSchema "sch" $ \dir → do
+            js ← either (assertFailure . show) pure =<< loadSched dir 0 0 "[ L.ScheduleJob::{ jobId = \"w\", action = L.Action.Prompt \"p\", retryMax = Some 3, retryWait = Some 60 } ]"
             let j = js !! 0
                 -- The prose a `summarize` turn produced, standing in for the raw error.
                 prose = "The wake FAILED: the power call was refused."
@@ -3615,8 +3643,8 @@ scheduleTests =
             -- A success that needed retries reports how many; a first-try success does not.
             Sch.reportBody j True "all good" (Sch.FireRecord 1 Nothing False) @?= "\9989 `w` \183 all good"
             Sch.reportBody j True "all good" (Sch.FireRecord 2 Nothing False) @?= "\9989 `w` (after 2 attempts) \183 all good"
-        , testCase "schedule_run queues a known job and errors on an unknown one" $ withTmp "sch" $ \dir → do
-            js ← either (assertFailure . show) pure =<< loadSched dir 0 0 "[ d // { jobId = \"j\", prompt = Some \"p\" } ]"
+        , testCase "schedule_run queues a known job and errors on an unknown one" $ withSchema "sch" $ \dir → do
+            js ← either (assertFailure . show) pure =<< loadSched dir 0 0 "[ L.ScheduleJob::{ jobId = \"j\", action = L.Action.Prompt \"p\" } ]"
             reg ← Sch.newRegistry 0 js
             let runTool = Sch.scheduleTools reg !! 2 -- list, status, run
             r1 ← toolInvoke runTool (object ["id" .= ("j" ∷ Text)])
@@ -3691,11 +3719,13 @@ cronTests =
             case parseCliJob "* * * * * ping" 0 3 30 of
                 Right j → (cjRetryMax j, cjRetryWait j) @?= (3, 30)
                 Left e → assertFailure (show e)
-        , testCase "cron-file (Dhall) reads jobs with session defaults" $ withTmp "cron" $ \dir → do
+        , -- The cron file now uses the schema's own CronJob type, the same one the config's
+          -- `cron` field uses; it used to be a separate flat record with a packed schedule string.
+          testCase "cron-file (Dhall) reads jobs with session defaults" $ withSchema "cron" $ \dir → do
             r ←
                 loadCron dir 0 0 $
-                    "[ c // { schedule = \"0 9 * * *\", session = Some \"digest\", prompt = \"morning digest\" }"
-                        <> ", c // { schedule = \"*/15 * * * *\", prompt = \"poll the queue\" } ]"
+                    "[ L.CronJob::{ schedule = L.dailyAt 9, session = Some \"digest\", prompt = \"morning digest\" }"
+                        <> ", L.CronJob::{ schedule = L.everyMinutes 15, prompt = \"poll the queue\" } ]"
             case r of
                 Right [j0, j1] → do
                     cjSession j0 @?= "digest"
@@ -3703,25 +3733,64 @@ cronTests =
                     cjPrompt j1 @?= "poll the queue"
                 Right _ → assertFailure "expected two jobs"
                 Left e → assertFailure (show e)
-        , testCase "cron-file (Dhall) per-job retry overrides the global default" $ withTmp "cron" $ \dir → do
+        , testCase "cron-file (Dhall) per-job retry overrides the global default" $ withSchema "cron" $ \dir → do
             r ←
                 loadCron dir 2 60 $
-                    "[ c // { schedule = \"0 9 * * *\", prompt = \"defaults\" }"
-                        <> ", c // { schedule = \"0 9 * * *\", prompt = \"override\", retryMax = Some 5, retryWait = Some 120 } ]"
+                    "[ L.CronJob::{ schedule = L.dailyAt 9, prompt = \"defaults\" }"
+                        <> ", L.CronJob::{ schedule = L.dailyAt 9, prompt = \"override\", retryMax = Some 5, retryWait = Some 120 } ]"
             case r of
                 Right [j0, j1] → do
                     (cjRetryMax j0, cjRetryWait j0) @?= (2, 60)
                     (cjRetryMax j1, cjRetryWait j1) @?= (5, 120)
                 Right _ → assertFailure "expected two jobs"
                 Left e → assertFailure (show e)
-        , testCase "cron-file (Dhall) surfaces a bad schedule" $ withTmp "cron" $ \dir → do
-            r ← loadCron dir 0 0 "[ c // { schedule = \"bad\", prompt = \"x\" } ]"
-            assertBool "bad schedule" (isLeftCfg r)
+        , -- An out-of-range field is a *load* error naming the field, not a gateway-start error.
+          testCase "cron-file (Dhall) rejects an out-of-range field by name" $ withSchema "cron" $ \dir → do
+            r ← loadCron dir 0 0 "[ L.CronJob::{ schedule = L.Schedule::{ hour = [ L.at 24 ] }, prompt = \"x\" } ]"
+            case r of
+                Left e → assertBool ("names the field: " <> T.unpack e) ("hour: 24 is out of range 0-23" `T.isInfixOf` e)
+                Right _ → assertFailure "an hour of 24 must not load"
+        , {- The crontab string is now one surface over the ADT rather than the representation, so
+          it has to round-trip: whatever the config expresses, `--cron` can express too. -}
+          testProperty "renderCronExpr round-trips through parseCronExpr" $
+            forAll genCronExpr $
+                \e → parseCronExpr (renderCronExpr e) === Right e
+        , testProperty "parseCron agrees with parseCronExpr then compileCron" $
+            forAll genCronExpr $ \e →
+                parseCron (renderCronExpr e) === Right (compileCron e)
         ]
     where
         parseOk e = either (assertFailure . ("bad cron: " <>) . show) pure (parseCron e)
         isLeftE = either (const True) (const False)
-        isLeftCfg = either (const True) (const False)
+
+{- | Generate a valid 'CronExpr': one to three terms per field, every value inside that field's own
+range so 'mkCronExpr' always succeeds.
+-}
+genCronExpr ∷ Gen CronExpr
+genCronExpr = do
+    fields ← mapM genField [Minute, Hour, DayOfMonth, Month, DayOfWeek]
+    case fields of
+        [mi, ho, dom, mo, dow] →
+            either (const (pure everyMinute)) pure (mkCronExpr mi ho dom mo dow)
+        _ → pure everyMinute
+    where
+        genField k = do
+            let (lo, hi) = cronFieldBounds k
+            n ← choose (1, 3 ∷ Int)
+            replicateM n (genTerm lo hi)
+
+        genTerm lo hi = do
+            base ←
+                oneof
+                    [ pure EveryValue
+                    , Exactly <$> choose (lo, hi)
+                    , do
+                        a ← choose (lo, hi)
+                        b ← choose (a, hi)
+                        pure (Between a b)
+                    ]
+            stp ← oneof [pure Nothing, Just <$> choose (1, 10)]
+            pure (CronTerm base stp)
 
 -- --- Phase 19: xAI provider (offline; OpenAI-compat request + SSE decoder, ports lvz-xai http.rs) --
 

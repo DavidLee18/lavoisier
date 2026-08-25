@@ -69,10 +69,11 @@ in  L.Config::{
       [ L.ModelRef::{ provider = L.Provider.Google, model = "gemini-2.5-flash" } ]
     , fallbackCooldown = Some 60
 
-    -- Cron: the schedule fields are named, and the prompt is its own field.
+    -- Cron: the schedule fields are named and typed. `*/30 9-17 * * 1-5` is
+    -- `everyN 30`, `between 9 17`, `between 1 5`; `every`, `at` and `from` cover the rest.
     , cron = Some
       [ L.CronJob::{
-        , schedule = L.Schedule::{ minute = "*/30", hour = "9-17", dayOfWeek = "1-5" }
+        , schedule = L.Schedule::{ minute = [ L.everyN 30 ], hour = [ L.between 9 17 ], dayOfWeek = [ L.between 1 5 ] }
         , prompt = "check CI and report failures"
         }
       , L.CronJob::{ schedule = L.dailyAt 9, prompt = "summarise yesterday's commits" }

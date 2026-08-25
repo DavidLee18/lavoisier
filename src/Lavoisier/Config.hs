@@ -22,9 +22,12 @@ module Lavoisier.Config (
     FileConfig (..),
     defaultConfig,
     loadConfig,
+    loadCronFile,
+    loadScheduleFile,
 )
 where
 
+import Control.Exception (SomeException, try)
 import Data.Either.Validation (Validation (..))
 import Data.Text (Text)
 import Data.Word (Word32)
@@ -175,16 +178,55 @@ mcpSpecDecoder =
             <*> Dhall.field "target" mcpTargetDecoder
         )
 
-cronExprDecoder ∷ Decoder CronExpr
-cronExprDecoder =
-    Dhall.record
-        ( CronExpr
-            <$> Dhall.field "minute" Dhall.auto
-            <*> Dhall.field "hour" Dhall.auto
-            <*> Dhall.field "dayOfMonth" Dhall.auto
-            <*> Dhall.field "month" Dhall.auto
-            <*> Dhall.field "dayOfWeek" Dhall.auto
+{- | A cron value: a 'Natural' narrowed to 'Int'. The narrowing is checked rather than a bare
+'fromIntegral' because a 'Natural' large enough to wrap would land back /inside/ a field's range
+and pass the check below.
+-}
+cronNat ∷ Decoder Int
+cronNat =
+    refine (Dhall.auto @Natural) $ \n →
+        if n > 10000
+            then Left ("cron: " <> T.pack (show n) <> " is not a cron value")
+            else Right (fromIntegral n)
+
+-- | @< Every | Exactly : Natural | Between : { from : Natural, to : Natural } >@.
+cronBaseDecoder ∷ Decoder CronBase
+cronBaseDecoder =
+    Dhall.union
+        ( (EveryValue <$ Dhall.constructor "Every" Dhall.unit)
+            <> (Exactly <$> Dhall.constructor "Exactly" cronNat)
+            <> Dhall.constructor
+                "Between"
+                (Dhall.record (Between <$> Dhall.field "from" cronNat <*> Dhall.field "to" cronNat))
         )
+
+-- | @{ base, step }@ — one comma-separated term of a field.
+cronTermDecoder ∷ Decoder CronTerm
+cronTermDecoder =
+    Dhall.record
+        ( CronTerm
+            <$> Dhall.field "base" cronBaseDecoder
+            <*> Dhall.field "step" (Dhall.maybe cronNat)
+        )
+
+{- | The five schedule fields, each a list of terms, checked against that field's own range by
+'mkCronExpr'. This is the whole of the cron validation story for config files: a value out of
+range is a __load__ error naming its field, so 'Lavoisier.Schedule.Cron.compileCron' is total and
+nothing is left to fail when a gateway starts.
+-}
+cronExprDecoder ∷ Decoder CronExpr
+cronExprDecoder = refine record (\(mi, ho, dom, mo, dow) → mkCronExpr mi ho dom mo dow)
+    where
+        terms = Dhall.list cronTermDecoder
+        record =
+            Dhall.record
+                ( (,,,,)
+                    <$> Dhall.field "minute" terms
+                    <*> Dhall.field "hour" terms
+                    <*> Dhall.field "dayOfMonth" terms
+                    <*> Dhall.field "month" terms
+                    <*> Dhall.field "dayOfWeek" terms
+                )
 
 cronJobDecoder ∷ Decoder CronJobSpec
 cronJobDecoder =
@@ -400,5 +442,62 @@ defaultConfig =
 notably @./schema.dhall@ — resolves against the config file's own directory rather than the
 process working directory. Throws a @Dhall@ exception on a parse, type, or range error.
 -}
+
+{- | @< Prompt : Text | Tool : { name : Text, args : Optional Text } >@ — what a scheduled job
+does. Was @tool@ and @prompt@ as two @Optional Text@ fields with a runtime check that exactly one
+was set; the union makes "both" and "neither" unrepresentable.
+-}
+scheduleActionDecoder ∷ Decoder ScheduleAction
+scheduleActionDecoder =
+    Dhall.union
+        ( (SAPrompt <$> Dhall.constructor "Prompt" Dhall.auto)
+            <> Dhall.constructor
+                "Tool"
+                ( Dhall.record
+                    ( SATool
+                        <$> Dhall.field "name" (ToolName <$> Dhall.auto)
+                        <*> Dhall.field "args" (Dhall.maybe Dhall.auto)
+                    )
+                )
+        )
+
+-- | One @--schedule-file@ entry. The room is sigil-checked here, as it is everywhere else.
+scheduleJobDecoder ∷ Decoder ScheduleJobSpec
+scheduleJobDecoder =
+    Dhall.record
+        ( ScheduleJobSpec
+            <$> Dhall.field "jobId" Dhall.auto
+            <*> Dhall.field "schedule" cronExprDecoder
+            <*> Dhall.field "action" scheduleActionDecoder
+            <*> Dhall.field "room" (Dhall.maybe room)
+            <*> Dhall.field "session" (fmap SessionId <$> Dhall.auto)
+            <*> Dhall.field "summarize" (Dhall.maybe Dhall.auto)
+            <*> Dhall.field "retryMax" (fmap (RetryCount . fromIntegral @Natural) <$> Dhall.auto)
+            <*> Dhall.field "retryWait" (fmap (Seconds . fromIntegral @Natural) <$> Dhall.auto)
+        )
+    where
+        room =
+            refine (Dhall.auto @Text) $ \t →
+                maybe (Left ("room: not a Matrix room id (want ! or #): " <> t)) Right (mkRoomId t)
+
+{- | Load a @--cron-file@: a Dhall @List L.CronJob\/Type@, the __same__ type the config's own
+@cron@ field uses. It used to be a separate flat record whose @schedule@ was a packed crontab
+string — the one place the 0.17.0 typing pass did not reach.
+-}
+loadCronFile ∷ FilePath → IO (Either Text [CronJobSpec])
+loadCronFile = loadDhallList cronJobDecoder
+
+-- | Load a @--schedule-file@: a Dhall @List L.ScheduleJob\/Type@.
+loadScheduleFile ∷ FilePath → IO (Either Text [ScheduleJobSpec])
+loadScheduleFile = loadDhallList scheduleJobDecoder
+
+{- | Read a Dhall list through a decoder, turning any parse, type or refinement failure into the
+message the caller reports. Dhall's own errors already name the offending field and value.
+-}
+loadDhallList ∷ ∀ a. Decoder a → FilePath → IO (Either Text [a])
+loadDhallList d path = do
+    r ← try (Dhall.inputFile (Dhall.list d) path) ∷ IO (Either SomeException [a])
+    pure (either (Left . T.pack . show) Right r)
+
 loadConfig ∷ FilePath → IO FileConfig
 loadConfig = Dhall.inputFile Dhall.auto

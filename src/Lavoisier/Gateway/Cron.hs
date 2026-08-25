@@ -16,27 +16,22 @@ module Lavoisier.Gateway.Cron (
     CronConfigError (..),
     parseCliJob,
     jobFromSpec,
-    loadFileJobs,
     cronGateway,
 )
 where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (mapConcurrently_)
-import Control.Exception (SomeException, try)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import GHC.Generics (Generic)
-import Numeric.Natural (Natural)
 
 import Data.Text qualified as T
-import Dhall qualified
 
 import Lavoisier.Protocol.Agent (AgentHandle (..), turnRequest)
 import Lavoisier.Protocol.Gateway (Gateway (..), GatewayError)
 import Lavoisier.Protocol.Stream (Producer (..))
-import Lavoisier.Schedule.Cron (CronError, CronSchedule, nextAfter, parseCron)
+import Lavoisier.Schedule.Cron (CronError, CronSchedule, compileCron, nextAfter, parseCron)
 
 import Lavoisier.Domain qualified as D
 
@@ -61,31 +56,28 @@ data CronConfigError
       CCECron CronError
     | -- | A @--cron@ quick spec lacked a prompt after its 5 schedule fields.
       CCEMissingPrompt Text
-    | -- | The @--cron-file@ Dhall failed to parse or type-check.
-      CCEFile Text
     deriving stock (Eq, Show)
 
-{- | Parse a quick CLI spec: the first __five__ whitespace-separated tokens are the cron schedule, the
-remainder is the prompt. @index@ seeds the default session id (@cron-\<index\>@). @retryMax@\/
-@retryWait@ are the global retry defaults (a quick spec carries no inline retry policy).
-| Build a job from an already-structured 'D.CronJobSpec'. The schedule fields and the prompt
-arrive separately, so there is no whitespace split to get wrong — the flag reader and the Dhall
-config both produce this shape.
--}
-jobFromSpec ∷ D.CronJobSpec → Int → D.RetryCount → D.Seconds → Either CronConfigError CronJob
-jobFromSpec spec index rmax rwait =
-    case parseCron (D.renderCronExpr (D.csSchedule spec)) of
-        Left e → Left (CCECron e)
-        Right sched →
-            Right
-                CronJob
-                    { cjSchedule = sched
-                    , cjSession = maybe ("cron-" <> tshow index) D.unSessionId (D.csSession spec)
-                    , cjPrompt = D.csPrompt spec
-                    , cjRetryMax = fromIntegral (D.unRetryCount (fromMaybe rmax (D.csRetryMax spec)))
-                    , cjRetryWait = fromIntegral (D.unSeconds (fromMaybe rwait (D.csRetryWait spec)))
-                    }
+{- | Build a job from an already-structured 'D.CronJobSpec'.
 
+__Total.__ The schedule arrives as a checked 'D.CronExpr' — from the Dhall decoder or from the
+@--cron@ reader, both of which validate at the edge — so compiling it cannot fail and there is no
+error left for gateway construction to report.
+-}
+jobFromSpec ∷ D.CronJobSpec → Int → D.RetryCount → D.Seconds → CronJob
+jobFromSpec spec index rmax rwait =
+    CronJob
+        { cjSchedule = compileCron (D.csSchedule spec)
+        , cjSession = maybe ("cron-" <> tshow index) D.unSessionId (D.csSession spec)
+        , cjPrompt = D.csPrompt spec
+        , cjRetryMax = fromIntegral (D.unRetryCount (fromMaybe rmax (D.csRetryMax spec)))
+        , cjRetryWait = fromIntegral (D.unSeconds (fromMaybe rwait (D.csRetryWait spec)))
+        }
+
+{- | Parse a quick CLI spec: the first __five__ whitespace-separated tokens are the cron schedule,
+the remainder is the prompt. @index@ seeds the default session id (@cron-\<index\>@). @retryMax@\/
+@retryWait@ are the global retry defaults (a quick spec carries no inline retry policy).
+-}
 parseCliJob ∷ Text → Int → Int → Int → Either CronConfigError CronJob
 parseCliJob spec index retryMax retryWait =
     case T.words spec of
@@ -95,45 +87,6 @@ parseCliJob spec index retryMax retryWait =
                 Left e → Left (CCECron e)
                 Right sched →
                     Right (CronJob sched ("cron-" <> tshow index) (T.unwords (drop 5 toks)) retryMax retryWait)
-
-{- | Dhall shape for a @--cron-file@ job: a list of records
-@{ schedule : Text, session : Optional Text, prompt : Text, retryMax : Optional Natural,
-retryWait : Optional Natural }@. A per-job @retryMax@\/@retryWait@ overrides the global default.
-The field names are the Dhall record keys (Dhall is camelCase by convention).
--}
-data CronSpec = CronSpec
-    { schedule ∷ Text
-    , session ∷ Maybe Text
-    , prompt ∷ Text
-    , retryMax ∷ Maybe Natural
-    , retryWait ∷ Maybe Natural
-    }
-    deriving stock Generic
-
-instance Dhall.FromDhall CronSpec
-
-{- | Load a @--cron-file@ Dhall document (a list of job specs), type-checked by Dhall at load. A
-missing @session@ defaults to @cron-\<index\>@; a missing @retryMax@\/@retryWait@ falls back to the
-global default. A parse\/type error surfaces as 'CCEFile'.
--}
-loadFileJobs ∷ FilePath → Int → Int → IO (Either CronConfigError [CronJob])
-loadFileJobs path defRetryMax defRetryWait = do
-    r ← try (Dhall.inputFile Dhall.auto path ∷ IO [CronSpec]) ∷ IO (Either SomeException [CronSpec])
-    pure $ case r of
-        Left e → Left (CCEFile (T.pack (show e)))
-        Right specs → traverse toJob (zip [0 ..] specs)
-    where
-        toJob (i, s) = case parseCron (schedule s) of
-            Left e → Left (CCECron e)
-            Right sched →
-                Right
-                    CronJob
-                        { cjSchedule = sched
-                        , cjSession = fromMaybe ("cron-" <> tshow (i ∷ Int)) (session s)
-                        , cjPrompt = prompt s
-                        , cjRetryMax = maybe defRetryMax fromIntegral (retryMax s)
-                        , cjRetryWait = maybe defRetryWait fromIntegral (retryWait s)
-                        }
 
 {- | The 'Gateway' record: drives the shared agent from a set of 'CronJob's. An empty set returns
 immediately.

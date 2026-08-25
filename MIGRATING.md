@@ -47,7 +47,7 @@ Anything not listed is unchanged.
 | `legionJudge` | `Some "google:gemini-2.5-flash"` | `Some L.ModelRef::{ provider = L.Provider.Google, model = "gemini-2.5-flash" }` |
 | `legionDebaters` | `Some [ "anthropic:claude-sonnet-4-5" ]` | `Some [ L.ModelRef::{ provider = L.Provider.Anthropic, model = "claude-sonnet-4-5" } ]` |
 | `mcpServers` | `Some [ "fs: npx -y … ." ]` | `Some [ L.Mcp::{ label = "fs", target = L.McpTarget.Stdio "npx -y … ." } ]` |
-| `cron` | `Some [ "*/30 9-17 * * 1-5 check CI" ]` | `Some [ L.CronJob::{ schedule = L.Schedule::{ minute = "*/30", hour = "9-17", dayOfWeek = "1-5" }, prompt = "check CI" } ]` |
+| `cron` | `Some [ "*/30 9-17 * * 1-5 check CI" ]` | `Some [ L.CronJob::{ schedule = L.Schedule::{ minute = [ L.everyN 30 ], hour = [ L.between 9 17 ], dayOfWeek = [ L.between 1 5 ] }, prompt = "check CI" } ]` |
 | `matrixRoomTools` | ``Some (toMap { `!ops:hs` = [ "shell" ] })`` | `Some [ L.ToolGrant::{ subject = "!ops:hs", tools = [ "shell" ] } ]` |
 | `matrixUserTools` | ``Some (toMap { `@bob:hs` = [ "read_file" ] })`` | `Some [ L.ToolGrant::{ subject = "@bob:hs", tools = [ "read_file" ] } ]` |
 
@@ -56,14 +56,59 @@ Notes on the less obvious ones:
 - **An HTTP MCP target is stated, not sniffed.** `L.McpTarget.Http "https://…/sse"` for a URL,
   `L.McpTarget.Stdio "cmd …"` for a subprocess. Previously the string was inspected for an `http`
   prefix at connect time; now the choice is made at load, and the HTTP arm is checked for a scheme.
-- **Cron schedules name their fields.** `L.Schedule` defaults every field to `"*"`, so write only
-  what you constrain. `L.everyMinutes 30` and `L.dailyAt 9` are shorthands.
+- **Cron schedules name *and type* their fields.** A field is a list of terms, each built with
+  `L.every` (`*`), `L.everyN 30` (`*/30`), `L.at 9` (`9`), `L.between 9 17` (`9-17`) or
+  `L.from 5 10` (`5/10`); commas become list elements, so `0,15,30` is `[ L.at 0, L.at 15, L.at 30 ]`.
+  `L.Schedule` defaults every field to `[ L.every ]`, so write only what you constrain, and
+  `L.everyMinutes 30` / `L.dailyAt 9` remain as shorthands. Each value is range-checked against its
+  own field at load — an `hour` of `24` is an error naming `hour`, not a job that never fires.
 - **Matrix tool grants are a list, not a `toMap`.** Same semantics: a room or user absent from the
   list is unconstrained, and when both a room and a user grant apply the effective set is their
   **intersection**.
 - **Ports are range-checked.** Still `Natural`, but `serve = Some 0` or `Some 70000` is now a load
   error naming the field. Dhall cannot express this (its `assert` cannot refine a function argument),
   so the check lives in the decoder.
+
+### `--cron-file` and `--schedule-file` are typed too
+
+These two files kept their old flat shape through 0.17.0 and are converted here, so a cron file
+written for any earlier release needs editing.
+
+**`--cron-file`** is now a `List L.CronJob/Type` — the *same* type the config's `cron` field uses,
+which means one shape for a cron job instead of two:
+
+```dhall
+-- before: a bare record list, every Optional spelled out, the schedule a packed string
+[ { schedule = "0 9 * * *", session = Some "digest", prompt = "morning digest"
+  , retryMax = None Natural, retryWait = None Natural } ]
+
+-- after
+let L = ./schema.dhall
+in  [ L.CronJob::{ schedule = L.dailyAt 9, session = Some "digest", prompt = "morning digest" } ]
+```
+
+**`--schedule-file`** is a `List L.ScheduleJob/Type`, and its `tool`/`toolArgs`/`prompt` trio has
+become one `action` union:
+
+```dhall
+-- before
+[ { jobId = "disk", schedule = "0 * * * *", tool = Some "shell"
+  , toolArgs = Some "{\"command\":\"df\"}", prompt = None Text, room = None Text
+  , session = None Text, summarize = None Text, retryMax = None Natural, retryWait = None Natural } ]
+
+-- after
+let L = ./schema.dhall
+in  [ L.ScheduleJob::{ jobId = "disk"
+                     , schedule = L.Schedule::{ minute = [ L.at 0 ] }
+                     , action = L.Action.Tool { name = "shell", args = Some "{\"command\":\"df\"}" }
+                     } ]
+```
+
+Setting both `tool` and `prompt`, or neither, used to be a runtime error; the union makes both
+states unrepresentable. `args` stays a JSON object string on purpose — cron has a fixed grammar
+worth typing, tool arguments have no schema but the invoked tool's own.
+
+Both files import `./schema.dhall` relative to **their own** directory, the same rule as the config.
 
 ### New fields, all optional
 
@@ -93,6 +138,9 @@ These need no config edit, but you will see them.
   reasoning tokens than you asked for.
 - **Batch submissions are checked too**, at submit time rather than after the batch is accepted, and
   `batch_edit` prints any degraded knob once at the top of its report.
+- **A bad cron schedule is a load error, not a start-up error.** Every field value is checked
+  against its own range when the file is read, naming the field. Nothing is left to fail when the
+  cron or schedule gateway starts.
 
 ## 4. If you use `mainWith`
 

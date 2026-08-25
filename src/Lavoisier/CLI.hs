@@ -50,11 +50,11 @@ import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 
 import Lavoisier.Agent
-import Lavoisier.Config (FileConfig (..), loadConfig)
+import Lavoisier.Config (FileConfig (..), loadConfig, loadCronFile, loadScheduleFile)
 import Lavoisier.Domain
 import Lavoisier.Gateway.A2A (a2aGateway, defaultA2aConfig)
 import Lavoisier.Gateway.Acp (acpGateway)
-import Lavoisier.Gateway.Cron (CronJob, cronGateway, jobFromSpec, loadFileJobs)
+import Lavoisier.Gateway.Cron (CronJob, cronGateway, jobFromSpec)
 import Lavoisier.Gateway.Http (GatewayConfig (..), httpGateway)
 import Lavoisier.Gateway.Matrix (matrixFromEnv, matrixGateway)
 import Lavoisier.Gateway.Slack (slackFromEnv, slackGateway)
@@ -81,7 +81,8 @@ import Lavoisier.Provider.Google.Batch (googleBatch)
 import Lavoisier.Provider.Xai (xaiFromEnv)
 import Lavoisier.Provider.Xai.Grpc (defaultXaiGrpcEndpoint, xaiGrpcProvider)
 import Lavoisier.Provider.Xai.Responses (xaiResponsesFromEnv)
-import Lavoisier.Schedule (ScheduleRegistry, loadScheduleFile, newRegistry, scheduleTools)
+import Lavoisier.Schedule (ScheduleRegistry, jobsFromSpecs, newRegistry, scheduleTools)
+import Lavoisier.Schedule.Cron (cronErrorText, parseCronExpr)
 import Lavoisier.Tool.Batch (batchEditTool)
 import Lavoisier.Tool.Registry (ToolRegistry, invokeTool, registerTools, withBuiltins)
 import Lavoisier.Tune (LearningTuner, asTuner, defaultTuneConfig, learningTuner, loadTuner, saveTuner)
@@ -255,10 +256,15 @@ cronReader ∷ ReadM CronJobSpec
 cronReader = eitherReader $ \raw →
     case T.words (T.pack raw) of
         (mi : h : dom : mo : dow : rest)
-            | not (null rest) →
+            | not (null rest) → do
+                sched ←
+                    either
+                        (Left . T.unpack . cronErrorText)
+                        Right
+                        (parseCronExpr (T.unwords [mi, h, dom, mo, dow]))
                 Right
                     CronJobSpec
-                        { csSchedule = CronExpr mi h dom mo dow
+                        { csSchedule = sched
                         , csPrompt = T.unwords rest
                         , csSession = Nothing
                         , csRetryMax = Nothing
@@ -540,8 +546,9 @@ buildScheduleReg opts = case optScheduleFile opts of
     Just path → do
         let rmax = fromIntegral (unRetryCount (fromMaybe (RetryCount 0) (optScheduleRetryMax opts)))
             rwait = fromIntegral (unSeconds (fromMaybe (Seconds 0) (optScheduleRetryWait opts)))
-        ejobs ← loadScheduleFile path rmax rwait
-        case ejobs of
+        especs ← loadScheduleFile path
+        specs ← either (errExit . ("schedule-file: " <>)) pure especs
+        case jobsFromSpecs specs rmax rwait of
             Left e → errExit ("schedule: " <> tshow e)
             Right jobs → do
                 now ← round <$> getPOSIXTime
@@ -641,18 +648,15 @@ buildCronJobs ∷ Options → IO [CronJob]
 buildCronJobs opts = do
     let rmax = fromMaybe (RetryCount 0) (optCronRetryMax opts)
         rwait = fromMaybe (Seconds 0) (optCronRetryWait opts)
-    cliJobs ←
-        mapM
-            (\(i, spec) → either (errExit . cronErr) pure (jobFromSpec spec i rmax rwait))
-            (zip [0 ..] (optCron opts))
+    let cliJobs = [jobFromSpec spec i rmax rwait | (i, spec) ← zip [0 ..] (optCron opts)]
     fileJobs ← case optCronFile opts of
         Nothing → pure []
         Just path →
-            loadFileJobs path (fromIntegral (unRetryCount rmax)) (fromIntegral (unSeconds rwait))
-                >>= either (errExit . cronErr) pure
+            loadCronFile path
+                >>= either
+                    (errExit . ("cron-file: " <>))
+                    (pure . map (\(i, spec) → jobFromSpec spec i rmax rwait) . zip [length (optCron opts) ..])
     pure (cliJobs <> fileJobs)
-    where
-        cronErr e = "cron: " <> tshow e
 
 {- | Build one council debater from a @provider:model@ spec, its provider from env.
 The @provider:model@ split is the option reader's job now; this had its own third copy of it.

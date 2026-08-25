@@ -48,7 +48,8 @@ posture is efficiency-first.
   **fourmolu** before every commit (config in `fourmolu.yaml`; 4-space indent, leading commas,
   no column limit, unicode arrows). Never sweep `gen/` — use the explicit path list in Commands. Correctness via ADTs + exhaustive `case`. Tests are `tasty` — prefer QuickCheck properties.
 - **Config is Dhall** (`schema.dhall` + `lavoisier.dhall.example`); `--cron-file` and
-  `--schedule-file` are Dhall record lists. (The retired Rust tree used TOML and JSON — old issues
+  `--schedule-file` are Dhall lists of `schema.dhall`'s own `CronJob`/`ScheduleJob` types, loaded by
+  `Config.loadCronFile`/`loadScheduleFile`. (The retired Rust tree used TOML and JSON — old issues
   and infra may still say so.)
 - **Enumerable config fields are Dhall unions, not `Text`** (since 0.17.0). The user's file does
   `let L = ./schema.dhall in L.Config::{ … }`, and `loadConfig` uses `Dhall.inputFile` so that
@@ -90,6 +91,13 @@ posture is efficiency-first.
   `(device, txn id)` and answers a repeat with the *previous* response, so a counter restarting at 0
   makes the first sends after every restart vanish silently. The Rust `process_seed` says so in a
   comment; this tree had dropped it, and it swallowed room-key shares and the unwedge until 0.13.4.
+- **A cron field is an ADT, not a string** (since 0.17.1): `CronField` is a kind-tagged non-empty
+  list of `CronTerm`s, its constructor hidden so `mkCronExpr` is the only way in — which range-checks
+  each field against its own bounds and names it on failure. That is what makes
+  `Schedule.Cron.compileCron` **total**: a bad schedule fails when the config *loads*, not when the
+  gateway starts. `parseCronExpr` keeps the crontab string as a surface for `--cron` (and only for
+  it); a QuickCheck property pins `parseCronExpr . renderCronExpr` as a round-trip, so the two
+  surfaces cannot express different things.
 - Dhall record fields become top-level selectors, so they collide with same-named function
   parameters and lambdas. Hence `jobId`/`toolArgs` rather than `id`/`args`.
 - **Dhall's `assert` cannot refine a function argument.** It type-checks a lambda body with the
