@@ -19,3 +19,6 @@ cbits/ts-*/** linguist-vendored=true
 # source: without this the five .rs files make GitHub list Rust as a project language, which after
 # the Haskell swap is exactly the wrong signal.
 tests/budget/** linguist-detectable=false
+
+# A recorded xAI Responses SSE stream, used as the decoder's spec — not hand-written source.
+tests/fixtures/** linguist-generated=true

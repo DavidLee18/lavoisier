@@ -91,6 +91,7 @@ import Lavoisier.Provider.Anthropic.Batch (batchRequestsBody, parseResultLine)
 import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
 import Lavoisier.Provider.ClaudeCli (eofDecoder, initDecoder, pushLine, renderPrompt)
 import Lavoisier.Provider.Xai (buildMessages)
+import Lavoisier.Provider.Xai.ResponsesSse (initResp, respEof, respPush, serverToolItemName)
 import Lavoisier.Schedule.Cron (Civil (..), CronError (..), civilFromUnix, nextAfter, parseCron)
 import Lavoisier.Tool.Batch (applyResponse, batchEditTool, stripCodeFence)
 import Lavoisier.Tool.Builtins
@@ -159,6 +160,7 @@ tests =
         , domainTests
         , negotiationTests
         , typedRequestTests
+        , xaiResponsesTests
         , configTests
         , logTests
         , mcpTests
@@ -2614,6 +2616,56 @@ negotiationTests =
                 Left (PUnsupported _) → pure ()
                 _ → assertFailure "expected PUnsupported before any send"
         ]
+
+-- --- xAI Responses API (Agent Tools) -----------------------------------------------------------------
+
+xaiResponsesTests ∷ TestTree
+xaiResponsesTests =
+    testGroup
+        "xAI Responses SSE"
+        [ testCase "replays a recorded live stream into the Event model" $ do
+            -- tests/fixtures/xai-responses-stream.sse is a real captured stream, one frame of each
+            -- event type, trimmed. xAI documents only chat/completions streaming, so this recording
+            -- IS the spec for this decoder — regenerate it if the wire format moves.
+            bs ← BS.readFile "tests/fixtures/xai-responses-stream.sse"
+            let (st, evs) = respPush initResp bs
+                out = [e | Right e ← evs <> respEof st]
+            assertBool "reasoning summary becomes Thinking" (any isThinking out)
+            assertBool "output text becomes TextDelta" (any isTextDelta out)
+            [(i, n) | ServerToolUse i n ← out] @?= [("ws_bc705a7b-fb9c-9f0b-8af7-6375c401cdfc_call-30528b6b-c095-45ab-85cd-10555e1c0ba2-0", "web_search")]
+            [n | ServerToolResult _ n ← out] @?= ["web_search"]
+            [u | Citation _ u ← out] @?= ["https://x.ai/news"]
+            [s' | Done s' ← out] @?= [EndTurn]
+        , testCase "usage comes off response.completed with the cache read" $ do
+            bs ← BS.readFile "tests/fixtures/xai-responses-stream.sse"
+            let (st, evs) = respPush initResp bs
+                out = [e | Right e ← evs <> respEof st]
+            case [u | Usage u ← out] of
+                [u] → do
+                    assertBool "input tokens counted" (inputTokens u > 0)
+                    assertBool "output tokens counted" (outputTokens u > 0)
+                    -- xAI caches server-side with no request markers, so there is no creation counter.
+                    cacheCreationTokens u @?= 0
+                other → assertFailure ("expected exactly one Usage, got " <> show (length other))
+        , testCase "a stream that stops early terminates, but not as EndTurn" $ do
+            -- A dropped connection must not look like a finished turn; the agent loop would treat a
+            -- truncated answer as final.
+            let (st, _) = respPush initResp "event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n"
+            [e | Right e ← respEof st] @?= [Done (Other "incomplete")]
+        , testCase "response.failed surfaces the error and does not report EndTurn" $ do
+            let frame = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n"
+                (_, evs) = respPush initResp frame
+            [m | Left (PApi _ m) ← evs] @?= ["boom"]
+            [s' | Right (Done s') ← evs] @?= [Other "failed"]
+        , testCase "only tool-call item types open a server-tool call" $ do
+            serverToolItemName "web_search_call" @?= Just "web_search"
+            serverToolItemName "x_search_call" @?= Just "x_search"
+            serverToolItemName "reasoning" @?= Nothing
+            serverToolItemName "message" @?= Nothing
+        ]
+    where
+        isThinking = \case Thinking _ → True; _ → False
+        isTextDelta = \case TextDelta _ → True; _ → False
 
 -- --- the type-level request index ------------------------------------------------------------------
 
