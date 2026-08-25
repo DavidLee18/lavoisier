@@ -252,10 +252,9 @@ toolChoiceJson = \case
 Assistant tool calls and their results round-trip as @function_call@ \/ @function_call_output@ items
 keyed by @call_id@ — the id the stream reports as @call_id@, __not__ the @fc_…@ item id.
 
-__Unverified:__ the @function_call_output@ echo shape is the documented OpenAI-Responses encoding
-but was not exercised against the live endpoint, so a multi-turn tool loop on this transport is
-offline-tested only. Confirm with a second-turn request carrying a @function_call@ +
-@function_call_output@ pair before relying on it.
+Verified live on 2026-08-25 by a three-turn agent run: the model called a tool, saw its result, and
+answered from it, which only happens if both the @function_call@ echo and the
+@function_call_output@ item are encoded as the provider expects.
 -}
 inputItems ∷ [Message] → Value
 inputItems msgs = toJSON (concatMap one msgs)

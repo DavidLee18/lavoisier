@@ -371,6 +371,7 @@ go (`L.ServerTool.XSearch { allowedHandles = ["nasa"], … }`).
 
 xAI's provider-run tools (`web_search`, `x_search`, `code_execution` → `code_interpreter`,
 `collections_search`) are reachable **only via `--provider xai-responses`**, xAI's Responses API.
+Note that xAI does not treat `--max-tokens` as a ceiling on reasoning tokens there.
 The `xai` transport speaks `/chat/completions`, whose route into them — Live Search's
 `search_parameters` — has returned `410 Gone` since 2026-01-12.
 

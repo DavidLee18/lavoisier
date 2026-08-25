@@ -113,7 +113,8 @@ posture is efficiency-first.
   `withNegotiated @Caps req $ \nreq -> …` and nothing else. Adding a *new* send path — the batch
   submitters were exactly this — fails to compile until it negotiates too, which is the point.
 - **xAI has three transports**: `xai` (`/chat/completions`), `xai-grpc`, and `xai-responses` (the
-  Responses API). Provider-run tools exist **only** on `xai-responses` — Live Search on
+  Responses API, **live-verified 2026-08-25** — ask, server tools + citations, and a three-turn
+  agent tool loop). Provider-run tools exist **only** on `xai-responses` — Live Search on
   `/chat/completions` is 410 Gone since 2026-01-12. The Responses body is a different shape:
   `input` not `messages`, `instructions` not a system message, `max_output_tokens` not `max_tokens`,
   and function tools declared **flat** (`{"type":"function","name":…}`) rather than nested.
@@ -121,6 +122,9 @@ posture is efficiency-first.
   deltas, `call_id` (`call-…`) is what must be echoed back on the result. They are different
   strings; emitting the item id yields a tool result the provider cannot match and the loop stalls
   silently. Same class of trap as Gemini's `thoughtSignature`.
+- **xAI's `max_output_tokens` does not bound reasoning tokens** — a `--max-tokens 512` turn returned
+  `out=1273`. The field is sent; the provider does not honour it as a ceiling. `--budget` is
+  cost-weighted with output at ~5×, so ceilings are softer on this transport than on Anthropic.
 - **`tests/fixtures/xai-responses-*.sse` are recorded live streams and serve as the decoder's spec.**
   xAI documents the Responses request body but not its streaming events, so if the wire moves,
   re-record rather than guess.
