@@ -44,7 +44,7 @@ import Data.Word (Word64)
 import Lavoisier.Domain (ModelId (..))
 import Lavoisier.Protocol.Event (Event (..), StopReason (..), Usage (..))
 import Lavoisier.Protocol.Message (ChatRequest (..), Role (..), SystemPrompt (..), messageText, msgRole)
-import Lavoisier.Protocol.Provider (EventStream, Provider (..), ProviderError (..), noCapabilities)
+import Lavoisier.Protocol.Provider (EventStream, Provider (..), ProviderError (..), declare, negotiatedRequest, withNegotiated)
 import Lavoisier.Protocol.Stream (Producer (..))
 import System.Environment (lookupEnv)
 import System.IO (Handle)
@@ -79,19 +79,26 @@ claudeCliFromEnv = do
 -- | The 'Provider' record backed by @claude -p@. Advertises no optional 'Capabilities' (the
 -- subscription path has no caching, and @claude -p@ runs its own tools opaquely), and offers no
 -- native token counting.
+-- | @claude -p@ advertises nothing optional: the subscription path has no caching, it runs its own
+-- tools opaquely, it has no image input, and its thinking is not caller-controllable. Note the last
+-- one means \"cannot be /asked/ to think\" — the subprocess reasons on its own schedule and this
+-- adapter does emit the resulting 'Lavoisier.Protocol.Event.Thinking' events.
+type ClaudeCliCaps = '[]
+
 claudeCliProvider :: ClaudeCliConfig -> Provider
 claudeCliProvider cfg =
   Provider
     { providerStream = claudeCliStream cfg,
-      providerCapabilities = noCapabilities,
+      providerCapabilities = declare @ClaudeCliCaps,
       providerCountTokens = \_ -> pure (Right Nothing)
     }
 
 -- --- streaming -------------------------------------------------------------------------------------
 
 claudeCliStream :: ClaudeCliConfig -> ChatRequest -> IO (Either ProviderError EventStream)
-claudeCliStream cfg req = do
-  let prompt = renderPrompt req
+claudeCliStream cfg chatReq = withNegotiated @ClaudeCliCaps chatReq $ \nreq -> do
+  let req = negotiatedRequest nreq
+      prompt = renderPrompt req
       sysArgs = maybe [] (\sp -> ["--append-system-prompt", T.unpack (spText sp)]) (crSystem req)
       args =
         [ "-p",

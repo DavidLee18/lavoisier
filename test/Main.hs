@@ -83,7 +83,7 @@ import Lavoisier.Protocol.Provider
 import Lavoisier.Protocol.Stream (drain, fromList)
 import Lavoisier.Protocol.Tool
 import Lavoisier.Protocol.Tune qualified as Tn
-import Lavoisier.Provider.Anthropic (buildBody)
+import Lavoisier.Provider.Anthropic (AnthropicCaps, buildBody)
 import Lavoisier.Provider.Anthropic.Batch (batchRequestsBody, parseResultLine)
 import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
 import Lavoisier.Provider.ClaudeCli (eofDecoder, initDecoder, pushLine, renderPrompt)
@@ -153,6 +153,7 @@ tests =
       tuiTests,
       memoryTests,
       domainTests,
+      negotiationTests,
       configTests,
       logTests,
       mcpTests,
@@ -487,6 +488,13 @@ toolStream =
 
 -- --- Phase 2: Anthropic request body (example-based) ----------------------------------------------
 
+-- | Run 'negotiate' for @caps@ and take the request, failing loudly on a refusal. Tests that want
+-- to exercise a body builder must still go through the check — that is the point of 'Negotiated'.
+negotiatedFor :: forall caps. (Declares caps) => ChatRequest -> Negotiated caps
+negotiatedFor req = case negotiate @caps req of
+  (_, Right n) -> n
+  (_, Left e) -> error ("negotiatedFor: unexpected refusal: " <> show e)
+
 anthropicBodyTests :: TestTree
 anthropicBodyTests =
   testGroup
@@ -508,7 +516,7 @@ anthropicBodyTests =
         assertBool "has temperature" ("temperature" `T.isInfixOf` bodyText req)
     ]
   where
-    bodyText = decodeUtf8Lenient . BL.toStrict . encode . buildBody False
+    bodyText = decodeUtf8Lenient . BL.toStrict . encode . buildBody False . negotiatedFor @AnthropicCaps
 
 -- --- Phase 11: Google (Gemini) provider (offline; ports lvz-google tests) --------------------------
 
@@ -553,7 +561,7 @@ googleTests =
                       Message User [ToolResultBlock "c1" "files" False]
                     ]
                 }
-            bt = decodeUtf8Lenient (BL.toStrict (encode (G.buildBody G.defaultReasoningFloor req)))
+            bt = decodeUtf8Lenient (BL.toStrict (encode (G.buildBody G.defaultReasoningFloor (negotiatedFor @G.GoogleCaps req))))
         assertBool "assistant -> model" ("\"role\":\"model\"" `T.isInfixOf` bt)
         assertBool "functionCall" ("functionCall" `T.isInfixOf` bt)
         assertBool "functionResponse" ("functionResponse" `T.isInfixOf` bt)
@@ -720,7 +728,7 @@ batchEditTests =
           Left e -> assertFailure (show e),
       testCase "Anthropic batchRequestsBody wraps custom_id + strips stream" $ do
         let task = BatchTask "0" ((chatRequest "claude") {crMessages = [userMessage "hi"], crMaxTokens = 64})
-            body = batchRequestsBody False [task]
+            body = either (error . show) id (batchRequestsBody False [task])
             req0 = jix (jkey "requests" body) 0
         jkey "custom_id" req0 @?= Just (String "0")
         assertBool "params carries the model" (jkey "model" (maybe Null id (jkey "params" req0)) == Just (String "claude"))
@@ -737,7 +745,7 @@ batchEditTests =
       testCase "Google batchBody inlines request + metadata key" $ do
         let cfg = G.GoogleConfig "k" "https://x" undefined G.defaultReasoningFloor
             task = BatchTask "task-0" ((chatRequest "gemini") {crMessages = [userMessage "hi"], crMaxTokens = 64})
-            body = GB.batchBody cfg [task]
+            body = either (error . show) id (GB.batchBody cfg [task])
             inl = jix (jkey "requests" (maybe Null id (jkey "requests" (maybe Null id (jkey "input_config" (maybe Null id (jkey "batch" body))))))) 0
         jkey "key" (maybe Null id (jkey "metadata" inl)) @?= Just (String "task-0")
         assertBool "carries a request" (jkey "request" inl /= Nothing),
@@ -2377,6 +2385,90 @@ domainTests =
         promptCaching caps @?= True
         extendedThinking caps @?= True
         vision caps @?= False
+    ]
+
+-- --- capability negotiation -----------------------------------------------------------------------
+
+negotiationTests :: TestTree
+negotiationTests =
+  testGroup
+    "capability negotiation"
+    [ testCase "a caller knob degrades and says so" $ do
+        -- claude-cli declares nothing: --thinking used to vanish in silence.
+        let req = (chatRequest "m") {crMessages = [userMessage "hi"], crThinking = Just ThinkHigh}
+            (notices, out) = negotiate @'[] req
+        case notices of
+          [n] -> assertBool "notice mentions thinking" ("thinking" `T.isInfixOf` n)
+          other -> assertFailure ("expected exactly one notice, got " <> show other)
+        case out of
+          Left e -> assertFailure ("knob must not refuse the turn: " <> show e)
+          Right n -> crThinking (negotiatedRequest n) @?= Nothing,
+      testCase "a supported knob passes through untouched and silently" $ do
+        let req = (chatRequest "m") {crMessages = [userMessage "hi"], crThinking = Just ThinkHigh}
+            (notices, out) = negotiate @'[ 'ExtendedThinking] req
+        notices @?= []
+        fmap (crThinking . negotiatedRequest) out @?= Right (Just ThinkHigh),
+      testCase "ThinkOff needs no capability" $ do
+        let req = (chatRequest "m") {crMessages = [userMessage "hi"], crThinking = Just ThinkOff}
+        fst (negotiate @'[] req) @?= [],
+      testCase "an image refuses rather than being dropped" $ do
+        -- The whole point: a silently dropped image makes the model answer about what it never saw.
+        let req = (chatRequest "m") {crMessages = [Message User [imageBase64 "image/png" "AA=="]]}
+        case snd (negotiate @'[] req) of
+          Left (PUnsupported m) -> assertBool "names vision" ("vision" `T.isInfixOf` m)
+          Left e -> assertFailure ("wrong error: " <> show e)
+          Right _ -> assertFailure "an image must not pass a provider without vision",
+      testCase "an image passes a provider with vision" $
+        assertBool "accepted" $
+          case snd (negotiate @'[ 'Vision] ((chatRequest "m") {crMessages = [Message User [imageBase64 "image/png" "AA=="]]})) of
+            Right _ -> True
+            Left _ -> False,
+      testCase "a server-side tool refuses and names the tool" $ do
+        let req = (chatRequest "m") {crMessages = [userMessage "hi"], crServerTools = [STWebSearch Nothing [] []]}
+        case snd (negotiate @'[] req) of
+          Left (PUnsupported m) -> assertBool "names web_search" ("web_search" `T.isInfixOf` m)
+          other -> assertFailure ("expected a refusal naming the tool, got " <> show (fmap (const ()) other)),
+      testCase "a builtin tool refuses too" $ do
+        let req = (chatRequest "m") {crMessages = [userMessage "hi"], crBuiltinTools = [BTBash]}
+        case snd (negotiate @'[] req) of
+          Left (PUnsupported m) -> assertBool "names bash" ("bash" `T.isInfixOf` m)
+          other -> assertFailure ("expected a refusal, got " <> show (fmap (const ()) other)),
+      testCase "content refusal wins over a knob notice" $ do
+        -- Both apply; the turn must not proceed just because the knob was survivable.
+        let req =
+              (chatRequest "m")
+                { crMessages = [Message User [imageBase64 "image/png" "AA=="]],
+                  crThinking = Just ThinkHigh
+                }
+        case snd (negotiate @'[] req) of
+          Left _ -> pure ()
+          Right _ -> assertFailure "must refuse",
+      testCase "a fully-capable provider is a no-op" $ do
+        let req =
+              (chatRequest "m")
+                { crMessages = [Message User [imageBase64 "image/png" "AA=="]],
+                  crThinking = Just ThinkHigh,
+                  crServerTools = [STWebSearch Nothing [] []]
+                }
+            (notices, out) = negotiate @'[ 'ExtendedThinking, 'ServerSideTools, 'Vision] req
+        notices @?= []
+        fmap (\n -> negotiatedRequest n == req) out @?= Right True,
+      testCase "notices reach the stream ahead of the provider's own events" $ do
+        let req = (chatRequest "m") {crMessages = [userMessage "hi"], crThinking = Just ThinkHigh}
+        r <- withNegotiated @'[] req $ \_ -> Right <$> fromList [Right (TextDelta "hello")]
+        case r of
+          Left e -> assertFailure (show e)
+          Right st -> do
+            evs <- drain st
+            case evs of
+              (Right (Notice _) : Right (TextDelta "hello") : _) -> pure ()
+              other -> assertFailure ("unexpected stream: " <> show other),
+      testCase "a refused turn yields no stream at all" $ do
+        let req = (chatRequest "m") {crMessages = [Message User [imageBase64 "image/png" "AA=="]]}
+        r <- withNegotiated @'[] req $ \_ -> assertFailure "send must not run" >> undefined
+        case r of
+          Left (PUnsupported _) -> pure ()
+          _ -> assertFailure "expected PUnsupported before any send"
     ]
 
 configTests :: TestTree

@@ -104,6 +104,23 @@ posture is efficiency-first.
   They used to be five positional `Bool`s (`Capabilities True True True True True`), where
   reordering the record silently re-labelled every provider. Note the space in `@'[ '` — `@'['` is
   a lex error.
+- **Every adapter names its capability list once** (`type AnthropicCaps = …`) and uses it for both
+  `declare @Caps` and `negotiate @Caps`, so the advertised list and the enforced list cannot drift.
+- **`Negotiated caps` is unforgeable evidence.** Its constructor is hidden; `negotiate` is the only
+  way to build one, and the body builders (`buildBody`, `buildRequest`) take it instead of a
+  `ChatRequest`, so no send path can skip the capability check. `providerStream` is
+  `withNegotiated @Caps req $ \nreq -> …` and nothing else. Adding a *new* send path — the batch
+  submitters were exactly this — fails to compile until it negotiates too, which is the point.
+- **Capabilities fail in two opposite directions, deliberately.** *Caller knobs* (`ExtendedThinking`)
+  **degrade and emit a `Notice`** — never kill a turn, because one request builder crosses the whole
+  heterogeneous fallback chain; but never stay silent either, because the user paid for a feature
+  they did not get. *Transcript content* (`Vision`, `ServerSideTools`) **refuses with
+  `PUnsupported`** — a silently dropped image makes the model answer about something it never saw,
+  which looks like success. Do not "simplify" these into one behaviour.
+- **There is no `ParallelToolUse` capability.** It was mis-modelled: `crDisableParallelToolUse` is an
+  *inverse* knob, so a provider lacking parallel tool use already satisfies "disabled" and there is
+  nothing to detect. If the concept is needed it belongs to the agent loop, not to provider
+  capabilities.
 - On Apple Silicon, `install_name_tool` invalidates the signature — re-sign ad hoc (`codesign -f -s -`)
   or the binary is killed on launch. `scripts/package-haskell.sh` does this.
 - CI builds native deps from source (tree-sitter 0.26.12 for grammar ABI 15, libolm 3.2.16) and needs

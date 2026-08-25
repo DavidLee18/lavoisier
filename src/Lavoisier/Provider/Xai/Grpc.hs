@@ -80,13 +80,16 @@ defaultXaiGrpcEndpoint = "api.x.ai"
 
 -- | Build a 'Provider' that streams over the xAI gRPC chat service. @host@ is the gRPC endpoint
 -- (usually 'defaultXaiGrpcEndpoint'); the connection is TLS on port 443.
+-- | Everything the xAI gRPC transport supports, named once so 'declare' and 'negotiate' cannot
+-- drift apart.
+type XaiGrpcCaps = '[ 'ServerSideTools, 'Vision]
+
 xaiGrpcProvider :: Text -> Text -> Provider
 xaiGrpcProvider apiKey host =
   Provider
     { providerStream = grpcStream apiKey host,
-      -- xAI caches server-side (no request markers); it exposes provider-side tools + vision, and
-      -- supports parallel tool use.
-      providerCapabilities = declare @'[ 'ParallelToolUse, 'ServerSideTools, 'Vision],
+      -- xAI caches server-side (no request markers); it exposes provider-side tools + vision.
+      providerCapabilities = declare @XaiGrpcCaps,
       providerCountTokens = \_ -> pure (Right Nothing)
     }
 
@@ -94,10 +97,10 @@ xaiGrpcProvider apiKey host =
 -- 'Nothing') through a 'Chan' that backs the pull 'Producer' — grapesy's @withRPC@ is scoped, the
 -- 'Producer' is pull-based, so the thread owns the call's lifetime.
 grpcStream :: Text -> Text -> ChatRequest -> IO (Either ProviderError EventStream)
-grpcStream apiKey host req = do
+grpcStream apiKey host chatReq = withNegotiated @XaiGrpcCaps chatReq $ \nreq -> do
   chan <- newChan
   _ <- forkIO $ do
-    r <- try (runCall apiKey host (buildRequest req) chan)
+    r <- try (runCall apiKey host (buildRequest nreq) chan)
     case r of
       Left (e :: SomeException) -> do
         writeChan chan (Just (Left (PTransport (T.pack (show e)))))
@@ -197,8 +200,13 @@ usageFrom u =
 
 -- --- normalised ChatRequest → GetCompletionsRequest ------------------------------------------------
 
-buildRequest :: ChatRequest -> P.GetCompletionsRequest
-buildRequest req =
+buildRequest :: Negotiated caps -> P.GetCompletionsRequest
+buildRequest nreq =
+  let req = negotiatedRequest nreq
+   in buildRequestFor req
+
+buildRequestFor :: ChatRequest -> P.GetCompletionsRequest
+buildRequestFor req =
   foldr
     (.)
     id

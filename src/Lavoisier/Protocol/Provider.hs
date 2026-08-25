@@ -18,10 +18,14 @@ module Lavoisier.Protocol.Provider
     noCapabilities,
     promptCaching,
     extendedThinking,
-    parallelToolUse,
     serverSideTools,
     vision,
+    Negotiated,
+    negotiatedRequest,
+    negotiate,
+    withNegotiated,
     ProviderError (..),
+    providerErrorText,
     EventStream,
     Provider (..),
   )
@@ -30,17 +34,24 @@ where
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Word (Word64)
-import Lavoisier.Protocol.Event (Event)
-import Lavoisier.Protocol.Message (ChatRequest)
-import Lavoisier.Protocol.Stream (Producer)
+import Lavoisier.Protocol.Event (Event (..))
+import Lavoisier.Protocol.Message
+  ( BuiltinTool (..),
+    ChatRequest (..),
+    ContentBlock (..),
+    Message (..),
+    ServerTool (..),
+    ThinkingLevel (..),
+  )
+import Lavoisier.Protocol.Stream (Producer, prepend)
 
 -- | An optional feature a provider may support. The agent conditions behaviour on these — e.g. it
 -- only attaches cache markers when 'promptCaching' holds.
 data Capability
   = PromptCaching
   | ExtendedThinking
-  | ParallelToolUse
   | ServerSideTools
   | Vision
   deriving stock (Eq, Ord, Show, Enum, Bounded)
@@ -77,8 +88,6 @@ instance KnownCapability 'PromptCaching where capabilityVal = PromptCaching
 
 instance KnownCapability 'ExtendedThinking where capabilityVal = ExtendedThinking
 
-instance KnownCapability 'ParallelToolUse where capabilityVal = ParallelToolUse
-
 instance KnownCapability 'ServerSideTools where capabilityVal = ServerSideTools
 
 instance KnownCapability 'Vision where capabilityVal = Vision
@@ -103,12 +112,116 @@ allCapabilities :: Capabilities
 allCapabilities = Capabilities (Set.fromList [minBound .. maxBound])
 
 -- | Named predicates, kept so call sites read as before.
-promptCaching, extendedThinking, parallelToolUse, serverSideTools, vision :: Capabilities -> Bool
+promptCaching, extendedThinking, serverSideTools, vision :: Capabilities -> Bool
 promptCaching = supports PromptCaching
 extendedThinking = supports ExtendedThinking
-parallelToolUse = supports ParallelToolUse
 serverSideTools = supports ServerSideTools
 vision = supports Vision
+
+-- --- capability negotiation -----------------------------------------------------------------------
+
+-- | A 'ChatRequest' that has been checked against a provider declaring exactly @caps@, and adjusted
+-- where it could be. The constructor is __hidden__: 'negotiate' is the only way to obtain one, so a
+-- value of this type /is/ the evidence that the check ran. An adapter whose builders take
+-- @'Negotiated' caps@ cannot skip it.
+--
+-- The index is the provider\'s declared capability list — the same promoted list passed to
+-- 'declare'. Adapters should name it once as a type synonym and use it for both, so the declaration
+-- and the check cannot drift apart.
+newtype Negotiated (caps :: [Capability]) = Negotiated ChatRequest
+
+-- | Unwrap a negotiated request. Deliberately the only accessor.
+negotiatedRequest :: Negotiated caps -> ChatRequest
+negotiatedRequest (Negotiated req) = req
+
+-- | Check a request against the capabilities @caps@ and return any notices alongside either a
+-- refusal or the adjusted request.
+--
+-- The two kinds of capability fail in __opposite__ directions, deliberately:
+--
+--   * __Caller knobs__ — the user asked for something optional ('ExtendedThinking'). These
+--     __degrade__ and emit a notice. Killing the turn would be worse than not thinking, and the
+--     fallback chain applies one request across several providers. Staying silent is what the tree
+--     did before, and it billed the user for a feature they did not get.
+--
+--   * __Transcript content__ — the messages already carry bytes the provider must accept
+--     ('Vision', 'ServerSideTools'). These __refuse__ with 'PUnsupported'. Dropping an image
+--     silently makes the model answer about something it never saw, which looks like success.
+--
+-- Notices are returned even alongside a refusal; the caller may drop them in that case, since a
+-- refused turn has no event stream to carry them.
+negotiate ::
+  forall caps.
+  (Declares caps) =>
+  ChatRequest ->
+  ([Text], Either ProviderError (Negotiated caps))
+negotiate req = (notices, outcome)
+  where
+    caps = declare @caps
+
+    -- Caller knobs: degrade.
+    wantsThinking = case crThinking req of
+      Just lvl | lvl /= ThinkOff -> True
+      _ -> False
+    dropThinking = wantsThinking && not (extendedThinking caps)
+
+    notices =
+      [ "extended thinking was requested but this provider does not support it; continuing without it"
+      | dropThinking
+      ]
+
+    adjusted
+      | dropThinking = req {crThinking = Nothing}
+      | otherwise = req
+
+    -- Transcript content: refuse.
+    hasImage = any (any isImage . msgContent) (crMessages req)
+    isImage = \case
+      ImageBlock _ -> True
+      _ -> False
+
+    offeredServerTools =
+      map serverToolName (crServerTools req) <> map builtinToolName (crBuiltinTools req)
+
+    outcome
+      | hasImage && not (vision caps) =
+          Left (PUnsupported "the request contains an image block but this provider does not support vision")
+      | (t : _) <- offeredServerTools,
+        not (serverSideTools caps) =
+          Left (PUnsupported ("server-side tool `" <> t <> "` was offered but this provider does not support server-side tools"))
+      | otherwise = Right (Negotiated adjusted)
+
+-- | The adapter-facing wrapper: negotiate, then run the send with the checked request, prefixing any
+-- notices onto the front of the returned stream as 'Notice' events. An adapter\'s @providerStream@ is
+-- this call and nothing else, so the check cannot be forgotten and the notices cannot be dropped.
+withNegotiated ::
+  forall caps.
+  (Declares caps) =>
+  ChatRequest ->
+  (Negotiated caps -> IO (Either ProviderError EventStream)) ->
+  IO (Either ProviderError EventStream)
+withNegotiated req send = case negotiate @caps req of
+  (_, Left e) -> pure (Left e)
+  (notices, Right nreq) ->
+    send nreq >>= \case
+      Left e -> pure (Left e)
+      Right st -> Right <$> prepend [Right (Notice n) | n <- notices] st
+
+-- | Name a 'ServerTool' for use in a refusal message.
+serverToolName :: ServerTool -> Text
+serverToolName = \case
+  STWebSearch {} -> "web_search"
+  STWebFetch {} -> "web_fetch"
+  STCodeExecution -> "code_execution"
+  STXSearch {} -> "x_search"
+  STCollectionsSearch {} -> "collections_search"
+
+-- | Name a 'BuiltinTool' for use in a refusal message.
+builtinToolName :: BuiltinTool -> Text
+builtinToolName = \case
+  BTBash -> "bash"
+  BTTextEditor -> "text_editor"
+  BTMemory -> "memory"
 
 -- | Errors surfaced by a provider. Adapters map their transport\/API failures onto these.
 data ProviderError
@@ -125,6 +238,20 @@ data ProviderError
   | -- | Configuration problem (missing API key, bad base URL).
     PConfig Text
   deriving stock (Eq, Show)
+
+-- | Render a 'ProviderError' as a one-line human message, for gateways and batch paths that carry
+-- their own error type and only have a 'Text' to put it in.
+providerErrorText :: ProviderError -> Text
+providerErrorText = \case
+  PTransport t -> "transport error: " <> t
+  PApi code t -> "api error " <> tshow code <> ": " <> t
+  PDecode t -> "decode error: " <> t
+  PCancelled -> "cancelled"
+  PUnsupported t -> t
+  PConfig t -> "configuration error: " <> t
+  where
+    tshow :: (Show a) => a -> Text
+    tshow = T.pack . show
 
 -- | A streamed turn: a pull stream of events, each of which may be an error.
 type EventStream = Producer (Either ProviderError Event)

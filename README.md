@@ -354,8 +354,27 @@ above; requires `--serve-matrix`) ·
 `--provider anthropic|google|xai|xai-grpc|claude-cli` · `--model` · `--max-tokens` · `--max-steps` ·
 `--system` · `--persona <PATH>` / `--no-persona` (persona layered above the operating instructions;
 `./PERSONA.md` auto-loads when present) ·
-`--thinking <off|low|medium|high>` · `--budget` (total-task token ceiling) ·
+`--thinking <off|low|medium|high>` (see *Capability negotiation* below) · `--budget` (total-task
+token ceiling) ·
 `--session-dir <DIR>` (durable gateway sessions).
+
+### Capability negotiation
+
+Each provider declares what it supports, and since **0.17.0** every request is checked against that
+declaration before it is sent. The two kinds of capability fail in opposite directions on purpose:
+
+- **Optional knobs you asked for degrade, loudly.** `--thinking high` against a provider with no
+  extended thinking (today: `claude-cli`) drops the setting, runs the turn, and emits a **notice**
+  on the event stream. Before 0.17.0 the flag was silently ignored — you were billed for a turn
+  believing you had enabled a feature. Degrading rather than failing matters because one request
+  crosses the whole `--fallback` chain, and providers in that chain differ.
+- **Content the provider cannot read is refused.** A request carrying an image, or offering a
+  server-side tool, against a provider that supports neither now fails with a clear error naming
+  what was unsupported. Dropping the image instead would leave the model answering confidently about
+  something it never saw.
+
+The check runs for batch submissions too, so an unsupported task is rejected at submit time rather
+than after the batch has been accepted.
 
 Efficiency / cost levers: `--summary-model` / `--context-limit` (compaction + eviction) ·
 `--cheap-model` / `--escalate-after` (cheap-model-first) · `--advisor-model` (advisor+executor split) ·

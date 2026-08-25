@@ -10,6 +10,7 @@ module Lavoisier.Protocol.Stream
     drain,
     forEach,
     mapProducer,
+    prepend,
   )
 where
 
@@ -45,6 +46,19 @@ forEach p f = loop
       nextItem p >>= \case
         Nothing -> pure ()
         Just x -> f x >> loop
+
+-- | Yield the given items first, then everything the underlying producer yields. Used to emit
+-- capability notices ahead of a provider's own events without buffering the stream.
+prepend :: [a] -> Producer a -> IO (Producer a)
+prepend [] p = pure p
+prepend xs0 p = do
+  ref <- newIORef xs0
+  pure $
+    Producer $
+      atomicModifyIORef' ref (\case [] -> ([], Nothing); (x : rest) -> (rest, Just x))
+        >>= \case
+          Just x -> pure (Just x)
+          Nothing -> nextItem p
 
 -- | Transform each item as it is pulled (lazy — no buffering).
 mapProducer :: (a -> b) -> Producer a -> Producer b

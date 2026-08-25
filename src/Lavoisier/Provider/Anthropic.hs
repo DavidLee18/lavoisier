@@ -11,6 +11,7 @@ module Lavoisier.Provider.Anthropic
     AnthropicConfig (..),
     newAnthropicConfig,
     -- exposed for testing
+    AnthropicCaps,
     buildBody,
     buildCountBody,
   )
@@ -72,20 +73,23 @@ anthropicFromEnv = do
       cfg <- newAnthropicConfig (T.pack key) base
       pure (Right (anthropicProvider cfg))
 
+-- | Everything Anthropic supports, named once so 'declare' and 'negotiate' cannot drift apart.
+type AnthropicCaps = '[ 'PromptCaching, 'ExtendedThinking, 'ServerSideTools, 'Vision]
+
 -- | The 'Provider' record backed by an 'AnthropicConfig'.
 anthropicProvider :: AnthropicConfig -> Provider
 anthropicProvider cfg =
   Provider
     { providerStream = anthropicStream cfg,
-      providerCapabilities = declare @'[ 'PromptCaching, 'ExtendedThinking, 'ParallelToolUse, 'ServerSideTools, 'Vision],
+      providerCapabilities = declare @AnthropicCaps,
       providerCountTokens = anthropicCountTokens cfg
     }
 
 -- --- streaming -------------------------------------------------------------------------------------
 
 anthropicStream :: AnthropicConfig -> ChatRequest -> IO (Either ProviderError EventStream)
-anthropicStream cfg req = do
-  let body = encode (buildBody (acExtendedTtl cfg) req)
+anthropicStream cfg chatReq = withNegotiated @AnthropicCaps chatReq $ \nreq -> do
+  let body = encode (buildBody (acExtendedTtl cfg) nreq)
       url = T.unpack (T.dropWhileEnd (== '/') (acBaseUrl cfg)) <> "/v1/messages"
   ereq0 <- try (parseRequest url) :: IO (Either SomeException Request)
   case ereq0 of
@@ -175,13 +179,14 @@ anthropicCountTokens cfg req = do
 
 -- | Build the Messages-API request body from a normalised 'ChatRequest'. @extended_ttl@ puts the
 -- 1-hour TTL on the immutable-prefix breakpoints.
-buildBody :: Bool -> ChatRequest -> Value
-buildBody ttl req =
+buildBody :: Bool -> Negotiated caps -> Value
+buildBody ttl nreq =
   Object
     . markConversationTail
     . applyThinking (crThinking req) (unModelId (crModel req)) (crMaxTokens req)
     $ kmap pairs
   where
+    req = negotiatedRequest nreq
     pairs =
       concat
         [ [ ("model", String (unModelId (crModel req))),

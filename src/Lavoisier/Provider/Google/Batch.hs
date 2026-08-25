@@ -28,7 +28,8 @@ import Lavoisier.Domain (ModelId (..))
 import Lavoisier.Protocol.Batch
 import Lavoisier.Protocol.Event (Usage (..), emptyUsage)
 import Lavoisier.Protocol.Message (crModel)
-import Lavoisier.Provider.Google (GoogleConfig (..), buildBody)
+import Lavoisier.Protocol.Provider (negotiate, providerErrorText)
+import Lavoisier.Provider.Google (GoogleCaps, GoogleConfig (..), buildBody)
 import Network.HTTP.Client
 import Network.HTTP.Types (RequestHeaders)
 import Network.HTTP.Types.Status (statusCode, statusIsSuccessful)
@@ -49,14 +50,17 @@ runGoogleBatch _ [] = pure (Left (BatchError "run_batch: no tasks"))
 runGoogleBatch cfg tasks@(t0 : _) = do
   -- All tasks in a Gemini batch share the URL's model; take it from the first request.
   let model = unModelId (crModel (btRequest t0))
-  created <- batchPost cfg ("models/" <> T.unpack model <> ":batchGenerateContent") (batchBody cfg tasks)
-  case created of
+  case batchBody cfg tasks of
     Left e -> pure (Left e)
-    Right v ->
-      let (name, _, _) = parseBatchOp v
-       in if T.null name
-            then pure (Left (BatchError "batch response had no operation name"))
-            else poll name maxPolls
+    Right reqBody -> do
+      created <- batchPost cfg ("models/" <> T.unpack model <> ":batchGenerateContent") reqBody
+      case created of
+        Left e -> pure (Left e)
+        Right v ->
+          let (name, _, _) = parseBatchOp v
+           in if T.null name
+                then pure (Left (BatchError "batch response had no operation name"))
+                else poll name maxPolls
   where
     poll _ 0 = pure (Left (BatchError "batch did not finish within the poll window"))
     poll name n = do
@@ -75,23 +79,27 @@ runGoogleBatch cfg tasks@(t0 : _) = do
 
 -- | The @{"batch":{"display_name":…,"input_config":{"requests":{"requests":[…]}}}}@ body. Each entry
 -- is the normal generation body under @request@ plus a @metadata.key@ carrying the @custom_id@.
-batchBody :: GoogleConfig -> [BatchTask] -> Value
-batchBody cfg tasks =
-  object
-    [ "batch"
-        .= object
-          [ "display_name" .= String "lavoisier-batch",
-            "input_config" .= object ["requests" .= object ["requests" .= inlined]]
-          ]
-    ]
-  where
-    inlined =
-      [ object
-          [ "request" .= buildBody (gcReasoningFloor cfg) (btRequest t),
-            "metadata" .= object ["key" .= btId t]
-          ]
-      | t <- tasks
+-- | Every task is negotiated against 'GoogleCaps' first, exactly as the streaming path is.
+batchBody :: GoogleConfig -> [BatchTask] -> Either BatchError Value
+batchBody cfg tasks = do
+  inlined <- traverse entry tasks
+  pure $
+    object
+      [ "batch"
+          .= object
+            [ "display_name" .= String "lavoisier-batch",
+              "input_config" .= object ["requests" .= object ["requests" .= inlined]]
+            ]
       ]
+  where
+    entry t = case negotiate @GoogleCaps (btRequest t) of
+      (_, Left e) -> Left (BatchError ("batch task \"" <> btId t <> "\": " <> providerErrorText e))
+      (_, Right nreq) ->
+        Right $
+          object
+            [ "request" .= buildBody (gcReasoningFloor cfg) nreq,
+              "metadata" .= object ["key" .= btId t]
+            ]
 
 -- | Parse a batch long-running-operation object into @(name, state, done)@.
 parseBatchOp :: Value -> (Text, Text, Bool)

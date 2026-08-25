@@ -12,6 +12,7 @@ module Lavoisier.Provider.Google
     GoogleConfig (..),
     newGoogleConfig,
     -- exposed for testing
+    GoogleCaps,
     buildBody,
     defaultReasoningFloor,
   )
@@ -70,11 +71,14 @@ googleFromEnv = do
       cfg <- newGoogleConfig (T.pack key) base
       pure (Right (googleProvider cfg))
 
+-- | Everything Gemini supports, named once so 'declare' and 'negotiate' cannot drift apart.
+type GoogleCaps = '[ 'ExtendedThinking, 'ServerSideTools, 'Vision]
+
 googleProvider :: GoogleConfig -> Provider
 googleProvider cfg =
   Provider
     { providerStream = googleStream cfg,
-      providerCapabilities = declare @'[ 'ExtendedThinking, 'ParallelToolUse, 'ServerSideTools, 'Vision],
+      providerCapabilities = declare @GoogleCaps,
       -- Native countTokens exists but is deferred; the agent falls back to its own estimate.
       providerCountTokens = \_ -> pure (Right Nothing)
     }
@@ -82,8 +86,9 @@ googleProvider cfg =
 -- --- streaming -------------------------------------------------------------------------------------
 
 googleStream :: GoogleConfig -> ChatRequest -> IO (Either ProviderError EventStream)
-googleStream cfg req = do
-  let body = encode (buildBody (gcReasoningFloor cfg) req)
+googleStream cfg chatReq = withNegotiated @GoogleCaps chatReq $ \nreq -> do
+  let req = negotiatedRequest nreq
+      body = encode (buildBody (gcReasoningFloor cfg) nreq)
       base = T.unpack (T.dropWhileEnd (== '/') (gcBaseUrl cfg))
       url = base <> "/v1beta/models/" <> T.unpack (unModelId (crModel req)) <> ":streamGenerateContent?alt=sse"
   ereq0 <- try (parseRequest url) :: IO (Either SomeException Request)
@@ -143,8 +148,13 @@ headers cfg =
 
 -- --- request-body construction --------------------------------------------------------------------
 
-buildBody :: Word32 -> ChatRequest -> Value
-buildBody reasoningFloor req =
+buildBody :: Word32 -> Negotiated caps -> Value
+buildBody reasoningFloor nreq =
+  let req = negotiatedRequest nreq
+   in buildBodyFor reasoningFloor req
+
+buildBodyFor :: Word32 -> ChatRequest -> Value
+buildBodyFor reasoningFloor req =
   kobj $
     concat
       [ [("contents", buildContents (crMessages req))],

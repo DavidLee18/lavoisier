@@ -26,7 +26,8 @@ import Data.Vector qualified as V
 import Data.Word (Word64)
 import Lavoisier.Protocol.Batch
 import Lavoisier.Protocol.Event (Usage (..), emptyUsage)
-import Lavoisier.Provider.Anthropic (AnthropicConfig (..), buildBody)
+import Lavoisier.Protocol.Provider (negotiate, providerErrorText)
+import Lavoisier.Provider.Anthropic (AnthropicCaps, AnthropicConfig (..), buildBody)
 import Network.HTTP.Client
 import Network.HTTP.Types (RequestHeaders)
 import Network.HTTP.Types.Status (statusCode, statusIsSuccessful)
@@ -46,11 +47,13 @@ anthropicBatch :: AnthropicConfig -> Batch
 anthropicBatch cfg = Batch (runAnthropicBatch cfg)
 
 runAnthropicBatch :: AnthropicConfig -> [BatchTask] -> IO (Either BatchError [BatchItem])
-runAnthropicBatch cfg tasks = do
-  created <- batchPost cfg "" (batchRequestsBody (acExtendedTtl cfg) tasks)
-  case created >>= idOf of
-    Left e -> pure (Left e)
-    Right bid -> poll bid maxPolls
+runAnthropicBatch cfg tasks = case batchRequestsBody (acExtendedTtl cfg) tasks of
+  Left e -> pure (Left e)
+  Right reqBody -> do
+    created <- batchPost cfg "" reqBody
+    case created >>= idOf of
+      Left e -> pure (Left e)
+      Right bid -> poll bid maxPolls
   where
     poll _ 0 = pure (Left (BatchError "batch did not finish within the poll window"))
     poll bid n = do
@@ -67,10 +70,18 @@ runAnthropicBatch cfg tasks = do
 
 -- | The @{"requests":[{"custom_id":…,"params":…}]}@ body. Each request's @params@ is the normal
 -- (non-streaming) message body with @stream@ stripped (the batch endpoint rejects it).
-batchRequestsBody :: Bool -> [BatchTask] -> Value
-batchRequestsBody ttl tasks =
-  object ["requests" .= [object ["custom_id" .= btId t, "params" .= stripStream (buildBody ttl (btRequest t))] | t <- tasks]]
+--
+-- Every task is negotiated against 'AnthropicCaps' first, exactly as the streaming path is: a batch
+-- is still a request to this provider, and a whole batch that would be rejected mid-flight is worth
+-- refusing at submit time.
+batchRequestsBody :: Bool -> [BatchTask] -> Either BatchError Value
+batchRequestsBody ttl tasks = do
+  params <- traverse negotiated tasks
+  pure (object ["requests" .= [object ["custom_id" .= btId t, "params" .= p] | (t, p) <- zip tasks params]])
   where
+    negotiated t = case negotiate @AnthropicCaps (btRequest t) of
+      (_, Left e) -> Left (BatchError ("batch task \"" <> btId t <> "\": " <> providerErrorText e))
+      (_, Right nreq) -> Right (stripStream (buildBody ttl nreq))
     stripStream (Object o) = Object (KM.delete "stream" o)
     stripStream v = v
 

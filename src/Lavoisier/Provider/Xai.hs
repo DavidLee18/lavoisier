@@ -71,21 +71,25 @@ xaiFromEnv = do
       cfg <- newXaiConfig (T.pack key) base
       pure (Right (xaiProvider cfg))
 
--- | The 'Provider' record backed by an 'XaiConfig'. No caching\/thinking\/server-tools; parallel
--- tool use and vision supported. No native token counting on this transport.
+-- | Everything the xAI REST transport supports, named once so 'declare' and 'negotiate' cannot
+-- drift apart.
+type XaiCaps = '[ 'Vision]
+
+-- | The 'Provider' record backed by an 'XaiConfig'. No caching\/thinking\/server-tools; vision is
+-- supported. No native token counting on this transport.
 xaiProvider :: XaiConfig -> Provider
 xaiProvider cfg =
   Provider
     { providerStream = xaiStream cfg,
-      providerCapabilities = declare @'[ 'ParallelToolUse, 'Vision],
+      providerCapabilities = declare @XaiCaps,
       providerCountTokens = \_ -> pure (Right Nothing)
     }
 
 -- --- streaming -------------------------------------------------------------------------------------
 
 xaiStream :: XaiConfig -> ChatRequest -> IO (Either ProviderError EventStream)
-xaiStream cfg req = do
-  let body = encode (buildBody req)
+xaiStream cfg chatReq = withNegotiated @XaiCaps chatReq $ \nreq -> do
+  let body = encode (buildBody nreq)
       url = T.unpack (T.dropWhileEnd (== '/') (xcBaseUrl cfg)) <> "/chat/completions"
   ereq0 <- try (parseRequest url) :: IO (Either SomeException Request)
   case ereq0 of
@@ -147,8 +151,13 @@ headers cfg =
 -- --- request-body construction (ports build_messages/build_tools/&c.) ------------------------------
 
 -- | Build the OpenAI chat-completions request body from a normalised 'ChatRequest'.
-buildBody :: ChatRequest -> Value
-buildBody req =
+buildBody :: Negotiated caps -> Value
+buildBody nreq =
+  let req = negotiatedRequest nreq
+   in buildBodyFor req
+
+buildBodyFor :: ChatRequest -> Value
+buildBodyFor req =
   Object . kmap $
     concat
       [ [ ("model", String (unModelId (crModel req))),
