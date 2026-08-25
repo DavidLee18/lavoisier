@@ -21,6 +21,7 @@ extra-source-files:
   cbits/**/*.h
   tests/budget/**/*.txt
   tests/budget/**/*.rs
+  tests/fixtures/**/*.sse
 
 flag e2ee
   description: Matrix end-to-end encryption (Olm/Megolm via the olm/libolm FFI package).

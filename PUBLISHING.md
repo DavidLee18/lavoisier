@@ -14,11 +14,14 @@ and the crates.io packages are frozen (see the last section).
 
    ```sh
    cabal sdist all          # NOT `cabal sdist lavoisier` — that errors on the library component
-   tar tzf dist-newstyle/sdist/lavoisier-*.tar.gz | grep -E '\.h$|tests/budget'
+   tar tzf dist-newstyle/sdist/lavoisier-*.tar.gz | grep -E '\.h$|tests/budget|tests/fixtures'
    ```
 
-   Anything a build reads at compile time must be in `extra-source-files`: the `cbits/**/*.h`
-   shims and the `tests/budget/**` fixtures.
+   Anything a build **or the test suite** reads must be in `extra-source-files`: the `cbits/**/*.h`
+   shims, the `tests/budget/**` fixtures, and the `tests/fixtures/**/*.sse` recorded streams. The
+   test suite reads files at *runtime*, so a missing entry here is invisible in a working tree and
+   only fails from an sdist — which is how `hs-v0.13.1` shipped broken. Re-run this check whenever a
+   test starts reading a new file.
 4. Tag and push:
 
    ```sh
