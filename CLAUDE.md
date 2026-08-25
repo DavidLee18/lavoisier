@@ -111,6 +111,12 @@ posture is efficiency-first.
   `ChatRequest`, so no send path can skip the capability check. `providerStream` is
   `withNegotiated @Caps req $ \nreq -> …` and nothing else. Adding a *new* send path — the batch
   submitters were exactly this — fails to compile until it negotiates too, which is the point.
+- **Server-side tools get one capability each, not a category.** `WebSearch`/`WebFetch`/
+  `CodeExecution`/`XSearch`/`CollectionsSearch`/`ClientBuiltinTools`/`RemoteMcp`. The old
+  `ServerSideTools` flag was wrong: provider tool sets are disjoint, so one flag let an xAI-only tool
+  through to Anthropic, whose mapper then dropped it silently. An adapter must declare exactly what
+  its mapper maps — a tasty test asserts the two agree, so widening a mapper without widening the
+  declaration (or the reverse) fails.
 - **Capabilities fail in two opposite directions, deliberately.** *Caller knobs* (`ExtendedThinking`)
   **degrade and emit a `Notice`** — never kill a turn, because one request builder crosses the whole
   heterogeneous fallback chain; but never stay silent either, because the user paid for a feature

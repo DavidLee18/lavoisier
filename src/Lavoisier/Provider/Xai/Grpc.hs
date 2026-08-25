@@ -81,14 +81,15 @@ defaultXaiGrpcEndpoint = "api.x.ai"
 -- | Build a 'Provider' that streams over the xAI gRPC chat service. @host@ is the gRPC endpoint
 -- (usually 'defaultXaiGrpcEndpoint'); the connection is TLS on port 443.
 -- | Everything the xAI gRPC transport supports, named once so 'declare' and 'negotiate' cannot
--- drift apart.
-type XaiGrpcCaps = '[ 'ServerSideTools, 'Vision]
+-- drift apart. It used to claim server-side tools; 'buildRequestFor' has never mapped
+-- @crServerTools@ or @crBuiltinTools@, so the claim only bought a silent drop.
+type XaiGrpcCaps = '[ 'Vision]
 
 xaiGrpcProvider :: Text -> Text -> Provider
 xaiGrpcProvider apiKey host =
   Provider
     { providerStream = grpcStream apiKey host,
-      -- xAI caches server-side (no request markers); it exposes provider-side tools + vision.
+      -- xAI caches server-side (no request markers), so no PromptCaching marker is declared.
       providerCapabilities = declare @XaiGrpcCaps,
       providerCountTokens = \_ -> pure (Right Nothing)
     }

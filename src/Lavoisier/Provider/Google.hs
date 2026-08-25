@@ -13,6 +13,7 @@ module Lavoisier.Provider.Google
     newGoogleConfig,
     -- exposed for testing
     GoogleCaps,
+    serverTool,
     buildBody,
     defaultReasoningFloor,
   )
@@ -71,8 +72,10 @@ googleFromEnv = do
       cfg <- newGoogleConfig (T.pack key) base
       pure (Right (googleProvider cfg))
 
--- | Everything Gemini supports, named once so 'declare' and 'negotiate' cannot drift apart.
-type GoogleCaps = '[ 'ExtendedThinking, 'ServerSideTools, 'Vision]
+-- | Everything Gemini supports, named once so 'declare' and 'negotiate' cannot drift apart. Only
+-- the two tools 'serverTool' maps are listed: Gemini also offers URL context, Maps grounding and
+-- File Search, but 'ServerTool' cannot express them yet, so declaring them would be a lie.
+type GoogleCaps = '[ 'ExtendedThinking, 'Vision, 'WebSearch, 'CodeExecution]
 
 googleProvider :: GoogleConfig -> Provider
 googleProvider cfg =
@@ -198,11 +201,15 @@ serverTool = \case
   STCodeExecution -> [kobj [("codeExecution", object [])]]
   _ -> []
 
+-- | Map a 'ThinkingLevel' to Gemini's @thinkingConfig@. Gemini 3 accepts
+-- @minimal|low|medium|high@ for @thinkingLevel@, so medium maps to medium — it used to map to
+-- @high@, which quietly bought more reasoning tokens than the caller asked for. @off@ still uses
+-- @thinkingBudget: 0@, since there is no @thinkingLevel@ that means \"none\".
 thinkingConfig :: ThinkingLevel -> Value
 thinkingConfig = \case
   ThinkOff -> kobj [("thinkingBudget", toJSON (0 :: Int))]
   ThinkLow -> kobj [("thinkingLevel", String "low")]
-  ThinkMedium -> kobj [("thinkingLevel", String "high")]
+  ThinkMedium -> kobj [("thinkingLevel", String "medium")]
   ThinkHigh -> kobj [("thinkingLevel", String "high")]
 
 effectiveMaxOutput :: Text -> Word32 -> Word32 -> Word32

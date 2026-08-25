@@ -83,7 +83,7 @@ import Lavoisier.Protocol.Provider
 import Lavoisier.Protocol.Stream (drain, fromList)
 import Lavoisier.Protocol.Tool
 import Lavoisier.Protocol.Tune qualified as Tn
-import Lavoisier.Provider.Anthropic (AnthropicCaps, buildBody)
+import Lavoisier.Provider.Anthropic (AnthropicCaps, buildBody, serverToolJson)
 import Lavoisier.Provider.Anthropic.Batch (batchRequestsBody, parseResultLine)
 import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
 import Lavoisier.Provider.ClaudeCli (eofDecoder, initDecoder, pushLine, renderPrompt)
@@ -551,6 +551,18 @@ googleTests =
         GS.mapFinish "STOP" @?= EndTurn
         GS.mapFinish "MAX_TOKENS" @?= MaxTokens
         GS.mapFinish "SAFETY" @?= Other "SAFETY",
+      testCase "thinkingLevel maps medium to medium, not high" $ do
+        -- Gemini 3 accepts minimal|low|medium|high; medium used to be sent as high, which bought
+        -- more reasoning tokens than the caller asked for.
+        let bodyFor lvl =
+              decodeUtf8Lenient . BL.toStrict . encode $
+                G.buildBody
+                  G.defaultReasoningFloor
+                  (negotiatedFor @G.GoogleCaps ((chatRequest "gemini-3-pro") {crMessages = [userMessage "hi"], crThinking = Just lvl}))
+        assertBool "medium" ("\"thinkingLevel\":\"medium\"" `T.isInfixOf` bodyFor ThinkMedium)
+        assertBool "high" ("\"thinkingLevel\":\"high\"" `T.isInfixOf` bodyFor ThinkHigh)
+        assertBool "low" ("\"thinkingLevel\":\"low\"" `T.isInfixOf` bodyFor ThinkLow)
+        assertBool "off uses a zero budget" ("\"thinkingBudget\":0" `T.isInfixOf` bodyFor ThinkOff),
       testCase "buildBody maps roles, functionCall/Response, generationConfig" $ do
         let req =
               (chatRequest "gemini-2.5-flash")
@@ -2456,9 +2468,32 @@ negotiationTests =
         case snd (negotiate @'[] req) of
           Left (PUnsupported m) -> assertBool "names web_search" ("web_search" `T.isInfixOf` m)
           other -> assertFailure ("expected a refusal naming the tool, got " <> show (fmap (const ()) other)),
+      -- The category flag let an xAI-only tool through to a provider that maps web search but not
+      -- x_search, which then dropped it in silence. Each tool is checked against its own capability.
+      testCase "supporting one server tool does not admit a different one" $ do
+        let req = (chatRequest "m") {crMessages = [userMessage "hi"], crServerTools = [STXSearch [] [] Nothing Nothing]}
+        case snd (negotiate @'[ 'WebSearch, 'WebFetch, 'CodeExecution] req) of
+          Left (PUnsupported m) -> do
+            assertBool "names x_search" ("x_search" `T.isInfixOf` m)
+            assertBool "names the capability" ("XSearch" `T.isInfixOf` m)
+          other -> assertFailure ("expected a refusal, got " <> show (fmap (const ()) other)),
+      testCase "the matching tool capability admits it" $
+        assertBool "accepted" $
+          case snd (negotiate @'[ 'XSearch] ((chatRequest "m") {crServerTools = [STXSearch [] [] Nothing Nothing]})) of
+            Right _ -> True
+            Left _ -> False,
+      testCase "remote MCP servers need their own capability" $ do
+        let req = (chatRequest "m") {crMessages = [userMessage "hi"], crMcpServers = [McpServer "n" "https://x" Nothing]}
+        case snd (negotiate @'[ 'WebSearch] req) of
+          Left (PUnsupported m) -> assertBool "names MCP" ("MCP" `T.isInfixOf` m)
+          other -> assertFailure ("expected a refusal, got " <> show (fmap (const ()) other))
+        assertBool "admitted when declared" $
+          case snd (negotiate @'[ 'RemoteMcp] req) of
+            Right _ -> True
+            Left _ -> False,
       testCase "a builtin tool refuses too" $ do
         let req = (chatRequest "m") {crMessages = [userMessage "hi"], crBuiltinTools = [BTBash]}
-        case snd (negotiate @'[] req) of
+        case snd (negotiate @'[ 'WebSearch] req) of
           Left (PUnsupported m) -> assertBool "names bash" ("bash" `T.isInfixOf` m)
           other -> assertFailure ("expected a refusal, got " <> show (fmap (const ()) other)),
       testCase "content refusal wins over a knob notice" $ do
@@ -2478,9 +2513,33 @@ negotiationTests =
                   crThinking = Just ThinkHigh,
                   crServerTools = [STWebSearch Nothing [] []]
                 }
-            (notices, out) = negotiate @'[ 'ExtendedThinking, 'ServerSideTools, 'Vision] req
+            (notices, out) = negotiate @'[ 'ExtendedThinking, 'WebSearch, 'Vision] req
         notices @?= []
         fmap (\n -> negotiatedRequest n == req) out @?= Right True,
+      -- The drift this guards against is the one that shipped: an adapter declaring a tool category
+      -- while its mapper silently dropped half the tools in it.
+      testCase "every declared tool capability is one the adapter actually maps" $ do
+        let allTools =
+              [ STWebSearch Nothing [] [],
+                STWebFetch Nothing,
+                STCodeExecution,
+                STXSearch [] [] Nothing Nothing,
+                STCollectionsSearch [] Nothing
+              ]
+        sequence_
+          [ assertEqual
+              ("Anthropic " <> show (serverToolCapability tl))
+              (supports (serverToolCapability tl) (declare @AnthropicCaps))
+              (isJust (serverToolJson tl))
+          | tl <- allTools
+          ]
+        sequence_
+          [ assertEqual
+              ("Google " <> show (serverToolCapability tl))
+              (supports (serverToolCapability tl) (declare @G.GoogleCaps))
+              (not (null (G.serverTool tl)))
+          | tl <- allTools
+          ],
       testCase "notices reach the stream ahead of the provider's own events" $ do
         let req = (chatRequest "m") {crMessages = [userMessage "hi"], crThinking = Just ThinkHigh}
         r <- withNegotiated @'[] req $ \_ -> Right <$> fromList [Right (TextDelta "hello")]

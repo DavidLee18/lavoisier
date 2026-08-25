@@ -18,8 +18,9 @@ module Lavoisier.Protocol.Provider
     noCapabilities,
     promptCaching,
     extendedThinking,
-    serverSideTools,
     vision,
+    serverToolCapability,
+    builtinToolCapability,
     Negotiated,
     negotiatedRequest,
     negotiate,
@@ -31,6 +32,7 @@ module Lavoisier.Protocol.Provider
   )
 where
 
+import Data.Maybe (listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -47,13 +49,32 @@ import Lavoisier.Protocol.Message
   )
 import Lavoisier.Protocol.Stream (Producer, prepend)
 
--- | An optional feature a provider may support. The agent conditions behaviour on these — e.g. it
--- only attaches cache markers when 'promptCaching' holds.
+-- | An optional feature a provider may support.
+--
+-- Server-side tools are enumerated __one capability per tool__, not as a single @ServerSideTools@
+-- category. The category flag was wrong: the providers' tool sets are genuinely disjoint (Anthropic
+-- web search\/fetch\/code execution + its own client builtins + remote MCP; Gemini search + code
+-- execution; xAI search + X search + collections), so one flag let a tool the adapter cannot map
+-- pass the check and be dropped in silence — the failure 'negotiate' exists to remove. Each adapter
+-- declares exactly the tools it maps.
 data Capability
   = PromptCaching
   | ExtendedThinking
-  | ServerSideTools
   | Vision
+  | -- | Provider-run web search ('STWebSearch'; Gemini\'s Google Search grounding).
+    WebSearch
+  | -- | Provider-run fetch of a named URL ('STWebFetch').
+    WebFetch
+  | -- | Provider-hosted code sandbox ('STCodeExecution').
+    CodeExecution
+  | -- | Search of X posts ('STXSearch', xAI only).
+    XSearch
+  | -- | RAG over provider-hosted document collections ('STCollectionsSearch', xAI only).
+    CollectionsSearch
+  | -- | Anthropic-defined client tools declared by versioned type ('BuiltinTool').
+    ClientBuiltinTools
+  | -- | Remote MCP servers the provider connects to on the model\'s behalf ('crMcpServers').
+    RemoteMcp
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 -- | What a provider supports. A /set/ of 'Capability', not a record of 'Bool': the record version
@@ -88,9 +109,21 @@ instance KnownCapability 'PromptCaching where capabilityVal = PromptCaching
 
 instance KnownCapability 'ExtendedThinking where capabilityVal = ExtendedThinking
 
-instance KnownCapability 'ServerSideTools where capabilityVal = ServerSideTools
-
 instance KnownCapability 'Vision where capabilityVal = Vision
+
+instance KnownCapability 'WebSearch where capabilityVal = WebSearch
+
+instance KnownCapability 'WebFetch where capabilityVal = WebFetch
+
+instance KnownCapability 'CodeExecution where capabilityVal = CodeExecution
+
+instance KnownCapability 'XSearch where capabilityVal = XSearch
+
+instance KnownCapability 'CollectionsSearch where capabilityVal = CollectionsSearch
+
+instance KnownCapability 'ClientBuiltinTools where capabilityVal = ClientBuiltinTools
+
+instance KnownCapability 'RemoteMcp where capabilityVal = RemoteMcp
 
 insertCap :: Capability -> Capabilities -> Capabilities
 insertCap c (Capabilities s) = Capabilities (Set.insert c s)
@@ -112,11 +145,24 @@ allCapabilities :: Capabilities
 allCapabilities = Capabilities (Set.fromList [minBound .. maxBound])
 
 -- | Named predicates, kept so call sites read as before.
-promptCaching, extendedThinking, serverSideTools, vision :: Capabilities -> Bool
+promptCaching, extendedThinking, vision :: Capabilities -> Bool
 promptCaching = supports PromptCaching
 extendedThinking = supports ExtendedThinking
-serverSideTools = supports ServerSideTools
 vision = supports Vision
+
+-- | The capability a given server-side tool requires.
+serverToolCapability :: ServerTool -> Capability
+serverToolCapability = \case
+  STWebSearch {} -> WebSearch
+  STWebFetch {} -> WebFetch
+  STCodeExecution -> CodeExecution
+  STXSearch {} -> XSearch
+  STCollectionsSearch {} -> CollectionsSearch
+
+-- | The capability a given client builtin tool requires. All three are Anthropic-defined, so they
+-- share one capability rather than getting three of their own.
+builtinToolCapability :: BuiltinTool -> Capability
+builtinToolCapability _ = ClientBuiltinTools
 
 -- --- capability negotiation -----------------------------------------------------------------------
 
@@ -144,9 +190,11 @@ negotiatedRequest (Negotiated req) = req
 --     fallback chain applies one request across several providers. Staying silent is what the tree
 --     did before, and it billed the user for a feature they did not get.
 --
---   * __Transcript content__ — the messages already carry bytes the provider must accept
---     ('Vision', 'ServerSideTools'). These __refuse__ with 'PUnsupported'. Dropping an image
---     silently makes the model answer about something it never saw, which looks like success.
+--   * __Transcript content and requested tools__ — the messages already carry bytes the provider
+--     must accept ('Vision'), or the caller asked for a specific provider-run tool. These
+--     __refuse__ with 'PUnsupported'. Dropping an image silently makes the model answer about
+--     something it never saw; dropping a tool leaves the model unable to do what it was set up to
+--     do. Both look like success.
 --
 -- Notices are returned even alongside a refusal; the caller may drop them in that case, since a
 -- refused turn has no event stream to carry them.
@@ -180,16 +228,33 @@ negotiate req = (notices, outcome)
       ImageBlock _ -> True
       _ -> False
 
-    offeredServerTools =
-      map serverToolName (crServerTools req) <> map builtinToolName (crBuiltinTools req)
+    -- Each tool is checked against its __own__ capability, because the providers' tool sets are
+    -- disjoint. A single category flag would let e.g. an xAI-only tool through to Anthropic, whose
+    -- mapper then silently drops it.
+    unsupportedTool =
+      listToMaybe $
+        [ (serverToolName t, c)
+        | t <- crServerTools req,
+          let c = serverToolCapability t,
+          not (supports c caps)
+        ]
+          <> [ (builtinToolName b, c)
+             | b <- crBuiltinTools req,
+               let c = builtinToolCapability b,
+               not (supports c caps)
+             ]
 
     outcome
       | hasImage && not (vision caps) =
           Left (PUnsupported "the request contains an image block but this provider does not support vision")
-      | (t : _) <- offeredServerTools,
-        not (serverSideTools caps) =
-          Left (PUnsupported ("server-side tool `" <> t <> "` was offered but this provider does not support server-side tools"))
+      | Just (name, c) <- unsupportedTool =
+          Left (PUnsupported ("tool `" <> name <> "` was offered but this provider does not support it (" <> tshowCap c <> ")"))
+      | not (null (crMcpServers req)),
+        not (supports RemoteMcp caps) =
+          Left (PUnsupported "remote MCP servers were offered but this provider does not connect to them")
       | otherwise = Right (Negotiated adjusted)
+
+    tshowCap = T.pack . show
 
 -- | The adapter-facing wrapper: negotiate, then run the send with the checked request, prefixing any
 -- notices onto the front of the returned stream as 'Notice' events. An adapter\'s @providerStream@ is

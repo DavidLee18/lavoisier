@@ -368,10 +368,11 @@ declaration before it is sent. The two kinds of capability fail in opposite dire
   on the event stream. Before 0.17.0 the flag was silently ignored — you were billed for a turn
   believing you had enabled a feature. Degrading rather than failing matters because one request
   crosses the whole `--fallback` chain, and providers in that chain differ.
-- **Content the provider cannot read is refused.** A request carrying an image, or offering a
-  server-side tool, against a provider that supports neither now fails with a clear error naming
-  what was unsupported. Dropping the image instead would leave the model answering confidently about
-  something it never saw.
+- **Content the provider cannot read, or a tool it cannot run, is refused.** A request carrying an
+  image against a provider without vision fails with a clear error, rather than leaving the model
+  answering confidently about something it never saw. Server-side tools are checked **individually**
+  — `x_search` is an xAI tool, `web_fetch` an Anthropic one, and asking the wrong provider for one
+  now says so instead of dropping it.
 
 The check runs for batch submissions too, so an unsupported task is rejected at submit time rather
 than after the batch has been accepted — and because a batch has no event stream to carry a notice,

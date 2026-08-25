@@ -12,6 +12,7 @@ module Lavoisier.Provider.Anthropic
     newAnthropicConfig,
     -- exposed for testing
     AnthropicCaps,
+    serverToolJson,
     buildBody,
     buildCountBody,
   )
@@ -74,7 +75,17 @@ anthropicFromEnv = do
       pure (Right (anthropicProvider cfg))
 
 -- | Everything Anthropic supports, named once so 'declare' and 'negotiate' cannot drift apart.
-type AnthropicCaps = '[ 'PromptCaching, 'ExtendedThinking, 'ServerSideTools, 'Vision]
+-- The tool entries must match what 'serverToolJson' and 'builtinToolJson' actually map.
+type AnthropicCaps =
+  '[ 'PromptCaching,
+     'ExtendedThinking,
+     'Vision,
+     'WebSearch,
+     'WebFetch,
+     'CodeExecution,
+     'ClientBuiltinTools,
+     'RemoteMcp
+   ]
 
 -- | The 'Provider' record backed by an 'AnthropicConfig'.
 anthropicProvider :: AnthropicConfig -> Provider
