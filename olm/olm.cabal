@@ -21,6 +21,7 @@ common lang
     LambdaCase
     ImportQualifiedPost
     DerivingStrategies
+    UnicodeSyntax
   ghc-options:
     -Wall -Werror
     -Wincomplete-patterns -Wincomplete-uni-patterns

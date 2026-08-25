@@ -6,7 +6,7 @@ and the crates.io packages are frozen (see the last section).
 
 ## Cutting a release
 
-1. Everything green on `main`: `cabal build` (`-Wall -Werror`), `cabal test`, `ormolu --mode check`.
+1. Everything green on `main`: `cabal build` (`-Wall -Werror`), `cabal test`, `fourmolu --mode check`.
    CI gates all three, including the budget-ceiling step.
 2. Bump `version:` in `lavoisier.cabal`. Commit it.
 3. **Check the sdist actually carries what the build needs** before tagging — this has bitten a

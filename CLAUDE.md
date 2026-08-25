@@ -44,8 +44,9 @@ posture is efficiency-first.
 
 ## Conventions
 
-- **Haskell**: GHC 9.10 / Cabal, `GHC2021`, `-Wall -Werror` kept clean, **ormolu** before every
-  commit. Correctness via ADTs + exhaustive `case`. Tests are `tasty` — prefer QuickCheck properties.
+- **Haskell**: GHC 9.10 / Cabal, `GHC2021` + `UnicodeSyntax`, `-Wall -Werror` kept clean,
+  **fourmolu** before every commit (config in `fourmolu.yaml`; 4-space indent, leading commas,
+  no column limit, unicode arrows). Never sweep `gen/` — use the explicit path list in Commands. Correctness via ADTs + exhaustive `case`. Tests are `tasty` — prefer QuickCheck properties.
 - **Config is Dhall** (`schema.dhall` + `lavoisier.dhall.example`); `--cron-file` and
   `--schedule-file` are Dhall record lists. (The retired Rust tree used TOML and JSON — old issues
   and infra may still say so.)
@@ -152,6 +153,10 @@ posture is efficiency-first.
   *inverse* knob, so a provider lacking parallel tool use already satisfies "disabled" and there is
   nothing to detect. If the concept is needed it belongs to the agent loop, not to provider
   capabilities.
+- **`unicode: always` in `fourmolu.yaml` needs `UnicodeSyntax`** in `default-extensions` — in
+  *both* `lavoisier.cabal` and `olm/olm.cabal`. Without it fourmolu fails on its own output
+  (`parse error on input '∷'`), because it re-parses what it printed. A new package needs the
+  extension before it can be formatted.
 - On Apple Silicon, `install_name_tool` invalidates the signature — re-sign ad hoc (`codesign -f -s -`)
   or the binary is killed on launch. `scripts/package-haskell.sh` does this.
 - CI builds native deps from source (tree-sitter 0.26.12 for grammar ABI 15, libolm 3.2.16) and needs
@@ -206,7 +211,7 @@ Still deferred: Matrix token streaming.
 ```sh
 cabal build && cabal test              # -Wall -Werror; tasty
 cabal build -fe2ee && cabal test lavoisier-e2ee-test
-ormolu --mode inplace $(git ls-files '*.hs')
+fourmolu --mode inplace $(git ls-files 'src/*.hs' 'app/*.hs' 'test/*.hs' 'test-e2ee/*.hs' 'olm/*.hs')
 cabal run lav -- --agent "edit task"
 
 # The retired Rust tree, if you need to read it:

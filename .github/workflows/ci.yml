@@ -1,6 +1,6 @@
 name: ci
 
-# CI for Lavoisier: ormolu (format), build, and the test suite — plus a parallel job that builds and
+# CI for Lavoisier: fourmolu (format), build, and the test suite — plus a parallel job that builds and
 # tests the opt-in `e2ee` feature (libolm). Native libraries the dev machine gets from Homebrew/~/.local
 # are here built from source or apt-installed to standard prefixes, selected by `cabal.project.ci`.
 #
@@ -24,7 +24,7 @@ env:
 
 jobs:
   build-test:
-    name: ormolu / build / test
+    name: fourmolu / build / test
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -78,10 +78,10 @@ jobs:
           key: ${{ runner.os }}-cabal-${{ hashFiles('lavoisier.cabal', 'cabal.project.ci') }}
           restore-keys: ${{ runner.os }}-cabal-
 
-      - name: Format (ormolu)
-        uses: haskell-actions/run-ormolu@f15613427428a49a241fa0331881dcf4cc118121 # v21
+      - name: Format (fourmolu)
+        uses: haskell-actions/run-fourmolu@1b9df64b784203126500372730b9725c97e4040b # v13
         with:
-          version: "0.8.2.0"
+          version: "0.20.0.0"
           pattern: |
             src/**/*.hs
             app/**/*.hs

@@ -572,11 +572,12 @@ nerdctl build --platform linux/arm64 -f Containerfile -t lavoisier:dev .
 ```sh
 cabal build && cabal test                      # -Wall -Werror; tasty (240+ tests)
 cabal build -fe2ee && cabal test lavoisier-e2ee-test
-ormolu --mode inplace $(git ls-files '*.hs')   # formatting; run before every commit
+fourmolu --mode inplace $(git ls-files 'src/*.hs' 'app/*.hs' 'test/*.hs' 'test-e2ee/*.hs' 'olm/*.hs')   # formatting; run before every commit
 ```
 
-`gen/` holds the committed xAI proto-lens bindings — generated code, so leave it out of the ormolu
-sweep. To read the retired Rust implementation, `git worktree add ../lavoisier-rust rust`.
+`gen/` holds the committed xAI proto-lens bindings — generated code, so it is left out of the
+formatter sweep above (the explicit path list is why; `git ls-files '*.hs'` would drag it in and
+churn 34k lines). Style is **fourmolu**, configured by `fourmolu.yaml` at the repo root. To read the retired Rust implementation, `git worktree add ../lavoisier-rust rust`.
 
 ## License
 
