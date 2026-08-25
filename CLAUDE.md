@@ -112,6 +112,18 @@ posture is efficiency-first.
   `ChatRequest`, so no send path can skip the capability check. `providerStream` is
   `withNegotiated @Caps req $ \nreq -> …` and nothing else. Adding a *new* send path — the batch
   submitters were exactly this — fails to compile until it negotiates too, which is the point.
+- **xAI has three transports**: `xai` (`/chat/completions`), `xai-grpc`, and `xai-responses` (the
+  Responses API). Provider-run tools exist **only** on `xai-responses` — Live Search on
+  `/chat/completions` is 410 Gone since 2026-01-12. The Responses body is a different shape:
+  `input` not `messages`, `instructions` not a system message, `max_output_tokens` not `max_tokens`,
+  and function tools declared **flat** (`{"type":"function","name":…}`) rather than nested.
+- **The Responses stream reports two ids per tool call** — `id` (`fc_…`) correlates the argument
+  deltas, `call_id` (`call-…`) is what must be echoed back on the result. They are different
+  strings; emitting the item id yields a tool result the provider cannot match and the loop stalls
+  silently. Same class of trap as Gemini's `thoughtSignature`.
+- **`tests/fixtures/xai-responses-*.sse` are recorded live streams and serve as the decoder's spec.**
+  xAI documents the Responses request body but not its streaming events, so if the wire moves,
+  re-record rather than guess.
 - **Server-side tools have a user surface since 0.17.0**: `--server-tools` (names only, defaults)
   and the Dhall `serverTools` list (the union, with filters). Before that they were fully mapped in
   the Anthropic/Google adapters and reachable only from `mainWith` — implemented and unusable.

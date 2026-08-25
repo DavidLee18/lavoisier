@@ -80,6 +80,7 @@ import Lavoisier.Provider.Google (googleFromEnv, newGoogleConfig)
 import Lavoisier.Provider.Google.Batch (googleBatch)
 import Lavoisier.Provider.Xai (xaiFromEnv)
 import Lavoisier.Provider.Xai.Grpc (defaultXaiGrpcEndpoint, xaiGrpcProvider)
+import Lavoisier.Provider.Xai.Responses (xaiResponsesFromEnv)
 import Lavoisier.Schedule (ScheduleRegistry, loadScheduleFile, newRegistry, scheduleTools)
 import Lavoisier.Tool.Batch (batchEditTool)
 import Lavoisier.Tool.Registry (ToolRegistry, invokeTool, registerTools, withBuiltins)
@@ -472,6 +473,7 @@ defaultModelFor = \case
     Google → "gemini-2.5-flash"
     Xai → "grok-4"
     XaiGrpc → "grok-4"
+    XaiResponses → "grok-4.6"
     ClaudeCli → "sonnet"
 
 {- | Build the requested provider and its default model, or an error message.
@@ -492,6 +494,7 @@ selectProvider pid = case pid of
                 | not (null k) →
                     Right (xaiGrpcProvider (T.pack k) defaultXaiGrpcEndpoint, defaultModelFor pid)
             _ → Left "XAI_API_KEY is not set"
+    XaiResponses → tag <$> xaiResponsesFromEnv
     ClaudeCli → tag <$> claudeCliFromEnv
     where
         tag = either (Left . tshow) (\p → Right (p, defaultModelFor pid))
@@ -563,6 +566,7 @@ batchEditTools opts model
         -- Neither has a discounted batch API; a missing arm here is a compile error, not a silent no.
         Xai → pure []
         XaiGrpc → pure []
+        XaiResponses → pure []
         ClaudeCli → pure []
     where
         withKey keyVar baseVar defBase k = do

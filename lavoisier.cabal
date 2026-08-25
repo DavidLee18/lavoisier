@@ -99,6 +99,7 @@ library
     Lavoisier.Provider.Xai.Grpc
     Lavoisier.Provider.Xai.Sse
     Lavoisier.Provider.Xai.ResponsesSse
+    Lavoisier.Provider.Xai.Responses
     Lavoisier.Tool.Batch
     Lavoisier.Tool.Builtins
     Lavoisier.Tool.Edit

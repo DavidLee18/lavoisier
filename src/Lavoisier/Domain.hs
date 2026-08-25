@@ -93,6 +93,7 @@ data ProviderId
     | Google
     | Xai
     | XaiGrpc
+    | XaiResponses
     | ClaudeCli
     deriving stock (Bounded, Enum, Eq, Generic, Ord, Show)
 
@@ -107,6 +108,7 @@ renderProviderId = \case
     Google → "google"
     Xai → "xai"
     XaiGrpc → "xai-grpc"
+    XaiResponses → "xai-responses"
     ClaudeCli → "claude-cli"
 
 -- | Parse a provider name. Total: an unrecognised name is 'Nothing', never a silent default.

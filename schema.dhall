@@ -13,7 +13,7 @@
 
 let Provider
     : Type
-    = < Anthropic | Google | Xai | XaiGrpc | ClaudeCli >
+    = < Anthropic | Google | Xai | XaiGrpc | XaiResponses | ClaudeCli >
 
 let Thinking
     : Type

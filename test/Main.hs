@@ -119,6 +119,7 @@ import Lavoisier.Provider.Google qualified as G
 import Lavoisier.Provider.Google.Batch qualified as GB
 import Lavoisier.Provider.Google.Sse qualified as GS
 import Lavoisier.Provider.Xai.Grpc qualified as XG
+import Lavoisier.Provider.Xai.Responses qualified as XR
 import Lavoisier.Provider.Xai.Sse qualified as XS
 import Lavoisier.Schedule qualified as Sch
 import Proto.Xai.Api.V1.Chat qualified as PX
@@ -2395,7 +2396,7 @@ domainTests =
             parseProviderId "" @?= Nothing
             parseProviderId "openai" @?= Nothing
         , testCase "the help string is generated from the type, so it cannot drift" $
-            providerIdList @?= "anthropic|google|xai|xai-grpc|claude-cli"
+            providerIdList @?= "anthropic|google|xai|xai-grpc|xai-responses|claude-cli"
         , testProperty "mkPort accepts exactly 1..65535" $ \(n ∷ Integer) →
             isJust (mkPort n) === (n > 0 && n <= 65535)
         , testProperty "a port round-trips through its rendering" $
@@ -2657,6 +2658,81 @@ xaiResponsesTests =
                 (_, evs) = respPush initResp frame
             [m | Left (PApi _ m) ← evs] @?= ["boom"]
             [s' | Right (Done s') ← evs] @?= [Other "failed"]
+        , testCase "a function call is emitted under its call_id, not its item id" $ do
+            -- The stream keys argument deltas by item_id (fc_…) but the id that must be echoed back
+            -- on the tool result is call_id (call-…). Emitting the item id would produce a result
+            -- the provider cannot match, and the loop would stall with nothing to explain why.
+            bs ← BS.readFile "tests/fixtures/xai-responses-toolcall.sse"
+            let (st, evs) = respPush initResp bs
+                out = [e | Right e ← evs <> respEof st]
+                callId = "call-055b61a7-eb60-4674-a42a-e910871fd1c3-0"
+            [(i, n) | ToolUseStart i n ← out] @?= [(callId, "read_file")]
+            [(i, d) | ToolUseDelta i d ← out] @?= [(callId, "{\"path\":\"notes.txt\"}")]
+            [i | ToolUseEnd i ← out] @?= [callId]
+            assertBool "the item id never escapes" (not (any (mentions "fc_") out))
+        , testCase "a turn that called a tool ends as ToolUse, not EndTurn" $ do
+            bs ← BS.readFile "tests/fixtures/xai-responses-toolcall.sse"
+            let (st, evs) = respPush initResp bs
+                out = [e | Right e ← evs <> respEof st]
+            [s' | Done s' ← out] @?= [ToolUse]
+        , testCase "the request body uses the Responses shape, not chat/completions" $ do
+            let req =
+                    (chatRequest "grok-4.6")
+                        { crSystem = Just (SystemPrompt "be terse" False)
+                        , crMessages = [userMessage "hi"]
+                        , crMaxTokens = 256
+                        , crThinking = Just ThinkHigh
+                        , crTools = [ToolDef "read_file" "Read a file" (object ["type" .= ("object" ∷ Text)]) False False]
+                        , crServerTools = [STWebSearch Nothing ["x.ai"] []]
+                        }
+                b = XR.buildBody (negotiatedFor @XR.XaiResponsesCaps req)
+                bt = decodeUtf8Lenient (BL.toStrict (encode b))
+            -- input/instructions/max_output_tokens, not messages/system/max_tokens.
+            assertBool "input" ("\"input\"" `T.isInfixOf` bt)
+            assertBool "instructions" ("\"instructions\"" `T.isInfixOf` bt)
+            assertBool "max_output_tokens" ("\"max_output_tokens\"" `T.isInfixOf` bt)
+            assertBool "no messages key" (not ("\"messages\"" `T.isInfixOf` bt))
+            assertBool "no max_tokens key" (not ("\"max_tokens\"" `T.isInfixOf` bt))
+            -- Function tools are flat here; chat/completions nests them under "function".
+            -- Flat: `name` sits beside `type`, not inside a nested "function" object.
+            assertBool "function tool declared" ("\"type\":\"function\"" `T.isInfixOf` bt)
+            assertBool "name at top level of the tool" ("\"name\":\"read_file\"" `T.isInfixOf` bt)
+            assertBool "not nested under function" (not ("\"function\":{" `T.isInfixOf` bt))
+            assertBool "reasoning effort" ("\"reasoning\":{\"effort\":\"high\"}" `T.isInfixOf` bt)
+            assertBool "server tool" ("\"web_search\"" `T.isInfixOf` bt)
+        , testCase "tool calls round-trip on call_id" $ do
+            let msgs =
+                    [ userMessage "read it"
+                    , Message Assistant [ToolUseBlock "call-1" "read_file" (object ["path" .= ("a.txt" ∷ Text)])]
+                    , Message User [ToolResultBlock "call-1" "contents" False]
+                    ]
+                bt = decodeUtf8Lenient (BL.toStrict (encode (XR.inputItems msgs)))
+            assertBool "function_call item" ("\"type\":\"function_call\"" `T.isInfixOf` bt)
+            assertBool "function_call_output item" ("\"type\":\"function_call_output\"" `T.isInfixOf` bt)
+            assertBool "keyed by call_id" ("\"call_id\":\"call-1\"" `T.isInfixOf` bt)
+        , testCase "web_search never sets both allowed and excluded domains" $ do
+            -- xAI rejects the pair; allowed wins.
+            let j f = decodeUtf8Lenient (BL.toStrict (encode (XR.serverToolJson f)))
+                both = j (STWebSearch Nothing ["a.com"] ["b.com"])
+            assertBool "allowed present" ("allowed_domains" `T.isInfixOf` both)
+            assertBool "excluded dropped" (not ("excluded_domains" `T.isInfixOf` both))
+            assertBool "excluded alone survives" ("excluded_domains" `T.isInfixOf` j (STWebSearch Nothing [] ["b.com"]))
+        , testCase "declared server tools are exactly the ones this transport maps" $ do
+            let allTools =
+                    [ STWebSearch Nothing [] []
+                    , STWebFetch Nothing
+                    , STCodeExecution
+                    , STXSearch [] [] Nothing Nothing
+                    , STCollectionsSearch [] Nothing
+                    , STUrlContext
+                    ]
+            sequence_
+                [ assertEqual
+                    ("XaiResponses " <> show (serverToolCapability tl))
+                    (supports (serverToolCapability tl) (declare @XR.XaiResponsesCaps))
+                    (isJust (XR.serverToolJson tl))
+                | tl ← allTools
+                ]
         , testCase "only tool-call item types open a server-tool call" $ do
             serverToolItemName "web_search_call" @?= Just "web_search"
             serverToolItemName "x_search_call" @?= Just "x_search"
@@ -2665,6 +2741,11 @@ xaiResponsesTests =
         ]
     where
         isThinking = \case Thinking _ → True; _ → False
+        mentions needle = \case
+            ToolUseStart i _ → needle `T.isInfixOf` i
+            ToolUseDelta i _ → needle `T.isInfixOf` i
+            ToolUseEnd i → needle `T.isInfixOf` i
+            _ → False
         isTextDelta = \case TextDelta _ → True; _ → False
 
 -- --- the type-level request index ------------------------------------------------------------------

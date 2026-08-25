@@ -51,16 +51,25 @@ import Lavoisier.Protocol.Event (Event (..), StopReason (..), Usage (..), emptyU
 import Lavoisier.Protocol.Provider (ProviderError (..))
 
 {- | Decoder state: the line buffer, the open server-tool calls (item id → tool name, so the
-completion can be labelled), and whether a terminal 'Done' has been emitted.
+completion can be labelled), the open function calls (see 'rsCallIds'), whether any function call
+was seen (so the turn ends as 'ToolUse' rather than 'EndTurn'), and whether a terminal 'Done' has
+been emitted.
 -}
 data RespState = RespState
     { rsBuf ∷ ByteString
     , rsOpenTools ∷ Map Text Text
+    , rsCallIds ∷ Map Text Text
+    {- ^ @item_id@ (@fc_…@) → @call_id@ (@call-…@). Argument deltas are correlated by __item id__,
+    but the id that must be echoed back on the tool result is the __call id__, and they are
+    different strings. Emitting the item id would produce a tool result the provider cannot match
+    to its call, and the loop would stall with no error to explain why.
+    -}
+    , rsSawToolCall ∷ Bool
     , rsDone ∷ Bool
     }
 
 initResp ∷ RespState
-initResp = RespState BS.empty Map.empty False
+initResp = RespState BS.empty Map.empty Map.empty False False
 
 -- | Feed a chunk of bytes; returns the advanced state and the events completed lines yielded.
 respPush ∷ RespState → ByteString → (RespState, [Either ProviderError Event])
@@ -107,8 +116,10 @@ decodeRespEvent st v = case objStr "type" v of
         "response.output_text.delta" → (st, delta TextDelta)
         "response.reasoning_summary_text.delta" → (st, delta Thinking)
         "response.output_item.added" → itemAdded
+        "response.function_call_arguments.delta" → argsDelta
+        "response.function_call_arguments.done" → argsDone
         "response.output_text.annotation.added" → (st, annotation)
-        "response.completed" → terminal EndTurn
+        "response.completed" → terminal (if rsSawToolCall st then ToolUse else EndTurn)
         "response.incomplete" → terminal (Other "incomplete")
         "response.failed" → failed
         _
@@ -131,10 +142,32 @@ decodeRespEvent st v = case objStr "type" v of
 
         itemAdded = case objGet "item" v of
             Just item
+                | Just "function_call" ← objStr "type" item
+                , Just itemId ← objStr "id" item
+                , Just callId ← objStr "call_id" item
+                , Just name ← objStr "name" item →
+                    ( st {rsCallIds = Map.insert itemId callId (rsCallIds st), rsSawToolCall = True}
+                    , [Right (ToolUseStart callId name)]
+                    )
                 | Just name ← serverToolItemName =<< objStr "type" item
                 , Just itemId ← objStr "id" item →
                     (st {rsOpenTools = Map.insert itemId name (rsOpenTools st)}, [Right (ServerToolUse itemId name)])
             _ → (st, [])
+
+        -- Argument deltas are keyed by item id; translate to the call id before emitting.
+        argsDelta =
+            ( st
+            , [ Right (ToolUseDelta callId d)
+              | Just itemId ← [objStr "item_id" v]
+              , Just callId ← [Map.lookup itemId (rsCallIds st)]
+              , Just d ← [objStr "delta" v]
+              , not (T.null d)
+              ]
+            )
+
+        argsDone = case objStr "item_id" v >>= \i → Map.lookup i (rsCallIds st) of
+            Nothing → (st, [])
+            Just callId → (st, [Right (ToolUseEnd callId)])
 
         terminal stop
             | rsDone st = (st, [])

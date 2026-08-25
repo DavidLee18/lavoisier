@@ -95,6 +95,7 @@ cabal build -fe2ee          # + Matrix end-to-end encryption (Olm/Megolm via the
 # One streaming turn (no tools):
 ANTHROPIC_API_KEY=… cabal run lav -- "explain a monad in one sentence"
 XAI_API_KEY=…       cabal run lav -- --provider xai-grpc "…"
+XAI_API_KEY=…       cabal run lav -- --provider xai-responses "…"   # Agent Tools
 
 # The multi-step agent with filesystem + shell + context tools:
 ANTHROPIC_API_KEY=… cabal run lav -- --agent "add a doc comment to the add() fn in src/Lib.hs"
@@ -351,7 +352,7 @@ in  L.Config::{
 `{jobId, schedule, room, session, tool, toolArgs, prompt, summarize, retryMax, retryWait}`, as
 above; requires `--serve-matrix`) ·
 `--schedule-retry-max <N>` / `--schedule-retry-wait <SECS>` (per-job overridable) ·
-`--provider anthropic|google|xai|xai-grpc|claude-cli` · `--model` · `--max-tokens` · `--max-steps` ·
+`--provider anthropic|google|xai|xai-grpc|xai-responses|claude-cli` · `--model` · `--max-tokens` · `--max-steps` ·
 `--system` · `--persona <PATH>` / `--no-persona` (persona layered above the operating instructions;
 `./PERSONA.md` auto-loads when present) ·
 `--thinking <off|low|medium|high>` (see *Capability negotiation* below) ·
@@ -367,6 +368,11 @@ itself mid-turn and streams back what it found, with no client round-trip per ca
 `web_search`, `web_fetch`, `code_execution`, `x_search`, `collections_search` and `url_context`; the
 flag takes their defaults, and the Dhall `serverTools` list is where domain, handle and date filters
 go (`L.ServerTool.XSearch { allowedHandles = ["nasa"], … }`).
+
+xAI's provider-run tools (`web_search`, `x_search`, `code_execution` → `code_interpreter`,
+`collections_search`) are reachable **only via `--provider xai-responses`**, xAI's Responses API.
+The `xai` transport speaks `/chat/completions`, whose route into them — Live Search's
+`search_parameters` — has returned `410 Gone` since 2026-01-12.
 
 The sets are **disjoint across providers** — `x_search` and `collections_search` are xAI's,
 `web_fetch` is Anthropic's, `url_context` is Gemini's — so asking the wrong provider for one is
@@ -491,7 +497,7 @@ Note the CLI's own interface — the streamed `[tool]` / `[usage]` / `[done]` re
 routed through logging: it's product output, so it always prints and no log filter can suppress it.
 
 Env: `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` · `XAI_API_KEY` / `XAI_BASE_URL` (transport is
-picked by `--provider xai` vs `xai-grpc`) · `GOOGLE_API_KEY` / `GOOGLE_BASE_URL` · `CLAUDE_CLI_BIN` ·
+picked by `--provider xai`, `xai-grpc` or `xai-responses`) · `GOOGLE_API_KEY` / `GOOGLE_BASE_URL` · `CLAUDE_CLI_BIN` ·
 Matrix: `MATRIX_HOMESERVER` / `MATRIX_USER` / `MATRIX_ACCESS_TOKEN` / `MATRIX_PASSWORD` /
 `MATRIX_DEVICE_ID` / `MATRIX_STATE_DIR` / `MATRIX_CRYPTO_STORE_KEY` / `MATRIX_ALLOWED_USERS` /
 `MATRIX_ALLOWED_ROOMS` / `MATRIX_HOME_ROOM` / `MATRIX_MEDIA_DIR` / `MATRIX_NO_AUTO_JOIN` ·
