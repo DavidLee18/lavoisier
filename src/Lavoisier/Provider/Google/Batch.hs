@@ -17,6 +17,8 @@ import Data.Aeson (Value (..), decode, encode, object, (.=))
 import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString.Lazy qualified as BL
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Scientific (toBoundedInteger)
 import Data.Text (Text)
@@ -72,7 +74,7 @@ runGoogleBatch cfg tasks@(t0 : _) = do
            in if done || state == "BATCH_STATE_SUCCEEDED"
                 then do
                   r <- batchGet cfg (T.unpack name)
-                  pure (fmap parseResults r)
+                  pure (fmap (attachNotices (batchNotices tasks) . parseResults) r)
                 else threadDelay pollIntervalMicros >> poll name (n - 1)
 
 -- --- pure body + result parsing --------------------------------------------------------------------
@@ -102,6 +104,10 @@ batchBody cfg tasks = do
               "metadata" .= object ["key" .= btId t]
             ]
 
+-- | The per-task capability notices raised at submit time, keyed by @custom_id@.
+batchNotices :: [BatchTask] -> Map Text [Text]
+batchNotices tasks = Map.fromList [(btId t, fst (negotiate @GoogleCaps (btRequest t))) | t <- tasks]
+
 -- | Parse a batch long-running-operation object into @(name, state, done)@.
 parseBatchOp :: Value -> (Text, Text, Bool)
 parseBatchOp v =
@@ -126,10 +132,10 @@ parseOne :: Value -> BatchItem
 parseOne v =
   let cid = fromMaybe "" (lookKey "metadata" v >>= lookStr "key")
    in case lookKey "error" v of
-        Just err@(Object _) -> BatchItem cid "" emptyUsage (Just (fromMaybe "unknown error" (lookStr "message" err)))
+        Just err@(Object _) -> batchItem cid "" emptyUsage (Just (fromMaybe "unknown error" (lookStr "message" err)))
         _ ->
           let response = fromMaybe Null (lookKey "response" v)
-           in BatchItem cid (textOf response) (usageOf response) Nothing
+           in batchItem cid (textOf response) (usageOf response) Nothing
   where
     textOf response = case lookKey "candidates" response of
       Just (Array a) | not (V.null a) -> partsText (V.head a)

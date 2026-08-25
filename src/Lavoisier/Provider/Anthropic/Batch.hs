@@ -17,6 +17,8 @@ import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (mapMaybe)
 import Data.Scientific (toBoundedInteger)
 import Data.Text (Text)
@@ -53,7 +55,7 @@ runAnthropicBatch cfg tasks = case batchRequestsBody (acExtendedTtl cfg) tasks o
     created <- batchPost cfg "" reqBody
     case created >>= idOf of
       Left e -> pure (Left e)
-      Right bid -> poll bid maxPolls
+      Right bid -> fmap (fmap (attachNotices (batchNotices tasks))) (poll bid maxPolls)
   where
     poll _ 0 = pure (Left (BatchError "batch did not finish within the poll window"))
     poll bid n = do
@@ -85,6 +87,12 @@ batchRequestsBody ttl tasks = do
     stripStream (Object o) = Object (KM.delete "stream" o)
     stripStream v = v
 
+-- | The per-task capability notices raised at submit time, keyed by @custom_id@. Computed from the
+-- same 'negotiate' call the body builder makes; recomputing is cheaper than threading it through the
+-- poll loop, and 'negotiate' is pure.
+batchNotices :: [BatchTask] -> Map Text [Text]
+batchNotices tasks = Map.fromList [(btId t, fst (negotiate @AnthropicCaps (btRequest t))) | t <- tasks]
+
 -- | Parse the JSONL results stream (one result object per line) into 'BatchItem's.
 parseResults :: Text -> [BatchItem]
 parseResults = map parseResultLine . mapMaybe (decodeStrict . encodeUtf8) . filter (not . T.null . T.strip) . T.lines
@@ -97,10 +105,10 @@ parseResultLine v =
    in case lookStr "type" result of
         Just "succeeded" ->
           let msg = maybe Null id (lookKey "message" result)
-           in BatchItem cid (textOf msg) (usageOf msg) Nothing
-        Just "errored" -> BatchItem cid "" emptyUsage (Just (maybe "unknown" id (lookKey "error" result >>= lookStr "type")))
-        Just "canceled" -> BatchItem cid "" emptyUsage (Just "canceled")
-        _ -> BatchItem cid "" emptyUsage (Just "expired")
+           in batchItem cid (textOf msg) (usageOf msg) Nothing
+        Just "errored" -> batchItem cid "" emptyUsage (Just (maybe "unknown" id (lookKey "error" result >>= lookStr "type")))
+        Just "canceled" -> batchItem cid "" emptyUsage (Just "canceled")
+        _ -> batchItem cid "" emptyUsage (Just "expired")
   where
     textOf msg = case lookKey "content" msg of
       Just (Array a) -> T.concat [t | b <- V.toList a, lookStr "type" b == Just "text", Just t <- [lookStr "text" b]]

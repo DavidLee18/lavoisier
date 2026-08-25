@@ -117,6 +117,10 @@ posture is efficiency-first.
   they did not get. *Transcript content* (`Vision`, `ServerSideTools`) **refuses with
   `PUnsupported`** — a silently dropped image makes the model answer about something it never saw,
   which looks like success. Do not "simplify" these into one behaviour.
+- **Batches carry notices too.** A batch has no event stream, so `BatchItem` has `biNotices`,
+  filled at submit time by correlating on `custom_id` (`attachNotices`), and `batch_edit` prints the
+  distinct set once. Build a `BatchItem` with the `batchItem` smart constructor, not the positional
+  constructor.
 - **There is no `ParallelToolUse` capability.** It was mis-modelled: `crDisableParallelToolUse` is an
   *inverse* knob, so a provider lacking parallel tool use already satisfies "disabled" and there is
   nothing to detect. If the concept is needed it belongs to the agent loop, not to provider

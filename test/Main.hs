@@ -74,7 +74,7 @@ import Lavoisier.Mcp
   )
 import Lavoisier.Memory (SessionStore (..), newFileStore, newInMemoryStore, sessionAgentHandle, trimTo)
 import Lavoisier.Protocol.Agent (AgentError (..), AgentHandle (..), turnRequest, withModel)
-import Lavoisier.Protocol.Batch (Batch (..), BatchItem (..), BatchTask (..))
+import Lavoisier.Protocol.Batch (Batch (..), BatchItem (..), BatchTask (..), attachNotices, batchItem)
 import Lavoisier.Protocol.Deliberate (DeliberateError (..), Deliberation (..), DeliberationContext (..), deliberate, runDeliberation)
 import Lavoisier.Protocol.Event
 import Lavoisier.Protocol.Gate (ToolDecision (..), ToolGate (..))
@@ -717,7 +717,7 @@ batchEditTests =
       testCase "batch_edit runs the batch and applies each result" $ withTmp "batch" $ \dir -> do
         let f = dir </> "m.rs"
         TIO.writeFile f "fn main() {\n    let x = 1;\n}\n"
-        let mockBatch = Batch $ \tasks -> pure (Right [BatchItem (btId task) "<<<<<<< SEARCH\n    let x = 1;\n=======\n    let x = 42;\n>>>>>>> REPLACE" emptyUsage Nothing | task <- tasks])
+        let mockBatch = Batch $ \tasks -> pure (Right [batchItem (btId task) "<<<<<<< SEARCH\n    let x = 1;\n=======\n    let x = 42;\n>>>>>>> REPLACE" emptyUsage Nothing | task <- tasks])
         r <- toolInvoke (batchEditTool "m" mockBatch) (object ["edits" .= [object ["path" .= T.pack f, "instruction" .= ("bump x" :: Text)]]])
         case r of
           Right o -> do
@@ -726,6 +726,34 @@ batchEditTests =
             c <- TIO.readFile f
             assertBool "file edited" ("let x = 42;" `T.isInfixOf` c)
           Left e -> assertFailure (show e),
+      testCase "batch_edit surfaces capability notices once, not per file" $ withTmp "batch-notice" $ \dir -> do
+        -- A batch has no event stream, so a degraded knob would otherwise be applied in silence.
+        let f1 = dir </> "a.rs"
+            f2 = dir </> "b.rs"
+        TIO.writeFile f1 "let x = 1;\n"
+        TIO.writeFile f2 "let x = 1;\n"
+        let note = "extended thinking was requested but this provider does not support it; continuing without it"
+            mockBatch = Batch $ \tasks ->
+              pure (Right [(batchItem (btId task) "let x = 42;\n" emptyUsage Nothing) {biNotices = [note]} | task <- tasks])
+        r <-
+          toolInvoke
+            (batchEditTool "m" mockBatch)
+            ( object
+                [ "edits"
+                    .= [ object ["path" .= T.pack f1, "instruction" .= ("bump" :: Text)],
+                         object ["path" .= T.pack f2, "instruction" .= ("bump" :: Text)]
+                       ]
+                ]
+            )
+        case r of
+          Right o -> do
+            assertBool "the notice is reported" (note `T.isInfixOf` toContent o)
+            T.count "note:" (toContent o) @?= 1
+          Left e -> assertFailure (show e),
+      testCase "attachNotices correlates on custom_id and leaves others empty" $ do
+        let items = [batchItem "0" "x" emptyUsage Nothing, batchItem "1" "y" emptyUsage Nothing]
+            attached = attachNotices (Map.fromList [("1", ["heads up"])]) items
+        map biNotices attached @?= [[], ["heads up"]],
       testCase "Anthropic batchRequestsBody wraps custom_id + strips stream" $ do
         let task = BatchTask "0" ((chatRequest "claude") {crMessages = [userMessage "hi"], crMaxTokens = 64})
             body = either (error . show) id (batchRequestsBody False [task])

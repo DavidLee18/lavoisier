@@ -17,6 +17,7 @@ import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as BS
+import Data.List (nub)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -120,8 +121,13 @@ batchEdit defaultModel batch args = case parseEdits args of
             let applied = length [() | ((_, True), _) <- outcomes]
                 usage = foldr (accumulateUsage . snd) emptyUsage outcomes
                 lns = map (fst . fst) outcomes <> prefailed
+                -- Capability notices are per-task but in practice identical across a batch (one
+                -- model, one knob), so report the distinct set once rather than per file.
+                notices = nub (concatMap biNotices items)
+                noticeLines = ["note: " <> n <> "\n" | n <- notices]
                 summary =
-                  "batch_edit: applied "
+                  T.concat noticeLines
+                    <> "batch_edit: applied "
                     <> tshow applied
                     <> "/"
                     <> tshow (length edits)

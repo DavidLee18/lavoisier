@@ -374,7 +374,8 @@ declaration before it is sent. The two kinds of capability fail in opposite dire
   something it never saw.
 
 The check runs for batch submissions too, so an unsupported task is rejected at submit time rather
-than after the batch has been accepted.
+than after the batch has been accepted — and because a batch has no event stream to carry a notice,
+`batch_edit` prints any degraded knob at the top of its report instead.
 
 Efficiency / cost levers: `--summary-model` / `--context-limit` (compaction + eviction) ·
 `--cheap-model` / `--escalate-after` (cheap-model-first) · `--advisor-model` (advisor+executor split) ·
