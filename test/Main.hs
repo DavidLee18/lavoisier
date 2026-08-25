@@ -83,7 +83,8 @@ import Lavoisier.Protocol.Provider
 import Lavoisier.Protocol.Stream (drain, fromList)
 import Lavoisier.Protocol.Tool
 import Lavoisier.Protocol.Tune qualified as Tn
-import Lavoisier.Provider.Anthropic (AnthropicCaps, buildBody, serverToolJson)
+import Lavoisier.Protocol.Typed
+import Lavoisier.Provider.Anthropic (AnthropicCaps, anthropicProvider, buildBody, newAnthropicConfig, serverToolJson)
 import Lavoisier.Provider.Anthropic.Batch (batchRequestsBody, parseResultLine)
 import Lavoisier.Provider.Anthropic.Sse (initSse, mapStop, sseEof, ssePush)
 import Lavoisier.Provider.ClaudeCli (eofDecoder, initDecoder, pushLine, renderPrompt)
@@ -154,6 +155,7 @@ tests =
       memoryTests,
       domainTests,
       negotiationTests,
+      typedRequestTests,
       configTests,
       logTests,
       mcpTests,
@@ -2603,6 +2605,64 @@ negotiationTests =
         case r of
           Left (PUnsupported _) -> pure ()
           _ -> assertFailure "expected PUnsupported before any send"
+    ]
+
+-- --- the type-level request index ------------------------------------------------------------------
+
+typedRequestTests :: TestTree
+typedRequestTests =
+  testGroup
+    "typed requests"
+    [ testCase "builders accumulate into the underlying request" $ do
+        let r =
+              unReq
+                . withUrlContext
+                . withThinking ThinkHigh
+                . withTopK 40
+                . withMessages [userMessage "hi"]
+                $ newReq "gemini-3-pro"
+        crThinking r @?= Just ThinkHigh
+        crTopK r @?= Just 40
+        crServerTools r @?= [STUrlContext]
+        crMessages r @?= [userMessage "hi"],
+      testCase "withImage appends to the last message rather than starting a new one" $ do
+        let r = unReq (withImage (SrcUrl "https://x/y.png") (withMessages [userMessage "look"] (newReq "m")))
+        map msgContent (crMessages r) @?= [[textBlock "look", ImageBlock (SrcUrl "https://x/y.png")]],
+      -- This is the payoff: the index is checked against the provider's declared list at compile
+      -- time. The negative case cannot be a runtime test — it is a type error — so it lives as a
+      -- doctest-style comment:
+      --
+      -- > streamTyped claudeCli (withThinking ThinkHigh (newReq "m"))
+      -- error: This request needs the capability 'ExtendedThinking, which the provider does not
+      --        declare.
+      testCase "a request within a provider's declared set type-checks and streams" $ do
+        let prov =
+              Provider
+                { providerStream = \_ -> Right <$> fromList [Right (TextDelta "ok")],
+                  providerCapabilities = declare @'[ 'ExtendedThinking, 'Vision],
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+        case attestTyped @'[ 'ExtendedThinking, 'Vision] prov of
+          Nothing -> assertFailure "attestation should match the provider's own declaration"
+          Just tp -> do
+            r <- streamTyped tp (withThinking ThinkHigh (newReq "m"))
+            case r of
+              Left e -> assertFailure (show e)
+              Right st -> drain st >>= \evs -> evs @?= [Right (TextDelta "ok")],
+      testCase "attestTyped refuses a claim the provider does not make" $ do
+        let prov =
+              Provider
+                { providerStream = \_ -> pure (Left (PConfig "unused")),
+                  providerCapabilities = declare @'[ 'Vision],
+                  providerCountTokens = \_ -> pure (Right Nothing)
+                }
+        -- Claiming more than the provider declares fails once, at construction.
+        assertBool "over-claim rejected" (isNothing (attestTyped @'[ 'Vision, 'ExtendedThinking] prov))
+        assertBool "exact claim accepted" (isJust (attestTyped @'[ 'Vision] prov)),
+      testCase "the real adapter capability lists attest" $ do
+        cfg <- newAnthropicConfig "k" "https://example.invalid"
+        assertBool "AnthropicCaps matches what the adapter declares" $
+          isJust (attestTyped @AnthropicCaps (anthropicProvider cfg))
     ]
 
 configTests :: TestTree

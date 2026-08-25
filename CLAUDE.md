@@ -132,6 +132,12 @@ posture is efficiency-first.
   `generateContent` example for either. `url_context` *is* documented for `generateContent`
   (`tools:[{"url_context":{}}]`, sent here as `urlContext`), so it is declared. Do not add the other
   two by guessing a wire format.
+- **`Lavoisier.Protocol.Typed` is the compile-time front door**, for `mainWith` callers who write a
+  request out in source. `Req needs` accumulates required capabilities in its type; `streamTyped`
+  discharges `Supports needs caps` and emits a prose `TypeError` naming the missing one.
+  `attestTyped` checks the type-level claim against the provider's own declaration at construction.
+  It does **not** replace `negotiate` — runtime-built requests (CLI, Dhall, gateways) cannot be
+  checked this way, and `streamTyped` negotiates anyway.
 - **Capabilities fail in two opposite directions, deliberately.** *Caller knobs* (`ExtendedThinking`)
   **degrade and emit a `Notice`** — never kill a turn, because one request builder crosses the whole
   heterogeneous fallback chain; but never stay silent either, because the user paid for a feature

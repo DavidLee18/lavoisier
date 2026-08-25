@@ -163,7 +163,43 @@ Your tools are registered **alongside the built-ins** wherever tools are used �
 `--agent`. A one-shot `ask` (no `--agent`, no `--serve*`) uses no tools, so your tools are not loaded
 there (matching the engine). The `schedule_*` tools and any `--mcp-server` tools compose the same way.
 
-## 6. Packaging for deployment
+## 6. Calling a provider directly, with the capability check at compile time
+
+If your extension builds a `ChatRequest` of its own rather than going through the agent loop, use
+`Lavoisier.Protocol.Typed`. A `Req` carries the capabilities it needs **in its type**, every builder
+that adds a demanding feature widens that set, and `streamTyped` refuses a provider that does not
+declare them:
+
+```haskell
+import Lavoisier.Protocol.Typed
+import Lavoisier.Provider.Anthropic (AnthropicCaps, anthropicProvider)
+
+main = do
+  Just prov <- pure (attestTyped @AnthropicCaps (anthropicProvider cfg))
+  let req = withThinking ThinkHigh
+          . withWebSearch Nothing [] []
+          . withMessages [userMessage "what shipped this week?"]
+          $ newReq "claude-sonnet-4-6"
+  streamTyped prov req
+```
+
+Ask for something the provider cannot do and you get a sentence, not a runtime surprise:
+
+```
+error: This request needs the capability ExtendedThinking, which the provider does not declare.
+       The provider declares: '[Vision]
+       Either pick a provider that supports it, or drop the builder that added it.
+```
+
+`attestTyped` checks your type-level claim against what the provider actually declares and returns
+`Nothing` if they disagree, so a wrong claim fails once at construction rather than licensing bad
+requests forever.
+
+This is optional. Requests built from runtime input (a CLI flag, a config file, a gateway message)
+cannot be checked this way, and are checked at the adapter boundary instead — `streamTyped` goes
+through the same check, so you are never worse off.
+
+## 7. Packaging for deployment
 
 `mainWith` gives you the whole CLI, so your binary deploys exactly like `lav`: build a self-contained
 tarball (bundle `libtree-sitter`/`libsnappy`, and `libolm` under e2ee; rewrite load paths — see the
