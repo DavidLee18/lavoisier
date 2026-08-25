@@ -316,9 +316,9 @@ only checked that the value was *a* `Text` and the typo travelled to the provide
 range-checked by the decoder (Dhall's `assert` can't refine a `Natural` inside a function), and
 `provider:model` / `label: target` / cron specs are records rather than packed strings.
 
-**This is a breaking change to the config format.** See
-[`lavoisier.dhall.example`](lavoisier.dhall.example) for the annotated full schema, and
-[`schema.dhall`](schema.dhall) for the types.
+**This is a breaking change to the config format.** [`MIGRATING.md`](MIGRATING.md) is the
+field-by-field list; [`lavoisier.dhall.example`](lavoisier.dhall.example) is an annotated full config
+in the new format, and [`schema.dhall`](schema.dhall) is the source of truth for the types.
 
 The Matrix per-room/per-member tool maps (above) have **no flag and no env var** — the config file is
 the only way to set them. Sessions are durable when `sessionDir` is set (a file store under that

@@ -18,6 +18,7 @@ build-type:         Simple
 -- the sdist tarball cabal builds for `source-repository-package` consumers.
 extra-source-files:
   schema.dhall
+  MIGRATING.md
   cbits/**/*.h
   tests/budget/**/*.txt
   tests/budget/**/*.rs

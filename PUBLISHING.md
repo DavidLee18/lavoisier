@@ -22,13 +22,16 @@ and the crates.io packages are frozen (see the last section).
    test suite reads files at *runtime*, so a missing entry here is invisible in a working tree and
    only fails from an sdist — which is how `hs-v0.13.1` shipped broken. Re-run this check whenever a
    test starts reading a new file.
-4. Tag and push:
+4. If the release breaks anything user-facing, make sure [`MIGRATING.md`](MIGRATING.md) covers it
+   **before** tagging — the release notes should link a page that already exists, and immutable
+   releases mean there is no second attempt at the tag.
+5. Tag and push:
 
    ```sh
    git tag v0.16.2 && git push origin v0.16.2
    ```
 
-5. The workflow builds three targets — `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`,
+6. The workflow builds three targets — `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`,
    `aarch64-unknown-linux-gnu` — packages each with `scripts/package-haskell.sh`, uploads them as
    run artifacts, and then a **single `publish` job** attaches all three at once.
 
@@ -37,7 +40,7 @@ and the crates.io packages are frozen (see the last section).
    > (`Cannot upload asset … to an immutable release`). The tag name is then **burned permanently** —
    > deleting the half-published release does not free it, and the version number is spent. `v0.16.0`
    > was lost this way; `v0.16.1` is the first release under the corrected workflow.
-6. **Verify the published artifact, not just the green run.** Download the tarball and run it:
+7. **Verify the published artifact, not just the green run.** Download the tarball and run it:
 
    ```sh
    gh release download v0.16.2 -R DavidLee18/lavoisier -p 'lavoisier-aarch64-apple-darwin.tar.gz'
