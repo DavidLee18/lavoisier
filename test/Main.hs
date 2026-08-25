@@ -2519,12 +2519,15 @@ negotiationTests =
       -- The drift this guards against is the one that shipped: an adapter declaring a tool category
       -- while its mapper silently dropped half the tools in it.
       testCase "every declared tool capability is one the adapter actually maps" $ do
+        -- Keep this list complete: `serverToolCapability` is exhaustive by -Wincomplete-patterns,
+        -- but nothing forces a new constructor to be added here.
         let allTools =
               [ STWebSearch Nothing [] [],
                 STWebFetch Nothing,
                 STCodeExecution,
                 STXSearch [] [] Nothing Nothing,
-                STCollectionsSearch [] Nothing
+                STCollectionsSearch [] Nothing,
+                STUrlContext
               ]
         sequence_
           [ assertEqual
@@ -2540,6 +2543,50 @@ negotiationTests =
               (not (null (G.serverTool tl)))
           | tl <- allTools
           ],
+      testCase "every dropped sampling knob produces its own notice" $ do
+        let req =
+              (chatRequest "m")
+                { crMessages = [userMessage "hi"],
+                  crTemperature = Just 0.5,
+                  crTopP = Just 0.9,
+                  crTopK = Just 40,
+                  crStopSequences = ["STOP"],
+                  crOutputFormat = Just (JsonSchema (object [])),
+                  crToolChoice = Just ChoiceAuto
+                }
+            (notices, out) = negotiate @'[] req
+        -- temperature and top_p share one capability, so five knobs -> five notices.
+        length notices @?= 5
+        case out of
+          Left e -> assertFailure ("knobs must never refuse: " <> show e)
+          Right n -> do
+            let r = negotiatedRequest n
+            crTemperature r @?= Nothing
+            crTopP r @?= Nothing
+            crTopK r @?= Nothing
+            crStopSequences r @?= []
+            crOutputFormat r @?= Nothing
+            crToolChoice r @?= Nothing,
+      testCase "top_k drops independently of temperature/top_p" $ do
+        -- xAI honours temperature and top_p but has no top_k.
+        let req = (chatRequest "m") {crTemperature = Just 0.5, crTopK = Just 40}
+            (notices, out) = negotiate @'[ 'Sampling] req
+        length notices @?= 1
+        assertBool "names top_k" (any ("top_k" `T.isInfixOf`) notices)
+        fmap ((\r -> (crTemperature r, crTopK r)) . negotiatedRequest) out @?= Right (Just 0.5, Nothing),
+      testCase "a supported knob is untouched and silent" $ do
+        let req = (chatRequest "m") {crStopSequences = ["STOP"], crTopK = Just 40}
+            (notices, out) = negotiate @'[ 'StopSequences, 'TopK] req
+        notices @?= []
+        fmap (crStopSequences . negotiatedRequest) out @?= Right ["STOP"],
+      testCase "url_context is a Gemini tool, refused elsewhere" $ do
+        let req = (chatRequest "m") {crServerTools = [STUrlContext]}
+        assertBool "Gemini accepts" $ case snd (negotiate @G.GoogleCaps req) of
+          Right _ -> True
+          Left _ -> False
+        case snd (negotiate @AnthropicCaps req) of
+          Left (PUnsupported m) -> assertBool "names url_context" ("url_context" `T.isInfixOf` m)
+          other -> assertFailure ("Anthropic must refuse url_context, got " <> show (fmap (const ()) other)),
       testCase "notices reach the stream ahead of the provider's own events" $ do
         let req = (chatRequest "m") {crMessages = [userMessage "hi"], crThinking = Just ThinkHigh}
         r <- withNegotiated @'[] req $ \_ -> Right <$> fromList [Right (TextDelta "hello")]

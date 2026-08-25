@@ -83,7 +83,7 @@ defaultXaiGrpcEndpoint = "api.x.ai"
 -- | Everything the xAI gRPC transport supports, named once so 'declare' and 'negotiate' cannot
 -- drift apart. It used to claim server-side tools; 'buildRequestFor' has never mapped
 -- @crServerTools@ or @crBuiltinTools@, so the claim only bought a silent drop.
-type XaiGrpcCaps = '[ 'Vision]
+type XaiGrpcCaps = '[ 'Vision, 'Sampling, 'StopSequences, 'ToolChoiceControl]
 
 xaiGrpcProvider :: Text -> Text -> Provider
 xaiGrpcProvider apiKey host =

@@ -72,10 +72,26 @@ googleFromEnv = do
       cfg <- newGoogleConfig (T.pack key) base
       pure (Right (googleProvider cfg))
 
--- | Everything Gemini supports, named once so 'declare' and 'negotiate' cannot drift apart. Only
--- the two tools 'serverTool' maps are listed: Gemini also offers URL context, Maps grounding and
--- File Search, but 'ServerTool' cannot express them yet, so declaring them would be a lie.
-type GoogleCaps = '[ 'ExtendedThinking, 'Vision, 'WebSearch, 'CodeExecution]
+-- | Everything Gemini supports, named once so 'declare' and 'negotiate' cannot drift apart.
+--
+-- Maps grounding and File Search are __not__ here. Both are documented only for the Interactions
+-- API (@\/v1beta\/interactions@, @tools:[{"type":"google_maps"}]@); this adapter speaks
+-- @generateContent@, whose @tools[]@ takes a different shape, and Google publishes no
+-- @generateContent@ example for either. Declaring them would mean guessing a wire format, and a
+-- wrong guess is a 400 at best. URL context /is/ documented for @generateContent@
+-- (@tools:[{"url_context":{}}]@), so it is here.
+type GoogleCaps =
+  '[ 'ExtendedThinking,
+     'Vision,
+     'WebSearch,
+     'CodeExecution,
+     'UrlContext,
+     'Sampling,
+     'TopK,
+     'StopSequences,
+     'StructuredOutput,
+     'ToolChoiceControl
+   ]
 
 googleProvider :: GoogleConfig -> Provider
 googleProvider cfg =
@@ -195,11 +211,16 @@ functionCalling = \case
   ChoiceNone -> object ["mode" .= s "NONE"]
   ChoiceTool n -> object ["mode" .= s "ANY", "allowedFunctionNames" .= [n]]
 
+-- | Map a 'ServerTool' onto a @generateContent@ @tools[]@ entry. An unmapped tool returns @[]@;
+-- 'negotiate' refuses those before they get here, and a tasty test pins the two lists together.
 serverTool :: ServerTool -> [Value]
 serverTool = \case
   STWebSearch {} -> [kobj [("googleSearch", object [])]]
   STCodeExecution -> [kobj [("codeExecution", object [])]]
-  _ -> []
+  STUrlContext -> [kobj [("urlContext", object [])]]
+  STWebFetch {} -> []
+  STXSearch {} -> []
+  STCollectionsSearch {} -> []
 
 -- | Map a 'ThinkingLevel' to Gemini's @thinkingConfig@. Gemini 3 accepts
 -- @minimal|low|medium|high@ for @thinkingLevel@, so medium maps to medium — it used to map to

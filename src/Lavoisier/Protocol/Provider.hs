@@ -32,7 +32,7 @@ module Lavoisier.Protocol.Provider
   )
 where
 
-import Data.Maybe (listToMaybe)
+import Data.Maybe (isJust, listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -71,10 +71,23 @@ data Capability
     XSearch
   | -- | RAG over provider-hosted document collections ('STCollectionsSearch', xAI only).
     CollectionsSearch
+  | -- | Provider-side fetch of URLs named in the prompt ('STUrlContext', Gemini only).
+    UrlContext
   | -- | Anthropic-defined client tools declared by versioned type ('BuiltinTool').
     ClientBuiltinTools
   | -- | Remote MCP servers the provider connects to on the model\'s behalf ('crMcpServers').
     RemoteMcp
+  | -- | @temperature@ and @top_p@ are honoured ('crTemperature', 'crTopP').
+    Sampling
+  | -- | @top_k@ is honoured ('crTopK'). Separate from 'Sampling' because xAI takes the other two
+    -- and not this one.
+    TopK
+  | -- | Caller-supplied stop sequences are honoured ('crStopSequences').
+    StopSequences
+  | -- | A response JSON schema is honoured ('crOutputFormat').
+    StructuredOutput
+  | -- | The caller can steer tool selection ('crToolChoice').
+    ToolChoiceControl
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 -- | What a provider supports. A /set/ of 'Capability', not a record of 'Bool': the record version
@@ -125,6 +138,18 @@ instance KnownCapability 'ClientBuiltinTools where capabilityVal = ClientBuiltin
 
 instance KnownCapability 'RemoteMcp where capabilityVal = RemoteMcp
 
+instance KnownCapability 'UrlContext where capabilityVal = UrlContext
+
+instance KnownCapability 'Sampling where capabilityVal = Sampling
+
+instance KnownCapability 'TopK where capabilityVal = TopK
+
+instance KnownCapability 'StopSequences where capabilityVal = StopSequences
+
+instance KnownCapability 'StructuredOutput where capabilityVal = StructuredOutput
+
+instance KnownCapability 'ToolChoiceControl where capabilityVal = ToolChoiceControl
+
 insertCap :: Capability -> Capabilities -> Capabilities
 insertCap c (Capabilities s) = Capabilities (Set.insert c s)
 
@@ -158,6 +183,7 @@ serverToolCapability = \case
   STCodeExecution -> CodeExecution
   STXSearch {} -> XSearch
   STCollectionsSearch {} -> CollectionsSearch
+  STUrlContext -> UrlContext
 
 -- | The capability a given client builtin tool requires. All three are Anthropic-defined, so they
 -- share one capability rather than getting three of their own.
@@ -207,20 +233,54 @@ negotiate req = (notices, outcome)
   where
     caps = declare @caps
 
-    -- Caller knobs: degrade.
+    -- Caller knobs: degrade, one notice each. Each entry is (was it asked for, which capability,
+    -- what to say, how to clear it) — adding a knob means adding a row, not a new code path.
     wantsThinking = case crThinking req of
       Just lvl | lvl /= ThinkOff -> True
       _ -> False
-    dropThinking = wantsThinking && not (extendedThinking caps)
 
-    notices =
-      [ "extended thinking was requested but this provider does not support it; continuing without it"
-      | dropThinking
+    knobs :: [(Bool, Capability, Text, ChatRequest -> ChatRequest)]
+    knobs =
+      [ ( wantsThinking,
+          ExtendedThinking,
+          "extended thinking",
+          \r -> r {crThinking = Nothing}
+        ),
+        ( isJust (crTemperature req) || isJust (crTopP req),
+          Sampling,
+          "temperature/top_p",
+          \r -> r {crTemperature = Nothing, crTopP = Nothing}
+        ),
+        ( isJust (crTopK req),
+          TopK,
+          "top_k",
+          \r -> r {crTopK = Nothing}
+        ),
+        ( not (null (crStopSequences req)),
+          StopSequences,
+          "stop sequences",
+          \r -> r {crStopSequences = []}
+        ),
+        ( isJust (crOutputFormat req),
+          StructuredOutput,
+          "a structured-output schema",
+          \r -> r {crOutputFormat = Nothing}
+        ),
+        ( isJust (crToolChoice req),
+          ToolChoiceControl,
+          "tool choice",
+          \r -> r {crToolChoice = Nothing}
+        )
       ]
 
-    adjusted
-      | dropThinking = req {crThinking = Nothing}
-      | otherwise = req
+    dropped = [(what, clear) | (asked, c, what, clear) <- knobs, asked, not (supports c caps)]
+
+    notices =
+      [ what <> " was requested but this provider does not support it; continuing without it"
+      | (what, _) <- dropped
+      ]
+
+    adjusted = foldl' (\r (_, clear) -> clear r) req dropped
 
     -- Transcript content: refuse.
     hasImage = any (any isImage . msgContent) (crMessages req)
@@ -280,6 +340,7 @@ serverToolName = \case
   STCodeExecution -> "code_execution"
   STXSearch {} -> "x_search"
   STCollectionsSearch {} -> "collections_search"
+  STUrlContext -> "url_context"
 
 -- | Name a 'BuiltinTool' for use in a refusal message.
 builtinToolName :: BuiltinTool -> Text

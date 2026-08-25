@@ -179,6 +179,8 @@ data ServerTool
     STXSearch [Text] [Text] (Maybe Text) (Maybe Text)
   | -- | RAG over xAI document collections: collection_ids, limit.
     STCollectionsSearch [Text] (Maybe Word32)
+  | -- | Let the provider fetch and read URLs named in the prompt (Gemini @url_context@).
+    STUrlContext
   deriving stock (Eq, Show)
 
 -- | A full chat-completion request in provider-agnostic form.

@@ -73,7 +73,8 @@ xaiFromEnv = do
 
 -- | Everything the xAI REST transport supports, named once so 'declare' and 'negotiate' cannot
 -- drift apart.
-type XaiCaps = '[ 'Vision]
+-- Note the missing 'TopK': xAI honours @temperature@ and @top_p@ but has no @top_k@.
+type XaiCaps = '[ 'Vision, 'Sampling, 'StopSequences, 'StructuredOutput, 'ToolChoiceControl]
 
 -- | The 'Provider' record backed by an 'XaiConfig'. No caching\/thinking\/server-tools; vision is
 -- supported. No native token counting on this transport.

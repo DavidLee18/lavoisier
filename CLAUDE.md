@@ -117,6 +117,18 @@ posture is efficiency-first.
   through to Anthropic, whose mapper then dropped it silently. An adapter must declare exactly what
   its mapper maps — a tasty test asserts the two agree, so widening a mapper without widening the
   declaration (or the reverse) fails.
+- **Sampling knobs are capabilities too** (`Sampling` = temperature+top_p, `TopK`, `StopSequences`,
+  `StructuredOutput`, `ToolChoiceControl`). `negotiate` clears each unsupported one and emits its own
+  notice, driven by a table — adding a knob is a row, not a code path. `TopK` is split from
+  `Sampling` because xAI honours temperature/top_p and has no top_k. Nothing in-tree sets these, so
+  like `Vision` they protect `mainWith` users; that is *why* they need checking, not a reason to skip
+  it.
+- **Gemini's Maps grounding and File Search are deliberately not declared.** Both are documented only
+  for the Interactions API (`/v1beta/interactions`, `tools:[{"type":"google_maps"}]`); this adapter
+  speaks `generateContent`, whose `tools[]` is shaped differently, and Google publishes no
+  `generateContent` example for either. `url_context` *is* documented for `generateContent`
+  (`tools:[{"url_context":{}}]`, sent here as `urlContext`), so it is declared. Do not add the other
+  two by guessing a wire format.
 - **Capabilities fail in two opposite directions, deliberately.** *Caller knobs* (`ExtendedThinking`)
   **degrade and emit a `Notice`** — never kill a turn, because one request builder crosses the whole
   heterogeneous fallback chain; but never stay silent either, because the user paid for a feature

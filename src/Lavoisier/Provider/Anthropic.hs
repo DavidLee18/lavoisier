@@ -84,7 +84,12 @@ type AnthropicCaps =
      'WebFetch,
      'CodeExecution,
      'ClientBuiltinTools,
-     'RemoteMcp
+     'RemoteMcp,
+     'Sampling,
+     'TopK,
+     'StopSequences,
+     'StructuredOutput,
+     'ToolChoiceControl
    ]
 
 -- | The 'Provider' record backed by an 'AnthropicConfig'.
@@ -364,6 +369,7 @@ serverToolJson = \case
   STCodeExecution -> Just (kobj [("type", String "code_execution_20260120"), ("name", String "code_execution")])
   STXSearch {} -> Nothing
   STCollectionsSearch {} -> Nothing
+  STUrlContext -> Nothing
 
 builtinToolJson :: BuiltinTool -> Value
 builtinToolJson = \case

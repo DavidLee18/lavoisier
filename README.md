@@ -365,7 +365,9 @@ declaration before it is sent. The two kinds of capability fail in opposite dire
 
 - **Optional knobs you asked for degrade, loudly.** `--thinking high` against a provider with no
   extended thinking (today: `claude-cli`) drops the setting, runs the turn, and emits a **notice**
-  on the event stream. Before 0.17.0 the flag was silently ignored — you were billed for a turn
+  on the event stream. The same holds for every other request knob a provider ignores — sampling
+  (`temperature`/`top_p`), `top_k` (xAI has none), stop sequences, structured-output schemas and
+  tool choice each degrade with their own notice rather than vanishing. Before 0.17.0 the flag was silently ignored — you were billed for a turn
   believing you had enabled a feature. Degrading rather than failing matters because one request
   crosses the whole `--fallback` chain, and providers in that chain differ.
 - **Content the provider cannot read, or a tool it cannot run, is refused.** A request carrying an
