@@ -62,7 +62,7 @@ import Lavoisier.Protocol.Deliberate (Deliberator)
 import Lavoisier.Protocol.Event
 import Lavoisier.Protocol.Gateway (Gateway (..))
 import Lavoisier.Protocol.Message
-import Lavoisier.Protocol.Provider (Provider (..), ProviderError)
+import Lavoisier.Protocol.Provider (Provider (..), ProviderError, providerErrorText)
 import Lavoisier.Protocol.Stream (Producer (..))
 import Lavoisier.Protocol.Tool (Tool (..), ToolError (..), ToolOutput, setChanged, toolErr, toolOk)
 import Lavoisier.Protocol.Tune (Tuner, noopTuner)
@@ -91,6 +91,9 @@ data Options = Options
     optProvider :: Maybe ProviderId,
     optModel :: Maybe ModelId,
     optThinking :: Maybe ThinkingLevel,
+    -- | Provider-run tools to offer. Empty means none; a tool the chosen provider cannot run is
+    -- refused by name before the request is sent.
+    optServerTools :: [ServerTool],
     optMaxTokens :: Maybe Word32,
     optMaxSteps :: Maybe Int,
     optContextLimit :: Maybe Int,
@@ -153,6 +156,7 @@ optionsParser =
     <*> optional (option providerReader (long "provider" <> metavar "PROVIDER" <> help ("Model provider (" <> providerIdList <> "; default anthropic)")))
     <*> optional (ModelId <$> strOption (long "model" <> metavar "MODEL" <> help "Model id"))
     <*> optional (option thinkingReader (long "thinking" <> metavar "LEVEL" <> help "off|low|medium|high"))
+    <*> (concat <$> many (option serverToolsReader (long "server-tools" <> metavar "NAMES" <> help "Provider-run tools, comma-separated: web_search|web_fetch|code_execution|x_search|collections_search|url_context; repeatable")))
     <*> optional (option auto (long "max-tokens" <> metavar "N" <> help "Generated-token ceiling"))
     <*> optional (option auto (long "max-steps" <> metavar "N" <> help "Agent tool-loop step budget"))
     <*> optional (option auto (long "context-limit" <> metavar "N" <> help "Per-request token ceiling; evict oldest tool output when exceeded after compaction"))
@@ -253,6 +257,23 @@ cronReader = eitherReader $ \raw ->
               }
     _ -> Left "expected 5 schedule fields then a prompt, e.g. '*/30 9-17 * * 1-5 check CI'"
 
+-- | @--server-tools web_search,code_execution@. Names only: every parameterised tool takes its
+-- defaults here, and the Dhall @serverTools@ list is where domain\/handle\/date filters are set.
+-- Which names a given provider accepts differs; that is checked against the provider, not here, so
+-- the error can name both the tool and the provider.
+serverToolsReader :: ReadM [ServerTool]
+serverToolsReader = eitherReader $ \raw ->
+  traverse one [T.strip w | w <- T.splitOn "," (T.pack raw), not (T.null (T.strip w))]
+  where
+    one = \case
+      "web_search" -> Right (STWebSearch Nothing [] [])
+      "web_fetch" -> Right (STWebFetch Nothing)
+      "code_execution" -> Right STCodeExecution
+      "x_search" -> Right (STXSearch [] [] Nothing Nothing)
+      "collections_search" -> Right (STCollectionsSearch [] Nothing)
+      "url_context" -> Right STUrlContext
+      other -> Left ("unknown server tool: " <> T.unpack other <> " (expected web_search|web_fetch|code_execution|x_search|collections_search|url_context)")
+
 thinkingReader :: ReadM ThinkingLevel
 thinkingReader = maybeReader $ \s -> case s of
   "off" -> Just ThinkOff
@@ -350,6 +371,8 @@ applyConfig fc o =
     { optProvider = optProvider o <|> provider fc,
       optModel = optModel o <|> model fc,
       optThinking = optThinking o <|> thinking fc,
+      -- A non-empty --server-tools wins wholesale; otherwise take the file's list.
+      optServerTools = if null (optServerTools o) then fromMaybe [] (serverTools fc) else optServerTools o,
       optMaxTokens = optMaxTokens o <|> fmap fromIntegral (maxTokens fc),
       optMaxSteps = optMaxSteps o <|> fmap fromIntegral (maxSteps fc),
       optContextLimit = optContextLimit o <|> fmap fromIntegral (contextLimit fc),
@@ -467,11 +490,12 @@ runAskMode prov opts model prompt = do
         (chatRequest model)
           { crMessages = [userMessage prompt],
             crMaxTokens = fromMaybe 2048 (optMaxTokens opts),
-            crThinking = optThinking opts
+            crThinking = optThinking opts,
+            crServerTools = optServerTools opts
           }
   estream <- providerStream prov req
   case estream of
-    Left e -> errExit (tshow e)
+    Left e -> errExit (providerErrorText e)
     Right stream -> renderStream stream
 
 -- | Build the tool registry the agent will use: the built-ins plus any @--mcp-server@'s tools
@@ -637,6 +661,7 @@ assembleAgent prov opts model tuner delib registry = do
         base
           { acSystem = sys,
             acThinking = optThinking opts,
+            acServerTools = optServerTools opts,
             acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts),
             acMaxSteps = fromMaybe (acMaxSteps base) (optMaxSteps opts),
             acContextLimit = optContextLimit opts,
@@ -783,7 +808,7 @@ renderStream p = loop
     loop =
       nextItem p >>= \case
         Nothing -> pure ()
-        Just (Left e) -> errExit (tshow e)
+        Just (Left e) -> errExit (providerErrorText e)
         Just (Right ev) -> renderEvent ev >> loop
 
 -- | The streamed interface (product output, not logging): answer on stdout, everything else stderr.

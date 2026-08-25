@@ -2622,6 +2622,26 @@ configTests =
         fc @?= defaultConfig,
       -- The whole point of the union: a misspelled provider is caught by Dhall at load, with the
       -- valid alternatives named, instead of travelling to the provider factory as a Text.
+      testCase "serverTools decodes the union, payloads and all" $ withSchema "stools" $ \dir -> do
+        f <-
+          writeCfg
+            dir
+            "{ serverTools = Some [ L.webSearch, L.ServerTool.CodeExecution, L.ServerTool.UrlContext\n\
+            \  , L.ServerTool.WebFetch { maxUses = Some 3 }\n\
+            \  , L.ServerTool.CollectionsSearch { collectionIds = [\"c1\"], limit = Some 5 } ] }"
+        fc <- loadConfig f
+        serverTools fc
+          @?= Just
+            [ STWebSearch Nothing [] [],
+              STCodeExecution,
+              STUrlContext,
+              STWebFetch (Just 3),
+              STCollectionsSearch ["c1"] (Just 5)
+            ],
+      testCase "a misspelled server tool is a load error" $ withSchema "stools-bad" $ \dir -> do
+        f <- writeCfg dir "{ serverTools = Some [ L.ServerTool.WebSerch ] }"
+        r <- try (loadConfig f) :: IO (Either SomeException FileConfig)
+        assertBool "rejected at load" (isLeft r),
       testCase "a misspelled provider is a load error, not a runtime one" $ withSchema "config3" $ \dir -> do
         f <- writeCfg dir "{ provider = Some L.Provider.Anthropi }"
         r <- try (loadConfig f) :: IO (Either SomeException FileConfig)

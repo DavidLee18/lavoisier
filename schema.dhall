@@ -108,6 +108,48 @@ let CronJob =
         }
       }
 
+{-| Provider-run ("server-side") tools: the provider executes them itself, mid-turn, and streams
+    back what it found — no client round-trip per call. Which ones a provider can actually run
+    differs, and the sets are disjoint: `XSearch` and `CollectionsSearch` are xAI's, `WebFetch` and
+    the client builtins are Anthropic's, `UrlContext` is Gemini's. Asking a provider for one it
+    cannot run is refused by name at load-to-send time, not dropped.
+-}
+let ServerTool
+    : Type
+    = < WebSearch :
+          { maxUses : Optional Natural
+          , allowedDomains : List Text
+          , blockedDomains : List Text
+          }
+      | WebFetch : { maxUses : Optional Natural }
+      | CodeExecution
+      | XSearch :
+          { allowedHandles : List Text
+          , blockedHandles : List Text
+          , fromDate : Optional Text
+          , toDate : Optional Text
+          }
+      | CollectionsSearch : { collectionIds : List Text, limit : Optional Natural }
+      | UrlContext
+      >
+
+{-| `ServerTool.WebSearch` with everything defaulted — the common case. -}
+let webSearch =
+      ServerTool.WebSearch
+        { maxUses = None Natural
+        , allowedDomains = [] : List Text
+        , blockedDomains = [] : List Text
+        }
+
+{-| `ServerTool.XSearch` with everything defaulted. -}
+let xSearch =
+      ServerTool.XSearch
+        { allowedHandles = [] : List Text
+        , blockedHandles = [] : List Text
+        , fromDate = None Text
+        , toDate = None Text
+        }
+
 {-| Per-room / per-member Matrix tool permissions. A room or user absent from the list is
     unconstrained; when both apply the effective set is their INTERSECTION.
 -}
@@ -139,6 +181,7 @@ let Config =
           , persona : Optional Text
           , system : Optional Text
           , logLevel : Optional LogLevel
+          , serverTools : Optional (List ServerTool)
           , serve : Optional Port
           , serveA2a : Optional Port
           , acp : Optional Bool
@@ -188,6 +231,7 @@ let Config =
           , persona = None Text
           , system = None Text
           , logLevel = None LogLevel
+          , serverTools = None (List ServerTool)
           , serve = None Port
           , serveA2a = None Port
           , acp = None Bool
@@ -222,6 +266,9 @@ in  { Provider
     , Thinking
     , Language
     , LogLevel
+    , ServerTool
+    , webSearch
+    , xSearch
     , Port
     , ModelRef
     , ModelRef/Type

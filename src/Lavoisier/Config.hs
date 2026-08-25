@@ -27,11 +27,12 @@ where
 import Data.Either.Validation (Validation (..))
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Word (Word32)
 import Dhall (Decoder, FromDhall (..), Natural)
 import Dhall qualified
 import Lavoisier.Domain
 import Lavoisier.Log (LogLevel (..))
-import Lavoisier.Protocol.Message (ThinkingLevel (..))
+import Lavoisier.Protocol.Message (ServerTool (..), ThinkingLevel (..))
 
 -- ---------------------------------------------------------------------------
 -- Decoders for the schema's unions
@@ -65,6 +66,48 @@ thinkingDecoder =
     ]
 
 -- | @< Error | Warn | Info | Debug >@, likewise unprefixed on the Dhall side.
+-- | @< WebSearch : … | WebFetch : … | CodeExecution | XSearch : … | CollectionsSearch : … |
+-- UrlContext >@. Written out rather than derived because the payload field names are the config's
+-- vocabulary (@allowedDomains@), not the ADT's positional shape.
+serverToolDecoder :: Decoder ServerTool
+serverToolDecoder =
+  Dhall.union
+    ( Dhall.constructor "WebSearch" webSearchRec
+        <> Dhall.constructor "WebFetch" webFetchRec
+        <> (STCodeExecution <$ Dhall.constructor "CodeExecution" Dhall.unit)
+        <> Dhall.constructor "XSearch" xSearchRec
+        <> Dhall.constructor "CollectionsSearch" collectionsRec
+        <> (STUrlContext <$ Dhall.constructor "UrlContext" Dhall.unit)
+    )
+  where
+    webSearchRec =
+      Dhall.record
+        ( STWebSearch
+            <$> Dhall.field "maxUses" (Dhall.maybe word32)
+            <*> Dhall.field "allowedDomains" Dhall.auto
+            <*> Dhall.field "blockedDomains" Dhall.auto
+        )
+    webFetchRec = Dhall.record (STWebFetch <$> Dhall.field "maxUses" (Dhall.maybe word32))
+    xSearchRec =
+      Dhall.record
+        ( STXSearch
+            <$> Dhall.field "allowedHandles" Dhall.auto
+            <*> Dhall.field "blockedHandles" Dhall.auto
+            <*> Dhall.field "fromDate" Dhall.auto
+            <*> Dhall.field "toDate" Dhall.auto
+        )
+    collectionsRec =
+      Dhall.record
+        ( STCollectionsSearch
+            <$> Dhall.field "collectionIds" Dhall.auto
+            <*> Dhall.field "limit" (Dhall.maybe word32)
+        )
+    word32 =
+      refine (Dhall.auto @Natural) $ \n ->
+        if n > fromIntegral (maxBound :: Word32)
+          then Left ("serverTools: value out of range: " <> T.pack (show n))
+          else Right (fromIntegral n :: Word32)
+
 logLevelDecoder :: Decoder LogLevel
 logLevelDecoder =
   enumDecoder
@@ -188,6 +231,9 @@ data FileConfig = FileConfig
     -- | Replaces the operational system prompt outright (the persona still layers above it).
     system :: Maybe Text,
     logLevel :: Maybe LogLevel,
+    -- | Provider-run tools to offer. Which ones a given provider can actually run differs, and a
+    -- request for one it cannot is refused by name rather than dropped.
+    serverTools :: Maybe [ServerTool],
     serve :: Maybe Port,
     serveA2a :: Maybe Port,
     acp :: Maybe Bool,
@@ -246,6 +292,7 @@ fileConfigDecoder =
         <*> Dhall.field "persona" (fmap T.unpack <$> Dhall.auto)
         <*> Dhall.field "system" Dhall.auto
         <*> Dhall.field "logLevel" (Dhall.maybe logLevelDecoder)
+        <*> Dhall.field "serverTools" (Dhall.maybe (Dhall.list serverToolDecoder))
         <*> Dhall.field "serve" (Dhall.maybe (portDecoder "serve"))
         <*> Dhall.field "serveA2a" (Dhall.maybe (portDecoder "serveA2a"))
         <*> Dhall.field "acp" Dhall.auto
@@ -286,6 +333,7 @@ instance FromDhall FileConfig where
 defaultConfig :: FileConfig
 defaultConfig =
   FileConfig
+    n
     n
     n
     n

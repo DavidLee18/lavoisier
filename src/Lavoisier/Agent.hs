@@ -87,6 +87,9 @@ data AgentConfig = AgentConfig
     acMaxSteps :: Int,
     acMaxTokens :: Word32,
     acThinking :: Maybe ThinkingLevel,
+    -- | Provider-run tools offered on every turn alongside the client-side registry. A tool the
+    -- provider cannot run is refused by name at the adapter, not silently dropped.
+    acServerTools :: [ServerTool],
     -- | System prompt; 'Nothing' uses 'defaultSystemPrompt'.
     acSystem :: Maybe Text,
     -- | Per-request token ceiling for the context-budget manager (§6.3). When set and still
@@ -130,7 +133,28 @@ data AgentConfig = AgentConfig
 -- context-eviction ceiling, no cheap\/advisor model (escalate-after 2), unbounded budget, no
 -- no-progress breaker.
 defaultAgentConfig :: ModelId -> AgentConfig
-defaultAgentConfig model = AgentConfig model 12 4096 Nothing Nothing Nothing Nothing 2 Nothing Nothing Nothing Nothing False False False Nothing False False
+defaultAgentConfig model =
+  AgentConfig
+    { acModel = model,
+      acMaxSteps = 12,
+      acMaxTokens = 4096,
+      acThinking = Nothing,
+      acServerTools = [],
+      acSystem = Nothing,
+      acContextLimit = Nothing,
+      acCheapModel = Nothing,
+      acEscalateAfter = 2,
+      acAdvisorModel = Nothing,
+      acTokenBudget = Nothing,
+      acNoProgressLimit = Nothing,
+      acVerifyCommand = Nothing,
+      acRequireEdit = False,
+      acVerifyAndFix = False,
+      acInLoopVerify = False,
+      acSummaryModel = Nothing,
+      acBudgetAwareness = False,
+      acClassifyWithModel = False
+    }
 
 -- | A per-position __circuit breaker__ for the fallback chain, shared across turns so a dead model
 -- isn't re-probed every turn. Position @0@ is the primary; position @i>0@ is @fallbacks !! (i-1)@.
@@ -399,7 +423,8 @@ runLoopSeeded agent allowed initial emit = do
                     crMessages = msgs',
                     crTools = defs,
                     crMaxTokens = acMaxTokens cfg,
-                    crThinking = effThinking
+                    crThinking = effThinking,
+                    crServerTools = acServerTools cfg
                   }
           res <- attempt (candidatesAt step) buildReq cursor
           case res of

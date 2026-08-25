@@ -354,9 +354,28 @@ above; requires `--serve-matrix`) ·
 `--provider anthropic|google|xai|xai-grpc|claude-cli` · `--model` · `--max-tokens` · `--max-steps` ·
 `--system` · `--persona <PATH>` / `--no-persona` (persona layered above the operating instructions;
 `./PERSONA.md` auto-loads when present) ·
-`--thinking <off|low|medium|high>` (see *Capability negotiation* below) · `--budget` (total-task
-token ceiling) ·
+`--thinking <off|low|medium|high>` (see *Capability negotiation* below) ·
+`--server-tools <web_search|web_fetch|code_execution|x_search|collections_search|url_context,…>`
+(provider-run tools; repeatable, and the Dhall `serverTools` list takes their filters) ·
+`--budget` (total-task token ceiling) ·
 `--session-dir <DIR>` (durable gateway sessions).
+
+### Provider-run tools
+
+`--server-tools web_search,code_execution` offers **provider-run** tools: the provider executes them
+itself mid-turn and streams back what it found, with no client round-trip per call. The names are
+`web_search`, `web_fetch`, `code_execution`, `x_search`, `collections_search` and `url_context`; the
+flag takes their defaults, and the Dhall `serverTools` list is where domain, handle and date filters
+go (`L.ServerTool.XSearch { allowedHandles = ["nasa"], … }`).
+
+The sets are **disjoint across providers** — `x_search` and `collections_search` are xAI's,
+`web_fetch` is Anthropic's, `url_context` is Gemini's — so asking the wrong provider for one is
+refused by name before anything is sent, rather than being silently dropped:
+
+```
+$ lav --provider claude-cli --server-tools x_search "…"
+error: tool `x_search` was offered but this provider does not support it (XSearch)
+```
 
 ### Capability negotiation
 

@@ -30,6 +30,19 @@ in  L.Config::{
     , serveA2a = Some 8081
     , logLevel = Some L.LogLevel.Info
 
+    -- Provider-run tools. The sets are disjoint across providers, so a tool the chosen provider
+    -- cannot run is refused by name before the request is sent, never dropped. `--server-tools`
+    -- takes the same names with defaults; this list is where the filters go.
+    , serverTools = Some
+      [ L.webSearch
+      , L.ServerTool.WebSearch
+        { maxUses = Some 5
+        , allowedDomains = [ "docs.haskell.org" ]
+        , blockedDomains = [] : List Text
+        }
+      , L.ServerTool.CodeExecution
+      ]
+
     -- MCP servers: the stdio-vs-HTTP choice is stated, not sniffed from the string.
     , mcpServers = Some
       [ L.Mcp::{
