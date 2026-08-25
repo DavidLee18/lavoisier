@@ -79,7 +79,8 @@ runGoogleBatch cfg tasks@(t0 : _) = do
 
 -- | The @{"batch":{"display_name":…,"input_config":{"requests":{"requests":[…]}}}}@ body. Each entry
 -- is the normal generation body under @request@ plus a @metadata.key@ carrying the @custom_id@.
--- | Every task is negotiated against 'GoogleCaps' first, exactly as the streaming path is.
+--
+-- Every task is negotiated against 'GoogleCaps' first, exactly as the streaming path is.
 batchBody :: GoogleConfig -> [BatchTask] -> Either BatchError Value
 batchBody cfg tasks = do
   inlined <- traverse entry tasks
