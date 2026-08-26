@@ -139,3 +139,14 @@ jobs:
         with:
           files: dist/*.tar.gz
           fail_on_unmatched_files: true
+          # Immutable releases mean the notes cannot be fixed after the fact either, so the body
+          # is generated here rather than written by hand at tag time. MIGRATING.md is linked at
+          # *this tag*, so the link always resolves to the version being released.
+          generate_release_notes: true
+          body: |
+            Prebuilt binaries for `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu` and
+            `aarch64-unknown-linux-gnu`. Each tarball carries its own dynamic libraries; unpack
+            and run `./lav`.
+
+            Upgrading: [`MIGRATING.md`](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/MIGRATING.md)
+            for this tag lists every breaking change and the edit it needs.
