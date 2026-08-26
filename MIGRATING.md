@@ -44,12 +44,17 @@ Anything not listed is unchanged.
 | `provider` | `Some "anthropic"` | `Some L.Provider.Anthropic` |
 | `thinking` | `Some "high"` | `Some L.Thinking.High` |
 | `lang` | `Some "ko_KR"` | `Some L.Language.Korean` |
-| `legionJudge` | `Some "google:gemini-2.5-flash"` | `Some L.ModelRef::{ provider = L.Provider.Google, model = "gemini-2.5-flash" }` |
-| `legionDebaters` | `Some [ "anthropic:claude-sonnet-4-5" ]` | `Some [ L.ModelRef::{ provider = L.Provider.Anthropic, model = "claude-sonnet-4-5" } ]` |
+| `legionDebaters` / `legionJudge` / `legionRounds` | three fields | one `legion = Some L.Legion::{ debaters = [ L.anthropic "claude-sonnet-4-5", L.google "gemini-2.5-flash" ], rounds = Some 1 }` |
+| `fallback` | `Some [ "google:gemini-2.5-flash" ]` | `Some [ L.google "gemini-2.5-flash" ]` |
+| `cheapModel` / `escalateAfter` | two fields | one `routing = Some L.Routing::{ cheapModel = "claude-haiku-4-5", escalateAfter = Some 2 }` |
+| `verifyCmd` / `verifyAndFix` / `inLoopVerify` | three fields | one `verify = Some L.Verify::{ command = "cabal test", andFix = True }` |
+| `tune` / `tuneBayes` / `tuneState` | three fields | one `tune = Some L.Tune::{ strategy = L.TuneStrategy.Bayes, state = Some "…" }` |
+| `tui` / `tuiAutoApprove` | two fields | one `tui = Some L.Tui::{ autoApprove = True }` |
 | `mcpServers` | `Some [ "fs: npx -y … ." ]` | `Some [ L.Mcp::{ label = "fs", target = L.McpTarget.Stdio "npx -y … ." } ]` |
-| `cron` | `Some [ "*/30 9-17 * * 1-5 check CI" ]` | `Some [ L.CronJob::{ schedule = L.Schedule::{ minute = [ L.everyN 30 ], hour = [ L.between 9 17 ], dayOfWeek = [ L.between 1 5 ] }, prompt = "check CI" } ]` |
-| `matrixRoomTools` | ``Some (toMap { `!ops:hs` = [ "shell" ] })`` | `Some [ L.ToolGrant::{ subject = "!ops:hs", tools = [ "shell" ] } ]` |
-| `matrixUserTools` | ``Some (toMap { `@bob:hs` = [ "read_file" ] })`` | `Some [ L.ToolGrant::{ subject = "@bob:hs", tools = [ "read_file" ] } ]` |
+| `cron` | `Some [ "*/30 9-17 * * 1-5 check CI" ]` | `Some [ L.CronJob::{ schedule = L.Schedule::{ minute = L.one (L.everyN 30), hour = L.one (L.between 9 17), dayOfWeek = L.one (L.between 1 5) }, prompt = "check CI" } ]` |
+| `matrixRoomTools` | ``Some (toMap { `!ops:hs` = [ "shell" ] })`` | `Some [ L.ToolGrant::{ subject = "!ops:hs", tools = [ L.ToolName.shell ] } ]` |
+| `matrixUserTools` | ``Some (toMap { `@bob:hs` = [ "read_file" ] })`` | `Some [ L.ToolGrant::{ subject = "@bob:hs", tools = [ L.ToolName.read_file ] } ]` |
+| `serverTools` X-search window | `fromDate = Some "2026-08-01"` | `fromDate = Some 2026-08-01` (Dhall's own `Date`) |
 
 Notes on the less obvious ones:
 
@@ -58,8 +63,9 @@ Notes on the less obvious ones:
   prefix at connect time; now the choice is made at load, and the HTTP arm is checked for a scheme.
 - **Cron schedules name *and type* their fields.** A field is a list of terms, each built with
   `L.every` (`*`), `L.everyN 30` (`*/30`), `L.at 9` (`9`), `L.between 9 17` (`9-17`) or
-  `L.from 5 10` (`5/10`); commas become list elements, so `0,15,30` is `[ L.at 0, L.at 15, L.at 30 ]`.
-  `L.Schedule` defaults every field to `[ L.every ]`, so write only what you constrain, and
+  `L.from 5 10` (`5/10`); commas become extra terms, so `0,15,30` is
+  `L.terms (L.at 0) [ L.at 15, L.at 30 ]`.
+  `L.Schedule` defaults every field to `L.one L.every`, so write only what you constrain, and
   `L.everyMinutes 30` / `L.dailyAt 9` remain as shorthands. Each value is range-checked against its
   own field at load — an `hour` of `24` is an error naming `hour`, not a job that never fires.
 - **Matrix tool grants are a list, not a `toMap`.** Same semantics: a room or user absent from the
@@ -68,6 +74,30 @@ Notes on the less obvious ones:
 - **Ports are range-checked.** Still `Natural`, but `serve = Some 0` or `Some 70000` is now a load
   error naming the field. Dhall cannot express this (its `assert` cannot refine a function argument),
   so the check lives in the decoder.
+- **Knobs that depend on each other are one field.** `routing`, `verify`, `tune`, `tui` and `legion`
+  each replaced two or three independent `Optional`s. This is not tidying: the broken combinations
+  loaded fine and were then *ignored*. `tuneBayes = True` with `tune = False` ran the Bayesian
+  learner anyway; `tuneState` without `tune` did nothing, despite the flag help promising it implied
+  it; `legionJudge` and `legionRounds` with no debaters were discarded whole; `tuiAutoApprove`
+  without `tui`, `escalateAfter` without `cheapModel`, and `verifyAndFix` without `verifyCmd` all did
+  nothing at all. None of those are writable now, and on the command line — where the flags are still
+  flat, because a command line is — the two that cannot be completed automatically are reported
+  instead of dropped. (`--tune-state` implies `--tune`, and `--tui-auto-approve` implies `--tui`.)
+- **A model cannot be named without saying whose it is.** `ModelRef` is a union over providers, not a
+  `{ provider, model }` record: `L.anthropic "claude-sonnet-4-5"`, or `L.ModelRef.Google
+  L.Model.Default` for whatever that provider's current default is. The record let the two fields
+  disagree, and defaulted `provider` to Anthropic when omitted — a silent default on the field that
+  picks which API key is used. `Named` is still free text, so this is structure, not a check that the
+  id exists.
+- **Tool names are a union**, `< read_file | write_file | shell | … | Custom : Text >`, with
+  `Custom` for MCP (`<label>_<tool>`) and `mainWith` tools. As bare `Text` a misspelling was not an
+  error at all: a grant matching no tool simply never applies, silently.
+- **A cron field is one-or-more terms.** `L.one t` for a single term, `L.terms t [ … ]` for several.
+  It was a `List`, so `minute = []` type-checked and became a load error; now it is not writable, and
+  the "needs at least one term" error is gone because nothing can produce it.
+- **X-search windows are dates.** `fromDate`/`toDate` take Dhall's built-in `Date` (`2026-08-01`),
+  not `Text`. `"2026-13-40"`, `"26/08/01"` and `"yesterday"` all used to type-check and reach the
+  provider, which answers with a 400 or an empty result set that reads like "nothing matched".
 
 ### `--cron-file` and `--schedule-file` are typed too
 
@@ -99,8 +129,8 @@ become one `action` union:
 -- after
 let L = ./schema.dhall
 in  [ L.ScheduleJob::{ jobId = "disk"
-                     , schedule = L.Schedule::{ minute = [ L.at 0 ] }
-                     , action = L.Action.Tool { name = "shell", args = Some "{\"command\":\"df\"}" }
+                     , schedule = L.Schedule::{ minute = L.one (L.at 0) }
+                     , action = L.Action.Tool { name = L.ToolName.shell, args = Some "{\"command\":\"df\"}" }
                      } ]
 ```
 

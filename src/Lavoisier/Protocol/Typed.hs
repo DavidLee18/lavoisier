@@ -67,7 +67,7 @@ import Data.Text (Text)
 import Data.Word (Word32)
 import GHC.TypeLits (ErrorMessage (..), TypeError)
 
-import Lavoisier.Domain (ModelId)
+import Lavoisier.Domain (Date, ModelId)
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider (
     Capabilities,
@@ -201,7 +201,7 @@ withCodeExecution ∷ Req ns → Req ('CodeExecution ': ns)
 withCodeExecution = addServerTool STCodeExecution
 
 -- | Offer X post search. Needs 'XSearch'.
-withXSearch ∷ [Text] → [Text] → Maybe Text → Maybe Text → Req ns → Req ('XSearch ': ns)
+withXSearch ∷ [Text] → [Text] → Maybe Date → Maybe Date → Req ns → Req ('XSearch ': ns)
 withXSearch ah bh from to = addServerTool (STXSearch ah bh from to)
 
 -- | Offer RAG over provider-hosted collections. Needs 'CollectionsSearch'.

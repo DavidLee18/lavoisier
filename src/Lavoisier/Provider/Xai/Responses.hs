@@ -43,7 +43,7 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.Text qualified as T
 
-import Lavoisier.Domain (ModelId (..))
+import Lavoisier.Domain (ModelId (..), renderDate)
 import Lavoisier.Protocol.Message
 import Lavoisier.Protocol.Provider
 import Lavoisier.Protocol.Stream (Producer (..))
@@ -230,8 +230,8 @@ serverToolJson = \case
             ["type" .= ("x_search" ∷ Text)]
                 <> ["allowed_x_handles" .= allowed | not (null allowed)]
                 <> ["excluded_x_handles" .= blocked | null allowed, not (null blocked)]
-                <> ["from_date" .= d | Just d ← [from]]
-                <> ["to_date" .= d | Just d ← [to]]
+                <> ["from_date" .= renderDate d | Just d ← [from]]
+                <> ["to_date" .= renderDate d | Just d ← [to]]
     STCodeExecution → Just (object ["type" .= ("code_interpreter" ∷ Text)])
     STCollectionsSearch ids lim →
         Just . object $

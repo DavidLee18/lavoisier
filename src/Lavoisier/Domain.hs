@@ -18,6 +18,7 @@ module Lavoisier.Domain (
     renderProviderId,
     parseProviderId,
     providerIdList,
+    defaultModelFor,
 
     -- * Network
     Port,
@@ -32,6 +33,7 @@ module Lavoisier.Domain (
     -- * Models and tools
     ModelId (..),
     ToolName (..),
+    builtinToolNames,
     SessionId (..),
 
     -- * Matrix identifiers
@@ -75,6 +77,20 @@ module Lavoisier.Domain (
     -- * Schedules
     ScheduleAction (..),
     ScheduleJobSpec (..),
+
+    -- * Dates
+    Date (dYear, dMonth, dDay),
+    mkDate,
+    renderDate,
+
+    -- * Co-dependent knob groups
+    Routing (..),
+    VerifySpec (..),
+    TuneStrategy (..),
+    Tuning (..),
+    TuiSpec (..),
+    LegionSpec (lgDebaters, lgJudge, lgRounds),
+    mkLegionSpec,
 
     -- * Permissions
     ToolGrant (..),
@@ -137,6 +153,22 @@ it cannot drift out of sync with 'parseProviderId'.
 -}
 providerIdList ∷ String
 providerIdList = intercalate "|" [T.unpack (renderProviderId p) | p ← allProviders]
+
+{- | The model a provider is driven with when nothing names one — neither @--model@, nor the config,
+nor a 'ModelRef'. An exhaustive @case@ on 'ProviderId': adding a provider is a compile error here
+until it has a default, which is the property the old string dispatch could not give.
+
+It lives beside 'ProviderId' rather than in the CLI because the config schema names it too: a
+'ModelRef' can say "this provider, its default model" instead of pinning an id that goes stale.
+-}
+defaultModelFor ∷ ProviderId → ModelId
+defaultModelFor = \case
+    Anthropic → "claude-sonnet-4-5"
+    Google → "gemini-2.5-flash"
+    Xai → "grok-4"
+    XaiGrpc → "grok-4"
+    XaiResponses → "grok-4.6"
+    ClaudeCli → "sonnet"
 
 -- ---------------------------------------------------------------------------
 -- Network
@@ -206,6 +238,38 @@ newtype ModelId = ModelId {unModelId ∷ Text}
 newtype ToolName = ToolName {unToolName ∷ Text}
     deriving stock (Eq, Ord, Show)
     deriving newtype IsString
+
+{- | Every tool name @lav@ itself ships, alphabetically — the vocabulary a config file can name
+without inventing one.
+
+Tool names used to be bare 'Text' wherever a config mentioned them (the Matrix grants, a scheduled
+tool action), so a typo granted or invoked nothing and said nothing: an unmatched name is not an
+error, it is simply a permission that never applies. The config schema turns this list into a
+union with a @Custom@ escape for MCP and @mainWith@ tools, so the typo is a load error and the
+escape is a deliberate act.
+
+A tasty test asserts this list is exactly the set of names the tool modules register, so the
+schema cannot fall behind the tools.
+-}
+builtinToolNames ∷ [ToolName]
+builtinToolNames =
+    [ "batch_edit"
+    , "edit_anchored"
+    , "edit_files"
+    , "find_references"
+    , "list_dir"
+    , "outline_file"
+    , "outline_files"
+    , "read_anchored"
+    , "read_file"
+    , "read_files"
+    , "schedule_list"
+    , "schedule_run"
+    , "schedule_status"
+    , "shell"
+    , "str_replace"
+    , "write_file"
+    ]
 
 -- | A conversation\/session key.
 newtype SessionId = SessionId {unSessionId ∷ Text}
@@ -429,10 +493,8 @@ data CronField = CronField
 {- | Check a list of terms against a kind's range. 'Left' names the field and the offending value,
 ready to be reported as a config load error.
 -}
-mkCronField ∷ CronFieldKind → [CronTerm] → Either Text CronField
-mkCronField kind terms = case NE.nonEmpty terms of
-    Nothing → Left (label <> ": a cron field needs at least one term")
-    Just ne → CronField kind <$> traverse checkTerm ne
+mkCronField ∷ CronFieldKind → NonEmpty CronTerm → Either Text CronField
+mkCronField kind terms = CronField kind <$> traverse checkTerm terms
     where
         (lo, hi) = cronFieldBounds kind
         label = cronFieldName kind
@@ -482,7 +544,13 @@ data CronExpr = CronExpr
 {- | Build an expression from the terms of each field, in cron's own order. Every field is checked
 against its own bounds and the __first__ failure is returned, naming that field.
 -}
-mkCronExpr ∷ [CronTerm] → [CronTerm] → [CronTerm] → [CronTerm] → [CronTerm] → Either Text CronExpr
+mkCronExpr ∷
+    NonEmpty CronTerm →
+    NonEmpty CronTerm →
+    NonEmpty CronTerm →
+    NonEmpty CronTerm →
+    NonEmpty CronTerm →
+    Either Text CronExpr
 mkCronExpr mi ho dom mo dow =
     CronExpr
         <$> mkCronField Minute mi
@@ -556,6 +624,147 @@ data ScheduleJobSpec = ScheduleJobSpec
     , sjsRetryWait ∷ Maybe Seconds
     }
     deriving stock (Eq, Generic, Show)
+
+-- ---------------------------------------------------------------------------
+-- Dates
+-- ---------------------------------------------------------------------------
+
+{- | A calendar date, for the server-tool search windows that used to be free 'Text' in
+@YYYY-MM-DD@ form.
+
+The constructor is hidden so 'mkDate' is the only way in: it range-checks the month and the day
+against that month in that year, leap years included. A date is the last thing in the config with
+a grammar the type did not state — @"2026-13-40"@, @"26/08/01"@ and @"yesterday"@ all
+type-checked as @Text@ and reached the provider, which answered with an unhelpful 400 or, worse,
+an empty result set that looked like "nothing matched".
+-}
+data Date = Date
+    { dYear ∷ Int
+    , dMonth ∷ Int
+    , dDay ∷ Int
+    }
+    deriving stock (Eq, Generic, Ord, Show)
+
+-- | Build a date, naming which component is out of range.
+mkDate ∷ Int → Int → Int → Either Text Date
+mkDate y m d
+    | y < 1 || y > 9999 = Left ("year: " <> tshow y <> " is out of range 1-9999")
+    | m < 1 || m > 12 = Left ("month: " <> tshow m <> " is out of range 1-12")
+    | d < 1 || d > daysInMonth y m =
+        Left ("day: " <> tshow d <> " is out of range 1-" <> tshow (daysInMonth y m) <> " for month " <> tshow m)
+    | otherwise = Right (Date y m d)
+
+-- | Days in a month, Gregorian leap years included.
+daysInMonth ∷ Int → Int → Int
+daysInMonth y = \case
+    2 | leap → 29
+    2 → 28
+    m | m `elem` [4, 6, 9, 11] → 30
+    _ → 31
+    where
+        leap = (y `mod` 4 == 0 && y `mod` 100 /= 0) || y `mod` 400 == 0
+
+-- | Render as @YYYY-MM-DD@, the form every provider that takes a date window wants.
+renderDate ∷ Date → Text
+renderDate (Date y m d) = pad 4 y <> "-" <> pad 2 m <> "-" <> pad 2 d
+    where
+        pad n v = T.justifyRight n '0' (tshow v)
+
+-- ---------------------------------------------------------------------------
+-- Co-dependent knob groups
+-- ---------------------------------------------------------------------------
+
+{- | Cheap-model-first routing: run the first 'rtEscalateAfter' round-trips on 'rtCheapModel',
+then escalate to the primary model.
+
+The threshold used to be a sibling of the model — two independent @Optional@ fields — so
+@escalateAfter = Some 5@ with no cheap model type-checked, loaded, and did nothing at all; the
+agent loop's own haddock said the knob was "ignored when the cheap model is Nothing". Grouping
+them makes that dead combination unrepresentable: there is no escalation threshold without a
+model to escalate /from/.
+-}
+data Routing = Routing
+    { rtCheapModel ∷ ModelId
+    , rtEscalateAfter ∷ Maybe Int
+    -- ^ 'Nothing' keeps the built-in default.
+    }
+    deriving stock (Eq, Generic, Show)
+
+{- | The verify lever: a command whose exit status decides whether the task is done, plus the two
+switches that say what to do with the answer.
+
+@verifyAndFix@ and @inLoopVerify@ were independent 'Bool's beside an @Optional Text@ command, and
+both are inert without one — 'Lavoisier.Agent.runVerify' cases on the command first and returns
+immediately when it is absent. Two switches that silently do nothing is exactly the shape this
+group removes.
+-}
+data VerifySpec = VerifySpec
+    { vsCommand ∷ Text
+    -- ^ Shell command; exit 0 means the task verifies.
+    , vsAndFix ∷ Bool
+    -- ^ On a would-be finish, feed a failure's output back and keep working (bounded).
+    , vsInLoop ∷ Bool
+    -- ^ Stop as soon as an edit turn makes the command pass, without waiting for the model.
+    }
+    deriving stock (Eq, Generic, Show)
+
+-- | Which ATO learner to run. There is no @Off@: absence of a 'Tuning' is what off means.
+data TuneStrategy
+    = -- | ε-greedy ("Lavoisier.Tune").
+      Greedy
+    | -- | Thompson sampling ("Lavoisier.Tune.Bayes").
+      Bayes
+    deriving stock (Bounded, Enum, Eq, Generic, Ord, Show)
+
+{- | The ATO tuner: which learner, and where its learned profiles live.
+
+This replaced three independent fields — @tune : Bool@, @tuneBayes : Bool@, @tuneState : Text@ —
+whose combinations disagreed with the code that read them. @tuneBayes = True@ with
+@tune = False@ ran the Bayesian learner anyway (the builder tested the Bayes flag first), and
+@tuneState@ without @tune@ was documented as implying it and did not. As one group both are
+gone: the strategy is a choice, not two booleans, and a state path cannot exist without a learner
+to persist.
+-}
+data Tuning = Tuning
+    { tuStrategy ∷ TuneStrategy
+    , tuState ∷ Maybe FilePath
+    -- ^ Load\/persist learned profiles here; 'Nothing' learns for the session only.
+    }
+    deriving stock (Eq, Generic, Show)
+
+{- | The interactive TUI. Auto-approval was a second top-level 'Bool' that only the TUI reads, so
+setting it without the TUI was silently nothing; here it is a field of the thing that reads it.
+-}
+newtype TuiSpec = TuiSpec
+    { tsAutoApprove ∷ Bool
+    -- ^ Skip the tool-approval prompts and run every tool unattended.
+    }
+    deriving stock (Eq, Generic, Show)
+
+{- | A legion council: the debaters, the judge that synthesises their verdict, and how many
+critique rounds follow the draft.
+
+The judge and the round count used to sit beside an independent debater list, and the council was
+built only when that list was non-empty — so a config that named a judge and a round count but no
+debaters was dropped in full, without a word. The constructor is hidden so 'mkLegionSpec' is the
+only way in, and it enforces the two-debater floor that "Lavoisier.Legion" needs; a one-model
+council is just the advisor pre-pass.
+-}
+data LegionSpec = LegionSpec
+    { lgDebaters ∷ [ModelRef]
+    , lgJudge ∷ Maybe ModelRef
+    -- ^ 'Nothing' judges with the first debater.
+    , lgRounds ∷ Maybe Int
+    -- ^ 'Nothing' keeps the built-in default.
+    }
+    deriving stock (Eq, Generic, Show)
+
+-- | Build a council, rejecting a panel too small to deliberate.
+mkLegionSpec ∷ [ModelRef] → Maybe ModelRef → Maybe Int → Either Text LegionSpec
+mkLegionSpec debaters judge rounds
+    | length debaters < 2 =
+        Left ("legion: a council needs at least 2 debaters, got " <> tshow (length debaters))
+    | otherwise = Right (LegionSpec debaters judge rounds)
 
 -- ---------------------------------------------------------------------------
 -- Permissions

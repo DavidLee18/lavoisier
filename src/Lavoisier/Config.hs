@@ -29,7 +29,9 @@ where
 
 import Control.Exception (SomeException, try)
 import Data.Either.Validation (Validation (..))
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Text (Text)
+import Data.Time.Calendar (Day, toGregorian)
 import Data.Word (Word32)
 import Dhall (Decoder, FromDhall (..), Natural)
 
@@ -102,8 +104,8 @@ serverToolDecoder =
                 ( STXSearch
                     <$> Dhall.field "allowedHandles" Dhall.auto
                     <*> Dhall.field "blockedHandles" Dhall.auto
-                    <*> Dhall.field "fromDate" Dhall.auto
-                    <*> Dhall.field "toDate" Dhall.auto
+                    <*> Dhall.field "fromDate" (Dhall.maybe (dateDecoder "xSearch.fromDate"))
+                    <*> Dhall.field "toDate" (Dhall.maybe (dateDecoder "xSearch.toDate"))
                 )
         collectionsRec =
             Dhall.record
@@ -111,6 +113,10 @@ serverToolDecoder =
                     <$> Dhall.field "collectionIds" Dhall.auto
                     <*> Dhall.field "limit" (Dhall.maybe word32)
                 )
+        dateDecoder field =
+            refine (Dhall.auto @Day) $ \day →
+                let (y, m, d) = toGregorian day
+                 in either (Left . ((field <> ": ") <>)) Right (mkDate (fromInteger y) m d)
         word32 =
             refine (Dhall.auto @Natural) $ \n →
                 if n > fromIntegral (maxBound ∷ Word32)
@@ -147,14 +153,26 @@ portDecoder field = refine (Dhall.auto @Natural) check
                 Right
                 (mkPort (toInteger n))
 
--- | @{ provider, model }@ — the record that replaced the packed @"provider:model"@ string.
+{- | @< Anthropic : Model | Google : Model | … >@ — a model that cannot be named without saying
+whose it is.
+
+This was a two-field record, and before that the packed string @"provider:model"@. The record let
+the two fields disagree (an Anthropic provider with a grok id type-checked and failed at the API)
+and defaulted the provider to Anthropic when it was omitted — a silent default on the field that
+decides which API key is used. The arm table is generated from 'allProviders', so a new provider
+extends the decoder rather than being forgotten by it.
+-}
 modelRefDecoder ∷ Decoder ModelRef
-modelRefDecoder =
-    Dhall.record
-        ( ModelRef
-            <$> Dhall.field "provider" providerDecoder
-            <*> Dhall.field "model" (ModelId <$> Dhall.auto)
-        )
+modelRefDecoder = Dhall.union (mconcat [arm p | p ← allProviders])
+    where
+        arm p = ModelRef p <$> Dhall.constructor (T.pack (show p)) (modelDecoder p)
+        -- @Default@ resolves through the same table the CLI uses, so a config can say "this
+        -- provider, whatever its current model is" instead of pinning an id that goes stale.
+        modelDecoder p =
+            Dhall.union
+                ( (defaultModelFor p <$ Dhall.constructor "Default" Dhall.unit)
+                    <> (ModelId <$> Dhall.constructor "Named" Dhall.auto)
+                )
 
 {- | @< Stdio : Text | Http : Text >@. The HTTP arm is validated as a URL here, so the
 stdio-vs-HTTP decision is made once at load instead of being re-sniffed at connect time.
@@ -217,7 +235,14 @@ nothing is left to fail when a gateway starts.
 cronExprDecoder ∷ Decoder CronExpr
 cronExprDecoder = refine record (\(mi, ho, dom, mo, dow) → mkCronExpr mi ho dom mo dow)
     where
-        terms = Dhall.list cronTermDecoder
+        -- @{ head, tail }@: Dhall has no non-empty list, but it can state one as a record, and
+        -- that is what keeps @minute = []@ from being writable at all.
+        terms =
+            Dhall.record
+                ( (:|)
+                    <$> Dhall.field "head" cronTermDecoder
+                    <*> Dhall.field "tail" (Dhall.list cronTermDecoder)
+                )
         record =
             Dhall.record
                 ( (,,,,)
@@ -239,6 +264,21 @@ cronJobDecoder =
             <*> Dhall.field "retryWait" (fmap (Seconds . fromIntegral @Natural) <$> Dhall.auto)
         )
 
+{- | @< read_file | … | Custom : Text >@ — a tool by name, with an escape for the ones @lav@ does
+not ship (MCP servers namespace theirs, and @mainWith@ callers add their own).
+
+The arms are generated from 'builtinToolNames', so the union and the tools cannot drift, and the
+arm labels /are/ the tool names — there is no mapping table to get wrong. As bare 'Text' a
+misspelled name was not an error at all: a grant that matches no tool simply never applies, and a
+scheduled action that names no tool fails only when it fires.
+-}
+toolNameDecoder ∷ Decoder ToolName
+toolNameDecoder =
+    Dhall.union
+        ( mconcat [n <$ Dhall.constructor (unToolName n) Dhall.unit | n ← builtinToolNames]
+            <> (ToolName <$> Dhall.constructor "Custom" Dhall.auto)
+        )
+
 {- | @{ subject, tools }@, with the subject parsed by the caller-supplied sigil check so a room id
 cannot be written where a user id belongs.
 -}
@@ -247,12 +287,74 @@ toolGrantDecoder field parseSubject =
     Dhall.record
         ( ToolGrant
             <$> Dhall.field "subject" subjectDecoder
-            <*> Dhall.field "tools" (map ToolName <$> Dhall.auto)
+            <*> Dhall.field "tools" (Dhall.list toolNameDecoder)
         )
     where
         subjectDecoder =
             refine (Dhall.auto @Text) $ \t →
                 maybe (Left (field <> ": malformed subject: " <> t)) Right (parseSubject t)
+
+{- | A 'Natural' narrowed to 'Int', checked rather than a bare 'fromIntegral' because a large
+enough 'Natural' wraps to a negative and then passes every downstream bound.
+-}
+natInt ∷ Text → Decoder Int
+natInt field =
+    refine (Dhall.auto @Natural) $ \n →
+        if n > fromIntegral (maxBound ∷ Int)
+            then Left (field <> ": " <> T.pack (show n) <> " is too large")
+            else Right (fromIntegral n)
+
+{- | @{ cheapModel, escalateAfter }@ — cheap-model-first routing. The threshold used to be a
+sibling field, independently optional and inert without a model to escalate from.
+-}
+routingDecoder ∷ Decoder Routing
+routingDecoder =
+    Dhall.record
+        ( Routing
+            <$> Dhall.field "cheapModel" (ModelId <$> Dhall.auto)
+            <*> Dhall.field "escalateAfter" (Dhall.maybe (natInt "routing.escalateAfter"))
+        )
+
+-- | @{ command, andFix, inLoop }@ — the verify lever and the two switches that read it.
+verifyDecoder ∷ Decoder VerifySpec
+verifyDecoder =
+    Dhall.record
+        ( VerifySpec
+            <$> Dhall.field "command" Dhall.auto
+            <*> Dhall.field "andFix" Dhall.auto
+            <*> Dhall.field "inLoop" Dhall.auto
+        )
+
+-- | @< Greedy | Bayes >@ — which ATO learner. Off is the absence of the whole group.
+tuneStrategyDecoder ∷ Decoder TuneStrategy
+tuneStrategyDecoder = enumDecoder [("Greedy", Greedy), ("Bayes", Bayes)]
+
+-- | @{ strategy, state }@ — the tuner, replacing three booleans-and-a-path that disagreed.
+tuningDecoder ∷ Decoder Tuning
+tuningDecoder =
+    Dhall.record
+        ( Tuning
+            <$> Dhall.field "strategy" tuneStrategyDecoder
+            <*> Dhall.field "state" (fmap T.unpack <$> Dhall.auto)
+        )
+
+-- | @{ autoApprove }@ — the TUI, which is the only thing that reads auto-approval.
+tuiDecoder ∷ Decoder TuiSpec
+tuiDecoder = Dhall.record (TuiSpec <$> Dhall.field "autoApprove" Dhall.auto)
+
+{- | @{ debaters, judge, rounds }@, with the two-debater floor checked here so a council too small
+to deliberate is a __load__ error naming the field rather than three fields silently dropped.
+-}
+legionDecoder ∷ Decoder LegionSpec
+legionDecoder = refine record (\(d, j, r) → mkLegionSpec d j r)
+    where
+        record =
+            Dhall.record
+                ( (,,)
+                    <$> Dhall.field "debaters" (Dhall.list modelRefDecoder)
+                    <*> Dhall.field "judge" (Dhall.maybe modelRefDecoder)
+                    <*> Dhall.field "rounds" (Dhall.maybe (natInt "legion.rounds"))
+                )
 
 -- ---------------------------------------------------------------------------
 -- The config record
@@ -266,15 +368,14 @@ data FileConfig = FileConfig
     , maxTokens ∷ Maybe Natural
     , maxSteps ∷ Maybe Natural
     , contextLimit ∷ Maybe Natural
-    , cheapModel ∷ Maybe ModelId
-    , escalateAfter ∷ Maybe Natural
+    , routing ∷ Maybe Routing
+    -- ^ Cheap-model-first routing; the escalation threshold lives inside it, not beside it.
     , advisorModel ∷ Maybe ModelId
     , budget ∷ Maybe Natural
     , noProgressLimit ∷ Maybe Natural
-    , verifyCmd ∷ Maybe Text
+    , verify ∷ Maybe VerifySpec
+    -- ^ The verify command and the two switches that are inert without one.
     , requireEdit ∷ Maybe Bool
-    , verifyAndFix ∷ Maybe Bool
-    , inLoopVerify ∷ Maybe Bool
     , summaryModel ∷ Maybe ModelId
     , budgetAwareness ∷ Maybe Bool
     , persona ∷ Maybe FilePath
@@ -289,8 +390,7 @@ data FileConfig = FileConfig
     , serve ∷ Maybe Port
     , serveA2a ∷ Maybe Port
     , acp ∷ Maybe Bool
-    , tui ∷ Maybe Bool
-    , tuiAutoApprove ∷ Maybe Bool
+    , tui ∷ Maybe TuiSpec
     , serveSlack ∷ Maybe Bool
     , serveMatrix ∷ Maybe Bool
     , matrixRoomTools ∷ Maybe [ToolGrant RoomId]
@@ -299,12 +399,9 @@ data FileConfig = FileConfig
     -- ^ Per-member Matrix tool permissions (intersected with the room's when both apply).
     , sessionDir ∷ Maybe FilePath
     , mcpServers ∷ Maybe [McpSpec]
-    , tune ∷ Maybe Bool
-    , tuneBayes ∷ Maybe Bool
-    , tuneState ∷ Maybe FilePath
-    , legionDebaters ∷ Maybe [ModelRef]
-    , legionJudge ∷ Maybe ModelRef
-    , legionRounds ∷ Maybe Natural
+    , tune ∷ Maybe Tuning
+    -- ^ Which ATO learner and where its profiles live; 'Nothing' is off.
+    , legion ∷ Maybe LegionSpec
     , lang ∷ Maybe Language
     , cron ∷ Maybe [CronJobSpec]
     , cronFile ∷ Maybe FilePath
@@ -331,15 +428,12 @@ fileConfigDecoder =
             <*> Dhall.field "maxTokens" Dhall.auto
             <*> Dhall.field "maxSteps" Dhall.auto
             <*> Dhall.field "contextLimit" Dhall.auto
-            <*> Dhall.field "cheapModel" (fmap ModelId <$> Dhall.auto)
-            <*> Dhall.field "escalateAfter" Dhall.auto
+            <*> Dhall.field "routing" (Dhall.maybe routingDecoder)
             <*> Dhall.field "advisorModel" (fmap ModelId <$> Dhall.auto)
             <*> Dhall.field "budget" Dhall.auto
             <*> Dhall.field "noProgressLimit" Dhall.auto
-            <*> Dhall.field "verifyCmd" Dhall.auto
+            <*> Dhall.field "verify" (Dhall.maybe verifyDecoder)
             <*> Dhall.field "requireEdit" Dhall.auto
-            <*> Dhall.field "verifyAndFix" Dhall.auto
-            <*> Dhall.field "inLoopVerify" Dhall.auto
             <*> Dhall.field "summaryModel" (fmap ModelId <$> Dhall.auto)
             <*> Dhall.field "budgetAwareness" Dhall.auto
             <*> Dhall.field "persona" (fmap T.unpack <$> Dhall.auto)
@@ -349,8 +443,7 @@ fileConfigDecoder =
             <*> Dhall.field "serve" (Dhall.maybe (portDecoder "serve"))
             <*> Dhall.field "serveA2a" (Dhall.maybe (portDecoder "serveA2a"))
             <*> Dhall.field "acp" Dhall.auto
-            <*> Dhall.field "tui" Dhall.auto
-            <*> Dhall.field "tuiAutoApprove" Dhall.auto
+            <*> Dhall.field "tui" (Dhall.maybe tuiDecoder)
             <*> Dhall.field "serveSlack" Dhall.auto
             <*> Dhall.field "serveMatrix" Dhall.auto
             <*> Dhall.field
@@ -361,12 +454,8 @@ fileConfigDecoder =
                 (Dhall.maybe (Dhall.list (toolGrantDecoder "matrixUserTools" mkMatrixUserId)))
             <*> Dhall.field "sessionDir" (fmap T.unpack <$> Dhall.auto)
             <*> Dhall.field "mcpServers" (Dhall.maybe (Dhall.list mcpSpecDecoder))
-            <*> Dhall.field "tune" Dhall.auto
-            <*> Dhall.field "tuneBayes" Dhall.auto
-            <*> Dhall.field "tuneState" (fmap T.unpack <$> Dhall.auto)
-            <*> Dhall.field "legionDebaters" (Dhall.maybe (Dhall.list modelRefDecoder))
-            <*> Dhall.field "legionJudge" (Dhall.maybe modelRefDecoder)
-            <*> Dhall.field "legionRounds" Dhall.auto
+            <*> Dhall.field "tune" (Dhall.maybe tuningDecoder)
+            <*> Dhall.field "legion" (Dhall.maybe legionDecoder)
             <*> Dhall.field "lang" (Dhall.maybe languageDecoder)
             <*> Dhall.field "cron" (Dhall.maybe (Dhall.list cronJobDecoder))
             <*> Dhall.field "cronFile" (fmap T.unpack <$> Dhall.auto)
@@ -386,14 +475,6 @@ instance FromDhall FileConfig where
 defaultConfig ∷ FileConfig
 defaultConfig =
     FileConfig
-        n
-        n
-        n
-        n
-        n
-        n
-        n
-        n
         n
         n
         n
@@ -455,7 +536,7 @@ scheduleActionDecoder =
                 "Tool"
                 ( Dhall.record
                     ( SATool
-                        <$> Dhall.field "name" (ToolName <$> Dhall.auto)
+                        <$> Dhall.field "name" toolNameDecoder
                         <*> Dhall.field "args" (Dhall.maybe Dhall.auto)
                     )
                 )

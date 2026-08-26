@@ -91,13 +91,32 @@ posture is efficiency-first.
   `(device, txn id)` and answers a repeat with the *previous* response, so a counter restarting at 0
   makes the first sends after every restart vanish silently. The Rust `process_seed` says so in a
   comment; this tree had dropped it, and it swallowed room-key shares and the unwedge until 0.13.4.
-- **A cron field is an ADT, not a string** (since 0.17.1): `CronField` is a kind-tagged non-empty
+- **A cron field is an ADT, not a string** (since 0.17.0): `CronField` is a kind-tagged non-empty
   list of `CronTerm`s, its constructor hidden so `mkCronExpr` is the only way in — which range-checks
   each field against its own bounds and names it on failure. That is what makes
   `Schedule.Cron.compileCron` **total**: a bad schedule fails when the config *loads*, not when the
   gateway starts. `parseCronExpr` keeps the crontab string as a surface for `--cron` (and only for
   it); a QuickCheck property pins `parseCronExpr . renderCronExpr` as a round-trip, so the two
   surfaces cannot express different things.
+- **A field the program ignores is worse than one it rejects.** Co-dependent knobs are one Dhall
+  field and one ADT — `routing`, `verify`, `tune`, `tui`, `legion` — because as independent
+  `Optional`s their broken combinations *loaded and were dropped in silence*: `tuneBayes` beat
+  `tune` on ordering, `legionJudge` with no debaters vanished, `tuneState` never implied `tune`
+  despite its own help. `Options` stays flat (a command line is), so `CLI.resolveGroups` is the one
+  place that regroups and the only one that can refuse; its `Groups` has a hidden constructor for
+  the same reason `Negotiated` does.
+- **`ModelRef` is a union over providers**, not `{ provider, model }` — the record let the pair
+  disagree and defaulted `provider` to Anthropic. `Model.Default` resolves through
+  `Domain.defaultModelFor`, which is why that table moved out of `CLI.hs`. `Named` is still free
+  text: this buys structure, not id validation, and a curated model list would ship stale (the tree
+  itself carries four grok ids and two sonnet ids).
+- **Tool names are a Dhall union whose alternatives are the names**, generated from
+  `Domain.builtinToolNames`, with `Custom : Text` for MCP/`mainWith` tools. There is no mapping
+  table to drift, and a tasty test pins the list to what the tool modules actually register. As
+  `Text` a misspelling was not an error: a grant matching nothing simply never applies.
+- **Dhall has no non-empty list but can state one**: `CronField` is `{ head, tail }`, built with
+  `one`/`terms`. That is what let `mkCronField` drop its empty case — the error is unreachable, not
+  handled.
 - Dhall record fields become top-level selectors, so they collide with same-named function
   parameters and lambdas. Hence `jobId`/`toolArgs` rather than `id`/`args`.
 - **Dhall's `assert` cannot refine a function argument.** It type-checks a lambda body with the

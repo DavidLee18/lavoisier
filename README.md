@@ -248,17 +248,23 @@ ANTHROPIC_API_KEY=… lav --serve-matrix --config lavoisier.dhall
 -- lavoisier.dhall — per-room / per-member tool permissions (no env equivalent).
 -- Absent from the list ⇒ unconstrained; when a room AND a member both apply, the effective
 -- set is their INTERSECTION (a tool must be permitted by the room *and* the member).
--- Subjects are sigil-checked at load: `ops:hs` without the `!` is a config error.
+-- Subjects are sigil-checked at load: `ops:hs` without the `!` is a config error, and tool
+-- names are a union — `L.ToolName.read_fil` is a load error, where the old `"read_fil"` was a
+-- grant that simply never matched anything.
 let L = ./schema.dhall
 
 in  L.Config::{
     , matrixRoomTools = Some
-      [ { subject = "!ops:hs", tools = [ "shell", "read_file", "write_file", "str_replace" ] }
-      , { subject = "!general:hs", tools = [ "read_file", "read_files", "outline_file" ] }
+      [ { subject = "!ops:hs"
+        , tools = [ L.ToolName.shell, L.ToolName.read_file, L.ToolName.write_file, L.ToolName.str_replace ]
+        }
+      , { subject = "!general:hs"
+        , tools = [ L.ToolName.read_file, L.ToolName.read_files, L.ToolName.outline_file ]
+        }
       ]
     , matrixUserTools = Some
-      [ { subject = "@alice:hs", tools = [ "shell", "read_file", "write_file" ] }
-      , { subject = "@bob:hs", tools = [ "read_file", "read_files" ] }
+      [ { subject = "@alice:hs", tools = [ L.ToolName.shell, L.ToolName.read_file, L.ToolName.write_file ] }
+      , { subject = "@bob:hs", tools = [ L.ToolName.read_file, L.ToolName.read_files ] }
       ]
     }
 ```
@@ -315,6 +321,25 @@ L.Provider.Anthropi` is a type error at load that names the missing constructor,
 only checked that the value was *a* `Text` and the typo travelled to the provider factory. Ports are
 range-checked by the decoder (Dhall's `assert` can't refine a `Natural` inside a function), and
 `provider:model` / `label: target` / cron specs are records rather than packed strings.
+
+It also carries the principle further — a field the program ignores is worse than one it rejects:
+
+- **Knobs that depend on each other are one field.** `routing` (cheap model + escalation
+  threshold), `verify` (command + `andFix` + `inLoop`), `tune` (strategy + state path), `tui`
+  (+ `autoApprove`) and `legion` (debaters + judge + rounds) each replaced two or three independent
+  fields whose broken combinations loaded fine and were then dropped in silence — a Bayesian tuner
+  with `tune = False` ran anyway, a judge with no debaters was discarded whole, and `tuneState`
+  without `tune` did nothing despite the flag help saying it implied it.
+- **A model can't be named without saying whose it is.** `ModelRef` is a union over providers
+  (`L.anthropic "claude-sonnet-4-5"`, or `L.ModelRef.Xai L.Model.Default`), not a record whose
+  `provider` and `model` fields could disagree — and whose `provider` silently defaulted to
+  Anthropic.
+- **Tool names are a union** with a `Custom : Text` escape for MCP and `mainWith` tools. A
+  misspelled name used to be no error at all: a grant that matches nothing simply never applies.
+- **Search windows are dates.** `fromDate = Some 2026-08-01` uses Dhall's own `Date`; it was
+  `Optional Text`, where `"2026-13-40"` and `"yesterday"` both reached the provider.
+- **A cron field is one-or-more terms**, stated as `{ head, tail }` and built with `one` / `terms`,
+  so `minute = []` is no longer writable.
 
 **This is a breaking change to the config format.** [`MIGRATING.md`](MIGRATING.md) is the
 field-by-field list; [`lavoisier.dhall.example`](lavoisier.dhall.example) is an annotated full config
@@ -406,7 +431,8 @@ than after the batch has been accepted — and because a batch has no event stre
 `batch_edit` prints any degraded knob at the top of its report instead.
 
 Efficiency / cost levers: `--summary-model` / `--context-limit` (compaction + eviction) ·
-`--cheap-model` / `--escalate-after` (cheap-model-first) · `--advisor-model` (advisor+executor split) ·
+`--cheap-model` / `--escalate-after` (cheap-model-first; one `routing` record in the config, since
+the threshold alone does nothing) · `--advisor-model` (advisor+executor split) ·
 `--no-progress-limit <N>` (hard-stop after 2N edit-free round-trips) · `--budget-awareness` (show the
 model its own ceilings) · `--classify-with-model` (model the task archetype instead of the keyword
 heuristic) · `--no-batch-edit` (don't offer the `batch_edit` fan-out).
@@ -427,8 +453,8 @@ e.g. `--legion-debater anthropic:claude-opus-4-8 --legion-debater xai:grok-4`) m
 **argue the task out before the agent acts**: each drafts a position, they critique each other
 (`--legion-rounds <N>`, default 1), and a judge (`--legion-judge <PROVIDER:MODEL>`, default the first
 debater) synthesises one agreed plan that seeds the executor (deliberate-then-act). Cross-provider is
-first-class; each named provider needs its API key in the env. Configurable via `legionDebaters` /
-`legionJudge` / `legionRounds`. Supersedes `--advisor-model`; the debate itself is internal (see it
+first-class; each named provider needs its API key in the env. Configurable via `legion`
+(`debaters` / `judge` / `rounds` in one record — fewer than two debaters is a load error). Supersedes `--advisor-model`; the debate itself is internal (see it
 with `--log-level debug`). The
 council streams short progress notices per phase (`🧠 council convened…` → `🗣 critique round…` →
 `⚖️ judge synthesising…`); these **localise** via `--lang <LOCALE>` (falls back to the `LANG` env var)
@@ -460,7 +486,8 @@ turn, `Ctrl-D` quits, `Ctrl-L` clears the screen, `Alt+Enter` inserts a newline.
 follows Claude Code's default — read-only tools run unattended, mutating tools and shells prompt (the
 call's full arguments are shown, then `y` allow once · `a` always · `n` deny); waive it with
 `--tui-auto-approve`. Logs are routed to `$LVZ_LOG_FILE` (or suppressed) so they don't corrupt the
-display. Configurable via `tui` / `tuiAutoApprove`.
+display. Configurable via `tui` (`Some L.Tui::{ autoApprove = True }`); `--tui-auto-approve`
+implies `--tui`.
 
 The port drives the terminal with ANSI escapes directly rather than through a TUI framework: the
 inline viewport is what makes this scrollback-native, and it has no Haskell equivalent (brick and vty
@@ -475,13 +502,16 @@ HTTP). Tools are namespaced `<label>_<tool>` so they never shadow the built-ins.
 
 ATO: `--tune` (ε-greedy) or `--tune-bayes` (Thompson sampling) · `--verify-cmd <cmd>` (real
 success gate, e.g. `cabal test`) · `--tune-state <path>` (persist learned profiles, saved after an
-`--agent` turn).
+`--agent` turn — and it *does* imply `--tune` now; it always claimed to). Configurable via `tune`
+(`Some L.Tune::{ strategy = L.TuneStrategy.Bayes, state = Some "…" }`), where leaving the field
+unset is what "off" means.
 
 Accuracy levers (opt-in — Lavoisier is efficient by default, so these trade cost for completion and
 are **off** unless asked for): `--require-edit` (don't let an edit task finish having changed nothing)
 · `--verify-and-fix` (when finishing, if `--verify-cmd` fails, feed the failure back and keep fixing,
 bounded — best with a real test gate) · `--in-loop-verify` (stop as soon as an edit makes
-`--verify-cmd` pass).
+`--verify-cmd` pass). Both need `--verify-cmd` and now say so instead of doing nothing; in the config
+they are fields of `verify`, so the dead combination cannot be written.
 
 Gateway: `--api-key <KEY>` (repeatable) · `--rate-limit <N per 60s>`.
 

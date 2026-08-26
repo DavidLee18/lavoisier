@@ -18,6 +18,7 @@ module Lavoisier.Agent (
     CircuitBreaker,
     newCircuitBreaker,
     defaultFallbackCooldown,
+    defaultEscalateAfter,
     runAgent,
     applyModelOverride,
     runLoopSeeded,
@@ -58,7 +59,7 @@ import Data.Text qualified as T
 import Data.Vector qualified as V
 
 import Lavoisier.Context.Tokens (estimateTokens)
-import Lavoisier.Domain (ModelId (..), ToolName (..))
+import Lavoisier.Domain (ModelId (..), Routing (..), ToolName (..), VerifySpec (..))
 import Lavoisier.Protocol.Agent
 import Lavoisier.Protocol.Deliberate (
     Deliberation (..),
@@ -101,12 +102,12 @@ data AgentConfig = AgentConfig
     {- ^ Per-request token ceiling for the context-budget manager (§6.3). When set and still
     exceeded after compaction, the oldest tool-result content is evicted. 'Nothing' ⇒ no eviction.
     -}
-    , acCheapModel ∷ Maybe ModelId
-    {- ^ Cheaper model for the first 'acEscalateAfter' round-trips before escalating to 'acModel'
-    (§8 cheap-model-first). 'Nothing' ⇒ every round-trip runs on 'acModel'. Primary only.
+    , acRouting ∷ Maybe Routing
+    {- ^ Cheap-model-first routing (§8): the first 'rtEscalateAfter' round-trips run on
+    'rtCheapModel', then escalate to 'acModel'. 'Nothing' ⇒ every round-trip runs on 'acModel'.
+    Primary only. The threshold was a separate 'Int' field until it became clear it did nothing
+    without a model beside it — the two are one value now.
     -}
-    , acEscalateAfter ∷ Int
-    -- ^ Round-trips to run on 'acCheapModel' before escalating (ignored when it is 'Nothing').
     , acAdvisorModel ∷ Maybe ModelId
     {- ^ Smarter model for a one-shot tool-less planning pre-pass that seeds the executor (§8).
     'Nothing' ⇒ no advisor. Superseded by a legion council when one is installed.
@@ -119,18 +120,13 @@ data AgentConfig = AgentConfig
     {- ^ No-progress circuit-breaker: after @2*limit@ edit-free round-trips the turn hard-stops with
     @Done (Other "no_progress")@; a nudge is injected at @limit@. 'Nothing' disables it.
     -}
-    , acVerifyCommand ∷ Maybe Text
-    {- ^ Shell command that verifies the task (exit 0 = pass). Drives the real ATO success signal and
-    the verify convergence levers. 'Nothing' ⇒ success falls back to "completed without erroring".
+    , acVerify ∷ Maybe VerifySpec
+    {- ^ The verify command (exit 0 = pass) and the two convergence switches that read it. Drives
+    the real ATO success signal. 'Nothing' ⇒ success falls back to "completed without erroring",
+    and neither switch can be set in isolation — both were inert without a command.
     -}
     , acRequireEdit ∷ Bool
     -- ^ Nudge a finish that edited nothing to actually edit (bounded by 'maxEditNudges').
-    , acVerifyAndFix ∷ Bool
-    {- ^ On a would-be finish, if 'acVerifyCommand' fails, feed its output back and keep working
-    (bounded by 'maxFixAttempts')..
-    -}
-    , acInLoopVerify ∷ Bool
-    -- ^ Stop as soon as an edit turn makes 'acVerifyCommand' pass (don't wait for the model).
     , acSummaryModel ∷ Maybe ModelId
     -- ^ Cheaper model for history-compaction summaries (§6.3 model tiering). 'Nothing' ⇒ 'acModel'.
     , acBudgetAwareness ∷ Bool
@@ -157,15 +153,12 @@ defaultAgentConfig model =
         , acServerTools = []
         , acSystem = Nothing
         , acContextLimit = Nothing
-        , acCheapModel = Nothing
-        , acEscalateAfter = 2
+        , acRouting = Nothing
         , acAdvisorModel = Nothing
         , acTokenBudget = Nothing
         , acNoProgressLimit = Nothing
-        , acVerifyCommand = Nothing
+        , acVerify = Nothing
         , acRequireEdit = False
-        , acVerifyAndFix = False
-        , acInLoopVerify = False
         , acSummaryModel = Nothing
         , acBudgetAwareness = False
         , acClassifyWithModel = False
@@ -334,7 +327,7 @@ primary); it does not select a different provider.
 applyModelOverride ∷ Maybe ModelId → Agent → Agent
 applyModelOverride Nothing agent = agent
 applyModelOverride (Just m) agent =
-    agent {agConfig = (agConfig agent) {acModel = m, acCheapModel = Nothing}}
+    agent {agConfig = (agConfig agent) {acModel = m, acRouting = Nothing}}
 
 {- | The loop, seeded with an initial transcript (@initial@ already includes this turn's user
 message). Streams events to @emit@ and returns the **full transcript** — @initial@ plus every
@@ -415,13 +408,13 @@ runLoopSeeded agent allowed initial emit = do
         systemText = fromMaybe defaultSystemPrompt (acSystem cfg)
         system = SystemPrompt systemText True
 
-        -- Cheap-model-first (§8) applies to the primary only: run 'acCheapModel' for the first
-        -- 'acEscalateAfter' round-trips, then escalate to 'acModel'. Fallbacks name their model.
+        -- Cheap-model-first (§8) applies to the primary only: run the cheap model for the first
+        -- 'rtEscalateAfter' round-trips, then escalate to 'acModel'. Fallbacks name their model.
         candidatesAt ∷ Int → [(Provider, ModelId)]
         candidatesAt step = (agProvider agent, primary) : agFallbacks agent
             where
-                primary = case acCheapModel cfg of
-                    Just c | step < acEscalateAfter cfg → c
+                primary = case acRouting cfg of
+                    Just r | step < fromMaybe defaultEscalateAfter (rtEscalateAfter r) → rtCheapModel r
                     _ → acModel cfg
 
         fallbacksLen ∷ Int
@@ -482,7 +475,7 @@ runLoopSeeded agent allowed initial emit = do
                                 <> [budgetNote (step + 1) (acMaxSteps cfg) (usageCost spentNow defaultCostWeights) (acTokenBudget cfg) | acBudgetAwareness cfg]
                         userMsg = Message User (map resultBlock results <> extras)
                         transcript = msgs' <> [assistantMsg, userMsg]
-                    done ← if acInLoopVerify cfg && madeEdit then runVerify cfg else pure False
+                    done ← if maybe False vsInLoop (acVerify cfg) && madeEdit then runVerify cfg else pure False
                     if done
                         then emit (Done EndTurn) >> pure (Right transcript)
                         else
@@ -496,7 +489,7 @@ runLoopSeeded agent allowed initial emit = do
                     if acRequireEdit cfg && not (cvEdited conv) && notOther && cvNudges conv < maxEditNudges
                         then continueWith requireEditNudge conv {cvNudges = cvNudges conv + 1}
                         else do
-                            vf ← if acVerifyAndFix cfg && cvFixes conv < maxFixAttempts then runVerifyOutput cfg else pure Nothing
+                            vf ← if maybe False vsAndFix (acVerify cfg) && cvFixes conv < maxFixAttempts then runVerifyOutput cfg else pure Nothing
                             case vf of
                                 Just (False, out) → continueWith (verifyFailPrompt out) conv {cvFixes = cvFixes conv + 1}
                                 _ → pure (Right base)
@@ -935,6 +928,13 @@ renderJson = decodeUtf8Lenient . BL.toStrict . encode
 
 -- --- convergence: verify command + mutable per-turn counters ---------------------------------------
 
+{- | Round-trips run on the cheap model before escalating, when 'Routing' does not say. Kept here
+rather than in 'Routing' so an unset threshold means "whatever the loop's default is" instead of
+freezing today's number into every config file.
+-}
+defaultEscalateAfter ∷ Int
+defaultEscalateAfter = 2
+
 -- | Bounds for the nudge\/fix guards, and the verify-output cap.
 maxEditNudges, maxFixAttempts, verifyOutputCap ∷ Int
 maxEditNudges = 2
@@ -958,16 +958,16 @@ conv0 = Conv 0 False 0 0
 is silenced.
 -}
 runVerify ∷ AgentConfig → IO Bool
-runVerify cfg = case acVerifyCommand cfg of
+runVerify cfg = case acVerify cfg of
     Nothing → pure True
-    Just cmd → (== ExitSuccess) <$> runProcess (setStderr nullStream (setStdout nullStream (proc "sh" ["-c", T.unpack cmd])))
+    Just v → (== ExitSuccess) <$> runProcess (setStderr nullStream (setStdout nullStream (proc "sh" ["-c", T.unpack (vsCommand v)])))
 
 -- | Run the verify command capturing (pass?, combined stdout+stderr, capped); 'Nothing' if unset.
 runVerifyOutput ∷ AgentConfig → IO (Maybe (Bool, Text))
-runVerifyOutput cfg = case acVerifyCommand cfg of
+runVerifyOutput cfg = case acVerify cfg of
     Nothing → pure Nothing
-    Just cmd → do
-        (code, out, err) ← readProcess (proc "sh" ["-c", T.unpack cmd])
+    Just v → do
+        (code, out, err) ← readProcess (proc "sh" ["-c", T.unpack (vsCommand v)])
         let text = decodeUtf8Lenient (BL.toStrict out) <> decodeUtf8Lenient (BL.toStrict err)
         pure (Just (code == ExitSuccess, fst (truncateToBytes verifyOutputCap text)))
 

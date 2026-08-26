@@ -39,15 +39,48 @@ let Port
     quoted "8080" is a type error here.
 -}
 
-{-| A provider-qualified model. Used for legion debaters, the legion judge, and the
-    `--fallback` chain — all three used to be the packed string "provider:model".
+{-| Which model, for a provider that has one. `Default` is that provider's built-in default,
+    which is the honest way to say "the current one" — model ids go stale and a config that
+    pinned one silently keeps using it.
 -}
-let ModelRef/Type
+let Model
     : Type
-    = { provider : Provider, model : Text }
+    = < Default | Named : Text >
 
-let ModelRef =
-      { Type = ModelRef/Type, default = { provider = Provider.Anthropic } }
+{-| A provider-qualified model. Used for legion debaters, the legion judge, and the `--fallback`
+    chain — all three used to be the packed string "provider:model", then a two-field record.
+
+    The record was the problem this union fixes: `provider` and `model` were independent fields
+    with a relationship nothing stated, so `{ provider = Anthropic, model = "grok-4" }`
+    type-checked, loaded, and failed at the API. Here a model cannot be named without saying
+    whose it is, and the provider defaulted to Anthropic when omitted — a silent default on the
+    one field that decides which API key is used.
+
+    Note the limit: `Named` is free text, so the pairing is structural, not a check that the id
+    belongs to that provider. Nothing in Dhall can do the latter, and a curated list of ids would
+    ship stale.
+-}
+let ModelRef
+    : Type
+    = < Anthropic : Model
+      | Google : Model
+      | Xai : Model
+      | XaiGrpc : Model
+      | XaiResponses : Model
+      | ClaudeCli : Model
+      >
+
+let anthropic = \(m : Text) -> ModelRef.Anthropic (Model.Named m)
+
+let google = \(m : Text) -> ModelRef.Google (Model.Named m)
+
+let xai = \(m : Text) -> ModelRef.Xai (Model.Named m)
+
+let xaiGrpc = \(m : Text) -> ModelRef.XaiGrpc (Model.Named m)
+
+let xaiResponses = \(m : Text) -> ModelRef.XaiResponses (Model.Named m)
+
+let claudeCli = \(m : Text) -> ModelRef.ClaudeCli (Model.Named m)
 
 {-| How to reach an MCP server. The stdio-vs-HTTP choice used to be recovered by sniffing the
     target string for an `http` prefix at connect time; here it is stated.
@@ -61,6 +94,83 @@ let Mcp/Type
     = { label : Text, target : McpTarget }
 
 let Mcp = { Type = Mcp/Type, default = {=} }
+
+{-| Cheap-model-first routing: run the first `escalateAfter` round-trips on `cheapModel`, then
+    escalate to `model`.
+
+    `escalateAfter` used to be a sibling field, independently optional, so setting it without a
+    cheap model type-checked, loaded, and did nothing — the agent loop ignores the threshold when
+    there is no model to escalate from. Here there is no threshold without one.
+-}
+let Routing/Type
+    : Type
+    = { cheapModel : Text, escalateAfter : Optional Natural }
+
+let Routing =
+      { Type = Routing/Type, default = { escalateAfter = None Natural } }
+
+{-| The verify lever: a command whose exit status decides whether the task is done (0 = pass),
+    plus what to do with the answer.
+
+    `andFix` and `inLoop` were top-level `Bool`s beside an optional command, and both are inert
+    without one: the agent returns immediately when the command is absent. Two switches that
+    silently did nothing.
+-}
+let Verify/Type
+    : Type
+    = { command : Text, andFix : Bool, inLoop : Bool }
+
+let Verify =
+      { Type = Verify/Type, default = { andFix = False, inLoop = False } }
+
+-- | Which ATO learner to run. There is no `Off`: leaving `tune` unset is what off means.
+let TuneStrategy
+    : Type
+    = < Greedy | Bayes >
+
+{-| The ATO tuner. This replaced `tune : Bool`, `tuneBayes : Bool` and `tuneState : Text`, three
+    independent fields whose combinations disagreed with the code reading them:
+    `tuneBayes = True` with `tune = False` ran the Bayesian learner anyway, and `tuneState`
+    without `tune` was documented as implying it and did not. A strategy is a choice, not two
+    booleans, and a state path cannot outlive the learner that writes it.
+-}
+let Tune/Type
+    : Type
+    = { strategy : TuneStrategy, state : Optional Text }
+
+let Tune =
+      { Type = Tune/Type
+      , default = { strategy = TuneStrategy.Greedy, state = None Text }
+      }
+
+{-| The interactive TUI. `autoApprove` was a second top-level `Bool` that only the TUI reads, so
+    setting it alone was silently nothing; here it belongs to the thing that reads it.
+-}
+let Tui/Type
+    : Type
+    = { autoApprove : Bool }
+
+let Tui = { Type = Tui/Type, default = { autoApprove = False } }
+
+{-| A legion council: the debaters, the judge that synthesises their verdict, and the number of
+    critique rounds after the draft.
+
+    The judge and the round count used to sit beside an independent debater list, and the council
+    was built only when that list was non-empty — so naming a judge and rounds but no debaters
+    dropped all three without a word. `lav` also requires at least two debaters (a one-model
+    council is just the advisor pre-pass) and says so at load.
+-}
+let Legion/Type
+    : Type
+    = { debaters : List ModelRef
+      , judge : Optional ModelRef
+      , rounds : Optional Natural
+      }
+
+let Legion =
+      { Type = Legion/Type
+      , default = { judge = None ModelRef, rounds = None Natural }
+      }
 
 {-| One term of a cron field, before any step: `*`, a single value, or a range.
 
@@ -83,10 +193,23 @@ let CronTerm =
       , default = { base = CronBase.Every, step = None Natural }
       }
 
--- | A whole cron field: one or more terms. `lav` range-checks each against the field it is in.
+{-| A whole cron field: one or more terms, stated as a record because Dhall has no non-empty
+    list. It was `List CronTerm`, so `minute = []` type-checked and became a load error; now it is
+    not writable. Build one with `one` or `terms`, never by hand.
+
+    `lav` range-checks each term against the field it lands in.
+-}
 let CronField
     : Type
-    = List CronTerm/Type
+    = { head : CronTerm/Type, tail : List CronTerm/Type }
+
+-- | The one-term field, which is nearly every field.
+let one =
+      \(t : CronTerm/Type) -> { head = t, tail = [] : List CronTerm/Type }
+
+-- | A field of two or more terms: `terms (at 0) [ at 30 ]` is `0,30`.
+let terms =
+      \(t : CronTerm/Type) -> \(ts : List CronTerm/Type) -> { head = t, tail = ts }
 
 let every = CronTerm::{=}
 
@@ -111,7 +234,10 @@ let from =
     surfaced once a gateway started.
 
     `*/30 9-17 * * 1-5` reads:
-      Schedule::{ minute = [ everyN 30 ], hour = [ between 9 17 ], dayOfWeek = [ between 1 5 ] }
+      Schedule::{ minute = one (everyN 30)
+                , hour = one (between 9 17)
+                , dayOfWeek = one (between 1 5)
+                }
 -}
 let Schedule/Type
     : Type
@@ -123,19 +249,20 @@ let Schedule/Type
       }
 
 let Schedule/default =
-      { minute = [ every ]
-      , hour = [ every ]
-      , dayOfMonth = [ every ]
-      , month = [ every ]
-      , dayOfWeek = [ every ]
+      { minute = one every
+      , hour = one every
+      , dayOfMonth = one every
+      , month = one every
+      , dayOfWeek = one every
       }
 
 let Schedule = { Type = Schedule/Type, default = Schedule/default }
 
-let everyMinutes = \(n : Natural) -> Schedule/default // { minute = [ everyN n ] }
+let everyMinutes = \(n : Natural) -> Schedule/default // { minute = one (everyN n) }
 
 let dailyAt =
-      \(h : Natural) -> Schedule/default // { minute = [ at 0 ], hour = [ at h ] }
+      \(h : Natural) ->
+        Schedule/default // { minute = one (at 0), hour = one (at h) }
 
 let CronJob/Type
     : Type
@@ -161,6 +288,11 @@ let CronJob =
     differs, and the sets are disjoint: `XSearch` and `CollectionsSearch` are xAI's, `WebFetch` and
     the client builtins are Anthropic's, `UrlContext` is Gemini's. Asking a provider for one it
     cannot run is refused by name at load-to-send time, not dropped.
+
+    The `XSearch` window uses Dhall's own `Date` — a bare `2026-08-26` literal, whose grammar and
+    ranges the language checks. It was `Optional Text`, so `"2026-13-40"`, `"26/08/01"` and
+    `"yesterday"` all type-checked and reached the provider, which answers with a 400 or with an
+    empty result set that reads like "nothing matched".
 -}
 let ServerTool
     : Type
@@ -174,8 +306,8 @@ let ServerTool
       | XSearch :
           { allowedHandles : List Text
           , blockedHandles : List Text
-          , fromDate : Optional Text
-          , toDate : Optional Text
+          , fromDate : Optional Date
+          , toDate : Optional Date
           }
       | CollectionsSearch : { collectionIds : List Text, limit : Optional Natural }
       | UrlContext
@@ -194,9 +326,38 @@ let xSearch =
       ServerTool.XSearch
         { allowedHandles = [] : List Text
         , blockedHandles = [] : List Text
-        , fromDate = None Text
-        , toDate = None Text
+        , fromDate = None Date
+        , toDate = None Date
         }
+
+{-| A tool by name: the ones `lav` ships, plus `Custom` for the ones it does not — MCP servers
+    namespace theirs as `<label>_<tool>`, and `mainWith` callers add their own.
+
+    These were bare `Text`, where a misspelling was not an error at all: a grant that matches no
+    tool simply never applies, and a scheduled action that names no tool fails only when it fires,
+    in a gateway, hours later. The alternatives here are the tool names themselves, so there is no
+    mapping to get wrong, and a tasty test pins the list to the tools actually registered.
+-}
+let ToolName
+    : Type
+    = < batch_edit
+      | edit_anchored
+      | edit_files
+      | find_references
+      | list_dir
+      | outline_file
+      | outline_files
+      | read_anchored
+      | read_file
+      | read_files
+      | schedule_list
+      | schedule_run
+      | schedule_status
+      | shell
+      | str_replace
+      | write_file
+      | Custom : Text
+      >
 
 {-| Per-room / per-member Matrix tool permissions. A room or user absent from the list is
     unconstrained; when both apply the effective set is their INTERSECTION.
@@ -210,7 +371,7 @@ let xSearch =
 -}
 let Action
     : Type
-    = < Prompt : Text | Tool : { name : Text, args : Optional Text } >
+    = < Prompt : Text | Tool : { name : ToolName, args : Optional Text } >
 
 -- | One entry of a `--schedule-file`: when, what, where to report, and the retry overrides.
 let ScheduleJob/Type
@@ -239,9 +400,10 @@ let ScheduleJob =
 
 let ToolGrant/Type
     : Type
-    = { subject : Text, tools : List Text }
+    = { subject : Text, tools : List ToolName }
 
-let ToolGrant = { Type = ToolGrant/Type, default = { tools = [] : List Text } }
+let ToolGrant =
+      { Type = ToolGrant/Type, default = { tools = [] : List ToolName } }
 
 let Config =
       { Type =
@@ -251,15 +413,12 @@ let Config =
           , maxTokens : Optional Natural
           , maxSteps : Optional Natural
           , contextLimit : Optional Natural
-          , cheapModel : Optional Text
-          , escalateAfter : Optional Natural
+          , routing : Optional Routing/Type
           , advisorModel : Optional Text
           , budget : Optional Natural
           , noProgressLimit : Optional Natural
-          , verifyCmd : Optional Text
+          , verify : Optional Verify/Type
           , requireEdit : Optional Bool
-          , verifyAndFix : Optional Bool
-          , inLoopVerify : Optional Bool
           , summaryModel : Optional Text
           , budgetAwareness : Optional Bool
           , persona : Optional Text
@@ -269,20 +428,15 @@ let Config =
           , serve : Optional Port
           , serveA2a : Optional Port
           , acp : Optional Bool
-          , tui : Optional Bool
-          , tuiAutoApprove : Optional Bool
+          , tui : Optional Tui/Type
           , serveSlack : Optional Bool
           , serveMatrix : Optional Bool
           , matrixRoomTools : Optional (List ToolGrant/Type)
           , matrixUserTools : Optional (List ToolGrant/Type)
           , sessionDir : Optional Text
           , mcpServers : Optional (List Mcp/Type)
-          , tune : Optional Bool
-          , tuneBayes : Optional Bool
-          , tuneState : Optional Text
-          , legionDebaters : Optional (List ModelRef/Type)
-          , legionJudge : Optional ModelRef/Type
-          , legionRounds : Optional Natural
+          , tune : Optional Tune/Type
+          , legion : Optional Legion/Type
           , lang : Optional Language
           , cron : Optional (List CronJob/Type)
           , cronFile : Optional Text
@@ -291,7 +445,7 @@ let Config =
           , scheduleFile : Optional Text
           , scheduleRetryMax : Optional Natural
           , scheduleRetryWait : Optional Natural
-          , fallback : Optional (List ModelRef/Type)
+          , fallback : Optional (List ModelRef)
           , fallbackCooldown : Optional Natural
           }
       , default =
@@ -301,15 +455,12 @@ let Config =
           , maxTokens = None Natural
           , maxSteps = None Natural
           , contextLimit = None Natural
-          , cheapModel = None Text
-          , escalateAfter = None Natural
+          , routing = None Routing/Type
           , advisorModel = None Text
           , budget = None Natural
           , noProgressLimit = None Natural
-          , verifyCmd = None Text
+          , verify = None Verify/Type
           , requireEdit = None Bool
-          , verifyAndFix = None Bool
-          , inLoopVerify = None Bool
           , summaryModel = None Text
           , budgetAwareness = None Bool
           , persona = None Text
@@ -319,20 +470,15 @@ let Config =
           , serve = None Port
           , serveA2a = None Port
           , acp = None Bool
-          , tui = None Bool
-          , tuiAutoApprove = None Bool
+          , tui = None Tui/Type
           , serveSlack = None Bool
           , serveMatrix = None Bool
           , matrixRoomTools = None (List ToolGrant/Type)
           , matrixUserTools = None (List ToolGrant/Type)
           , sessionDir = None Text
           , mcpServers = None (List Mcp/Type)
-          , tune = None Bool
-          , tuneBayes = None Bool
-          , tuneState = None Text
-          , legionDebaters = None (List ModelRef/Type)
-          , legionJudge = None ModelRef/Type
-          , legionRounds = None Natural
+          , tune = None Tune/Type
+          , legion = None Legion/Type
           , lang = None Language
           , cron = None (List CronJob/Type)
           , cronFile = None Text
@@ -341,7 +487,7 @@ let Config =
           , scheduleFile = None Text
           , scheduleRetryMax = None Natural
           , scheduleRetryWait = None Natural
-          , fallback = None (List ModelRef/Type)
+          , fallback = None (List ModelRef)
           , fallbackCooldown = None Natural
           }
       }
@@ -354,15 +500,34 @@ in  { Provider
     , webSearch
     , xSearch
     , Port
+    , Model
     , ModelRef
-    , ModelRef/Type
+    , anthropic
+    , google
+    , xai
+    , xaiGrpc
+    , xaiResponses
+    , claudeCli
     , McpTarget
+    , Routing
+    , Routing/Type
+    , Verify
+    , Verify/Type
+    , TuneStrategy
+    , Tune
+    , Tune/Type
+    , Tui
+    , Tui/Type
+    , Legion
+    , Legion/Type
     , Mcp
     , Mcp/Type
     , CronBase
     , CronTerm
     , CronTerm/Type
     , CronField
+    , one
+    , terms
     , every
     , everyN
     , at
@@ -378,6 +543,7 @@ in  { Provider
     , Action
     , ScheduleJob
     , ScheduleJob/Type
+    , ToolName
     , ToolGrant
     , ToolGrant/Type
     , Config

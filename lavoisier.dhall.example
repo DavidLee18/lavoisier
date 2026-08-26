@@ -17,13 +17,18 @@ in  L.Config::{
 
     -- Cost controls. `budget` is the whole-task cost-weighted token ceiling.
     , budget = Some 400000
-    , cheapModel = Some "claude-haiku-4-5"
-    , escalateAfter = Some 2
+    -- The threshold lives inside the group: there is no escalation without a model to escalate from.
+    , routing = Some L.Routing::{
+      , cheapModel = "claude-haiku-4-5"
+      , escalateAfter = Some 2
+      }
 
     -- Accuracy levers are opt-in; the default posture is efficiency-first.
     , requireEdit = Some True
-    , verifyCmd = Some "cabal build && cabal test"
-    , verifyAndFix = Some True
+    , verify = Some L.Verify::{
+      , command = "cabal build && cabal test"
+      , andFix = True
+      }
 
     -- Gateways. Ports are Naturals; the decoder rejects 0 and >65535 by name.
     , serve = Some 8080
@@ -52,28 +57,37 @@ in  L.Config::{
       , L.Mcp::{ label = "docs", target = L.McpTarget.Http "https://mcp.example.org/sse" }
       ]
 
-    -- The council pre-pass: >=2 debaters draft -> critique -> judge a plan.
-    , legionDebaters = Some
-      [ L.ModelRef::{ provider = L.Provider.Anthropic, model = "claude-sonnet-4-5" }
-      , L.ModelRef::{ provider = L.Provider.Google, model = "gemini-2.5-flash" }
-      ]
-    , legionJudge = Some L.ModelRef::{
-      , provider = L.Provider.Anthropic
-      , model = "claude-sonnet-4-5"
+    -- The council pre-pass: >=2 debaters draft -> critique -> judge a plan. Fewer than two is a
+    -- load error, not a council that is silently never built.
+    , legion = Some L.Legion::{
+      , debaters = [ L.anthropic "claude-sonnet-4-5", L.google "gemini-2.5-flash" ]
+      , judge = Some (L.anthropic "claude-sonnet-4-5")
+      , rounds = Some 1
       }
-    , legionRounds = Some 1
+
+    -- The ATO learner. Leaving `tune` unset is what "off" means; there is no strategy without one.
+    , tune = Some L.Tune::{
+      , strategy = L.TuneStrategy.Bayes
+      , state = Some "/var/lib/lavoisier/ato.json"
+      }
     , lang = Some L.Language.Korean
 
     -- Fallback chain: rerouted to when the primary errors before streaming any output.
-    , fallback = Some
-      [ L.ModelRef::{ provider = L.Provider.Google, model = "gemini-2.5-flash" } ]
+    -- `Model.Default` means "that provider's current default", so the chain does not pin an id
+    -- that goes stale.
+    , fallback = Some [ L.google "gemini-2.5-flash", L.ModelRef.Xai L.Model.Default ]
     , fallbackCooldown = Some 60
 
     -- Cron: the schedule fields are named and typed. `*/30 9-17 * * 1-5` is
     -- `everyN 30`, `between 9 17`, `between 1 5`; `every`, `at` and `from` cover the rest.
+    -- A field is one-or-more terms: `one t` for the common case, `terms t [ ... ]` for a list.
     , cron = Some
       [ L.CronJob::{
-        , schedule = L.Schedule::{ minute = [ L.everyN 30 ], hour = [ L.between 9 17 ], dayOfWeek = [ L.between 1 5 ] }
+        , schedule = L.Schedule::{
+          , minute = L.one (L.everyN 30)
+          , hour = L.one (L.between 9 17)
+          , dayOfWeek = L.one (L.between 1 5)
+          }
         , prompt = "check CI and report failures"
         }
       , L.CronJob::{ schedule = L.dailyAt 9, prompt = "summarise yesterday's commits" }
@@ -83,9 +97,9 @@ in  L.Config::{
     -- effective set is their INTERSECTION.
     , serveMatrix = Some True
     , matrixRoomTools = Some
-      [ { subject = "!ops:hs", tools = [ "shell", "read_file" ] }
-      , { subject = "!general:hs", tools = [ "read_file" ] }
+      [ { subject = "!ops:hs", tools = [ L.ToolName.shell, L.ToolName.read_file ] }
+      , { subject = "!general:hs", tools = [ L.ToolName.read_file ] }
       ]
     , matrixUserTools = Some
-      [ { subject = "@bob:hs", tools = [ "read_file", "read_files" ] } ]
+      [ { subject = "@bob:hs", tools = [ L.ToolName.read_file, L.ToolName.read_files ] } ]
     }

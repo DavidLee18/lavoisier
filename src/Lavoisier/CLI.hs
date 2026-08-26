@@ -11,6 +11,8 @@ module Lavoisier.CLI (
     Options (..),
     optionsParser,
     applyConfig,
+    Groups (grRouting, grVerify, grTuning, grTui, grLegion),
+    resolveGroups,
     layerPersona,
 
     -- * Custom-tool extension point (re-exported for downstream @mainWith@ crates)
@@ -34,7 +36,7 @@ import Control.Concurrent.Async (mapConcurrently)
 import Control.Exception (SomeException, try)
 import Control.Monad (when)
 import Data.Map.Strict (Map)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Text (Text)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Version (showVersion)
@@ -157,6 +159,58 @@ data Options = Options
     , optWords ∷ [String]
     }
 
+{- | The co-dependent flag groups, resolved once from the command line and the config file.
+
+'Options' is the __surface__: a command line is flat, so its flags are, and the config file fills
+each one individually — which is what lets a knob come from the file while its sibling comes from
+the flag. This is the __result__: every group is either absent or complete. The combinations that
+used to be accepted and then quietly dropped (a Bayesian learner with tuning "off", a judge with
+no debaters, auto-approval without the TUI) are reported here instead.
+
+The constructor is hidden so 'resolveGroups' is the only way to obtain one — the same
+unforgeable-evidence idiom as the provider layer's @Negotiated@, for the same reason: a new
+consumer cannot read a half-set group without going through the check.
+-}
+data Groups = Groups
+    { grRouting ∷ Maybe Routing
+    , grVerify ∷ Maybe VerifySpec
+    , grTuning ∷ Maybe Tuning
+    , grTui ∷ Maybe TuiSpec
+    , grLegion ∷ Maybe LegionSpec
+    }
+    deriving stock (Eq, Show)
+
+{- | Group the flat options, failing on a dependent knob whose parent is absent on __both__
+surfaces. Two of them can be completed instead of refused, and are: a tune-state path implies the
+learner that writes it (the flag's help always said so and the code never did), and
+@--tui-auto-approve@ implies the TUI it approves for.
+-}
+resolveGroups ∷ Options → Either Text Groups
+resolveGroups o = Groups <$> routing <*> verify <*> pure tuning <*> pure tui <*> legion
+    where
+        routing = case (optCheapModel o, optEscalateAfter o) of
+            (Just m, esc) → Right (Just (Routing m esc))
+            (Nothing, Just _) →
+                Left "escalate-after: does nothing without a cheap model to escalate from (--cheap-model, or routing.cheapModel)"
+            (Nothing, Nothing) → Right Nothing
+        verify = case optVerifyCmd o of
+            Just cmd → Right (Just (VerifySpec cmd (optVerifyAndFix o) (optInLoopVerify o)))
+            Nothing
+                | optVerifyAndFix o || optInLoopVerify o →
+                    Left "verify-and-fix/in-loop-verify: do nothing without a verify command (--verify-cmd, or verify.command)"
+                | otherwise → Right Nothing
+        tuning
+            | optTuneBayes o = Just (Tuning Bayes (optTuneState o))
+            | optTune o || isJust (optTuneState o) = Just (Tuning Greedy (optTuneState o))
+            | otherwise = Nothing
+        tui
+            | optTui o || optTuiAutoApprove o = Just (TuiSpec (optTuiAutoApprove o))
+            | otherwise = Nothing
+        legion
+            | null (optLegionDebaters o) && isNothing (optLegionJudge o) && isNothing (optLegionRounds o) =
+                Right Nothing
+            | otherwise = Just <$> mkLegionSpec (optLegionDebaters o) (optLegionJudge o) (optLegionRounds o)
+
 optionsParser ∷ Parser Options
 optionsParser =
     Options
@@ -169,14 +223,14 @@ optionsParser =
         <*> optional (option auto (long "max-steps" <> metavar "N" <> help "Agent tool-loop step budget"))
         <*> optional (option auto (long "context-limit" <> metavar "N" <> help "Per-request token ceiling; evict oldest tool output when exceeded after compaction"))
         <*> optional (ModelId <$> strOption (long "cheap-model" <> metavar "MODEL" <> help "Cheaper model for the first --escalate-after round-trips, then escalate to --model"))
-        <*> optional (option auto (long "escalate-after" <> metavar "N" <> help "Round-trips on --cheap-model before escalating (default 2)"))
+        <*> optional (option auto (long "escalate-after" <> metavar "N" <> help "Round-trips on --cheap-model before escalating (default 2); requires --cheap-model"))
         <*> optional (ModelId <$> strOption (long "advisor-model" <> metavar "MODEL" <> help "Smarter model for a one-shot planning pre-pass that seeds the executor"))
         <*> optional (option auto (long "budget" <> metavar "N" <> help "Whole-task cost-weighted token budget; the turn stops when exceeded"))
         <*> optional (option auto (long "no-progress-limit" <> metavar "N" <> help "Hard-stop after 2N edit-free round-trips (nudge at N)"))
         <*> optional (strOption (long "verify-cmd" <> metavar "CMD" <> help "Shell command that verifies the task (exit 0 = pass); drives the ATO success signal and verify levers"))
         <*> switch (long "require-edit" <> help "Nudge a finish that edited nothing to actually edit (bounded)")
-        <*> switch (long "verify-and-fix" <> help "On a would-be finish, if --verify-cmd fails, feed the output back and keep working (bounded)")
-        <*> switch (long "in-loop-verify" <> help "Stop as soon as an edit turn makes --verify-cmd pass")
+        <*> switch (long "verify-and-fix" <> help "On a would-be finish, if --verify-cmd fails, feed the output back and keep working (bounded); requires --verify-cmd")
+        <*> switch (long "in-loop-verify" <> help "Stop as soon as an edit turn makes --verify-cmd pass; requires --verify-cmd")
         <*> optional (ModelId <$> strOption (long "summary-model" <> metavar "MODEL" <> help "Cheaper model for history-compaction summaries (defaults to --model)"))
         <*> optional (strOption (long "persona" <> metavar "PATH" <> help "Persona/standing-instructions file layered above the operating instructions (default ./PERSONA.md if present)"))
         <*> switch (long "no-persona" <> help "Don't auto-load ./PERSONA.md (an explicit --persona still loads)")
@@ -190,7 +244,7 @@ optionsParser =
         <*> optional (option portReader (long "serve-a2a" <> metavar "PORT" <> help "Serve the agent as an A2A (Agent-to-Agent) gateway on this port"))
         <*> switch (long "acp" <> help "Run as a Zed Agent Client Protocol (ACP) agent over stdio (JSON-RPC 2.0), so an ACP-capable editor can launch `lav --acp` as a subprocess and drive the full tool loop from its agent panel. Takes over stdin/stdout; no bind address. For agent-to-agent interop use --serve-a2a instead.")
         <*> switch (long "tui" <> help "Launch the interactive inline terminal UI - a scrollback-native REPL that drives the agent with streaming output, tool-call cards, and Claude-Code-style tool-approval prompts. Takes over the terminal (logs go to $LVZ_LOG_FILE, or are suppressed, so they cannot corrupt the display).")
-        <*> switch (long "tui-auto-approve" <> help "With --tui, skip the tool-approval prompts and run every tool unattended (the default is Claude-Code-style: read-only tools run, mutating tools and shells ask first).")
+        <*> switch (long "tui-auto-approve" <> help "Skip the tool-approval prompts (implies --tui) and run every tool unattended (the default is Claude-Code-style: read-only tools run, mutating tools and shells ask first).")
         <*> switch (long "serve-slack" <> help "Serve the agent as a Slack gateway over Socket Mode (needs SLACK_APP_TOKEN + SLACK_BOT_TOKEN)")
         <*> switch (long "serve-matrix" <> help "Serve the agent as a Matrix gateway (needs MATRIX_HOMESERVER + MATRIX_USER + token/password)")
         -- matrixRoomTools / matrixUserTools: config-file only (nested maps), so no flag — see applyConfig.
@@ -316,6 +370,9 @@ mainWith extra = do
     hSetEncoding stderr utf8
     opts0 ← execParser pinfo
     opts ← mergeConfig opts0
+    -- One place turns the flat flag surface into complete groups, and the only place that can
+    -- report a knob whose parent is missing on both surfaces.
+    groups ← either errExit pure (resolveGroups opts)
     -- Operator-log threshold: --log-level > LVZ_LOG_LEVEL > default info.
     -- --log-level is already a LogLevel (the reader rejected anything else); only the env var is
     -- still text, and parseLogLevel keeps its RUST_LOG-style tolerance for deployment filter strings.
@@ -323,7 +380,7 @@ mainWith extra = do
     mapM_ setLogLevel (optLogLevel opts <|> envLevel)
     -- The inline TUI owns the terminal: stderr writes would corrupt its viewport, so route logs to
     -- \$LVZ_LOG_FILE when set, else drop them. Every other frontend keeps stderr as usual.
-    when (optTui opts) $ do
+    when (isJust (grTui groups)) $ do
         mpath ← lookupEnv "LVZ_LOG_FILE"
         msink ← maybe (pure Nothing) fileLogSink mpath
         setLogSink (fromMaybe nullLogSink msink)
@@ -336,7 +393,7 @@ mainWith extra = do
             -- same registry the executor gets, so "how's the disk job?" works in every frontend.
             msched ← buildScheduleReg opts
             withRegistryExtra opts model (extra <> maybe [] scheduleTools msched) $ \registry → do
-                gws ← buildGateways opts msched registry
+                gws ← buildGateways opts groups msched registry
                 if null gws
                     then do
                         prompt ← resolvePrompt (optWords opts)
@@ -344,9 +401,9 @@ mainWith extra = do
                             then errExit "empty prompt (pass it as arguments or on stdin)"
                             else
                                 if optAgent opts
-                                    then runAgentMode prov opts model prompt registry
+                                    then runAgentMode prov opts groups model prompt registry
                                     else runAskMode prov opts model prompt
-                    else serveGateways gws prov opts model registry
+                    else serveGateways gws prov opts groups model registry
     where
         -- `--version` is an infoOption, not an Options field: the parser is positional-applicative, so
         -- adding a field here would mean threading it through the record and every call site for a flag
@@ -394,15 +451,18 @@ applyConfig fc o =
         , optMaxTokens = optMaxTokens o <|> fmap fromIntegral (maxTokens fc)
         , optMaxSteps = optMaxSteps o <|> fmap fromIntegral (maxSteps fc)
         , optContextLimit = optContextLimit o <|> fmap fromIntegral (contextLimit fc)
-        , optCheapModel = optCheapModel o <|> cheapModel fc
-        , optEscalateAfter = optEscalateAfter o <|> fmap fromIntegral (escalateAfter fc)
+        , -- The file states each group whole; the flags state its parts. Exploding the group
+          -- here keeps the merge field-by-field, so --escalate-after still composes with a
+          -- routing.cheapModel from the file. 'resolveGroups' regroups what survives.
+          optCheapModel = optCheapModel o <|> (rtCheapModel <$> routing fc)
+        , optEscalateAfter = optEscalateAfter o <|> (routing fc >>= rtEscalateAfter)
         , optAdvisorModel = optAdvisorModel o <|> advisorModel fc
         , optBudget = optBudget o <|> fmap fromIntegral (budget fc)
         , optNoProgressLimit = optNoProgressLimit o <|> fmap fromIntegral (noProgressLimit fc)
-        , optVerifyCmd = optVerifyCmd o <|> verifyCmd fc
+        , optVerifyCmd = optVerifyCmd o <|> (vsCommand <$> verify fc)
         , optRequireEdit = optRequireEdit o || fromMaybe False (requireEdit fc)
-        , optVerifyAndFix = optVerifyAndFix o || fromMaybe False (verifyAndFix fc)
-        , optInLoopVerify = optInLoopVerify o || fromMaybe False (inLoopVerify fc)
+        , optVerifyAndFix = optVerifyAndFix o || maybe False vsAndFix (verify fc)
+        , optInLoopVerify = optInLoopVerify o || maybe False vsInLoop (verify fc)
         , optSummaryModel = optSummaryModel o <|> summaryModel fc
         , optPersona = optPersona o <|> persona fc
         , optSystem = optSystem o <|> system fc
@@ -410,8 +470,8 @@ applyConfig fc o =
         , optServe = optServe o <|> serve fc
         , optServeA2a = optServeA2a o <|> serveA2a fc
         , optAcp = optAcp o || fromMaybe False (acp fc)
-        , optTui = optTui o || fromMaybe False (tui fc)
-        , optTuiAutoApprove = optTuiAutoApprove o || fromMaybe False (tuiAutoApprove fc)
+        , optTui = optTui o || isJust (tui fc)
+        , optTuiAutoApprove = optTuiAutoApprove o || maybe False tsAutoApprove (tui fc)
         , optServeSlack = optServeSlack o || fromMaybe False (serveSlack fc)
         , optServeMatrix = optServeMatrix o || fromMaybe False (serveMatrix fc)
         , -- No flag sets these, so the file is the only source: take it as-is.
@@ -423,14 +483,14 @@ applyConfig fc o =
             [] → fromMaybe [] (mcpServers fc)
             given → given
         , -- --tune is a flag (default False); the file can turn it on when the flag was absent.
-          optTune = optTune o || fromMaybe False (tune fc)
-        , optTuneBayes = optTuneBayes o || fromMaybe False (tuneBayes fc)
-        , optTuneState = optTuneState o <|> tuneState fc
+          optTune = optTune o || isJust (tune fc)
+        , optTuneBayes = optTuneBayes o || ((tuStrategy <$> tune fc) == Just Bayes)
+        , optTuneState = optTuneState o <|> (tune fc >>= tuState)
         , optLegionDebaters = case optLegionDebaters o of
-            [] → fromMaybe [] (legionDebaters fc)
+            [] → maybe [] lgDebaters (legion fc)
             given → given
-        , optLegionJudge = optLegionJudge o <|> legionJudge fc
-        , optLegionRounds = optLegionRounds o <|> fmap fromIntegral (legionRounds fc)
+        , optLegionJudge = optLegionJudge o <|> (legion fc >>= lgJudge)
+        , optLegionRounds = optLegionRounds o <|> (legion fc >>= lgRounds)
         , optLang = optLang o <|> fmap localeOfLanguage (lang fc)
         , optCron = case optCron o of
             [] → fromMaybe [] (cron fc)
@@ -468,19 +528,6 @@ site can disagree about what the default is.
 -}
 providerOf ∷ Options → ProviderId
 providerOf = fromMaybe Anthropic . optProvider
-
-{- | The model a provider is driven with when neither @--model@ nor the config names one.
-An exhaustive @case@ on 'ProviderId': adding a provider is a compile error here until it has a
-default, which is the property the old string dispatch could not give.
--}
-defaultModelFor ∷ ProviderId → ModelId
-defaultModelFor = \case
-    Anthropic → "claude-sonnet-4-5"
-    Google → "gemini-2.5-flash"
-    Xai → "grok-4"
-    XaiGrpc → "grok-4"
-    XaiResponses → "grok-4.6"
-    ClaudeCli → "sonnet"
 
 {- | Build the requested provider and its default model, or an error message.
 
@@ -594,48 +641,52 @@ connectOne dspec = case serverSpecOf dspec of
             Left e → errExit ("mcp '" <> mssLabel spec <> "': " <> renderMcpError e)
             Right ts → pure ts
 
-{- | Build the ATO tuner: 'noopTuner' unless @--tune@\/@--tune-bayes@, else a learner — Bayesian
-(Thompson) when @--tune-bayes@, else ε-greedy — loaded from @--tune-state@ when present (a missing
-file loads cold). Returns the tuner plus a persist action (a no-op without @--tune-state@) the
-caller runs when a turn completes.
--}
-buildTuner ∷ Options → IO (Tuner, IO ())
-buildTuner opts
-    | optTuneBayes opts = case optTuneState opts of
-        Nothing → do t ← bayesTuner defaultTuneConfig; pure (t, pure ())
-        Just path → do
-            r ← loadBayes path defaultTuneConfig
-            case r of
-                Left e → errExit ("tune-state " <> T.pack path <> ": " <> T.pack e)
-                Right (bt ∷ BayesTuner) → pure (asBayesTuner bt, saveBayes bt path)
-    | not (optTune opts) = pure (noopTuner, pure ())
-    | otherwise = case optTuneState opts of
-        Nothing → do t ← learningTuner defaultTuneConfig; pure (t, pure ())
-        Just path → do
-            r ← loadTuner path defaultTuneConfig
-            case r of
-                Left e → errExit ("tune-state " <> T.pack path <> ": " <> T.pack e)
-                Right (lt ∷ LearningTuner) → pure (asTuner lt, saveTuner lt path)
+{- | Build the ATO tuner: 'noopTuner' when no 'Tuning' was configured, else the learner it names,
+loaded from its state path when it has one (a missing file loads cold). Returns the tuner plus a
+persist action (a no-op without a state path) the caller runs when a turn completes.
 
-{- | Build the legion council: 'Nothing' unless ≥2 @--legion-debater@s are given (a one-model council
-is just the advisor pre-pass), else a 'Deliberator' 'Panel'. Each debater\/judge spec is
-@provider:model@, its provider built from env via 'selectProvider'; a bad spec\/too-few debaters
-fails fast. The judge defaults to the first debater. Progress notices localize via @--lang@\/@LANG@.
+This used to test three independent flags in an order that decided the answer: @--tune-bayes@ was
+checked before @--tune@, so tuning "off" still ran the Bayesian learner. A 'Tuning' cannot say
+that, so the ordering stopped mattering.
 -}
-buildLegion ∷ Options → IO (Maybe Deliberator)
-buildLegion opts
-    | null (optLegionDebaters opts) = pure Nothing
-    | otherwise = do
-        debs ← mapM buildDebater (optLegionDebaters opts)
-        judge ← case (optLegionJudge opts, debs) of
-            (Just js, _) → buildDebater js
-            (Nothing, d : _) → pure d
-            (Nothing, []) → errExit "legion: no debaters configured"
-        lc ← maybe (Locale . maybe "" T.pack <$> lookupEnv "LANG") pure (optLang opts)
-        let lg = languageFromLocale lc
-        case newPanel debs judge (fromMaybe 1 (optLegionRounds opts)) of
-            Left e → errExit ("legion: " <> renderLegionError e)
-            Right panel → pure (Just (panelDeliberator (withLanguage lg panel)))
+buildTuner ∷ Maybe Tuning → IO (Tuner, IO ())
+buildTuner Nothing = pure (noopTuner, pure ())
+buildTuner (Just (Tuning strategy mstate)) = case (strategy, mstate) of
+    (Bayes, Nothing) → do t ← bayesTuner defaultTuneConfig; pure (t, pure ())
+    (Bayes, Just path) → do
+        r ← loadBayes path defaultTuneConfig
+        case r of
+            Left e → errExit ("tune-state " <> T.pack path <> ": " <> T.pack e)
+            Right (bt ∷ BayesTuner) → pure (asBayesTuner bt, saveBayes bt path)
+    (Greedy, Nothing) → do t ← learningTuner defaultTuneConfig; pure (t, pure ())
+    (Greedy, Just path) → do
+        r ← loadTuner path defaultTuneConfig
+        case r of
+            Left e → errExit ("tune-state " <> T.pack path <> ": " <> T.pack e)
+            Right (lt ∷ LearningTuner) → pure (asTuner lt, saveTuner lt path)
+
+{- | Build the legion council: 'Nothing' when none was configured, else a 'Deliberator' 'Panel'.
+Each debater\/judge is a 'ModelRef' whose provider is built from env via 'selectProvider'; a
+missing key fails fast. The judge defaults to the first debater. Progress notices localize via
+@--lang@\/@LANG@.
+
+The two-debater floor is 'mkLegionSpec'\'s, checked when the config loads, so 'newPanel' cannot
+fail here — a 'LegionSpec' is already a council big enough to deliberate. The 'errExit' stays for
+@mainWith@ callers who build a 'Lavoisier.Legion.Panel' by hand.
+-}
+buildLegion ∷ Options → Maybe LegionSpec → IO (Maybe Deliberator)
+buildLegion _ Nothing = pure Nothing
+buildLegion opts (Just spec) = do
+    debs ← mapM buildDebater (lgDebaters spec)
+    judge ← case (lgJudge spec, debs) of
+        (Just js, _) → buildDebater js
+        (Nothing, d : _) → pure d
+        (Nothing, []) → errExit "legion: no debaters configured"
+    lc ← maybe (Locale . maybe "" T.pack <$> lookupEnv "LANG") pure (optLang opts)
+    let lg = languageFromLocale lc
+    case newPanel debs judge (fromMaybe 1 (lgRounds spec)) of
+        Left e → errExit ("legion: " <> renderLegionError e)
+        Right panel → pure (Just (panelDeliberator (withLanguage lg panel)))
 
 -- | True when any @--cron@\/@--cron-file@ jobs are configured (selects the cron serve mode).
 cronActive ∷ Options → Bool
@@ -686,8 +737,8 @@ buildFallbacks opts = mapM one (optFallback opts)
 {- | Assemble the shared 'Agent': base config + tuner + legion council, then install the fallback
 chain (and its cross-turn circuit breaker) if @--fallback@ was given.
 -}
-assembleAgent ∷ Provider → Options → ModelId → Tuner → Maybe Deliberator → ToolRegistry → IO Agent
-assembleAgent prov opts model tuner delib registry = do
+assembleAgent ∷ Provider → Options → Groups → ModelId → Tuner → Maybe Deliberator → ToolRegistry → IO Agent
+assembleAgent prov opts groups model tuner delib registry = do
     sys ← systemPromptFor opts
     let base = defaultAgentConfig model
         cfg =
@@ -698,15 +749,12 @@ assembleAgent prov opts model tuner delib registry = do
                 , acMaxTokens = fromMaybe (acMaxTokens base) (optMaxTokens opts)
                 , acMaxSteps = fromMaybe (acMaxSteps base) (optMaxSteps opts)
                 , acContextLimit = optContextLimit opts
-                , acCheapModel = optCheapModel opts
-                , acEscalateAfter = fromMaybe (acEscalateAfter base) (optEscalateAfter opts)
+                , acRouting = grRouting groups
                 , acAdvisorModel = optAdvisorModel opts
                 , acTokenBudget = optBudget opts
                 , acNoProgressLimit = optNoProgressLimit opts
-                , acVerifyCommand = optVerifyCmd opts
+                , acVerify = grVerify groups
                 , acRequireEdit = optRequireEdit opts
-                , acVerifyAndFix = optVerifyAndFix opts
-                , acInLoopVerify = optInLoopVerify opts
                 , acSummaryModel = optSummaryModel opts
                 , acBudgetAwareness = optBudgetAwareness opts
                 , acClassifyWithModel = optClassifyWithModel opts
@@ -762,8 +810,8 @@ loadPersona opts = case (optPersona opts, optNoPersona opts) of
 falls back to a one-shot @ask@\/@--agent@ turn. They all run concurrently over one shared agent
 (see 'serveGateways'), so @--serve-matrix --serve --cron-file …@ composes rather than picking one.
 -}
-buildGateways ∷ Options → Maybe ScheduleRegistry → ToolRegistry → IO [Gateway]
-buildGateways opts msched registry = do
+buildGateways ∷ Options → Groups → Maybe ScheduleRegistry → ToolRegistry → IO [Gateway]
+buildGateways opts groups msched registry = do
     cron ← if cronActive opts then (\jobs → [cronGateway jobs]) <$> buildCronJobs opts else pure []
     matrix ← if optServeMatrix opts then pure <$> matrixGw else pure []
     slack ← if optServeSlack opts then pure <$> fromEnv slackFromEnv slackGateway else pure []
@@ -775,7 +823,7 @@ buildGateways opts msched registry = do
             , [acpGateway | optAcp opts]
             , -- The TUI is built here for ordering, but its approval gate must reach the *agent*, so
               -- 'serveGateways' rebuilds it with the gate's receiver once the agent exists.
-              [tuiGateway defaultTuiConfig | optTui opts]
+              [tuiGateway defaultTuiConfig | isJust (grTui groups)]
             , maybe [] (\p → [a2aGateway p defaultA2aConfig]) (optServeA2a opts)
             , maybe [] (\p → [httpGateway p (GatewayConfig (optApiKey opts) (fmap (\n → (fromIntegral n, 60)) (optRateLimit opts)))]) (optServe opts)
             ]
@@ -807,13 +855,13 @@ The interactive TUI is the one gateway that needs something installed on the age
 tool-approval 'ToolGate' — so the gate is built here (unless @--tui-auto-approve@ waives it) and
 its receiver handed to the TUI's config.
 -}
-serveGateways ∷ [Gateway] → Provider → Options → ModelId → ToolRegistry → IO ()
-serveGateways gws prov opts model registry = do
-    (tuner, _persist) ← buildTuner opts
-    delib ← buildLegion opts
-    agent0 ← assembleAgent prov opts model tuner delib registry
+serveGateways ∷ [Gateway] → Provider → Options → Groups → ModelId → ToolRegistry → IO ()
+serveGateways gws prov opts groups model registry = do
+    (tuner, _persist) ← buildTuner (grTuning groups)
+    delib ← buildLegion opts (grLegion groups)
+    agent0 ← assembleAgent prov opts groups model tuner delib registry
     (agent, permits) ←
-        if optTui opts && not (optTuiAutoApprove opts)
+        if maybe False (not . tsAutoApprove) (grTui groups)
             then do
                 (gate, ps) ← newChannelGate
                 pure (withToolGate gate agent0, Just ps)
@@ -829,13 +877,13 @@ serveGateways gws prov opts model registry = do
         (e : _) → errExit (tshow e)
         [] → pure ()
 
-runAgentMode ∷ Provider → Options → ModelId → Text → ToolRegistry → IO ()
-runAgentMode prov opts model prompt registry = do
-    (tuner, persist) ← buildTuner opts
-    delib ← buildLegion opts
-    agent ← assembleAgent prov opts model tuner delib registry
+runAgentMode ∷ Provider → Options → Groups → ModelId → Text → ToolRegistry → IO ()
+runAgentMode prov opts groups model prompt registry = do
+    (tuner, persist) ← buildTuner (grTuning groups)
+    delib ← buildLegion opts (grLegion groups)
+    agent ← assembleAgent prov opts groups model tuner delib registry
     res ← runAgent agent (turnRequest "cli" prompt) renderEvent
-    persist -- snapshot learned ATO profiles when --tune-state is set (a no-op otherwise)
+    persist -- snapshot learned ATO profiles when a tune-state path is set (a no-op otherwise)
     case res of
         Left e → errExit (tshow e)
         Right () → TIO.putStrLn ""

@@ -13,6 +13,7 @@ import Data.ByteString (ByteString)
 import Data.Char (isHexDigit)
 import Data.IORef
 import Data.List (find, isSuffixOf, sort)
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Maybe (fromJust, isJust, isNothing)
 import Data.ProtoLens (defMessage)
 import Data.ProtoLens.Labels ()
@@ -1140,7 +1141,7 @@ section8Tests =
                         , providerCapabilities = noCapabilities
                         , providerCountTokens = \_ → pure (Right Nothing)
                         }
-                cfg = (defaultAgentConfig "strong") {acCheapModel = Just "cheap", acEscalateAfter = 2}
+                cfg = (defaultAgentConfig "strong") {acRouting = Just (Routing "cheap" (Just 2))}
             agent ← mkAgent stub withBuiltins cfg Tn.noopTuner Nothing
             _ ← runLoopSeeded agent Nothing [userMessage "go"] (const (pure ()))
             readIORef models >>= (@?= ["cheap", "cheap", "strong"])
@@ -1282,7 +1283,7 @@ convergenceTests =
                         , providerCapabilities = noCapabilities
                         , providerCountTokens = \_ → pure (Right Nothing)
                         }
-                cfg = (defaultAgentConfig "m") {acVerifyCommand = Just "false", acVerifyAndFix = True}
+                cfg = (defaultAgentConfig "m") {acVerify = Just (VerifySpec "false" True False)}
             agent ← mkAgent stub withBuiltins cfg Tn.noopTuner Nothing
             r ← runLoopSeeded agent Nothing [userMessage "go"] (const (pure ()))
             n ← readIORef ref
@@ -1302,7 +1303,7 @@ convergenceTests =
                         , providerCapabilities = noCapabilities
                         , providerCountTokens = \_ → pure (Right Nothing)
                         }
-                cfg = (defaultAgentConfig "m") {acVerifyCommand = Just "true", acInLoopVerify = True}
+                cfg = (defaultAgentConfig "m") {acVerify = Just (VerifySpec "true" False True)}
             agent ← mkAgent stub withBuiltins cfg Tn.noopTuner Nothing
             _ ← runLoopSeeded agent Nothing [userMessage "write it"] (\e → modifyIORef' emitted (e :))
             n ← readIORef ref
@@ -2430,27 +2431,24 @@ domainTests =
             e ←
                 either (assertFailure . T.unpack) pure $
                     mkCronExpr
-                        [CronTerm EveryValue (Just 30)]
-                        [CronTerm (Between 9 17) Nothing]
-                        [CronTerm EveryValue Nothing]
-                        [CronTerm EveryValue Nothing]
-                        [CronTerm (Between 1 5) Nothing]
+                        (CronTerm EveryValue (Just 30) :| [])
+                        (CronTerm (Between 9 17) Nothing :| [])
+                        (CronTerm EveryValue Nothing :| [])
+                        (CronTerm EveryValue Nothing :| [])
+                        (CronTerm (Between 1 5) Nothing :| [])
             renderCronExpr e @?= "*/30 9-17 * * 1-5"
         , -- Each field carries its own bounds, so the error can name the field and the value.
           testCase "a cron field is range-checked against the field it is in" $ do
-            let bad mi ho = mkCronExpr mi ho [] [] []
-            mkCronField Hour [CronTerm (Exactly 24) Nothing]
+            mkCronField Hour (CronTerm (Exactly 24) Nothing :| [])
                 @?= Left "hour: 24 is out of range 0-23"
-            assertBool "minute 24" (isRight (mkCronField Minute [CronTerm (Exactly 24) Nothing]))
-            mkCronField Minute [] @?= Left "minute: a cron field needs at least one term"
-            mkCronField Minute [CronTerm EveryValue (Just 0)]
+            assertBool "minute 24" (isRight (mkCronField Minute (CronTerm (Exactly 24) Nothing :| [])))
+            mkCronField Minute (CronTerm EveryValue (Just 0) :| [])
                 @?= Left "minute: a step must be at least 1, not 0"
-            mkCronField DayOfWeek [CronTerm (Between 5 1) Nothing]
+            mkCronField DayOfWeek (CronTerm (Between 5 1) Nothing :| [])
                 @?= Left "dayOfWeek: range start 5 is greater than its end 1"
             -- 7 is Sunday: in range for dayOfWeek, out of range for month.
-            assertBool "dow 7" (isRight (mkCronField DayOfWeek [CronTerm (Exactly 7) Nothing]))
-            assertBool "month 0" (isLeft (mkCronField Month [CronTerm (Exactly 0) Nothing]))
-            assertBool "empty minute" (isLeft (bad [] [CronTerm EveryValue Nothing]))
+            assertBool "dow 7" (isRight (mkCronField DayOfWeek (CronTerm (Exactly 7) Nothing :| [])))
+            assertBool "month 0" (isLeft (mkCronField Month (CronTerm (Exactly 0) Nothing :| [])))
         , -- Capabilities were five positional Bools; the type-level declaration is the fix.
           testCase "type-level capability declaration matches the value-level set" $ do
             declare @'[ 'PromptCaching, 'Vision] @?= capabilitySet [PromptCaching, Vision]
@@ -2889,11 +2887,77 @@ configTests =
             f ←
                 writeCfg
                     dir
-                    "{ legionDebaters = Some [ L.ModelRef::{ provider = L.Provider.Anthropic, model = \"claude-sonnet-4-5\" }\n\
-                    \                        , L.ModelRef::{ provider = L.Provider.Google, model = \"gemini-2.5-flash\" } ] }"
+                    "{ legion = Some L.Legion::{ debaters = [ L.anthropic \"claude-sonnet-4-5\", L.google \"gemini-2.5-flash\" ] } }"
             fc ← loadConfig f
-            legionDebaters fc
+            fmap lgDebaters (legion fc)
                 @?= Just [ModelRef Anthropic "claude-sonnet-4-5", ModelRef Google "gemini-2.5-flash"]
+        , -- A judge and a round count with no debaters used to load fine and then be dropped in
+          -- full, without a word, because the council was built only when the list was non-empty.
+          testCase "a council too small to deliberate is a load error" $ withSchema "config7b" $ \dir → do
+            f ←
+                writeCfg
+                    dir
+                    "{ legion = Some L.Legion::{ debaters = [ L.anthropic \"claude-sonnet-4-5\" ], rounds = Some 3 } }"
+            r ← try (loadConfig f) ∷ IO (Either SomeException FileConfig)
+            assertBool "one debater is not a council" (isLeft r)
+        , -- tune/tuneBayes/tuneState were three independent fields; the builder read them in an
+          -- order that made "Bayes with tuning off" mean "Bayes".
+          testCase "the tuner is one group, so its strategy is a choice" $ withSchema "config7c" $ \dir → do
+            f ← writeCfg dir "{ tune = Some L.Tune::{ strategy = L.TuneStrategy.Bayes, state = Some \"/v/ato.json\" } }"
+            fc ← loadConfig f
+            tune fc @?= Just (Tuning Bayes (Just "/v/ato.json"))
+        , testCase "the verify switches cannot exist without their command" $ withSchema "config7d" $ \dir → do
+            f ← writeCfg dir "{ verify = Some L.Verify::{ command = \"cabal test\", inLoop = True } }"
+            fc ← loadConfig f
+            verify fc @?= Just (VerifySpec "cabal test" False True)
+            -- The old shape: a switch with no command to read. Now not a field at all.
+            g ← writeCfg dir "{ verifyAndFix = Some True }"
+            r ← try (loadConfig g) ∷ IO (Either SomeException FileConfig)
+            assertBool "the ungrouped switch is gone from the schema" (isLeft r)
+        , testCase "an escalation threshold cannot exist without a cheap model" $ withSchema "config7e" $ \dir → do
+            f ← writeCfg dir "{ routing = Some L.Routing::{ cheapModel = \"haiku\", escalateAfter = Some 4 } }"
+            fc ← loadConfig f
+            routing fc @?= Just (Routing "haiku" (Just 4))
+            g ← writeCfg dir "{ escalateAfter = Some 4 }"
+            r ← try (loadConfig g) ∷ IO (Either SomeException FileConfig)
+            assertBool "the orphan threshold is gone from the schema" (isLeft r)
+        , -- provider and model were two independent fields; the pair could disagree, and an
+          -- omitted provider silently defaulted to Anthropic.
+          testCase "a model cannot be named without saying whose it is" $ withSchema "config7f" $ \dir → do
+            f ← writeCfg dir "{ fallback = Some [ L.ModelRef.Google L.Model.Default, L.xai \"grok-4.6\" ] }"
+            fc ← loadConfig f
+            fallback fc @?= Just [ModelRef Google (defaultModelFor Google), ModelRef Xai "grok-4.6"]
+            g ← writeCfg dir "{ fallback = Some [ { provider = L.Provider.Google, model = \"gemini-2.5-flash\" } ] }"
+            r ← try (loadConfig g) ∷ IO (Either SomeException FileConfig)
+            assertBool "the two-field record is gone from the schema" (isLeft r)
+        , -- The last packed string with a grammar: "2026-13-40" and "yesterday" both used to be
+          -- valid Text and both reached the provider.
+          testCase "an xSearch window is a date, not a string that looks like one" $ withSchema "config7g" $ \dir → do
+            f ←
+                writeCfg
+                    dir
+                    "{ serverTools = Some [ L.ServerTool.XSearch { allowedHandles = [] : List Text\n\
+                    \                                           , blockedHandles = [] : List Text\n\
+                    \                                           , fromDate = Some 2026-08-01\n\
+                    \                                           , toDate = None Date } ] }"
+            fc ← loadConfig f
+            serverTools fc @?= Just [STXSearch [] [] (either (error . T.unpack) Just (mkDate 2026 8 1)) Nothing]
+            g ←
+                writeCfg
+                    dir
+                    "{ serverTools = Some [ L.ServerTool.XSearch { allowedHandles = [] : List Text\n\
+                    \                                           , blockedHandles = [] : List Text\n\
+                    \                                           , fromDate = Some \"yesterday\"\n\
+                    \                                           , toDate = None Date } ] }"
+            r ← try (loadConfig g) ∷ IO (Either SomeException FileConfig)
+            assertBool "a string is not a date" (isLeft r)
+        , testCase "mkDate checks the day against its own month and year" $ do
+            assertBool "leap day in a leap year" (isRight (mkDate 2024 2 29))
+            assertBool "no leap day in 2026" (isLeft (mkDate 2026 2 29))
+            assertBool "1900 is not a leap year" (isLeft (mkDate 1900 2 29))
+            assertBool "2000 is" (isRight (mkDate 2000 2 29))
+            assertBool "month 13" (isLeft (mkDate 2026 13 1))
+            fmap renderDate (mkDate 2026 8 1) @?= Right "2026-08-01"
         , -- The stdio/HTTP choice is stated in the config now, not sniffed at connect time.
           testCase "mcp targets carry their transport" $ withSchema "config8" $ \dir → do
             f ←
@@ -2913,7 +2977,7 @@ configTests =
             f ←
                 writeCfg
                     dir
-                    "{ cron = Some [ L.CronJob::{ schedule = L.Schedule::{ minute = [ L.everyN 30 ], hour = [ L.between 9 17 ] }\n\
+                    "{ cron = Some [ L.CronJob::{ schedule = L.Schedule::{ minute = L.one (L.everyN 30), hour = L.one (L.between 9 17) }\n\
                     \                          , prompt = \"2 checks then report\" } ] }"
             fc ← loadConfig f
             fmap (map (renderCronExpr . csSchedule)) (cron fc) @?= Just ["*/30 9-17 * * *"]
@@ -2923,8 +2987,8 @@ configTests =
             f ←
                 writeCfg
                     dir
-                    "{ matrixRoomTools = Some [ { subject = \"!ops:hs\", tools = [\"obs_start\", \"schedule_list\"] } ]\n\
-                    \, matrixUserTools = Some [ { subject = \"@rian:hs\", tools = [\"obs_start\"] } ]\n\
+                    "{ matrixRoomTools = Some [ { subject = \"!ops:hs\", tools = [ L.ToolName.Custom \"obs_start\", L.ToolName.schedule_list ] } ]\n\
+                    \, matrixUserTools = Some [ { subject = \"@rian:hs\", tools = [ L.ToolName.Custom \"obs_start\" ] } ]\n\
                     \, persona = Some \"/etc/lavoisier/PERSONA.md\"\n\
                     \, scheduleRetryMax = Some 3, scheduleRetryWait = Some 60 }"
             fc ← loadConfig f
@@ -2936,9 +3000,29 @@ configTests =
             scheduleRetryWait fc @?= Just (Seconds 60)
         , -- A room id without its sigil is not a room id.
           testCase "a malformed Matrix subject is a load error" $ withSchema "configC" $ \dir → do
-            f ← writeCfg dir "{ matrixRoomTools = Some [ { subject = \"ops:hs\", tools = [\"x\"] } ] }"
+            f ← writeCfg dir "{ matrixRoomTools = Some [ { subject = \"ops:hs\", tools = [ L.ToolName.shell ] } ] }"
             r ← try (loadConfig f) ∷ IO (Either SomeException FileConfig)
             assertBool "sigil-less room id must fail at load" (isLeft r)
+        , -- As bare Text a misspelling was not an error: a grant that matches no tool simply
+          -- never applies, silently.
+          testCase "a misspelled tool name is a load error, and Custom is the way out" $ withSchema "config7h" $ \dir → do
+            f ← writeCfg dir "{ matrixRoomTools = Some [ { subject = \"!ops:hs\", tools = [ L.ToolName.read_fil ] } ] }"
+            r ← try (loadConfig f) ∷ IO (Either SomeException FileConfig)
+            assertBool "a typo must fail at load" (isLeft r)
+            g ← writeCfg dir "{ matrixRoomTools = Some [ { subject = \"!ops:hs\", tools = [ L.ToolName.Custom \"obs_start\" ] } ] }"
+            fc ← loadConfig g
+            fmap (map tgTools) (matrixRoomTools fc) @?= Just [["obs_start"]]
+        , -- The schema's alternatives are the tool names themselves, so this is the only thing
+          -- that can put them out of step with the tools that actually exist.
+          testCase "builtinToolNames is exactly what the tool modules register" $ do
+            reg ← Sch.newRegistry 0 []
+            let registered =
+                    builtinTools
+                        <> [findReferencesTool]
+                        <> editToolset
+                        <> [batchEditTool "m" (Batch (\_ → pure (Right [])))]
+                        <> Sch.scheduleTools reg
+            sort (map toolName registered) @?= sort builtinToolNames
         , testCase "applyConfig writes them onto Options (the file is their only source)" $ do
             let fc =
                     defaultConfig
@@ -2956,6 +3040,35 @@ configTests =
             CLI.optSystem o @?= Just "custom"
             CLI.optScheduleRetryMax o @?= Just (RetryCount 3)
             CLI.optScheduleRetryWait o @?= Just (Seconds 60)
+        , -- The flags stay flat (a command line is), so the grouping happens once, here.
+          testCase "resolveGroups completes what it can and refuses what it cannot" $ do
+            let ok o = case CLI.resolveGroups o of
+                    Right g → pure g
+                    Left e → assertFailure ("expected a resolved group: " <> T.unpack e)
+                bad label o = assertBool label (isLeft (CLI.resolveGroups o))
+            -- A state path implies the learner that writes it; the flag's help always said so.
+            g1 ← ok bareOptions {CLI.optTuneState = Just "/v/ato.json"}
+            CLI.grTuning g1 @?= Just (Tuning Greedy (Just "/v/ato.json"))
+            -- --tune-bayes with --tune absent no longer depends on which is tested first.
+            g2 ← ok bareOptions {CLI.optTuneBayes = True}
+            CLI.grTuning g2 @?= Just (Tuning Bayes Nothing)
+            g3 ← ok bareOptions
+            CLI.grTuning g3 @?= Nothing
+            -- Auto-approval implies the TUI it approves for, rather than being ignored.
+            g4 ← ok bareOptions {CLI.optTuiAutoApprove = True}
+            CLI.grTui g4 @?= Just (TuiSpec True)
+            -- These two cannot be completed, so they are reported instead of dropped.
+            bad "escalate-after without a cheap model" bareOptions {CLI.optEscalateAfter = Just 4}
+            bad "verify-and-fix without a command" bareOptions {CLI.optVerifyAndFix = True}
+            bad "in-loop-verify without a command" bareOptions {CLI.optInLoopVerify = True}
+            bad "a one-model council" bareOptions {CLI.optLegionDebaters = [ModelRef Anthropic "a"]}
+            g5 ← ok bareOptions {CLI.optVerifyCmd = Just "cabal test", CLI.optInLoopVerify = True}
+            CLI.grVerify g5 @?= Just (VerifySpec "cabal test" False True)
+        , -- The file states a group whole, the flags state its parts; the merge is field-by-field
+          -- so one can still complete the other.
+          testCase "a flag and the file can complete the same group between them" $ do
+            let o = CLI.applyConfig defaultConfig {routing = Just (Routing "haiku" Nothing)} bareOptions {CLI.optEscalateAfter = Just 7}
+            CLI.grRouting <$> CLI.resolveGroups o @?= Right (Just (Routing "haiku" (Just 7)))
         , testCase "a CLI --persona wins over the file" $ do
             let o = CLI.applyConfig defaultConfig {persona = Just "from-file"} bareOptions {CLI.optPersona = Just "from-flag"}
             CLI.optPersona o @?= Just "from-flag"
@@ -3583,7 +3696,7 @@ scheduleTests =
         [ testCase "loadScheduleFile builds tool + prompt jobs with defaults (Dhall)" $ withSchema "sch" $ \dir → do
             js ←
                 loadSched dir 2 30 $
-                    "[ L.ScheduleJob::{ jobId = \"disk\", schedule = L.Schedule::{ minute = [ L.at 0 ] }, action = L.Action.Tool { name = \"shell\", args = Some \"{\\\"command\\\":\\\"df\\\"}\" } }"
+                    "[ L.ScheduleJob::{ jobId = \"disk\", schedule = L.Schedule::{ minute = L.one (L.at 0) }, action = L.Action.Tool { name = L.ToolName.shell, args = Some \"{\\\"command\\\":\\\"df\\\"}\" } }"
                         <> ", L.ScheduleJob::{ jobId = \"digest\", schedule = L.dailyAt 9, action = L.Action.Prompt \"summarize\" } ]"
             js2 ← either (assertFailure . show) pure js
             map Sch.sjId js2 @?= ["disk", "digest"]
@@ -3746,7 +3859,7 @@ cronTests =
                 Left e → assertFailure (show e)
         , -- An out-of-range field is a *load* error naming the field, not a gateway-start error.
           testCase "cron-file (Dhall) rejects an out-of-range field by name" $ withSchema "cron" $ \dir → do
-            r ← loadCron dir 0 0 "[ L.CronJob::{ schedule = L.Schedule::{ hour = [ L.at 24 ] }, prompt = \"x\" } ]"
+            r ← loadCron dir 0 0 "[ L.CronJob::{ schedule = L.Schedule::{ hour = L.one (L.at 24) }, prompt = \"x\" } ]"
             case r of
                 Left e → assertBool ("names the field: " <> T.unpack e) ("hour: 24 is out of range 0-23" `T.isInfixOf` e)
                 Right _ → assertFailure "an hour of 24 must not load"
@@ -3776,8 +3889,8 @@ genCronExpr = do
     where
         genField k = do
             let (lo, hi) = cronFieldBounds k
-            n ← choose (1, 3 ∷ Int)
-            replicateM n (genTerm lo hi)
+            n ← choose (0, 2 ∷ Int)
+            (:|) <$> genTerm lo hi <*> replicateM n (genTerm lo hi)
 
         genTerm lo hi = do
             base ←

@@ -23,6 +23,7 @@ module Lavoisier.Schedule.Cron (
 where
 
 import Data.Bits (bit, testBit, (.|.))
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Text (Text)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word64)
@@ -143,8 +144,13 @@ parseCronExpr expr =
         fields → Left (CronFieldCount (length fields))
 
 -- | Parse one field's text into terms. Range checking is 'mkCronExpr'\'s job, not this one\'s.
-parseTerms ∷ Text → Either CronError [CronTerm]
-parseTerms field = traverse parsePart (T.splitOn "," field)
+parseTerms ∷ Text → Either CronError (NonEmpty CronTerm)
+parseTerms field = case T.splitOn "," field of
+    -- 'T.splitOn' never returns an empty list, so the second arm is unreachable; it is here
+    -- because the type of 'T.splitOn' cannot say so, and a field with no terms is exactly what
+    -- the 'NonEmpty' upstream of here exists to rule out.
+    (p : ps) → traverse parsePart (p :| ps)
+    [] → bad "a cron field needs at least one term"
     where
         bad reason = Left (CronFieldError field reason)
         num s reason = maybe (bad reason) Right (readMaybe (T.unpack s))

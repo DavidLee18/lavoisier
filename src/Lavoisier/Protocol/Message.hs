@@ -49,7 +49,7 @@ import Data.Word (Word32)
 
 import Data.Text qualified as T
 
-import Lavoisier.Domain (ModelId (..))
+import Lavoisier.Domain (Date, ModelId (..))
 
 {- | Normalised extended-thinking effort, mapped per-provider by each adapter. A cost dial:
 'ThinkOff'\/'ThinkLow' cheapest, 'ThinkHigh' the most. 'Ord' matters (the agent dials it down for
@@ -180,8 +180,10 @@ data ServerTool
       STWebFetch (Maybe Word32)
     | -- | Run code in a provider-hosted sandbox.
       STCodeExecution
-    | -- | Search X posts (xAI): allowed_handles, blocked_handles, from_date, to_date.
-      STXSearch [Text] [Text] (Maybe Text) (Maybe Text)
+    | {- | Search X posts (xAI): allowed_handles, blocked_handles, from_date, to_date. The window
+      is a checked 'Date', not a @YYYY-MM-DD@ string the provider has to reject for us.
+      -}
+      STXSearch [Text] [Text] (Maybe Date) (Maybe Date)
     | -- | RAG over xAI document collections: collection_ids, limit.
       STCollectionsSearch [Text] (Maybe Word32)
     | -- | Let the provider fetch and read URLs named in the prompt (Gemini @url_context@).
