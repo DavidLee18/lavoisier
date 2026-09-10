@@ -28,7 +28,7 @@ mod tool;
 mod tune;
 
 pub use agent::{AgentError, AgentHandle, TurnRequest};
-pub use batch::{BatchItem, BatchProvider, BatchTask};
+pub use batch::{batch_item, BatchItem, BatchProvider, BatchTask};
 pub use deliberate::{DeliberateError, Deliberation, DeliberationContext, Deliberator};
 pub use event::{CostWeights, Event, StopReason, Usage};
 pub use gate::{ToolDecision, ToolGate};

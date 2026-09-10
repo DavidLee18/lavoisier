@@ -176,8 +176,8 @@ impl AnthropicProvider {
         &self,
         nreq: Negotiated<AnthropicCaps>,
     ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
+        let body = build_body(&nreq, self.extended_cache_ttl);
         let req = nreq.into_request();
-        let body = build_body(&req, self.extended_cache_ttl);
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
 
         // Collect the beta flags this request needs (sent as one comma-joined header).
@@ -348,7 +348,13 @@ fn cache_control(ttl_1h: bool) -> Value {
 
 /// Build the Messages API request body from a normalised [`ChatRequest`]. `extended_ttl` puts the
 /// 1-hour TTL on the immutable-prefix breakpoints (system / tools / skeleton).
-fn build_body(req: &ChatRequest, extended_ttl: bool) -> Value {
+/// Build the Messages-API body from a **negotiated** request.
+///
+/// Taking [`Negotiated`] rather than a bare [`ChatRequest`] is what makes the capability check
+/// unskippable: every send path — streaming, batch, and any future one — has to negotiate before it
+/// can call this, or it does not compile.
+fn build_body(nreq: &Negotiated<AnthropicCaps>, extended_ttl: bool) -> Value {
+    let req = nreq.request();
     let mut body = json!({
         "model": req.model,
         "max_tokens": req.max_tokens,
@@ -683,6 +689,14 @@ fn build_tools(tools: &[ToolDef], extended_ttl: bool) -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    /// Negotiate a fixture so it can reach `build_body`, which now demands the capability
+    /// receipt. Anthropic declares nearly every knob, so for these fixtures this is a
+    /// pass-through — the point is that even a test cannot reach the body builder unchecked.
+    fn nb(req: &ChatRequest, ttl: bool) -> Value {
+        let (_, out) = lvz_protocol::negotiate::<AnthropicCaps>(req.clone());
+        build_body(&out.expect("fixture must negotiate"), ttl)
+    }
     use super::*;
     use lvz_protocol::ContentBlock;
 
@@ -701,7 +715,7 @@ mod tests {
             strict: false,
         });
 
-        let body = build_body(&req, false);
+        let body = nb(&req, false);
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
@@ -713,7 +727,7 @@ mod tests {
         let req = ChatRequest::new("claude-sonnet-4-6")
             .system("volatile")
             .push(Message::user("hi"));
-        let body = build_body(&req, false);
+        let body = nb(&req, false);
         assert!(body["system"][0]["cache_control"].is_null());
     }
 
@@ -727,7 +741,7 @@ mod tests {
                 is_error: false,
             }],
         };
-        let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
+        let body = nb(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
         let block = &body["messages"][0]["content"][0];
         assert_eq!(block["type"], "tool_result");
         assert_eq!(block["tool_use_id"], "toolu_9");
@@ -742,7 +756,7 @@ mod tests {
             .push(Message::user("do the task"))
             .push(Message::assistant("on it"))
             .push(Message::user("more context here"));
-        let body = build_body(&req, false);
+        let body = nb(&req, false);
         let msgs = body["messages"].as_array().unwrap();
         let last = msgs.last().unwrap();
         let last_block = last["content"].as_array().unwrap().last().unwrap();
@@ -765,7 +779,7 @@ mod tests {
                 ContentBlock::text("the answer"),
             ],
         };
-        let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
+        let body = nb(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1, "thinking block must be omitted");
         assert_eq!(content[0]["type"], "text");
@@ -806,7 +820,7 @@ mod tests {
             cache: true,
             strict: false,
         });
-        let body = build_body(&req, false);
+        let body = nb(&req, false);
         assert_eq!(
             count_cache_breakpoints(&body),
             4,
@@ -834,7 +848,7 @@ mod tests {
             cache: false,
             strict: true,
         });
-        let body = build_body(&req, false);
+        let body = nb(&req, false);
         assert_eq!(body["tool_choice"]["type"], "tool");
         assert_eq!(body["tool_choice"]["name"], "get_weather");
         assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], true);
@@ -860,7 +874,7 @@ mod tests {
                 ContentBlock::text("describe these"),
             ],
         };
-        let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
+        let body = nb(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
         let c = &body["messages"][0]["content"];
         assert_eq!(c[0]["type"], "image");
         assert_eq!(c[0]["source"]["type"], "base64");
@@ -887,7 +901,7 @@ mod tests {
             url: "https://mcp.example/sse".into(),
             authorization_token: Some("tok".into()),
         }];
-        let body = build_body(&req, false);
+        let body = nb(&req, false);
         let tools = body["tools"].as_array().unwrap();
         assert!(tools.iter().any(|t| t["type"] == "web_search_20260209"));
         assert!(tools.iter().any(|t| t["type"] == "code_execution_20260120"));
@@ -910,7 +924,7 @@ mod tests {
             BuiltinTool::TextEditor,
             BuiltinTool::Memory,
         ];
-        let body = build_body(&req, false);
+        let body = nb(&req, false);
         let tools = body["tools"].as_array().unwrap();
         let bash = tools.iter().find(|t| t["name"] == "bash").unwrap();
         assert_eq!(bash["type"], "bash_20250124");
@@ -936,7 +950,7 @@ mod tests {
                 citations: false,
             }],
         };
-        let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
+        let body = nb(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
         let src = &body["messages"][0]["content"][0]["source"];
         assert_eq!(src["type"], "file");
         assert_eq!(src["file_id"], "file_123");
@@ -953,7 +967,7 @@ mod tests {
                 citations: true,
             }],
         };
-        let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
+        let body = nb(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
         assert_eq!(
             body["messages"][0]["content"][0]["citations"]["enabled"],
             true
@@ -971,7 +985,7 @@ mod tests {
                 citations: true,
             }],
         };
-        let body = build_body(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
+        let body = nb(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
         let src = &body["messages"][0]["content"][0]["source"];
         assert_eq!(src["type"], "text");
         assert_eq!(src["media_type"], "text/plain");
@@ -1009,7 +1023,7 @@ mod tests {
         let mk = |level: Option<ThinkingLevel>| {
             let mut req = ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi"));
             req.thinking = level;
-            build_body(&req, false)
+            nb(&req, false)
         };
         assert!(mk(None)["thinking"].is_null());
         assert!(mk(Some(ThinkingLevel::Off))["thinking"].is_null());
@@ -1022,7 +1036,7 @@ mod tests {
         for model in ["claude-sonnet-4-6", "claude-opus-4-8", "claude-fable-5"] {
             let mut req = ChatRequest::new(model).push(Message::user("hi"));
             req.thinking = Some(ThinkingLevel::High);
-            let body = build_body(&req, false);
+            let body = nb(&req, false);
             assert_eq!(body["thinking"]["type"], "adaptive", "{model}");
             assert!(body["thinking"]["budget_tokens"].is_null(), "{model}");
             assert_eq!(body["output_config"]["effort"], "high", "{model}");
@@ -1030,7 +1044,7 @@ mod tests {
         // Effort tracks the level (Medium → "medium").
         let mut req = ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi"));
         req.thinking = Some(ThinkingLevel::Medium);
-        assert_eq!(build_body(&req, false)["output_config"]["effort"], "medium");
+        assert_eq!(nb(&req, false)["output_config"]["effort"], "medium");
     }
 
     #[test]
@@ -1039,7 +1053,7 @@ mod tests {
         let mut req = ChatRequest::new("claude-haiku-4-5").push(Message::user("hi"));
         req.thinking = Some(ThinkingLevel::High);
         req.max_tokens = 4096;
-        let body = build_body(&req, false);
+        let body = nb(&req, false);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 12000);
         assert!(body["max_tokens"].as_u64().unwrap() > 12000);
@@ -1052,14 +1066,14 @@ mod tests {
         req.temperature = Some(0.7);
         req.top_p = Some(0.9);
         req.top_k = Some(40);
-        let body = build_body(&req, false);
+        let body = nb(&req, false);
         assert!(body["temperature"].is_null());
         assert!(body["top_p"].is_null());
         assert!(body["top_k"].is_null());
         // Sonnet 4.6 still accepts them.
         let mut s = ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi"));
         s.temperature = Some(0.5);
-        assert!(!build_body(&s, false)["temperature"].is_null());
+        assert!(!nb(&s, false)["temperature"].is_null());
     }
 
     #[test]
@@ -1067,7 +1081,7 @@ mod tests {
         let mut req = ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi"));
         req.thinking = Some(ThinkingLevel::High);
         req.temperature = Some(0.7);
-        let body = build_body(&req, false);
+        let body = nb(&req, false);
         assert!(
             body["temperature"].is_null(),
             "temperature must be dropped when thinking is enabled"
@@ -1090,7 +1104,7 @@ mod tests {
             text: "rules".into(),
             cache: true,
         });
-        let body = build_body(&req, true);
+        let body = nb(&req, true);
         // System + skeleton (immutable prefix) get the 1h TTL...
         assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
         assert_eq!(

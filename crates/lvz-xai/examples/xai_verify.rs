@@ -31,7 +31,10 @@ async fn a6_deferred(provider: &GrpcTransport) {
     let mut req = ChatRequest::new("grok-4").push(Message::user("Reply with exactly: deferred-ok"));
     req.max_tokens = 32;
 
-    let id = provider.start_deferred(req).await.expect("start_deferred");
+    let (notices, id) = provider.start_deferred(req).await.expect("start_deferred");
+    for n in &notices {
+        println!("  notice: {n}");
+    }
     println!("  request_id: {id}");
 
     for attempt in 1..=20 {

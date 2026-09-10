@@ -174,14 +174,12 @@ async fn a11_batch(key: &str) {
     let mut req = ChatRequest::new(MODEL).push(Message::user("Reply with exactly: batch-ok"));
     req.max_tokens = 256;
 
+    let (notices, entry) = BatchRequest::negotiated("verify-1", req);
+    for n in &notices {
+        println!("  notice: {n}");
+    }
     let batch = match provider
-        .create_batch(
-            MODEL,
-            &[BatchRequest {
-                custom_id: "verify-1".into(),
-                request: req,
-            }],
-        )
+        .create_batch(MODEL, &[entry.expect("batch request must negotiate")])
         .await
     {
         Ok(b) => {

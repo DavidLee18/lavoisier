@@ -30,6 +30,9 @@ impl BatchTask {
 }
 
 /// The outcome of one batched request, correlated by `custom_id`.
+///
+/// Build one with [`batch_item`] rather than the positional literal: `notices` is easy to forget,
+/// and a batch that drops them loses the only channel it has for reporting a degraded request.
 #[derive(Debug, Clone)]
 pub struct BatchItem {
     /// The `custom_id` of the [`BatchTask`] this result belongs to.
@@ -40,6 +43,38 @@ pub struct BatchItem {
     pub usage: Usage,
     /// Set if the request failed, was canceled, or expired.
     pub error: Option<String>,
+    /// Capability notices raised when this task was negotiated at submit time — the knobs the
+    /// provider does not support and so did not honour.
+    ///
+    /// A streaming turn delivers these as [`Event::Notice`](crate::Event::Notice), but a batch has
+    /// no event stream, so they are correlated back by `custom_id` and carried here. Without this
+    /// the caller pays for a batch silently stripped of the features they asked for.
+    pub notices: Vec<String>,
+}
+
+/// Build a [`BatchItem`]. Prefer this over the struct literal so a new field cannot be silently
+/// omitted at one of the several construction sites.
+pub fn batch_item(
+    custom_id: impl Into<String>,
+    text: impl Into<String>,
+    usage: Usage,
+    error: Option<String>,
+) -> BatchItem {
+    BatchItem {
+        custom_id: custom_id.into(),
+        text: text.into(),
+        usage,
+        error,
+        notices: Vec::new(),
+    }
+}
+
+impl BatchItem {
+    /// Attach the capability notices raised for this task at submit time.
+    pub fn with_notices(mut self, notices: Vec<String>) -> Self {
+        self.notices = notices;
+        self
+    }
 }
 
 /// A provider offering a discounted asynchronous **batch** API. [`run_batch`](BatchProvider::run_batch)

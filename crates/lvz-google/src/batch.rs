@@ -3,13 +3,17 @@
 //! long-running operation until it finishes, then read the per-request inline responses. Like the
 //! Anthropic batch path, this is for non-interactive workloads (offline evals, bulk classification).
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lvz_protocol::{BatchItem, BatchProvider, BatchTask, ChatRequest, ProviderError, Usage};
+use lvz_protocol::{
+    batch_item, negotiate, BatchItem, BatchProvider, BatchTask, ChatRequest, Negotiated,
+    ProviderError, Usage,
+};
 use serde_json::{json, Value};
 
-use crate::{build_body, GoogleProvider};
+use crate::{build_body, GoogleCaps, GoogleProvider};
 
 /// How often [`BatchProvider::run_batch`] polls for completion.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -19,11 +23,27 @@ const MAX_POLLS: u32 = 360;
 /// One entry in a batch: a caller-chosen `custom_id` (echoed back to correlate the result) and the
 /// request. All requests in a batch share the batch's `model` (passed to
 /// [`create_batch`](GoogleProvider::create_batch)).
+/// `request` is a [`Negotiated`], not a bare [`ChatRequest`], so a batch entry cannot exist
+/// without having been capability-checked. Build one with [`BatchRequest::negotiated`].
 pub struct BatchRequest {
     /// Caller-chosen id, echoed onto the matching [`BatchResult`] so results can be correlated.
     pub custom_id: String,
-    /// The generation request to run.
-    pub request: ChatRequest,
+    /// The capability-checked generation request to run.
+    pub request: Negotiated<GoogleCaps>,
+}
+
+impl BatchRequest {
+    /// Negotiate `request` against Gemini's declared capabilities. Returns the notices raised
+    /// alongside either the batch entry or the refusal; a batch has no event stream, so the caller
+    /// carries the notices onto the resulting [`BatchItem`].
+    pub fn negotiated(
+        custom_id: impl Into<String>,
+        request: ChatRequest,
+    ) -> (Vec<String>, Result<Self, ProviderError>) {
+        let (notices, outcome) = negotiate::<GoogleCaps>(request);
+        let custom_id = custom_id.into();
+        (notices, outcome.map(|request| Self { custom_id, request }))
+    }
 }
 
 /// A submitted/queried batch (the underlying long-running operation).
@@ -145,19 +165,45 @@ impl BatchProvider for GoogleProvider {
             .first()
             .map(|t| t.request.model.clone())
             .ok_or_else(|| ProviderError::Config("run_batch: no tasks".into()))?;
-        let reqs: Vec<BatchRequest> = tasks
-            .into_iter()
-            .map(|t| BatchRequest {
-                custom_id: t.custom_id,
-                request: t.request,
-            })
-            .collect();
+        // Negotiate every task before anything is submitted. A refused task becomes an error item
+        // rather than failing the whole batch, but it is never silently dropped; notices are kept
+        // by custom_id and re-attached below, since a batch has no event stream to carry them.
+        let mut reqs: Vec<BatchRequest> = Vec::new();
+        let mut notices: HashMap<String, Vec<String>> = HashMap::new();
+        let mut refused: Vec<BatchItem> = Vec::new();
+        for t in tasks {
+            let custom_id = t.custom_id.clone();
+            let (ns, outcome) = BatchRequest::negotiated(t.custom_id, t.request);
+            if !ns.is_empty() {
+                notices.insert(custom_id.clone(), ns.clone());
+            }
+            match outcome {
+                Ok(r) => reqs.push(r),
+                Err(e) => refused.push(
+                    batch_item(custom_id, "", Usage::default(), Some(e.to_string()))
+                        .with_notices(ns),
+                ),
+            }
+        }
+
+        if reqs.is_empty() {
+            return Ok(refused);
+        }
+
         let batch = self.create_batch(&model, &reqs).await?;
         for _ in 0..MAX_POLLS {
             let got = self.get_batch(&batch.name).await?;
             if got.done || got.succeeded() {
                 let results = self.batch_results(&batch.name).await?;
-                return Ok(results.into_iter().map(item_from_result).collect());
+                let mut items: Vec<BatchItem> = results
+                    .into_iter()
+                    .map(|r| {
+                        let ns = notices.get(&r.custom_id).cloned().unwrap_or_default();
+                        item_from_result(r).with_notices(ns)
+                    })
+                    .collect();
+                items.extend(refused);
+                return Ok(items);
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
@@ -173,12 +219,7 @@ fn item_from_result(r: BatchResult) -> BatchItem {
         BatchOutcome::Succeeded { text, usage } => (text, usage, None),
         BatchOutcome::Errored(e) => (String::new(), Usage::default(), Some(e)),
     };
-    BatchItem {
-        custom_id: r.custom_id,
-        text,
-        usage,
-        error,
-    }
+    batch_item(r.custom_id, text, usage, error)
 }
 
 fn parse_batch(v: &Value) -> Batch {

@@ -366,13 +366,13 @@ impl GoogleProvider {
         &self,
         nreq: Negotiated<GoogleCaps>,
     ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
-        let req = nreq.into_request();
         let mut body = build_body(
-            &req,
+            &nreq,
             self.thinking.as_deref(),
             self.cached_content.as_deref(),
             self.reasoning_floor,
         );
+        let req = nreq.into_request();
         if !self.safety_settings.is_empty() {
             body["safetySettings"] = safety_settings_json(&self.safety_settings);
         }
@@ -493,12 +493,18 @@ struct SseState {
 
 /// Build the `generateContent` request body from a normalised [`ChatRequest`]. The model id lives
 /// in the URL path, not the body.
+/// Build the `generateContent` body from a **negotiated** request.
+///
+/// Taking [`Negotiated`] rather than a bare [`ChatRequest`] is what makes the capability check
+/// unskippable: every send path — streaming, batch, and any future one — has to negotiate before
+/// it can call this, or it does not compile.
 fn build_body(
-    req: &ChatRequest,
+    nreq: &Negotiated<GoogleCaps>,
     thinking: Option<&str>,
     cached_content: Option<&str>,
     reasoning_floor: u32,
 ) -> Value {
+    let req = nreq.request();
     let mut body = json!({ "contents": build_contents(&req.messages) });
     if let Some(name) = cached_content {
         body["cachedContent"] = json!(name);
@@ -708,6 +714,17 @@ fn content_part(block: &ContentBlock, id_to_name: &HashMap<&str, &str>) -> Value
 
 #[cfg(test)]
 mod tests {
+
+    /// Negotiate a fixture so it can reach `build_body`, which now demands the capability receipt.
+    fn nb(req: &ChatRequest, thinking: Option<&str>, cached: Option<&str>, floor: u32) -> Value {
+        let (_, out) = lvz_protocol::negotiate::<GoogleCaps>(req.clone());
+        build_body(
+            &out.expect("fixture must negotiate"),
+            thinking,
+            cached,
+            floor,
+        )
+    }
     use super::*;
     use lvz_protocol::{SystemPrompt, ToolDef};
 
@@ -731,7 +748,7 @@ mod tests {
 
     #[test]
     fn maps_system_tools_and_generation_config() {
-        let body = build_body(&req(), Some("high"), None, DEFAULT_REASONING_FLOOR);
+        let body = nb(&req(), Some("high"), None, DEFAULT_REASONING_FLOOR);
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be terse");
         assert_eq!(
             body["tools"][0]["functionDeclarations"][0]["name"],
@@ -752,14 +769,14 @@ mod tests {
         let mut r = req();
         r.thinking = Some(ThinkingLevel::Low);
         // Construction fallback says "high", but the per-request Low must win.
-        let body = build_body(&r, Some("high"), None, DEFAULT_REASONING_FLOOR);
+        let body = nb(&r, Some("high"), None, DEFAULT_REASONING_FLOOR);
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "low"
         );
         // Off disables thinking outright.
         r.thinking = Some(ThinkingLevel::Off);
-        let body = build_body(&r, Some("high"), None, DEFAULT_REASONING_FLOOR);
+        let body = nb(&r, Some("high"), None, DEFAULT_REASONING_FLOOR);
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             0
@@ -776,7 +793,7 @@ mod tests {
         r.output_format = Some(OutputFormat::JsonSchema {
             schema: json!({"type": "object"}),
         });
-        let body = build_body(&r, None, None, DEFAULT_REASONING_FLOOR);
+        let body = nb(&r, None, None, DEFAULT_REASONING_FLOOR);
         let fcc = &body["toolConfig"]["functionCallingConfig"];
         assert_eq!(fcc["mode"], "ANY");
         assert_eq!(fcc["allowedFunctionNames"][0], "read_file");
@@ -792,15 +809,15 @@ mod tests {
     fn reasoning_models_get_a_max_output_floor() {
         // A small cap on a reasoning model is raised to the floor…
         let r = ChatRequest::new("gemini-3-flash-preview").max_tokens(256);
-        let body = build_body(&r, None, None, DEFAULT_REASONING_FLOOR);
+        let body = nb(&r, None, None, DEFAULT_REASONING_FLOOR);
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 8192);
         // …a larger cap is left untouched…
         let r = ChatRequest::new("gemini-3-flash-preview").max_tokens(20000);
-        let body = build_body(&r, None, None, DEFAULT_REASONING_FLOOR);
+        let body = nb(&r, None, None, DEFAULT_REASONING_FLOOR);
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 20000);
         // …and a non-reasoning model is never bumped.
         let r = ChatRequest::new("gemini-2.0-flash").max_tokens(256);
-        let body = build_body(&r, None, None, DEFAULT_REASONING_FLOOR);
+        let body = nb(&r, None, None, DEFAULT_REASONING_FLOOR);
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 256);
     }
 
@@ -834,7 +851,7 @@ mod tests {
             },
             ServerTool::CodeExecution,
         ];
-        let body = build_body(
+        let body = nb(
             &r,
             None,
             Some("cachedContents/abc"),
@@ -852,7 +869,7 @@ mod tests {
 
     #[test]
     fn numeric_thinking_is_a_budget_not_a_level() {
-        let body = build_body(&req(), Some("2048"), None, DEFAULT_REASONING_FLOOR);
+        let body = nb(&req(), Some("2048"), None, DEFAULT_REASONING_FLOOR);
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             2048

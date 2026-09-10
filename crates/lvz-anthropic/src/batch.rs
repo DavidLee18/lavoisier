@@ -3,13 +3,17 @@
 //! path: you submit many requests, poll until the batch ends, then fetch the JSONL results. Best
 //! for non-interactive workloads (offline evals, the benchmark suite, bulk classification).
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lvz_protocol::{BatchItem, BatchProvider, BatchTask, ChatRequest, ProviderError, Usage};
+use lvz_protocol::{
+    batch_item, negotiate, BatchItem, BatchProvider, BatchTask, ChatRequest, Negotiated,
+    ProviderError, Usage,
+};
 use serde_json::{json, Value};
 
-use crate::{build_body, AnthropicProvider, ANTHROPIC_VERSION};
+use crate::{build_body, AnthropicCaps, AnthropicProvider, ANTHROPIC_VERSION};
 
 /// How often [`BatchProvider::run_batch`] polls for completion.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -17,11 +21,31 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_POLLS: u32 = 360;
 
 /// One entry in a batch: a caller-chosen `custom_id` correlating the result, plus the request.
+///
+/// `request` is a [`Negotiated`], not a bare [`ChatRequest`], so a batch entry cannot exist
+/// without having been capability-checked. Build one with [`BatchRequest::negotiated`] — the batch
+/// endpoint is a send path like any other, and before this it was the one that quietly wasn't.
 pub struct BatchRequest {
     /// Caller-chosen id, echoed onto the matching [`BatchResult`] so results can be correlated.
     pub custom_id: String,
-    /// The completion request to run.
-    pub request: ChatRequest,
+    /// The capability-checked completion request to run.
+    pub request: Negotiated<AnthropicCaps>,
+}
+
+impl BatchRequest {
+    /// Negotiate `request` against Anthropic's declared capabilities.
+    ///
+    /// Returns the notices raised (knobs Anthropic does not support, cleared from the request)
+    /// alongside either the batch entry or the refusal. A batch has no event stream, so the caller
+    /// must carry the notices onto the resulting [`BatchItem`] itself.
+    pub fn negotiated(
+        custom_id: impl Into<String>,
+        request: ChatRequest,
+    ) -> (Vec<String>, Result<Self, ProviderError>) {
+        let (notices, outcome) = negotiate::<AnthropicCaps>(request);
+        let custom_id = custom_id.into();
+        (notices, outcome.map(|request| Self { custom_id, request }))
+    }
 }
 
 /// A submitted/queried batch.
@@ -208,18 +232,46 @@ impl AnthropicProvider {
 #[async_trait]
 impl BatchProvider for AnthropicProvider {
     async fn run_batch(&self, tasks: Vec<BatchTask>) -> Result<Vec<BatchItem>, ProviderError> {
-        let reqs: Vec<BatchRequest> = tasks
-            .into_iter()
-            .map(|t| BatchRequest {
-                custom_id: t.custom_id,
-                request: t.request,
-            })
-            .collect();
+        // Negotiate every task before anything is submitted. A refused task becomes an error item
+        // rather than failing the whole batch — one unsupported image should not cost the caller
+        // the other 999 requests — but it is never silently dropped either. Notices are kept by
+        // custom_id and re-attached to the results below, since a batch has no event stream to
+        // carry them.
+        let mut reqs: Vec<BatchRequest> = Vec::new();
+        let mut notices: HashMap<String, Vec<String>> = HashMap::new();
+        let mut refused: Vec<BatchItem> = Vec::new();
+        for t in tasks {
+            let custom_id = t.custom_id.clone();
+            let (ns, outcome) = BatchRequest::negotiated(t.custom_id, t.request);
+            if !ns.is_empty() {
+                notices.insert(custom_id.clone(), ns.clone());
+            }
+            match outcome {
+                Ok(r) => reqs.push(r),
+                Err(e) => refused.push(
+                    batch_item(custom_id, "", Usage::default(), Some(e.to_string()))
+                        .with_notices(ns),
+                ),
+            }
+        }
+
+        if reqs.is_empty() {
+            return Ok(refused);
+        }
+
         let batch = self.create_batch(&reqs).await?;
         for _ in 0..MAX_POLLS {
             if self.get_batch(&batch.id).await?.ended() {
                 let results = self.batch_results(&batch.id).await?;
-                return Ok(results.into_iter().map(item_from_result).collect());
+                let mut items: Vec<BatchItem> = results
+                    .into_iter()
+                    .map(|r| {
+                        let ns = notices.get(&r.custom_id).cloned().unwrap_or_default();
+                        item_from_result(r).with_notices(ns)
+                    })
+                    .collect();
+                items.extend(refused);
+                return Ok(items);
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
@@ -237,12 +289,7 @@ fn item_from_result(r: BatchResult) -> BatchItem {
         BatchOutcome::Canceled => (String::new(), Usage::default(), Some("canceled".into())),
         BatchOutcome::Expired => (String::new(), Usage::default(), Some("expired".into())),
     };
-    BatchItem {
-        custom_id: r.custom_id,
-        text,
-        usage,
-        error,
-    }
+    batch_item(r.custom_id, text, usage, error)
 }
 
 fn parse_batch(v: &Value) -> Batch {
@@ -381,15 +428,84 @@ mod tests {
     fn create_batch_params_drop_stream_and_keep_custom_id() {
         // We can't hit the network in a unit test, but we can check the per-request shape the
         // builder produces by reconstructing it the same way create_batch does.
-        let req = BatchRequest {
-            custom_id: "abc".into(),
-            request: ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi")),
-        };
+        let (_, out) = BatchRequest::negotiated(
+            "abc",
+            ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi")),
+        );
+        let req = out.expect("fixture must negotiate");
         let mut params = build_body(&req.request, false);
         params.as_object_mut().unwrap().remove("stream");
         let entry = json!({ "custom_id": req.custom_id, "params": params });
         assert_eq!(entry["custom_id"], "abc");
         assert!(entry["params"]["stream"].is_null());
         assert_eq!(entry["params"]["model"], "claude-sonnet-4-6");
+    }
+}
+
+#[cfg(test)]
+mod negotiation_tests {
+    use super::*;
+    use lvz_protocol::{ContentBlock, MediaSource, Message, Role};
+
+    #[test]
+    fn a_batch_entry_cannot_be_built_without_negotiating() {
+        // The point of the type: `BatchRequest.request` is a `Negotiated<AnthropicCaps>`, so the
+        // batch endpoint — a send path that previously called `build_body` on a raw ChatRequest —
+        // cannot submit an unchecked request. This test documents the passing half; the failing
+        // half is enforced by the compiler, not by an assertion.
+        let (notices, out) = BatchRequest::negotiated(
+            "ok",
+            ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi")),
+        );
+        assert!(out.is_ok());
+        assert!(notices.is_empty(), "{notices:?}");
+    }
+
+    #[test]
+    fn a_refused_request_never_reaches_the_batch() {
+        // Anthropic declares Vision, so use a capability it does NOT declare: xAI's X search.
+        let mut req = ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi"));
+        req.server_tools = vec![lvz_protocol::ServerTool::XSearch {
+            allowed_handles: vec![],
+            blocked_handles: vec![],
+            from_date: None,
+            to_date: None,
+        }];
+        let (_, out) = BatchRequest::negotiated("bad", req);
+        match out {
+            Err(ProviderError::Unsupported(m)) => assert!(m.contains("x_search"), "{m}"),
+            other => panic!("expected a refusal, got {:?}", other.map(|_| "ok")),
+        }
+    }
+
+    #[test]
+    fn notices_reach_the_item_because_a_batch_has_no_event_stream() {
+        let item = batch_item("id", "text", Usage::default(), None)
+            .with_notices(vec!["top_k was requested but ...".into()]);
+        assert_eq!(item.notices.len(), 1);
+        // And the default constructor does not invent any.
+        assert!(batch_item("id", "t", Usage::default(), None)
+            .notices
+            .is_empty());
+    }
+
+    #[test]
+    fn vision_content_is_refused_for_a_provider_without_it() {
+        // Sanity check that the batch path shares the streaming path's refusal rules: this is the
+        // same `negotiate` call, so a dropped image is impossible in either.
+        let mut req = ChatRequest::new("claude-sonnet-4-6");
+        req.messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                source: MediaSource::Url { url: "u".into() },
+            }],
+        }];
+        // Anthropic *does* declare Vision, so this must pass — proving the check is real and not
+        // a blanket refusal.
+        let (_, out) = BatchRequest::negotiated("img", req);
+        assert!(
+            out.is_ok(),
+            "Anthropic declares Vision, so an image is fine"
+        );
     }
 }

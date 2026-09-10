@@ -159,11 +159,12 @@ async fn a5_batch(provider: &AnthropicProvider) {
 
     let mut req = ChatRequest::new("claude-haiku-4-5").push(Message::user("Reply with: ok"));
     req.max_tokens = 16;
+    let (notices, entry) = BatchRequest::negotiated("verify-1", req);
+    for n in &notices {
+        println!("  notice: {n}");
+    }
     let batch = provider
-        .create_batch(&[BatchRequest {
-            custom_id: "verify-1".into(),
-            request: req,
-        }])
+        .create_batch(&[entry.expect("batch request must negotiate")])
         .await
         .expect("create_batch");
     println!(

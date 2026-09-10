@@ -13,9 +13,9 @@ use std::collections::VecDeque;
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    retry_transient, with_negotiated, Capabilities, Capability, ChatRequest, ContentBlock, Event,
-    MediaSource, Message, Negotiated, OutputFormat, Provider, ProviderCaps, ProviderError, Role,
-    ServerTool, StopReason, ThinkingLevel, ToolChoice, Usage,
+    negotiate, retry_transient, with_negotiated, Capabilities, Capability, ChatRequest,
+    ContentBlock, Event, MediaSource, Message, Negotiated, OutputFormat, Provider, ProviderCaps,
+    ProviderError, Role, ServerTool, StopReason, ThinkingLevel, ToolChoice, Usage,
 };
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
@@ -79,14 +79,21 @@ impl GrpcTransport {
     /// Start a **deferred** (async) completion: submit the request and immediately receive a
     /// `request_id` to poll with [`poll_deferred`](Self::poll_deferred). Best for long jobs where
     /// holding a stream open is impractical; xAI keeps the result available for a limited window.
-    pub async fn start_deferred(&self, req: ChatRequest) -> Result<String, ProviderError> {
+    /// Notices raised while negotiating are returned alongside the request id: a deferred job has
+    /// no event stream either, so this is the only place they can reach the caller.
+    pub async fn start_deferred(
+        &self,
+        req: ChatRequest,
+    ) -> Result<(Vec<String>, String), ProviderError> {
+        let (notices, outcome) = negotiate::<XaiGrpcCaps>(req);
+        let nreq = outcome?;
         let mut client = self.connect().await?;
         let resp = client
-            .start_deferred_completion(self.authed(build_request(req))?)
+            .start_deferred_completion(self.authed(build_request(nreq))?)
             .await
             .map_err(status_to_err)?
             .into_inner();
-        Ok(resp.request_id)
+        Ok((notices, resp.request_id))
     }
 
     /// Poll a deferred completion by `request_id`. `Ok(None)` while still pending; `Ok(Some(events))`
@@ -168,8 +175,7 @@ impl GrpcTransport {
         &self,
         nreq: Negotiated<XaiGrpcCaps>,
     ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
-        let req = nreq.into_request();
-        let grpc_req = build_request(req);
+        let grpc_req = build_request(nreq);
 
         // Bounded exponential backoff on transient throttling (shared `retry_transient`): xAI returns
         // gRPC ResourceExhausted (→429) when rate-limited and Unavailable (→503) when overloaded;
@@ -401,7 +407,11 @@ fn status_to_err(status: tonic::Status) -> ProviderError {
 
 // --- request building: normalised ChatRequest → xAI GetCompletionsRequest ---
 
-fn build_request(req: ChatRequest) -> pb::GetCompletionsRequest {
+/// Build the proto request from a **negotiated** request. Taking [`Negotiated`] is what makes the
+/// capability check unskippable: the streaming path and the deferred path both have to negotiate
+/// before they can call this, or they do not compile.
+fn build_request(nreq: Negotiated<XaiGrpcCaps>) -> pb::GetCompletionsRequest {
+    let req = nreq.into_request();
     // Custom tools + any provider-executed server tools mapped to the proto `Tool` oneof.
     // (WebSearch is handled separately via `search_parameters`, below.)
     let mut tools = build_tools(&req);
@@ -733,6 +743,12 @@ fn build_tools(req: &ChatRequest) -> Vec<pb::Tool> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Negotiate a fixture so it can reach `build_request`, which now demands the receipt.
+    fn nr(req: ChatRequest) -> pb::GetCompletionsRequest {
+        let (_, out) = lvz_protocol::negotiate::<XaiGrpcCaps>(req);
+        build_request(out.expect("fixture must negotiate"))
+    }
     use super::*;
     use lvz_protocol::{Message, ToolDef};
     use serde_json::json;
@@ -761,7 +777,7 @@ mod tests {
             strict: false,
         });
 
-        let g = build_request(req);
+        let g = nr(req);
         assert_eq!(g.model, "grok-4");
         assert_eq!(g.max_tokens, Some(1024));
         assert_eq!(g.messages[0].role, pb::MessageRole::RoleSystem as i32);
@@ -787,7 +803,7 @@ mod tests {
             },
             ServerTool::CodeExecution,
         ];
-        let g = build_request(req);
+        let g = nr(req);
         // WebSearch → Live Search (AUTO mode) with the cap + allowed-domain web source.
         let sp = g.search_parameters.unwrap();
         assert_eq!(sp.mode, pb::SearchMode::AutoSearchMode as i32);
@@ -825,7 +841,7 @@ mod tests {
             .push(Message::user("go"))
             .push(assistant)
             .push(result);
-        let g = build_request(req);
+        let g = nr(req);
 
         // user("go"), assistant(tool_calls), tool(result)
         let asst = &g.messages[1];
@@ -1020,7 +1036,7 @@ mod tests {
             url: "https://mcp.example".into(),
             authorization_token: Some("tok".into()),
         }];
-        let g = build_request(req);
+        let g = nr(req);
         let xs = g
             .tools
             .iter()

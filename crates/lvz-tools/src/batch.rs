@@ -185,10 +185,19 @@ are several independent edits."
         let mut applied = 0usize;
         let mut lines: Vec<String> = Vec::new();
         let mut total = Usage::default();
+        // A batch has no event stream, so capability notices ride on each item. Every task in a
+        // batch is built from the same template against the same provider, so the same notice
+        // repeats on all of them — collect the distinct set and print it once rather than N times.
+        let mut notices: Vec<String> = Vec::new();
         for (i, (path, original)) in originals.iter().enumerate() {
             match by_id.remove(&i.to_string()) {
                 Some(item) => {
                     accumulate(&mut total, &item.usage);
+                    for n in &item.notices {
+                        if !notices.contains(n) {
+                            notices.push(n.clone());
+                        }
+                    }
                     if let Some(err) = item.error {
                         lines.push(format!("{path}: batch error ({err})"));
                         continue;
@@ -229,12 +238,18 @@ are several independent edits."
             lines.push(f.clone());
         }
 
+        let notice_block = if notices.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", notices.join("\n"))
+        };
         let summary = format!(
             "batch_edit: applied {applied}/{} edits via discounted batch (~50% token cost; tokens: \
-in={} out={}).\n{}",
+in={} out={}).{}\n{}",
             originals.len(),
             total.input_tokens,
             total.output_tokens,
+            notice_block,
             lines.join("\n")
         );
         // `applied` counts only writes that actually changed a file (unchanged/failed are skipped),
@@ -341,7 +356,7 @@ fn accumulate(total: &mut Usage, u: &Usage) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lvz_protocol::{BatchItem, ProviderError};
+    use lvz_protocol::{batch_item, BatchItem, ProviderError};
 
     /// A stand-in batch provider: returns each request's text uppercased (a deterministic, visible
     /// "edit") so the tool's read -> batch -> write path can be exercised without a network call.
@@ -361,15 +376,15 @@ mod tests {
                         .and_then(|s| s.split("\n```").next())
                         .unwrap_or_default()
                         .to_uppercase();
-                    BatchItem {
-                        custom_id: t.custom_id,
-                        text: body,
-                        usage: Usage {
+                    batch_item(
+                        t.custom_id,
+                        body,
+                        Usage {
                             output_tokens: 3,
                             ..Default::default()
                         },
-                        error: None,
-                    }
+                        None,
+                    )
                 })
                 .collect())
         }
