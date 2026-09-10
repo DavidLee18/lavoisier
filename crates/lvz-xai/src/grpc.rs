@@ -13,9 +13,9 @@ use std::collections::VecDeque;
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    retry_transient, Capabilities, ChatRequest, ContentBlock, Event, MediaSource, Message,
-    OutputFormat, Provider, ProviderError, Role, ServerTool, StopReason, ThinkingLevel, ToolChoice,
-    Usage,
+    retry_transient, with_negotiated, Capabilities, Capability, ChatRequest, ContentBlock, Event,
+    MediaSource, Message, Negotiated, OutputFormat, Provider, ProviderCaps, ProviderError, Role,
+    ServerTool, StopReason, ThinkingLevel, ToolChoice, Usage,
 };
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
@@ -124,12 +124,51 @@ impl GrpcTransport {
     }
 }
 
+/// The native gRPC transport's capability list — exactly what `build_request` maps.
+///
+/// Unlike the `/chat/completions` transport, this one really does map provider-run tools onto the
+/// proto `Tool` oneof (`CodeExecution`, `XSearch`, `CollectionsSearch`) and MCP servers onto
+/// `Tool::Mcp`, with `WebSearch` going to `search_parameters` — so they are declared here. No
+/// [`Capability::WebFetch`] (xAI has no equivalent) and no [`Capability::TopK`] (xAI honours
+/// temperature/top_p and not top_k, which is why `TopK` is split from `Sampling` at all).
+pub struct XaiGrpcCaps;
+
+impl ProviderCaps for XaiGrpcCaps {
+    const CAPS: &'static [Capability] = &[
+        Capability::Vision,
+        Capability::Sampling,
+        Capability::StopSequences,
+        Capability::ToolChoiceControl,
+        Capability::WebSearch,
+        Capability::CodeExecution,
+        Capability::XSearch,
+        Capability::CollectionsSearch,
+        Capability::RemoteMcp,
+    ];
+}
+
 #[async_trait]
 impl Provider for GrpcTransport {
+    /// Negotiate, then send: this method is the negotiation call and nothing else, so the check
+    /// cannot be forgotten and its notices cannot be dropped.
     async fn stream(
         &self,
         req: ChatRequest,
     ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
+        with_negotiated::<XaiGrpcCaps, _, _>(req, |nreq| self.send(nreq)).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        XaiGrpcCaps::declare()
+    }
+}
+
+impl GrpcTransport {
+    async fn send(
+        &self,
+        nreq: Negotiated<XaiGrpcCaps>,
+    ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
+        let req = nreq.into_request();
         let grpc_req = build_request(req);
 
         // Bounded exponential backoff on transient throttling (shared `retry_transient`): xAI returns
@@ -180,18 +219,6 @@ impl Provider for GrpcTransport {
         });
 
         Ok(events.boxed())
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            // xAI caches automatically server-side; we don't honour request-side cache markers.
-            prompt_caching: false,
-            extended_thinking: false,
-            parallel_tool_use: true,
-            // The native path exposes provider-executed tools (web/x search, code exec, …).
-            server_side_tools: true,
-            vision: true,
-        }
     }
 }
 
@@ -411,8 +438,10 @@ fn build_request(req: ChatRequest) -> pb::GetCompletionsRequest {
                     },
                 )));
             }
-            // WebSearch → search_parameters; WebFetch has no xAI equivalent.
-            ServerTool::WebSearch { .. } | ServerTool::WebFetch { .. } => {}
+            // WebSearch → search_parameters; WebFetch and Gemini's url_context have no xAI
+            // equivalent (neither is declared, so negotiate refuses them before reaching here).
+            ServerTool::WebSearch { .. } | ServerTool::WebFetch { .. } | ServerTool::UrlContext => {
+            }
         }
     }
     // MCP servers are a `Tool` variant on the xAI proto (Anthropic uses a top-level field).

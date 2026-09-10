@@ -107,6 +107,14 @@ pub enum ServerTool {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
     },
+    /// Provider-side fetch of URLs named in the prompt (Gemini `url_context`, sent as
+    /// `urlContext`). Gemini-specific — other providers ignore it.
+    ///
+    /// Gemini's **Maps grounding** and **File Search** are deliberately absent: both are documented
+    /// only for the Interactions API, whose `tools[]` is shaped differently from
+    /// `generateContent`'s, and Google publishes no `generateContent` example for either. Do not
+    /// add them by guessing a wire format.
+    UrlContext,
 }
 
 /// An Anthropic-defined tool whose argument schema the model already knows — declared by a

@@ -104,7 +104,7 @@ impl ContextKey {
     fn of(ctx: &TaskContext) -> Self {
         Self {
             archetype: ctx.archetype,
-            caching: ctx.caps.prompt_caching,
+            caching: ctx.caps.prompt_caching(),
             model: ctx.model,
             model_id: ctx.model_id.clone(),
             repo_id: ctx.repo_id.clone(),
@@ -426,7 +426,7 @@ pub(crate) fn next_f64(state: &mut u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lvz_protocol::{Capabilities, RepoProfile};
+    use lvz_protocol::{Capabilities, Capability, RepoProfile};
 
     fn ctx() -> TaskContext {
         TaskContext {
@@ -543,9 +543,9 @@ mod tests {
             decay: 1.0,
         });
         let mut cached = ctx();
-        cached.caps.prompt_caching = true;
+        cached.caps = Capabilities::from_list(&[Capability::PromptCaching]);
         let mut uncached = ctx();
-        uncached.caps.prompt_caching = false;
+        uncached.caps = Capabilities::none();
 
         let cheaper = Knobs {
             batch_width: 8,

@@ -25,8 +25,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    retry_transient, Capabilities, ChatRequest, ContentBlock, Event, MediaSource, Message,
-    OutputFormat, Provider, ProviderError, Role, ServerTool, ThinkingLevel, ToolChoice,
+    retry_transient, with_negotiated, Capabilities, Capability, ChatRequest, ContentBlock, Event,
+    MediaSource, Message, Negotiated, OutputFormat, Provider, ProviderCaps, ProviderError, Role,
+    ServerTool, ThinkingLevel, ToolChoice,
 };
 use serde_json::{json, Value};
 
@@ -313,12 +314,59 @@ impl GoogleProvider {
     }
 }
 
+/// Gemini's capability list, named **once** so the declaration and the
+/// [`negotiate`](lvz_protocol::negotiate) call cannot drift apart.
+///
+/// No [`Capability::PromptCaching`]: Gemini caches implicitly server-side and we emit no
+/// request-side cache markers (hits still surface as `cache_read` in usage). No
+/// [`Capability::WebFetch`] either — Gemini has no equivalent, so the mapper skips it and the
+/// declaration must say so rather than let it be dropped in silence.
+///
+/// Maps grounding and File Search are deliberately absent: both are documented only for the
+/// Interactions API, whose `tools[]` differs from `generateContent`'s. Do not add them by guessing.
+pub struct GoogleCaps;
+
+impl ProviderCaps for GoogleCaps {
+    const CAPS: &'static [Capability] = &[
+        Capability::ExtendedThinking,
+        Capability::Vision,
+        Capability::WebSearch,
+        Capability::CodeExecution,
+        Capability::UrlContext,
+        Capability::Sampling,
+        Capability::TopK,
+        Capability::StopSequences,
+        Capability::StructuredOutput,
+        Capability::ToolChoiceControl,
+    ];
+}
+
 #[async_trait]
 impl Provider for GoogleProvider {
+    /// Negotiate, then send: this method is the negotiation call and nothing else, so the check
+    /// cannot be forgotten and its notices cannot be dropped.
     async fn stream(
         &self,
         req: ChatRequest,
     ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
+        with_negotiated::<GoogleCaps, _, _>(req, |nreq| self.send(nreq)).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        GoogleCaps::declare()
+    }
+
+    async fn count_tokens(&self, req: &ChatRequest) -> Result<Option<u64>, ProviderError> {
+        self.count_tokens_inner(req).await
+    }
+}
+
+impl GoogleProvider {
+    async fn send(
+        &self,
+        nreq: Negotiated<GoogleCaps>,
+    ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
+        let req = nreq.into_request();
         let mut body = build_body(
             &req,
             self.thinking.as_deref(),
@@ -397,21 +445,9 @@ impl Provider for GoogleProvider {
         Ok(events.boxed())
     }
 
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            // Gemini caches implicitly server-side; we emit no request-side cache markers (cache
-            // hits still surface as `cache_read` in usage), so we don't advertise prompt_caching.
-            prompt_caching: false,
-            extended_thinking: true,
-            parallel_tool_use: true,
-            server_side_tools: false,
-            vision: true,
-        }
-    }
-
     /// Native token counting via `models/{model}:countTokens` (the Generative Language API's own
     /// counter), so pre-flight budgeting is exact rather than estimated.
-    async fn count_tokens(&self, req: &ChatRequest) -> Result<Option<u64>, ProviderError> {
+    async fn count_tokens_inner(&self, req: &ChatRequest) -> Result<Option<u64>, ProviderError> {
         let body = json!({ "contents": build_contents(&req.messages) });
         let url = format!(
             "{}/v1beta/models/{}:countTokens",
@@ -492,6 +528,10 @@ fn build_body(
         match st {
             ServerTool::WebSearch { .. } => tools.push(json!({ "googleSearch": {} })),
             ServerTool::CodeExecution => tools.push(json!({ "codeExecution": {} })),
+            // Documented for `generateContent` (unlike Maps grounding and File Search), so it is
+            // declared and mapped. Note the camelCase key — the docs' `url_context` is the
+            // Interactions-API spelling.
+            ServerTool::UrlContext => tools.push(json!({ "urlContext": {} })),
             ServerTool::WebFetch { .. } => {} // no direct Gemini equivalent
             // xAI-specific provider tools — no Gemini equivalent.
             ServerTool::XSearch { .. } | ServerTool::CollectionsSearch { .. } => {}

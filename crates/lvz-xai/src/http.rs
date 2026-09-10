@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    retry_transient, Capabilities, ChatRequest, ContentBlock, Event, MediaSource, OutputFormat,
-    Provider, ProviderError, Role, ServerTool, StopReason, ThinkingLevel, ToolChoice, Usage,
+    retry_transient, with_negotiated, Capabilities, Capability, ChatRequest, ContentBlock, Event,
+    MediaSource, Negotiated, OutputFormat, Provider, ProviderCaps, ProviderError, Role, ServerTool,
+    StopReason, ThinkingLevel, ToolChoice, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -44,12 +45,48 @@ impl HttpTransport {
     }
 }
 
+/// The `/chat/completions` transport's capability list.
+///
+/// **No provider-run tools.** xAI retired Live Search on this endpoint (410 Gone since
+/// 2026-01-12), so a server tool offered here would be mapped to nothing and dropped in silence —
+/// exactly the failure the per-tool capabilities exist to surface. Provider-run tools live on the
+/// Responses transport instead. xAI caches server-side with no request markers, hence no
+/// [`Capability::PromptCaching`], and grok reasons automatically with no request-side control,
+/// hence no [`Capability::ExtendedThinking`].
+pub struct XaiHttpCaps;
+
+impl ProviderCaps for XaiHttpCaps {
+    const CAPS: &'static [Capability] = &[
+        Capability::Vision,
+        Capability::Sampling,
+        Capability::StopSequences,
+        Capability::StructuredOutput,
+        Capability::ToolChoiceControl,
+    ];
+}
+
 #[async_trait]
 impl Provider for HttpTransport {
+    /// Negotiate, then send: this method is the negotiation call and nothing else, so the check
+    /// cannot be forgotten and its notices cannot be dropped.
     async fn stream(
         &self,
         req: ChatRequest,
     ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
+        with_negotiated::<XaiHttpCaps, _, _>(req, |nreq| self.send(nreq)).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        XaiHttpCaps::declare()
+    }
+}
+
+impl HttpTransport {
+    async fn send(
+        &self,
+        nreq: Negotiated<XaiHttpCaps>,
+    ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
+        let req = nreq.into_request();
         let body = OaiRequest {
             messages: build_messages(&req),
             tools: build_tools(&req),
@@ -137,16 +174,6 @@ impl Provider for HttpTransport {
         });
 
         Ok(events.boxed())
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            prompt_caching: false,
-            extended_thinking: false,
-            parallel_tool_use: true,
-            server_side_tools: false,
-            vision: true,
-        }
     }
 }
 

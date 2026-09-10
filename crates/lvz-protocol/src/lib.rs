@@ -37,7 +37,10 @@ pub use message::{
     BuiltinTool, ChatRequest, ContentBlock, McpServer, MediaSource, Message, OutputFormat, Role,
     ServerTool, SystemPrompt, ThinkingLevel, ToolChoice, ToolDef,
 };
-pub use provider::{Capabilities, Provider, ProviderError};
+pub use provider::{
+    builtin_tool_capability, negotiate, server_tool_capability, with_negotiated, Capabilities,
+    Capability, Negotiated, Provider, ProviderCaps, ProviderError,
+};
 pub use retry::{is_transient_status, retry_transient};
 pub use telemetry::{TaskTelemetry, TelemetrySink};
 pub use tool::{Tool, ToolError, ToolOutput};
@@ -81,9 +84,19 @@ mod tests {
     #[test]
     fn default_capabilities_are_conservative() {
         let caps = Capabilities::default();
-        assert!(!caps.prompt_caching);
-        assert!(!caps.extended_thinking);
-        assert!(!caps.parallel_tool_use);
-        assert!(!caps.server_side_tools);
+        for c in Capability::ALL {
+            assert!(!caps.supports(*c), "{c:?} should not be on by default");
+        }
+    }
+
+    #[test]
+    fn capability_all_is_complete() {
+        // `Capabilities::all()` is built from `Capability::ALL`, so a variant missing from that
+        // list would silently never be advertised by anything. Round-trip catches the omission.
+        let all = Capabilities::all();
+        for c in Capability::ALL {
+            assert!(all.supports(*c));
+        }
+        assert_eq!(Capability::ALL.len(), 16);
     }
 }

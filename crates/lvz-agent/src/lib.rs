@@ -1262,7 +1262,7 @@ impl Observation<'_> {
             &realised,
             radius_traces,
             round_trips,
-            self.ctx.caps.prompt_caching,
+            self.ctx.caps.prompt_caching(),
             &self.config.cost_weights,
             self.config.radius_reexploration_risk,
         );
@@ -2263,10 +2263,10 @@ fn build_request(
     req.thinking = thinking;
     req.system = Some(SystemPrompt {
         text: system_with_knobs(&config.system, knobs),
-        cache: caps.prompt_caching,
+        cache: caps.prompt_caching(),
     });
     let mut defs = tool_defs.to_vec();
-    if caps.prompt_caching {
+    if caps.prompt_caching() {
         if let Some(last) = defs.last_mut() {
             last.cache = true; // breakpoint at the end of the stable tool-def prefix
         }
@@ -2281,7 +2281,7 @@ fn build_request(
                 0,
                 ContentBlock::Text {
                     text: format!("<repo_skeleton>\n{skeleton}\n</repo_skeleton>"),
-                    cache: caps.prompt_caching,
+                    cache: caps.prompt_caching(),
                 },
             );
         }
@@ -2400,7 +2400,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use futures::stream;
-    use lvz_protocol::{Tool, ToolError, ToolOutput};
+    use lvz_protocol::{Capability, Tool, ToolError, ToolOutput};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -2552,10 +2552,7 @@ mod tests {
         // one round-trip to the next, so a caching provider keeps hitting it; volatile per-turn
         // content (the budget-awareness progress note) must live only in the conversation tail.
         let config = AgentConfig::default();
-        let caps = Capabilities {
-            prompt_caching: true,
-            ..Default::default()
-        };
+        let caps = Capabilities::from_list(&[Capability::PromptCaching]);
         let knobs = Knobs::default();
         let defs = vec![ToolDef {
             name: "read_file".into(),
@@ -3851,10 +3848,7 @@ fn target() -> u32 { helper() + 10 }
     #[test]
     fn build_request_injects_cached_skeleton_prefix() {
         let config = AgentConfig::default();
-        let caps = Capabilities {
-            prompt_caching: true,
-            ..Capabilities::default()
-        };
+        let caps = Capabilities::from_list(&[Capability::PromptCaching]);
         let history = vec![Message::user("do the task")];
         let req = build_request(
             &config,
@@ -3889,10 +3883,7 @@ fn target() -> u32 { helper() + 10 }
     #[test]
     fn build_request_skeleton_uncached_when_provider_lacks_caching() {
         let config = AgentConfig::default();
-        let caps = Capabilities {
-            prompt_caching: false,
-            ..Capabilities::default()
-        };
+        let caps = Capabilities::none();
         let history = vec![Message::user("task")];
         let req = build_request(
             &config,

@@ -24,7 +24,8 @@ use std::process::Stdio;
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    Capabilities, ChatRequest, Event, Provider, ProviderError, Role, StopReason, Usage,
+    with_negotiated, Capabilities, Capability, ChatRequest, Event, Negotiated, Provider,
+    ProviderCaps, ProviderError, Role, StopReason, Usage,
 };
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -62,12 +63,38 @@ impl Default for ClaudeCliProvider {
     }
 }
 
+/// The claude-cli subscription path advertises **nothing**: it does no request-side caching, and
+/// `claude -p` runs its own tools opaquely, so none of the optional features are ours to offer.
+/// An empty list is a real declaration — every knob the caller sets degrades with a notice, and
+/// any image or provider-run tool is refused outright rather than silently ignored.
+pub struct ClaudeCliCaps;
+
+impl ProviderCaps for ClaudeCliCaps {
+    const CAPS: &'static [Capability] = &[];
+}
+
 #[async_trait]
 impl Provider for ClaudeCliProvider {
+    /// Negotiate, then send: this method is the negotiation call and nothing else, so the check
+    /// cannot be forgotten and its notices cannot be dropped.
     async fn stream(
         &self,
         req: ChatRequest,
     ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
+        with_negotiated::<ClaudeCliCaps, _, _>(req, |nreq| self.send(nreq)).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        ClaudeCliCaps::declare()
+    }
+}
+
+impl ClaudeCliProvider {
+    async fn send(
+        &self,
+        nreq: Negotiated<ClaudeCliCaps>,
+    ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
+        let req = nreq.into_request();
         let prompt = render_prompt(&req);
 
         let mut cmd = Command::new(&self.bin);
@@ -137,18 +164,6 @@ impl Provider for ClaudeCliProvider {
         });
 
         Ok(events.boxed())
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        // Subscription path: no caching, and `claude -p` runs its own tools opaquely, so we
-        // advertise none of the optional features.
-        Capabilities {
-            prompt_caching: false,
-            extended_thinking: false,
-            parallel_tool_use: false,
-            server_side_tools: false,
-            vision: false,
-        }
     }
 }
 

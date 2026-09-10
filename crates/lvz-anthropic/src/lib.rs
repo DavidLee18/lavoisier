@@ -21,9 +21,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    retry_transient, BuiltinTool, Capabilities, ChatRequest, ContentBlock, Event, MediaSource,
-    Message, OutputFormat, Provider, ProviderError, Role, ServerTool, SystemPrompt, ThinkingLevel,
-    ToolChoice, ToolDef,
+    retry_transient, with_negotiated, BuiltinTool, Capabilities, Capability, ChatRequest,
+    ContentBlock, Event, MediaSource, Message, Negotiated, OutputFormat, Provider, ProviderCaps,
+    ProviderError, Role, ServerTool, SystemPrompt, ThinkingLevel, ToolChoice, ToolDef,
 };
 use serde_json::{json, Value};
 
@@ -127,12 +127,56 @@ impl AnthropicProvider {
     }
 }
 
+/// Anthropic's capability list, named **once** so [`Provider::capabilities`] and the
+/// [`negotiate`](lvz_protocol::negotiate) call in `stream` cannot drift apart. The server-tool
+/// entries are exactly what [`build_server_tool`] maps — no more.
+pub struct AnthropicCaps;
+
+impl ProviderCaps for AnthropicCaps {
+    const CAPS: &'static [Capability] = &[
+        Capability::PromptCaching,
+        Capability::ExtendedThinking,
+        Capability::Vision,
+        Capability::WebSearch,
+        Capability::WebFetch,
+        Capability::CodeExecution,
+        Capability::ClientBuiltinTools,
+        Capability::RemoteMcp,
+        Capability::Sampling,
+        Capability::TopK,
+        Capability::StopSequences,
+        Capability::StructuredOutput,
+        Capability::ToolChoiceControl,
+    ];
+}
+
 #[async_trait]
 impl Provider for AnthropicProvider {
+    /// Negotiate, then send. This method is the negotiation call **and nothing else**, so the
+    /// check cannot be forgotten and the resulting notices cannot be dropped — they ride out on
+    /// the front of the event stream.
     async fn stream(
         &self,
         req: ChatRequest,
     ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
+        with_negotiated::<AnthropicCaps, _, _>(req, |nreq| self.send(nreq)).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        AnthropicCaps::declare()
+    }
+
+    async fn count_tokens(&self, req: &ChatRequest) -> Result<Option<u64>, ProviderError> {
+        self.count_tokens_inner(req).await
+    }
+}
+
+impl AnthropicProvider {
+    async fn send(
+        &self,
+        nreq: Negotiated<AnthropicCaps>,
+    ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
+        let req = nreq.into_request();
         let body = build_body(&req, self.extended_cache_ttl);
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
 
@@ -233,19 +277,8 @@ impl Provider for AnthropicProvider {
         Ok(events.boxed())
     }
 
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            prompt_caching: true,
-            extended_thinking: true,
-            parallel_tool_use: true,
-            // Provider-executed tools (web_search/web_fetch/code_execution) are declarable.
-            server_side_tools: true,
-            vision: true,
-        }
-    }
-
     /// Native token counting via `POST /v1/messages/count_tokens` (returns `usage.input_tokens`).
-    async fn count_tokens(&self, req: &ChatRequest) -> Result<Option<u64>, ProviderError> {
+    async fn count_tokens_inner(&self, req: &ChatRequest) -> Result<Option<u64>, ProviderError> {
         let body = build_count_body(req);
         let url = format!(
             "{}/v1/messages/count_tokens",
@@ -545,8 +578,10 @@ fn build_server_tool(tool: &ServerTool) -> Option<Value> {
         ServerTool::CodeExecution => {
             json!({ "type": "code_execution_20260120", "name": "code_execution" })
         }
-        // xAI-specific provider tools — no Anthropic equivalent.
-        ServerTool::XSearch { .. } | ServerTool::CollectionsSearch { .. } => return None,
+        // xAI-specific provider tools, and Gemini's url_context — no Anthropic equivalent.
+        ServerTool::XSearch { .. }
+        | ServerTool::CollectionsSearch { .. }
+        | ServerTool::UrlContext => return None,
     };
     Some(v)
 }
