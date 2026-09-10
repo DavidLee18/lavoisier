@@ -3,7 +3,8 @@
 # the file, which wins over the built-in default. Unknown keys are rejected (typos surface).
 
 [provider]
-# provider = "anthropic"        # xai | anthropic | google | claude-cli  (default: xai)
+# provider = "anthropic"        # xai | xai-responses | anthropic | google | claude-cli (default: xai)
+#                               # An unknown name is a load error, not a silently ignored field.
 # model    = "claude-..."       # default: the provider's default model
 # Fallback chain (ordered, each `provider:model`): if the primary model is unresponsive or errors
 # before streaming any output, the in-flight request is cancelled and the agent transparently

@@ -18,7 +18,7 @@ use lvz_memory::{FileStore, InMemoryStore, SessionStore};
 use lvz_protocol::ServerTool;
 use serde::Deserialize;
 
-use crate::{Cli, ProviderKind};
+use crate::{Cli, ModelRef, ProviderKind};
 
 /// The parsed `lavoisier.toml`. Every field is optional; a missing file yields all-default.
 #[derive(Debug, Default, Deserialize)]
@@ -56,10 +56,12 @@ pub struct LogSection {
 pub struct LegionSection {
     /// Debater specs, each `provider:model` (e.g. `anthropic:claude-opus-4-8`, `xai:grok-4`). Two
     /// or more required to convene. `--legion-debater` (repeatable) takes precedence.
-    pub debaters: Option<Vec<String>>,
+    ///
+    /// Typed, so a bad spec fails at config load rather than when the council first convenes.
+    pub debaters: Option<Vec<ModelRef>>,
     /// The judge spec, `provider:model`; defaults to the first debater. `--legion-judge` takes
     /// precedence.
-    pub judge: Option<String>,
+    pub judge: Option<ModelRef>,
     /// Critique rounds after the draft (default 1; 0 = draft then judge). `--legion-rounds` /
     /// `LVZ_LEGION_ROUNDS` take precedence.
     pub rounds: Option<usize>,
@@ -79,12 +81,18 @@ pub struct McpSection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderSection {
-    /// `xai` | `anthropic` | `google` | `claude-cli`.
-    pub provider: Option<String>,
+    /// Which provider to drive. A real enum, so an unknown name is a *load* error listing the
+    /// valid ones — as free text, `parse_provider` returned `None` and the value was silently
+    /// ignored, leaving the default provider running under a config that plainly said otherwise.
+    pub provider: Option<ProviderKind>,
     pub model: Option<String>,
     /// Ordered fallback chain, each `provider:model`. If the primary is unresponsive or errors
     /// before streaming output, the agent retries on the next. `--fallback` (repeatable) wins.
-    pub fallback: Option<Vec<String>>,
+    ///
+    /// Deserialised as [`ModelRef`], so an unknown provider or a missing `:model` half is a
+    /// **config-load** error naming the entry, rather than surfacing the first time the primary
+    /// model fails — which is the rare path, mid-run, and the worst moment to discover a typo.
+    pub fallback: Option<Vec<ModelRef>>,
     /// Seconds a failed fallback model stays demoted before re-probe (circuit breaker; default 60).
     /// `--fallback-cooldown` / `LVZ_FALLBACK_COOLDOWN` take precedence.
     pub fallback_cooldown: Option<u64>,
@@ -197,13 +205,27 @@ pub struct AgentSection {
 #[serde(default, deny_unknown_fields)]
 pub struct MemorySection {
     /// `memory` (default, process-local) or `file` (durable; needs `path`).
-    pub store: Option<String>,
+    ///
+    /// A real enum, so a typo is a *load* error listing the valid values rather than one caught by
+    /// a `match` arm buried in store construction — and impossible to reach at all from the
+    /// `deny_unknown_fields` sections around it.
+    pub store: Option<StoreKind>,
     /// Directory for the `file` store.
     pub path: Option<PathBuf>,
     /// Cap each session to its most recent N messages.
     pub max_messages: Option<usize>,
     /// Keep at most N sessions (LRU eviction); in-memory store only.
     pub max_sessions: Option<usize>,
+}
+
+/// Which session store `[memory]` describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreKind {
+    /// Process-local, lost on restart. The default.
+    Memory,
+    /// Durable, on disk; requires `memory.path`.
+    File,
 }
 
 /// `[gateway]` — serve addresses, auth, and rate limit.
@@ -297,9 +319,7 @@ impl Config {
     pub fn apply_to(&self, cli: &mut Cli) {
         // [provider]
         if cli.provider.is_none() {
-            if let Some(p) = self.provider.provider.as_deref().and_then(parse_provider) {
-                cli.provider = Some(p);
-            }
+            cli.provider = self.provider.provider;
         }
         merge(&mut cli.model, &self.provider.model);
         // A Vec flag: the file supplies it only when the CLI passed none (CLI wins wholesale).
@@ -385,12 +405,14 @@ impl Config {
 
     /// Build the session store described by `[memory]` (`memory` store unless `store = "file"`).
     pub fn build_session_store(&self) -> Result<Arc<dyn SessionStore>, String> {
-        match self.memory.store.as_deref() {
-            None | Some("memory") => Ok(Arc::new(InMemoryStore::with_limits(
+        // No unknown-value arm: an invalid `store` can no longer reach here, because serde
+        // rejects it at load with the accepted values named.
+        match self.memory.store.unwrap_or(StoreKind::Memory) {
+            StoreKind::Memory => Ok(Arc::new(InMemoryStore::with_limits(
                 self.memory.max_messages,
                 self.memory.max_sessions,
             ))),
-            Some("file") => {
+            StoreKind::File => {
                 let dir =
                     self.memory.path.clone().ok_or_else(|| {
                         "memory.store = \"file\" requires memory.path".to_string()
@@ -399,9 +421,6 @@ impl Config {
                     FileStore::new(dir).with_max_messages(self.memory.max_messages),
                 ))
             }
-            Some(other) => Err(format!(
-                "unknown memory.store {other:?} (expected \"memory\" or \"file\")"
-            )),
         }
     }
 }
@@ -421,6 +440,21 @@ fn merge_copy<T>(target: &mut Option<T>, from: Option<T>) {
 }
 
 /// Parse a `[provider] provider` string into a [`ProviderKind`] (matching the CLI value names).
+/// Deserialised through [`parse_provider`] rather than derived, so the underscore/compact aliases
+/// (`claude_cli`, `claudecli`, `xai_responses`) an existing config may already use keep working —
+/// a derive would have quietly started rejecting them. An unknown name now names the valid set
+/// instead of being ignored.
+impl<'de> serde::Deserialize<'de> for ProviderKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        parse_provider(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown provider {s:?} (expected xai|xai-responses|anthropic|google|claude-cli)"
+            ))
+        })
+    }
+}
+
 fn parse_provider(s: &str) -> Option<ProviderKind> {
     match s.to_ascii_lowercase().as_str() {
         "xai" => Some(ProviderKind::Xai),
@@ -459,10 +493,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.provider.provider.as_deref(), Some("anthropic"));
+        assert_eq!(cfg.provider.provider, Some(ProviderKind::Anthropic));
         assert_eq!(cfg.agent.compact_after, Some(50000));
         assert_eq!(cfg.agent.require_edit, Some(true));
-        assert_eq!(cfg.memory.store.as_deref(), Some("file"));
+        assert_eq!(cfg.memory.store, Some(StoreKind::File));
         assert_eq!(
             cfg.gateway.api_keys.as_deref(),
             Some(&["k1".to_string(), "k2".to_string()][..])
@@ -592,14 +626,14 @@ mod tests {
             cfg.legion.debaters.as_deref(),
             Some(
                 &[
-                    "anthropic:claude-opus-4-8".to_string(),
-                    "xai:grok-4".to_string()
+                    "anthropic:claude-opus-4-8".parse().unwrap(),
+                    "xai:grok-4".parse().unwrap()
                 ][..]
             )
         );
         assert_eq!(
-            cfg.legion.judge.as_deref(),
-            Some("anthropic:claude-opus-4-8")
+            cfg.legion.judge.as_ref(),
+            Some(&"anthropic:claude-opus-4-8".parse::<ModelRef>().unwrap())
         );
         assert_eq!(cfg.legion.rounds, Some(2));
 
@@ -774,5 +808,79 @@ kind = "code_execution"
             let c: Config = toml::from_str(&src).expect("kind must parse");
             assert_eq!(c.provider.server_tools.expect("present").len(), 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod typed_config_tests {
+    use super::*;
+
+    #[test]
+    fn a_bad_fallback_spec_fails_at_load_not_at_use() {
+        // As a packed String this parsed only when the primary model failed — the rare path,
+        // mid-run, the worst moment to discover a typo.
+        let err = toml::from_str::<Config>("[provider]\nfallback = [\"anthropc:claude\"]\n")
+            .expect_err("an unknown provider must fail the load");
+        assert!(err.to_string().contains("anthropc"), "{err}");
+
+        let err = toml::from_str::<Config>("[provider]\nfallback = [\"claude-opus-4-8\"]\n")
+            .expect_err("a spec with no provider half must fail the load");
+        assert!(err.to_string().contains("provider:model"), "{err}");
+
+        let err = toml::from_str::<Config>("[provider]\nfallback = [\"anthropic:\"]\n")
+            .expect_err("an empty model half must fail the load");
+        assert!(err.to_string().contains("empty model"), "{err}");
+    }
+
+    #[test]
+    fn a_good_fallback_chain_parses_to_typed_pairs() {
+        let c: Config = toml::from_str(
+            "[provider]\nfallback = [\"anthropic:claude-sonnet-4-6\", \"xai:grok-4\"]\n",
+        )
+        .expect("valid chain");
+        let chain = c.provider.fallback.expect("present");
+        assert_eq!(chain[0].provider, ProviderKind::Anthropic);
+        assert_eq!(chain[0].model, "claude-sonnet-4-6");
+        assert_eq!(chain[1].provider, ProviderKind::Xai);
+        // Round-trips through the canonical spelling.
+        assert_eq!(chain[1].to_string(), "xai:grok-4");
+    }
+
+    #[test]
+    fn legion_specs_are_typed_too() {
+        let err = toml::from_str::<Config>("[legion]\njudge = \"nope:m\"\n")
+            .expect_err("an unknown judge provider must fail the load");
+        assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_provider_name_is_rejected_rather_than_ignored() {
+        // As free text this returned None from `parse_provider` and was silently dropped, leaving
+        // the default provider running under a config that plainly said otherwise.
+        let err = toml::from_str::<Config>("[provider]\nprovider = \"antropic\"\n")
+            .expect_err("must fail");
+        assert!(err.to_string().contains("antropic"), "{err}");
+    }
+
+    #[test]
+    fn provider_aliases_still_parse() {
+        // These spellings predate the typed field; a derive would have started rejecting them.
+        for (src, want) in [
+            ("claude_cli", ProviderKind::ClaudeCli),
+            ("claudecli", ProviderKind::ClaudeCli),
+            ("claude-cli", ProviderKind::ClaudeCli),
+            ("xai_responses", ProviderKind::XaiResponses),
+            ("xai-responses", ProviderKind::XaiResponses),
+        ] {
+            let c: Config = toml::from_str(&format!("[provider]\nprovider = \"{src}\"\n"))
+                .unwrap_or_else(|e| panic!("{src} must parse: {e}"));
+            assert_eq!(c.provider.provider, Some(want), "{src}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_memory_store_is_rejected_at_load() {
+        let err = toml::from_str::<Config>("[memory]\nstore = \"redis\"\n").expect_err("must fail");
+        assert!(err.to_string().contains("redis") || err.to_string().contains("unknown variant"));
     }
 }

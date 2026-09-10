@@ -189,11 +189,11 @@ struct Cli {
     /// before it acts (--agent/--serve). Supersedes --advisor-model. Each named provider needs its
     /// API key in the env. E.g. `--legion-debater anthropic:claude-opus-4-8 --legion-debater xai:grok-4`.
     #[arg(long = "legion-debater", value_name = "PROVIDER:MODEL")]
-    legion_debater: Vec<String>,
+    legion_debater: Vec<ModelRef>,
 
     /// The legion judge, `provider:model`. Defaults to the first --legion-debater.
     #[arg(long = "legion-judge", value_name = "PROVIDER:MODEL")]
-    legion_judge: Option<String>,
+    legion_judge: Option<ModelRef>,
 
     /// A **fallback model**, `provider:model` (repeatable, ordered). If the primary model is
     /// unresponsive or errors *before streaming any output* for a round-trip (a connect timeout,
@@ -202,7 +202,7 @@ struct Cli {
     /// first-class; each named provider needs its API key in the env. Once a model fails it is
     /// skipped for the rest of the turn. E.g. `--fallback anthropic:claude-sonnet-4-6 --fallback google:gemini-3-flash-preview`.
     #[arg(long = "fallback", value_name = "PROVIDER:MODEL")]
-    fallback: Vec<String>,
+    fallback: Vec<ModelRef>,
 
     /// Seconds a failed fallback-chain model stays demoted before it's re-probed (circuit breaker;
     /// default 60). A model that is unresponsive/errors is skipped from the start of subsequent
@@ -475,14 +475,17 @@ struct Cli {
     no_batch_edit: bool,
 }
 
+/// Which model backend to drive. Public because [`ModelRef`] names one.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
-enum ProviderKind {
+pub enum ProviderKind {
+    /// xAI over `/chat/completions` (or native gRPC via `XAI_TRANSPORT=grpc`).
     Xai,
     /// xAI's **Responses API** (`/v1/responses`) — the Agent-Tools transport, and the *only* xAI
     /// route to provider-run tools: Live Search on `chat/completions` has been 410 Gone since
     /// 2026-01-12. Pair it with `--server-tools web_search,x_search,code_execution`.
     #[value(name = "xai-responses")]
     XaiResponses,
+    /// Anthropic's native Messages API — the only transport with prompt caching.
     Anthropic,
     /// Google Gemini (native Generative Language API). Enables same-model benchmarking vs. agents
     /// that run on `gemini-3-flash-preview` (see `bench/README.md`).
@@ -509,6 +512,50 @@ impl From<ThinkingBudgetArg> for ThinkingLevel {
             ThinkingBudgetArg::High => ThinkingLevel::High,
         }
     }
+}
+
+/// Reject knobs set without the thing they configure.
+///
+/// `--tune-state`/`--tune-decay` are read *only* inside the `--tune`/`--tune-bayes` branches, and
+/// `--legion-judge`/`--legion-rounds` only when there are debaters, so on their own they loaded
+/// fine and were dropped in silence — no learning, no persisted file, no council, no explanation.
+/// A flag the program ignores is worse than one it rejects.
+///
+/// Runs in the early validation pass, *before* any provider is constructed, so the user sees the
+/// real problem rather than whichever API key happens to be missing.
+fn validate_orphaned_flags(cli: &Cli) -> Result<(), String> {
+    if !cli.tune && !cli.tune_bayes {
+        let orphans: Vec<&str> = [
+            cli.tune_state.is_some().then_some("--tune-state"),
+            cli.tune_decay.is_some().then_some("--tune-decay"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !orphans.is_empty() {
+            return Err(format!(
+                "{} set without --tune or --tune-bayes: there is no learner to persist or decay",
+                orphans.join(" and ")
+            ));
+        }
+    }
+    if cli.legion_debater.is_empty() {
+        // A judge or a round count with nobody to judge configures nothing.
+        let orphans: Vec<&str> = [
+            cli.legion_judge.is_some().then_some("--legion-judge"),
+            cli.legion_rounds.is_some().then_some("--legion-rounds"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !orphans.is_empty() {
+            return Err(format!(
+                "{} set without any --legion-debater: a council needs at least 2 debaters",
+                orphans.join(" and ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Reject a resolved provider-run tool that cannot do anything.
@@ -794,6 +841,7 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
     let config = Config::load(cli.config.as_deref())?;
     config.apply_to(&mut cli);
     validate_resolved_server_tools(&cli.resolved_server_tools)?;
+    validate_orphaned_flags(&cli)?;
 
     // Install the logging collector as early as possible — right after precedence is resolved, so
     // `[log] level` counts, and before any work worth logging happens.
@@ -1171,17 +1219,87 @@ fn load_persona(cli: &Cli) -> Option<String> {
 /// Parse a `provider:model` spec (e.g. `anthropic:claude-opus-4-8`) into its [`ProviderKind`] and
 /// model id. Shared by legion debater/judge specs and `--fallback` specs; the provider names match
 /// the `--provider` value set.
-fn parse_provider_spec(spec: &str) -> Result<(ProviderKind, String), String> {
-    let (prov, model) = spec.split_once(':').ok_or_else(|| {
-        format!("bad spec {spec:?}: expected `provider:model` (e.g. `anthropic:claude-opus-4-8`)")
-    })?;
-    if model.is_empty() {
-        return Err(format!("bad spec {spec:?}: empty model after `:`"));
+/// A provider paired with one of its models — the parsed form of a `provider:model` spec.
+///
+/// A **type, not a packed string**, because the string form let the pair be wrong in ways nothing
+/// checked until the value was used: `--legion-judge anthropic:typo` or a `[provider] fallback`
+/// entry naming a provider that does not exist used to parse at the moment the council convened or
+/// the primary model failed — i.e. mid-run, on the rare path, long after the config was read.
+/// Parsing at the boundary means a bad spec is a *startup* error naming the offending entry.
+///
+/// It also cannot disagree with itself the way the old `{provider, model}` pair could: there is one
+/// constructor and it validates both halves together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRef {
+    /// Which provider serves this model.
+    pub provider: ProviderKind,
+    /// The provider-specific model id.
+    pub model: String,
+}
+
+impl ModelRef {
+    /// The provider's canonical CLI spelling (`xai-responses`, `claude-cli`, …).
+    fn provider_name(&self) -> &'static str {
+        <ProviderKind as ValueEnum>::to_possible_value(&self.provider)
+            .map(|v| v.get_name().to_string().leak() as &'static str)
+            .unwrap_or("")
     }
-    let kind = <ProviderKind as ValueEnum>::from_str(prov, true).map_err(|_| {
-        format!("bad spec {spec:?}: unknown provider {prov:?} (expected xai|anthropic|google|claude-cli)")
-    })?;
-    Ok((kind, model.to_string()))
+}
+
+impl std::fmt::Display for ModelRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.provider_name(), self.model)
+    }
+}
+
+impl std::str::FromStr for ModelRef {
+    type Err = String;
+
+    fn from_str(spec: &str) -> Result<Self, Self::Err> {
+        let (prov, model) = spec.split_once(':').ok_or_else(|| {
+            format!(
+                "bad spec {spec:?}: expected `provider:model` (e.g. `anthropic:claude-opus-4-8`)"
+            )
+        })?;
+        if model.is_empty() {
+            return Err(format!("bad spec {spec:?}: empty model after `:`"));
+        }
+        let provider = <ProviderKind as ValueEnum>::from_str(prov, true).map_err(|_| {
+            // Derived from the enum rather than hard-coded, so adding a provider updates the
+            // message. A stale list here is how `xai-responses` would have gone unmentioned.
+            let names: Vec<String> = ProviderKind::value_variants()
+                .iter()
+                .filter_map(<ProviderKind as ValueEnum>::to_possible_value)
+                .map(|v| v.get_name().to_string())
+                .collect();
+            format!(
+                "bad spec {spec:?}: unknown provider {prov:?} (expected {})",
+                names.join("|")
+            )
+        })?;
+        Ok(ModelRef {
+            provider,
+            model: model.to_string(),
+        })
+    }
+}
+
+/// Compare against the canonical `provider:model` spelling. Keeps assertions and log matching
+/// readable now that the field is a type rather than the string it came from.
+impl PartialEq<&str> for ModelRef {
+    fn eq(&self, other: &&str) -> bool {
+        match other.split_once(':') {
+            Some((p, m)) => self.model == m && self.provider_name() == p,
+            None => false,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ModelRef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 /// An ordered fallback chain: `(provider, model)` pairs the agent reroutes to when the primary is
@@ -1199,11 +1317,11 @@ fn build_fallbacks(
 ) -> Result<FallbackChain, Box<dyn std::error::Error>> {
     let mut chain = Vec::with_capacity(cli.fallback.len());
     for spec in &cli.fallback {
-        let (kind, model) = parse_provider_spec(spec)?;
-        let (provider, _batch) = kind
+        let (provider, _batch) = spec
+            .provider
             .build(thinking, serving)
-            .map_err(|e| format!("fallback {spec:?}: {e}"))?;
-        chain.push((provider, model));
+            .map_err(|e| format!("fallback {spec}: {e}"))?;
+        chain.push((provider, spec.model.clone()));
     }
     if !chain.is_empty() {
         tracing::info!(fallbacks = chain.len(), "fallback chain configured");
@@ -1241,6 +1359,9 @@ fn build_legion(
     serving: bool,
 ) -> Result<Option<Arc<dyn Deliberator>>, Box<dyn std::error::Error>> {
     if cli.legion_debater.is_empty() {
+        // Orphaned --legion-judge/--legion-rounds are rejected earlier, by
+        // `validate_orphaned_flags`, so that the user sees the real problem rather than whichever
+        // API key happens to be missing.
         return Ok(None);
     }
     if cli.legion_debater.len() < 2 {
@@ -1249,12 +1370,17 @@ fn build_legion(
                 .into(),
         );
     }
-    let build_one = |spec: &str| -> Result<Debater, Box<dyn std::error::Error>> {
-        let (kind, model) = parse_provider_spec(spec)?;
-        let (provider, _batch) = kind
+    let build_one = |spec: &ModelRef| -> Result<Debater, Box<dyn std::error::Error>> {
+        let (provider, _batch) = spec
+            .provider
             .build(thinking, serving)
-            .map_err(|e| format!("legion debater {spec:?}: {e}"))?;
-        Ok(Debater::new(spec, provider, model, None))
+            .map_err(|e| format!("legion debater {spec}: {e}"))?;
+        Ok(Debater::new(
+            spec.to_string(),
+            provider,
+            spec.model.clone(),
+            None,
+        ))
     };
     let mut debaters = Vec::with_capacity(cli.legion_debater.len());
     for spec in &cli.legion_debater {
@@ -1660,26 +1786,40 @@ mod tests {
     }
 
     #[test]
-    fn legion_spec_parses_provider_and_model() {
-        assert_eq!(
-            parse_provider_spec("anthropic:claude-opus-4-8").unwrap(),
-            (ProviderKind::Anthropic, "claude-opus-4-8".to_string())
-        );
-        assert_eq!(
-            parse_provider_spec("xai:grok-4").unwrap(),
-            (ProviderKind::Xai, "grok-4".to_string())
-        );
-        assert_eq!(
-            parse_provider_spec("google:gemini-3").unwrap(),
-            (ProviderKind::Google, "gemini-3".to_string())
-        );
+    fn model_ref_parses_provider_and_model() {
+        for (spec, provider, model) in [
+            (
+                "anthropic:claude-opus-4-8",
+                ProviderKind::Anthropic,
+                "claude-opus-4-8",
+            ),
+            ("xai:grok-4", ProviderKind::Xai, "grok-4"),
+            ("google:gemini-3", ProviderKind::Google, "gemini-3"),
+            (
+                "xai-responses:grok-4.6",
+                ProviderKind::XaiResponses,
+                "grok-4.6",
+            ),
+        ] {
+            let r: ModelRef = spec.parse().unwrap_or_else(|e| panic!("{spec}: {e}"));
+            assert_eq!(r.provider, provider);
+            assert_eq!(r.model, model);
+            // Round-trips through the canonical spelling, which is what the comparison and every
+            // error message use.
+            assert_eq!(r.to_string(), spec);
+            assert_eq!(r, spec);
+        }
     }
 
     #[test]
-    fn legion_spec_rejects_bad_forms() {
-        assert!(parse_provider_spec("no-colon").is_err()); // missing `:`
-        assert!(parse_provider_spec("bogus:model").is_err()); // unknown provider
-        assert!(parse_provider_spec("anthropic:").is_err()); // empty model
+    fn model_ref_rejects_bad_forms() {
+        for bad in ["no-colon", "bogus:model", "anthropic:"] {
+            assert!(bad.parse::<ModelRef>().is_err(), "{bad} should not parse");
+        }
+        // The unknown-provider message lists the real set, derived from the enum rather than
+        // hard-coded, so adding a provider cannot leave it stale.
+        let err = "bogus:model".parse::<ModelRef>().unwrap_err();
+        assert!(err.contains("xai-responses"), "{err}");
     }
 
     #[test]
