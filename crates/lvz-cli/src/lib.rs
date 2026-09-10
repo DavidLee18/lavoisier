@@ -34,7 +34,8 @@ use lvz_mcp::McpServerSpec;
 use lvz_memory::SessionAgent;
 use lvz_protocol::{
     AgentHandle, BatchProvider, ChatRequest, CostWeights, Deliberator, Event, Gateway, Knobs,
-    Message, Outcome, Provider, TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, Tuner,
+    Message, Outcome, Provider, ServerTool, TaskContext, TaskTelemetry, TelemetrySink,
+    ThinkingLevel, Tuner,
 };
 use lvz_schedule::{
     ScheduleJob, ScheduleListTool, ScheduleRegistry, ScheduleRunTool, ScheduleStatusTool,
@@ -226,6 +227,24 @@ struct Cli {
     /// `[mcp] servers`.
     #[arg(long = "mcp-server", value_name = "LABEL:TARGET")]
     mcp_server: Vec<String>,
+
+    /// Provider-run (server-side) tools to offer, comma-separated and repeatable:
+    /// `web_search`, `web_fetch`, `code_execution`, `x_search`, `collections_search`,
+    /// `url_context`. The *provider* runs these and returns results inline, so they cost no
+    /// tool-loop round-trip — but they bill extra and each is provider-specific, so none are on by
+    /// default. Names only: every parameterised tool takes its defaults here; the config file's
+    /// `[[provider.server_tools]]` is where domain/handle/date filters go. Asking for a tool the
+    /// chosen provider does not support fails the turn rather than being ignored.
+    /// E.g. `--server-tools web_search,code_execution`.
+    #[arg(long = "server-tools", value_name = "NAMES", value_delimiter = ',')]
+    server_tools: Vec<ServerToolArg>,
+
+    /// Resolved provider-run tools: the `--server-tools` names expanded to their defaults when the
+    /// flag was given, else the config file's `[[provider.server_tools]]` verbatim. Filled by
+    /// `Config::apply_to`; not a flag itself, which is why the precedence rule lives in exactly one
+    /// place.
+    #[arg(skip)]
+    resolved_server_tools: Vec<ServerTool>,
 
     /// Locale for the legion council's progress notices (POSIX form, e.g. `ko_KR.UTF-8`). Only
     /// `KO_KR` selects Korean; anything else — including unset — keeps them English. Falls back to
@@ -487,6 +506,79 @@ impl From<ThinkingBudgetArg> for ThinkingLevel {
     }
 }
 
+/// Reject a resolved provider-run tool that cannot do anything.
+///
+/// `--server-tools` carries names only, so `collections_search` arrives with an empty
+/// `collection_ids` — a search over no collections. Rather than offer the model a tool that can
+/// only fail, say so and point at the surface that can express it. Same principle as negotiation:
+/// refuse loudly instead of shipping something inert.
+fn validate_resolved_server_tools(tools: &[ServerTool]) -> Result<(), String> {
+    for t in tools {
+        if let ServerTool::CollectionsSearch { collection_ids, .. } = t {
+            if collection_ids.is_empty() {
+                return Err(
+                    "--server-tools collections_search needs collection ids, which the \
+                     flag cannot express; set it in the config file instead:\n\n  \
+                     [[provider.server_tools]]\n  kind = \"collections_search\"\n  \
+                     collection_ids = [\"...\"]"
+                        .into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// CLI spelling of [`ServerTool`] for `--server-tools`: the tool **names** only.
+///
+/// A `ValueEnum` rather than a free string, so `--server-tools web_serach` is rejected by clap with
+/// the valid names listed, instead of parsing into a tool nothing maps and being dropped. Every
+/// parameterised tool takes its defaults here; the filters live in the config file, which is why
+/// this is a name list and not a mini-language.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ServerToolArg {
+    // Spelled snake_case explicitly: clap would derive kebab-case (`web-search`), which would
+    // disagree with the config file's `kind = "web_search"` and with every doc string naming them.
+    // One spelling for one concept.
+    #[value(name = "web_search")]
+    WebSearch,
+    #[value(name = "web_fetch")]
+    WebFetch,
+    #[value(name = "code_execution")]
+    CodeExecution,
+    #[value(name = "x_search")]
+    XSearch,
+    #[value(name = "collections_search")]
+    CollectionsSearch,
+    #[value(name = "url_context")]
+    UrlContext,
+}
+
+impl From<ServerToolArg> for ServerTool {
+    fn from(a: ServerToolArg) -> Self {
+        match a {
+            ServerToolArg::WebSearch => ServerTool::WebSearch {
+                max_uses: None,
+                allowed_domains: Vec::new(),
+                blocked_domains: Vec::new(),
+            },
+            ServerToolArg::WebFetch => ServerTool::WebFetch { max_uses: None },
+            ServerToolArg::CodeExecution => ServerTool::CodeExecution,
+            ServerToolArg::XSearch => ServerTool::XSearch {
+                allowed_handles: Vec::new(),
+                blocked_handles: Vec::new(),
+                from_date: None,
+                to_date: None,
+            },
+            ServerToolArg::CollectionsSearch => ServerTool::CollectionsSearch {
+                collection_ids: Vec::new(),
+                limit: None,
+            },
+            ServerToolArg::UrlContext => ServerTool::UrlContext,
+        }
+    }
+}
+
 /// A built streaming provider, plus an optional handle to the same instance as a [`BatchProvider`]
 /// (present only for providers with a discounted batch API: Anthropic / Google).
 type BuiltProvider = (Arc<dyn Provider>, Option<Arc<dyn BatchProvider>>);
@@ -693,6 +785,7 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
     // left unset — CLI/env always wins. Done before anything reads `cli`.
     let config = Config::load(cli.config.as_deref())?;
     config.apply_to(&mut cli);
+    validate_resolved_server_tools(&cli.resolved_server_tools)?;
 
     // Install the logging collector as early as possible — right after precedence is resolved, so
     // `[log] level` counts, and before any work worth logging happens.
@@ -973,6 +1066,9 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
         if let Some(t) = cli.temperature {
             req = req.temperature(t);
         }
+        // Provider-run tools apply to the one-shot path too — a plain `lav "..." --server-tools
+        // web_search` is the cheapest way to use them, since there is no tool loop at all.
+        req.server_tools = cli.resolved_server_tools.clone();
         let mut stream = provider.stream(req).await?;
         while let Some(event) = stream.next().await {
             renderer.handle(event?)?;
@@ -1231,6 +1327,8 @@ fn build_agent(
         .with_model(model)
         .with_cost_weights(cli.provider.unwrap_or(ProviderKind::Xai).cost_weights());
     config.max_tokens = cli.max_tokens.unwrap_or(2048);
+    // Provider-run tools, already resolved (flag over file) by `Config::apply_to`.
+    config.server_tools = cli.resolved_server_tools.clone();
     if let Some(max_steps) = cli.max_steps {
         config.max_steps = max_steps;
     }

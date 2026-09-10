@@ -41,7 +41,7 @@ use lvz_context::Lang;
 use lvz_protocol::{
     AgentError, AgentHandle, Archetype, Capabilities, ChatRequest, ContentBlock, CostWeights,
     DeliberationContext, Deliberator, Event, Knobs, Message, ModelTier, NoopTuner, Outcome,
-    Provider, RepoProfile, Role, StopReason, SystemPrompt, TaskContext, TaskTelemetry,
+    Provider, RepoProfile, Role, ServerTool, StopReason, SystemPrompt, TaskContext, TaskTelemetry,
     TelemetrySink, ThinkingLevel, ToolDecision, ToolDef, ToolGate, Tuner, TurnRequest, Usage,
 };
 use lvz_tools::ToolRegistry;
@@ -227,6 +227,17 @@ pub struct AgentConfig {
     /// optimistic to claim). `0.0` restores the old pure-saving behaviour. Only used when
     /// `radius_counterfactual` is on.
     pub radius_reexploration_risk: f64,
+    /// **Provider-run (server-side) tools** to offer each turn — web search, code execution, X
+    /// search, and so on. The *provider* executes these and returns results inline; the agent never
+    /// runs them, so they cost no tool-loop round-trip.
+    ///
+    /// Empty by default: they bill extra and every one of them is provider-specific. Set from
+    /// `--server-tools` (names with their defaults) or the config file's `[[provider.server_tools]]`
+    /// (the full shape, with domain/handle/date filters).
+    ///
+    /// A tool the chosen provider does not declare is **refused** at negotiation rather than
+    /// dropped, so asking for `x_search` on Anthropic fails loudly instead of quietly doing nothing.
+    pub server_tools: Vec<ServerTool>,
 }
 
 /// Above this fraction of dependency context removed, the estimate-based radius counterfactual
@@ -262,6 +273,7 @@ impl Default for AgentConfig {
             forced_thinking: None,
             cost_weights: CostWeights::default(),
             radius_reexploration_risk: 0.5,
+            server_tools: Vec::new(),
         }
     }
 }
@@ -2272,6 +2284,10 @@ fn build_request(
         }
     }
     req.tools = defs;
+    // Provider-run tools are offered every turn, like the client tool defs. They are not filtered
+    // by `allowed_tools` (that gates the *agent's* registry) — a provider that does not declare one
+    // refuses the turn at negotiation instead.
+    req.server_tools = config.server_tools.clone();
     req.messages = history.to_vec();
     if let Some(skeleton) = repo_skeleton {
         if let Some(first) = req.messages.first_mut() {

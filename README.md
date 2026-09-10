@@ -330,6 +330,15 @@ them. `TARGET` is either a command to spawn (stdio transport) or an `http(s)://`
 HTTP). Tools are namespaced `<label>_<tool>` so they never shadow the built-ins. E.g.
 `--mcp-server 'fs: npx -y @modelcontextprotocol/server-filesystem .'`. Configurable via `[mcp] servers`.
 
+Provider-run (server-side) tools: `--server-tools <NAMES>` (comma-separated, repeatable) —
+`web_search` · `web_fetch` · `code_execution` · `x_search` · `collections_search` · `url_context`.
+The **provider** executes these and returns results inline, so they cost no tool-loop round-trip.
+None are on by default: they bill extra and each is provider-specific. The flag takes names only,
+each with its defaults; `[[provider.server_tools]]` in the config file is where the domain/handle/date
+filters go, and a non-empty flag wins over the file wholesale. Each tool is checked against the
+chosen provider's declared capabilities, so a tool it does not support **fails the turn** rather than
+being silently dropped — `x_search` is xAI-only, `url_context` Gemini-only, `web_fetch` Anthropic-only.
+
 ATO: `--tune` (ε-greedy) or `--tune-bayes` (Thompson sampling) · `--verify-cmd <cmd>` (real
 success gate, e.g. `cargo test`) · `--tune-state <path>` (persist learned profiles) · `--tune-decay`
 · `--telemetry` (per-task token/cost summary to stderr).

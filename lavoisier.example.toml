@@ -14,6 +14,38 @@
 # re-probed, so a persistently-down provider isn't re-tried every turn. `0` = re-probe every turn.
 # fallback_cooldown = 60
 
+# Provider-run (server-side) tools: the *provider* executes these and returns results inline, so
+# they cost no tool-loop round-trip. None are on by default — they bill extra and each is
+# provider-specific. `--server-tools web_search,code_execution` turns them on with their defaults
+# and wins over this list wholesale; set them here when you need the filters.
+#
+# A tool the chosen provider does not support is REFUSED, not ignored: `x_search` is xAI-only, so
+# asking for it on Anthropic fails the turn rather than quietly doing nothing. Available kinds:
+# web_search | web_fetch | code_execution | x_search | collections_search | url_context.
+#
+# [[provider.server_tools]]
+# kind = "web_search"
+# max_uses = 5                       # cap searches per turn; omit for the provider default
+# allowed_domains = ["docs.rs"]      # restrict results (mutually exclusive with blocked_domains)
+# # blocked_domains = ["example.com"]
+#
+# [[provider.server_tools]]
+# kind = "code_execution"
+#
+# [[provider.server_tools]]          # xAI only
+# kind = "x_search"
+# allowed_handles = ["AnthropicAI"]
+# from_date = "2026-01-01"           # ISO-8601 YYYY-MM-DD window
+# to_date = "2026-06-30"
+#
+# [[provider.server_tools]]          # xAI only; collection_ids is REQUIRED
+# kind = "collections_search"
+# collection_ids = ["col_123"]
+# limit = 10
+#
+# [[provider.server_tools]]          # Gemini only
+# kind = "url_context"
+
 [agent]
 # Context compaction / eviction
 # compact_after = 60000         # compact history once it exceeds ~this many tokens

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lvz_memory::{FileStore, InMemoryStore, SessionStore};
+use lvz_protocol::ServerTool;
 use serde::Deserialize;
 
 use crate::{Cli, ProviderKind};
@@ -87,6 +88,86 @@ pub struct ProviderSection {
     /// Seconds a failed fallback model stays demoted before re-probe (circuit breaker; default 60).
     /// `--fallback-cooldown` / `LVZ_FALLBACK_COOLDOWN` take precedence.
     pub fallback_cooldown: Option<u64>,
+    /// **Provider-run (server-side) tools** to offer every turn. Deserialised as the real
+    /// [`ServerTool`] enum, tagged by `kind`, so a misspelled name or a filter on the wrong tool is
+    /// a *config load* error rather than a field the program ignores:
+    ///
+    /// ```toml
+    /// [[provider.server_tools]]
+    /// kind = "web_search"
+    /// max_uses = 5
+    /// allowed_domains = ["docs.rs"]
+    ///
+    /// [[provider.server_tools]]
+    /// kind = "code_execution"
+    /// ```
+    ///
+    /// `--server-tools` (names only, each with its defaults) wins wholesale when non-empty; this is
+    /// the surface for the filters the flag cannot express. A tool the chosen provider does not
+    /// declare is refused at negotiation, not silently dropped.
+    pub server_tools: Option<Vec<ServerTool>>,
+}
+
+/// The keys each `[[provider.server_tools]]` entry accepts, by `kind`.
+///
+/// Kept next to the [`ServerTool`] variants it mirrors. It exists because serde's
+/// `deny_unknown_fields` is **inert on internally-tagged enums** — with `#[serde(tag = "kind")]`
+/// an unrecognised key is silently discarded, so `kind = "code_execution"` with an
+/// `allowed_domains` filter would load fine and then quietly do nothing. That is precisely the
+/// "field the program ignores" failure this typed surface exists to remove, so the check is done
+/// by hand rather than left to an attribute that does not fire.
+fn server_tool_keys(kind: &str) -> Option<&'static [&'static str]> {
+    Some(match kind {
+        "web_search" => &["kind", "max_uses", "allowed_domains", "blocked_domains"],
+        "web_fetch" => &["kind", "max_uses"],
+        "code_execution" => &["kind"],
+        "x_search" => &[
+            "kind",
+            "allowed_handles",
+            "blocked_handles",
+            "from_date",
+            "to_date",
+        ],
+        "collections_search" => &["kind", "collection_ids", "limit"],
+        "url_context" => &["kind"],
+        _ => return None,
+    })
+}
+
+/// Reject a filter set on a tool that has no such filter. Runs after the typed parse, which has
+/// already rejected an unknown `kind`.
+fn validate_server_tools(text: &str) -> Result<(), String> {
+    let Ok(root) = toml::from_str::<toml::Value>(text) else {
+        return Ok(()); // the typed parse reports the syntax error
+    };
+    let Some(entries) = root
+        .get("provider")
+        .and_then(|p| p.get("server_tools"))
+        .and_then(|v| v.as_array())
+    else {
+        return Ok(());
+    };
+    for entry in entries {
+        let Some(table) = entry.as_table() else {
+            continue;
+        };
+        let Some(kind) = table.get("kind").and_then(|k| k.as_str()) else {
+            continue;
+        };
+        let Some(allowed) = server_tool_keys(kind) else {
+            continue;
+        };
+        for key in table.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(format!(
+                    "[[provider.server_tools]] kind = \"{kind}\" has no `{key}` \
+                     (accepted: {})",
+                    allowed.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `[agent]` — the tool loop, compaction, routing, and accuracy levers.
@@ -206,6 +287,8 @@ impl Config {
             .map_err(|e| format!("reading config {}: {e}", path.display()))?;
         let mut config: Config =
             toml::from_str(&text).map_err(|e| format!("parsing config {}: {e}", path.display()))?;
+        validate_server_tools(&text)
+            .map_err(|e| format!("parsing config {}: {e}", path.display()))?;
         config.source = Some(path);
         Ok(config)
     }
@@ -226,6 +309,15 @@ impl Config {
             }
         }
         merge_copy(&mut cli.fallback_cooldown, self.provider.fallback_cooldown);
+        // Provider-run tools: a non-empty `--server-tools` wins **wholesale** (it is a set, not a
+        // field to merge item-by-item), otherwise take the file's list. The flag carries names with
+        // their defaults; the file is where the domain/handle/date filters live, so mixing the two
+        // would silently drop whichever half lost.
+        cli.resolved_server_tools = if cli.server_tools.is_empty() {
+            self.provider.server_tools.clone().unwrap_or_default()
+        } else {
+            cli.server_tools.iter().copied().map(Into::into).collect()
+        };
 
         // [agent]
         merge(&mut cli.summary_model, &self.agent.summary_model);
@@ -582,5 +674,104 @@ mod tests {
         assert_eq!(parse_provider("Anthropic"), Some(ProviderKind::Anthropic));
         assert_eq!(parse_provider("claude-cli"), Some(ProviderKind::ClaudeCli));
         assert_eq!(parse_provider("bogus"), None);
+    }
+}
+
+#[cfg(test)]
+mod server_tool_tests {
+    use super::*;
+
+    fn cfg(toml_src: &str) -> Config {
+        toml::from_str(toml_src).expect("config must parse")
+    }
+
+    #[test]
+    fn server_tools_deserialise_as_the_real_enum_with_their_filters() {
+        let c = cfg(r#"
+[[provider.server_tools]]
+kind = "web_search"
+max_uses = 5
+allowed_domains = ["docs.rs"]
+
+[[provider.server_tools]]
+kind = "code_execution"
+"#);
+        let tools = c.provider.server_tools.expect("server_tools present");
+        assert_eq!(tools.len(), 2);
+        match &tools[0] {
+            ServerTool::WebSearch {
+                max_uses,
+                allowed_domains,
+                blocked_domains,
+            } => {
+                assert_eq!(*max_uses, Some(5));
+                assert_eq!(allowed_domains, &["docs.rs"]);
+                assert!(blocked_domains.is_empty());
+            }
+            other => panic!("expected WebSearch, got {other:?}"),
+        }
+        assert_eq!(tools[1], ServerTool::CodeExecution);
+    }
+
+    #[test]
+    fn a_misspelled_tool_is_a_load_error_not_a_field_that_is_ignored() {
+        // As free text this would parse and then match nothing, so the tool would simply never be
+        // offered — the exact silent-drop failure the typed surface exists to prevent.
+        let err = toml::from_str::<Config>("[[provider.server_tools]]\nkind = \"web_serach\"\n")
+            .expect_err("a misspelled tool name must fail the load");
+        assert!(
+            err.to_string().contains("web_serach") || err.to_string().contains("unknown variant"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_filter_on_the_wrong_tool_is_rejected() {
+        // `allowed_domains` belongs to web_search, not code_execution. serde's
+        // deny_unknown_fields is inert on internally-tagged enums, so without the explicit check
+        // this would load and be dropped in silence.
+        let err = validate_server_tools(
+            "[[provider.server_tools]]\nkind = \"code_execution\"\nallowed_domains = [\"x\"]\n",
+        )
+        .expect_err("a filter on the wrong tool must fail the load");
+        assert!(
+            err.contains("allowed_domains") && err.contains("code_execution"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_filter_on_the_right_tool_is_accepted() {
+        validate_server_tools(
+            "[[provider.server_tools]]\nkind = \"web_search\"\nallowed_domains = [\"x\"]\n",
+        )
+        .expect("web_search does take allowed_domains");
+    }
+
+    #[test]
+    fn every_variant_key_list_matches_what_actually_deserialises() {
+        // Guards the hand-written key table against drift from the ServerTool variants: each
+        // listed key must be one the typed parse accepts for that kind.
+        for kind in [
+            "web_search",
+            "web_fetch",
+            "code_execution",
+            "x_search",
+            "collections_search",
+            "url_context",
+        ] {
+            let keys = server_tool_keys(kind).expect("known kind");
+            assert!(keys.contains(&"kind"), "{kind} must accept `kind`");
+            // collections_search has a *required* field (a search over no collections is
+            // meaningless), so give it one; every other kind parses bare.
+            let extra = if kind == "collections_search" {
+                "collection_ids = [\"c1\"]\n"
+            } else {
+                ""
+            };
+            let src = format!("[[provider.server_tools]]\nkind = \"{kind}\"\n{extra}");
+            let c: Config = toml::from_str(&src).expect("kind must parse");
+            assert_eq!(c.provider.server_tools.expect("present").len(), 1);
+        }
     }
 }
