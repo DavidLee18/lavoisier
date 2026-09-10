@@ -1,0 +1,15 @@
+event: response.output_item.added
+data: {"sequence_number":38,"type":"response.output_item.added","item":{"arguments":"","call_id":"call-055b61a7-eb60-4674-a42a-e910871fd1c3-0","name":"read_file","type":"function_call","id":"fc_16d1dacd-2732-9d47-a131-d6e1e83b4981_0","status":"in_progress"},"output_index":1}
+
+event: response.function_call_arguments.delta
+data: {"sequence_number":39,"type":"response.function_call_arguments.delta","delta":"{\"path\":\"notes.txt\"}","item_id":"fc_16d1dacd-2732-9d47-a131-d6e1e83b4981_0","output_index":1}
+
+event: response.function_call_arguments.done
+data: {"sequence_number":40,"type":"response.function_call_arguments.done","arguments":"{\"path\":\"notes.txt\"}","item_id":"fc_16d1dacd-2732-9d47-a131-d6e1e83b4981_0","name":"read_file","output_index":1}
+
+event: response.output_item.done
+data: {"sequence_number":41,"type":"response.output_item.done","item":{"arguments":"{\"path\":\"notes.txt\"}","call_id":"call-055b61a7-eb60-4674-a42a-e910871fd1c3-0","name":"read_file","type":"function_call","id":"fc_16d1dacd-2732-9d47-a131-d6e1e83b4981_0","status":"completed"},"output_index":1}
+
+event: response.completed
+data: {"sequence_number":42,"type":"response.completed","response":{"id":"16d1dacd-2732-9d47-a131-d6e1e83b4981","model":"grok-4.6","status":"completed","usage":{"input_tokens":716,"input_tokens_details":{"cached_tokens":512},"output_tokens":44,"output_tokens_details":{"reasoning_tokens":31},"total_tokens":760,"num_sources_used":0,"num_server_side_tools_used":0,"cost_in_usd_ticks":9280000,"context_details":{"input_tokens":716,"output_tokens":44}},"error":null,"output":[{"type":"reasoning"},{"type":"function_call"}]}}
+

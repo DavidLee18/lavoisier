@@ -330,6 +330,13 @@ them. `TARGET` is either a command to spawn (stdio transport) or an `http(s)://`
 HTTP). Tools are namespaced `<label>_<tool>` so they never shadow the built-ins. E.g.
 `--mcp-server 'fs: npx -y @modelcontextprotocol/server-filesystem .'`. Configurable via `[mcp] servers`.
 
+xAI has **three transports**: `--provider xai` (`/chat/completions`), `xai-grpc` (native gRPC), and
+`xai-responses` (the Responses API). Provider-run tools exist **only** on `xai-responses` — Live
+Search on `/chat/completions` has been 410 Gone since 2026-01-12. Note that `xai-responses` does not
+honour `--max-tokens` as a ceiling on reasoning tokens: the field is sent, but a 512-token cap has
+been seen returning 1273 output tokens, so `--budget` (cost-weighted, output at ~5x) is the firmer
+control there.
+
 Provider-run (server-side) tools: `--server-tools <NAMES>` (comma-separated, repeatable) —
 `web_search` · `web_fetch` · `code_execution` · `x_search` · `collections_search` · `url_context`.
 The **provider** executes these and returns results inline, so they cost no tool-loop round-trip.

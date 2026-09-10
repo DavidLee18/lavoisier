@@ -13,9 +13,12 @@
 
 mod grpc;
 mod http;
+mod responses;
+mod responses_sse;
 
 pub use grpc::GrpcTransport;
 pub use http::HttpTransport;
+pub use responses::{ResponsesTransport, XaiResponsesCaps};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;

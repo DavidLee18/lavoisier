@@ -424,6 +424,7 @@ fn merge_copy<T>(target: &mut Option<T>, from: Option<T>) {
 fn parse_provider(s: &str) -> Option<ProviderKind> {
     match s.to_ascii_lowercase().as_str() {
         "xai" => Some(ProviderKind::Xai),
+        "xai-responses" | "xai_responses" | "xairesponses" => Some(ProviderKind::XaiResponses),
         "anthropic" => Some(ProviderKind::Anthropic),
         "google" => Some(ProviderKind::Google),
         "claude-cli" | "claude_cli" | "claudecli" => Some(ProviderKind::ClaudeCli),

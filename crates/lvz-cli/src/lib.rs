@@ -42,7 +42,7 @@ use lvz_schedule::{
 };
 use lvz_tools::{BatchEditTool, ToolRegistry};
 use lvz_tune::{BayesTuner, LearningTuner, PersistableTuner, TuneConfig};
-use lvz_xai::XaiProvider;
+use lvz_xai::{ResponsesTransport, XaiProvider};
 
 mod config;
 use config::Config;
@@ -478,6 +478,11 @@ struct Cli {
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
 enum ProviderKind {
     Xai,
+    /// xAI's **Responses API** (`/v1/responses`) — the Agent-Tools transport, and the *only* xAI
+    /// route to provider-run tools: Live Search on `chat/completions` has been 410 Gone since
+    /// 2026-01-12. Pair it with `--server-tools web_search,x_search,code_execution`.
+    #[value(name = "xai-responses")]
+    XaiResponses,
     Anthropic,
     /// Google Gemini (native Generative Language API). Enables same-model benchmarking vs. agents
     /// that run on `gemini-3-flash-preview` (see `bench/README.md`).
@@ -587,6 +592,7 @@ impl ProviderKind {
     fn default_model(self) -> &'static str {
         match self {
             ProviderKind::Xai => "grok-4",
+            ProviderKind::XaiResponses => "grok-4.6",
             ProviderKind::Anthropic => "claude-sonnet-4-6",
             ProviderKind::Google => "gemini-3-flash-preview",
             ProviderKind::ClaudeCli => "sonnet",
@@ -597,7 +603,7 @@ impl ProviderKind {
     /// non-caching claude-cli path uses flat weights (no cache classes to value).
     fn cost_weights(self) -> CostWeights {
         match self {
-            ProviderKind::Xai => CostWeights::xai(),
+            ProviderKind::Xai | ProviderKind::XaiResponses => CostWeights::xai(),
             ProviderKind::Anthropic => CostWeights::anthropic(),
             ProviderKind::Google => CostWeights::google(),
             ProviderKind::ClaudeCli => CostWeights::flat(),
@@ -614,6 +620,8 @@ impl ProviderKind {
     ) -> Result<BuiltProvider, lvz_protocol::ProviderError> {
         Ok(match self {
             ProviderKind::Xai => (Arc::new(XaiProvider::from_env()?), None),
+            // No batch provider: the Responses API has no batch endpoint.
+            ProviderKind::XaiResponses => (Arc::new(ResponsesTransport::from_env()?), None),
             ProviderKind::Anthropic => {
                 // A long-running gateway benefits from the 1-hour cache TTL on the immutable prefix
                 // (it survives idle gaps between turns); one-shot runs keep the cheaper 5-min TTL.
