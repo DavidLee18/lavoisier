@@ -1,0 +1,72 @@
+name: codeql
+
+# Static security analysis of the Rust workspace. Separate from `ci` because it is slower and
+# runs on a schedule as well as on changes — a finding can appear from an updated query pack
+# without the code moving at all, which a push-only trigger would never surface.
+#
+# Third-party actions are pinned to a full commit SHA per CLAUDE.md; the trailing comment records
+# the version.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, Monday 07:00 UTC. Catches query-pack updates against unchanged code.
+    - cron: "0 7 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (rust)
+    runs-on: ubuntu-22.04
+    permissions:
+      # Required to upload the SARIF results to the Security tab.
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # CodeQL builds the workspace itself, and `lvz-xai`'s build script needs protoc. Same
+      # SHA-256-pinned direct download as ci.yml — no JS action, so no Node runtime and no token.
+      - name: Install protoc
+        shell: bash
+        env:
+          PROTOC_VERSION: "29.3"
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)   asset=linux-x86_64;   sha=3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a ;;
+            Linux-ARM64) asset=linux-aarch_64; sha=6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32 ;;
+            *) echo "unsupported runner ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+          esac
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${asset}.zip"
+          curl -fsSL -o protoc.zip "$url"
+          echo "${sha}  protoc.zip" | shasum -a 256 -c -
+          unzip -q protoc.zip -d "$HOME/.protoc"
+          echo "$HOME/.protoc/bin" >> "$GITHUB_PATH"
+          "$HOME/.protoc/bin/protoc" --version
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master @ 2026-06-18
+        with:
+          toolchain: stable
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+        with:
+          languages: rust
+          # `security-extended` over the default pack: this is an agent that runs shell commands
+          # and edits files on a user's machine, so the extra taint queries earn their runtime.
+          queries: security-extended
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+        with:
+          category: "/language:rust"
