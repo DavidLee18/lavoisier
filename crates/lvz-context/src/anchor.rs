@@ -59,11 +59,22 @@ pub enum EditOp {
     Delete,
 }
 
-/// A single anchored edit.
+/// A single anchored edit: the anchor of the line to act on, an optional *landmark* anchor that
+/// disambiguates when several lines share that content, and what to do there.
+///
+/// [`after`](Edit::after) is what makes a repeated line addressable **without ever becoming
+/// positional**: the target stays content-addressed, and the landmark only says which side of a
+/// unique nearby line the meant copy sits on — the *first* matching line strictly after it.
+///
+/// Deliberately not a line range or an occurrence index. Those fail *silently* against a file that
+/// has shifted since it was read, editing a plausible-looking wrong line; this cannot. It matches
+/// `str_replace`'s `after` argument, so one rule covers both edit tools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edit {
     /// Anchor of the line to act on.
     pub anchor: String,
+    /// Anchor of a unique landmark line; the target is the first match strictly after it.
+    pub after: Option<String>,
     /// What to do at the matched line.
     pub op: EditOp,
 }
@@ -73,6 +84,7 @@ impl Edit {
     pub fn replace(anchor: impl Into<String>, text: impl Into<String>) -> Self {
         Edit {
             anchor: anchor.into(),
+            after: None,
             op: EditOp::Replace(text.into()),
         }
     }
@@ -80,6 +92,7 @@ impl Edit {
     pub fn insert_after(anchor: impl Into<String>, text: impl Into<String>) -> Self {
         Edit {
             anchor: anchor.into(),
+            after: None,
             op: EditOp::InsertAfter(text.into()),
         }
     }
@@ -87,6 +100,7 @@ impl Edit {
     pub fn insert_before(anchor: impl Into<String>, text: impl Into<String>) -> Self {
         Edit {
             anchor: anchor.into(),
+            after: None,
             op: EditOp::InsertBefore(text.into()),
         }
     }
@@ -94,8 +108,16 @@ impl Edit {
     pub fn delete(anchor: impl Into<String>) -> Self {
         Edit {
             anchor: anchor.into(),
+            after: None,
             op: EditOp::Delete,
         }
+    }
+
+    /// Qualify this edit with the anchor of a unique landmark line: the target becomes the first
+    /// matching line strictly after it. Disambiguates a repeated target without naming a position.
+    pub fn after(mut self, landmark: impl Into<String>) -> Self {
+        self.after = Some(landmark.into());
+        self
     }
 }
 
@@ -104,22 +126,61 @@ impl Edit {
 pub enum AnchorError {
     /// No line matched the anchor — the file changed under the edit.
     NotFound(String),
-    /// More than one line matched the anchor — the target is ambiguous.
+    /// More than one line matched the anchor and no `after` landmark was given.
     Ambiguous {
         /// The over-matched anchor.
         anchor: String,
         /// How many lines it matched.
         count: usize,
     },
+    /// An `after` landmark was given but matched no line.
+    AfterNotFound(String),
+    /// An `after` landmark is itself repeated, so it pins nothing.
+    AfterAmbiguous {
+        /// The repeated landmark anchor.
+        anchor: String,
+        /// How many lines it matched.
+        count: usize,
+    },
+    /// No line matched the anchor after the landmark.
+    NoneAfter {
+        /// The target anchor.
+        anchor: String,
+        /// The landmark anchor it was searched after.
+        after: String,
+    },
 }
 
 impl std::fmt::Display for AnchorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AnchorError::NotFound(a) => write!(f, "no line matches anchor {a}"),
-            AnchorError::Ambiguous { anchor, count } => {
-                write!(f, "anchor {anchor} matches {count} lines (ambiguous)")
-            }
+            // Every message names the FIX, not just the fault. `read_anchored`'s gutter already
+            // shows every neighbouring anchor, so the suggested landmark can be supplied without
+            // re-reading the file.
+            AnchorError::NotFound(a) => write!(
+                f,
+                "anchor {a:?} matched no line — the file changed since it was read; \
+                 re-read it with read_anchored"
+            ),
+            AnchorError::Ambiguous { anchor, count } => write!(
+                f,
+                "anchor {anchor:?} matches {count} identical lines — add \"after\": the anchor of \
+                 a unique line just above the one you mean"
+            ),
+            AnchorError::AfterNotFound(a) => write!(
+                f,
+                "after-anchor {a:?} matched no line — re-read the file with read_anchored"
+            ),
+            AnchorError::AfterAmbiguous { anchor, count } => write!(
+                f,
+                "after-anchor {anchor:?} is itself repeated ({count} lines) — \"after\" must be \
+                 unique; pick a distinctive line above the target"
+            ),
+            AnchorError::NoneAfter { anchor, after } => write!(
+                f,
+                "no line matching anchor {anchor:?} follows after-anchor {after:?} — \"after\" \
+                 must name a line above the target"
+            ),
         }
     }
 }
@@ -147,10 +208,38 @@ pub fn apply_edits(source: &str, edits: &[Edit]) -> Result<String, AnchorError> 
             [] => return Err(AnchorError::NotFound(edit.anchor.clone())),
             [i] => resolved.push((*i, &edit.op)),
             many => {
-                return Err(AnchorError::Ambiguous {
-                    anchor: edit.anchor.clone(),
-                    count: many.len(),
-                })
+                // Repeated target: only a landmark can pin it, and only if the landmark is itself
+                // unique. Anything less is a refusal — never a guess at the "probable" copy.
+                let Some(landmark) = edit.after.as_deref() else {
+                    return Err(AnchorError::Ambiguous {
+                        anchor: edit.anchor.clone(),
+                        count: many.len(),
+                    });
+                };
+                let lm: Vec<usize> = lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| anchor_of(l) == landmark)
+                    .map(|(i, _)| i)
+                    .collect();
+                match lm.as_slice() {
+                    [] => return Err(AnchorError::AfterNotFound(landmark.to_string())),
+                    [ni] => match many.iter().find(|i| *i > ni) {
+                        Some(i) => resolved.push((*i, &edit.op)),
+                        None => {
+                            return Err(AnchorError::NoneAfter {
+                                anchor: edit.anchor.clone(),
+                                after: landmark.to_string(),
+                            })
+                        }
+                    },
+                    more => {
+                        return Err(AnchorError::AfterAmbiguous {
+                            anchor: landmark.to_string(),
+                            count: more.len(),
+                        })
+                    }
+                }
             }
         }
     }
@@ -262,5 +351,122 @@ mod tests {
         let rendered = render_anchored("hello");
         assert!(rendered.starts_with(&anchor_of("hello")));
         assert!(rendered.contains('\u{2502}'));
+    }
+}
+
+#[cfg(test)]
+mod landmark_tests {
+    use super::*;
+
+    /// Three identical `    return None;` lines under three distinct headers — the shape that makes
+    /// a repeated anchor genuinely ambiguous.
+    const SRC: &str = "fn alpha() {\n    return None;\n}\nfn beta() {\n    return None;\n}\nfn gamma() {\n    return None;\n}\n";
+
+    fn anchor_for(needle: &str) -> String {
+        anchored_lines(SRC)
+            .into_iter()
+            .find(|l| l.text.contains(needle))
+            .map(|l| l.anchor)
+            .unwrap_or_else(|| panic!("no line containing {needle:?}"))
+    }
+
+    #[test]
+    fn a_repeated_anchor_without_a_landmark_is_refused_not_guessed() {
+        let target = anchor_for("return None;");
+        let err = apply_edits(SRC, &[Edit::replace(&target, "    return Some(1);")])
+            .expect_err("three identical lines must not be edited on a guess");
+        match err {
+            AnchorError::Ambiguous { count, .. } => assert_eq!(count, 3),
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+        // The message must name the fix, since the model has the gutter and can supply a landmark
+        // without re-reading.
+        assert!(err_text(&err).contains("after"), "{}", err_text(&err));
+    }
+
+    fn err_text(e: &AnchorError) -> String {
+        e.to_string()
+    }
+
+    #[test]
+    fn a_landmark_selects_the_first_match_after_it() {
+        let target = anchor_for("return None;");
+        let beta = anchor_for("fn beta()");
+        let out = apply_edits(
+            SRC,
+            &[Edit::replace(&target, "    return Some(2);").after(&beta)],
+        )
+        .expect("the landmark pins the second copy");
+        // Exactly the beta one changed — not alpha's (before the landmark) and not gamma's.
+        assert!(out.contains("fn alpha() {\n    return None;"), "{out}");
+        assert!(out.contains("fn beta() {\n    return Some(2);"), "{out}");
+        assert!(out.contains("fn gamma() {\n    return None;"), "{out}");
+    }
+
+    #[test]
+    fn a_repeated_landmark_pins_nothing_and_is_refused() {
+        // `}` occurs three times, so it cannot disambiguate anything.
+        let target = anchor_for("return None;");
+        let brace = anchor_for("}");
+        match apply_edits(SRC, &[Edit::replace(&target, "x").after(&brace)]) {
+            Err(AnchorError::AfterAmbiguous { count, .. }) => assert_eq!(count, 3),
+            other => panic!("expected AfterAmbiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_landmark_below_every_match_is_refused_rather_than_wrapping() {
+        // "a" repeats at lines 0 and 1; the landmark sits at line 2, after both. There is no
+        // match strictly after it, so this must refuse — NOT wrap around to the top, which is how
+        // a positional scheme would quietly edit the wrong line.
+        let src = "a\na\nzzz\n";
+        let a = anchored_lines(src)
+            .into_iter()
+            .find(|l| l.text == "a")
+            .unwrap()
+            .anchor;
+        let z = anchored_lines(src)
+            .into_iter()
+            .find(|l| l.text == "zzz")
+            .unwrap()
+            .anchor;
+        match apply_edits(src, &[Edit::replace(&a, "b").after(&z)]) {
+            Err(AnchorError::NoneAfter { after, .. }) => assert_eq!(after, z),
+            other => panic!("expected NoneAfter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_landmark_between_two_matches_selects_the_later_one() {
+        let src = "a\nmid\na\n";
+        let a = anchored_lines(src)
+            .into_iter()
+            .find(|l| l.text == "a")
+            .unwrap()
+            .anchor;
+        let mid = anchored_lines(src)
+            .into_iter()
+            .find(|l| l.text == "mid")
+            .unwrap()
+            .anchor;
+        let out = apply_edits(src, &[Edit::replace(&a, "b").after(&mid)]).expect("pins the second");
+        assert_eq!(out, "a\nmid\nb\n");
+    }
+
+    #[test]
+    fn an_unknown_landmark_is_refused() {
+        let target = anchor_for("return None;");
+        match apply_edits(SRC, &[Edit::replace(&target, "x").after("zzzz")]) {
+            Err(AnchorError::AfterNotFound(a)) => assert_eq!(a, "zzzz"),
+            other => panic!("expected AfterNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_unique_anchor_ignores_the_landmark_entirely() {
+        let beta = anchor_for("fn beta()");
+        let out = apply_edits(SRC, &[Edit::replace(&beta, "fn BETA() {")])
+            .expect("a unique anchor needs no landmark");
+        assert!(out.contains("fn BETA() {"), "{out}");
     }
 }

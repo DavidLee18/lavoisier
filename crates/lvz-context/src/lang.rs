@@ -40,6 +40,9 @@ pub(crate) struct LangSpec {
     /// are locals, so they are excluded from references — this is the scope/shadowing fix: a local
     /// variable that happens to share a top-level symbol's name no longer links to that symbol.
     pub binder_kinds: &'static [&'static str],
+    /// Import / `use` declaration kinds. Their raw text is mined for module-path segments, which
+    /// **rank** cross-file definitions of a name — never *resolve* them (see [`super::symbols`]).
+    pub import_kinds: &'static [&'static str],
 }
 
 impl Lang {
@@ -82,6 +85,7 @@ impl Lang {
                 keeps_docstring: false,
                 ref_ident_kinds: &["identifier", "type_identifier"],
                 binder_kinds: &["parameter", "let_declaration", "closure_parameters"],
+                import_kinds: &["use_declaration"],
             },
             Lang::Python => LangSpec {
                 def_kinds: &["function_definition"],
@@ -90,6 +94,7 @@ impl Lang {
                 keeps_docstring: true,
                 ref_ident_kinds: &["identifier"],
                 binder_kinds: &["parameters", "lambda_parameters"],
+                import_kinds: &["import_statement", "import_from_statement"],
             },
             Lang::JavaScript => LangSpec {
                 def_kinds: &[
@@ -106,6 +111,7 @@ impl Lang {
                 keeps_docstring: false,
                 ref_ident_kinds: &["identifier"],
                 binder_kinds: &["formal_parameters", "variable_declarator"],
+                import_kinds: &["import_statement"],
             },
             Lang::TypeScript => LangSpec {
                 def_kinds: &[
@@ -129,6 +135,7 @@ impl Lang {
                     "required_parameter",
                     "optional_parameter",
                 ],
+                import_kinds: &["import_statement"],
             },
         }
     }

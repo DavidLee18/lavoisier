@@ -39,6 +39,79 @@ type Sym = (usize, String);
 pub struct SymbolGraph {
     edges: HashMap<Sym, HashSet<Sym>>,
     file_count: usize,
+    narrowed: usize,
+}
+
+/// One file in a multi-file graph build: its path (for import ranking), language, and source.
+pub struct SourceFile<'a> {
+    /// Repo-relative path. `""` simply means "no evidence" — ranking then degrades to linking
+    /// every definer, exactly as before.
+    pub path: &'a str,
+    /// The file's language.
+    pub lang: Lang,
+    /// The file's contents.
+    pub source: &'a str,
+}
+
+/// A file's definitions plus the evidence used to rank it as a cross-file target.
+struct FileInfo {
+    /// Path components of this file (directories plus the basename stem).
+    path_tokens: HashSet<String>,
+    /// Module-path segments mentioned by this file's imports.
+    imports: HashSet<String>,
+    /// `(name, referenced names)` for each symbol defined here.
+    defs: Vec<(String, HashSet<String>)>,
+}
+
+/// A path's identifying components: directory names plus the basename stem
+/// (`src/parser.rs` → `{src, parser, rs}`). Extension noise is harmless — imports do not name it.
+///
+/// Hyphens fold to underscores because the two sides spell the same module differently: a Rust
+/// crate directory `lvz-context/` is imported as `lvz_context`, and a JS module `foo-bar.ts` as
+/// `'./foo-bar'`. Without the fold almost no real import matches anything.
+fn path_tokens(path: &str) -> HashSet<String> {
+    path.split(['/', '.', '\\'])
+        .filter(|t| !t.is_empty())
+        .map(|t| t.replace('-', "_"))
+        .collect()
+}
+
+/// The module-path segments named by a file's imports: every identifier-ish run in an import
+/// declaration's raw text, minus the keywords every language sprinkles through them.
+fn collect_import_segments(source: &str, lang: Lang) -> HashSet<String> {
+    const KEYWORDS: &[&str] = &[
+        "use", "import", "from", "as", "pub", "crate", "self", "super", "type", "const", "default",
+        "require", "mod",
+    ];
+    let mut out = HashSet::new();
+    let Some(tree) = parse(source, lang) else {
+        return out;
+    };
+    let spec = lang.spec();
+    fn go(node: Node, source: &str, kinds: &[&str], keywords: &[&str], out: &mut HashSet<String>) {
+        if kinds.contains(&node.kind()) {
+            let raw = text(node, source);
+            for seg in raw.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                if seg.is_empty() || keywords.contains(&seg) {
+                    continue;
+                }
+                out.insert(seg.replace('-', "_"));
+            }
+            return;
+        }
+        let mut cur = node.walk();
+        for child in node.children(&mut cur) {
+            go(child, source, kinds, keywords, out);
+        }
+    }
+    go(
+        tree.root_node(),
+        source,
+        spec.import_kinds,
+        KEYWORDS,
+        &mut out,
+    );
+    out
 }
 
 impl SymbolGraph {
@@ -46,7 +119,11 @@ impl SymbolGraph {
     pub fn from_source(source: &str, lang: Lang) -> Self {
         let mut defs = Vec::new();
         collect_symbol_refs(source, lang, &mut defs);
-        SymbolGraph::link(vec![defs])
+        SymbolGraph::link(vec![FileInfo {
+            path_tokens: HashSet::new(),
+            imports: HashSet::new(),
+            defs,
+        }])
     }
 
     /// Build a graph spanning several files (e.g. a cross-file refactor fixture). A reference is
@@ -58,34 +135,77 @@ impl SymbolGraph {
         // First pass: per file, per symbol, its name + the names it *references* (resolved from
         // identifier nodes, minus its own locals). Second pass ([`link`]) resolves those names to
         // file-scoped symbols, preferring the same file.
-        let per_file: Vec<Vec<(String, HashSet<String>)>> = sources
+        let per_file: Vec<FileInfo> = sources
             .into_iter()
             .map(|(lang, source)| {
                 let mut defs = Vec::new();
                 collect_symbol_refs(source, lang, &mut defs);
-                defs
+                // No path ⇒ no evidence ⇒ every candidate ties, which is exactly the old
+                // link-every-definer behaviour.
+                FileInfo {
+                    path_tokens: HashSet::new(),
+                    imports: HashSet::new(),
+                    defs,
+                }
             })
             .collect();
         SymbolGraph::link(per_file)
+    }
+
+    /// Build a graph spanning several **named** files, using each file's imports to *rank* the
+    /// cross-file definers of a name.
+    ///
+    /// The cross-file fallback is **ranked, not resolved**. Import/`use` declarations are mined for
+    /// module-path segments, and a candidate definer scores by how many of them its own path
+    /// matches; only the best-scoring tier survives.
+    ///
+    /// Deliberately not a name resolver: a real one drops a true edge whenever it is wrong, and a
+    /// missing edge is *invisible* — the model silently never sees the body it needed. Ranking can
+    /// only narrow where positive evidence exists, and degrades exactly to link-every-definer where
+    /// it does not. [`narrowed_count`](Self::narrowed_count) says which happened.
+    pub fn from_files(files: &[SourceFile<'_>]) -> Self {
+        let per_file: Vec<FileInfo> = files
+            .iter()
+            .map(|f| {
+                let mut defs = Vec::new();
+                collect_symbol_refs(f.source, f.lang, &mut defs);
+                FileInfo {
+                    path_tokens: path_tokens(f.path),
+                    imports: collect_import_segments(f.source, f.lang),
+                    defs,
+                }
+            })
+            .collect();
+        SymbolGraph::link(per_file)
+    }
+
+    /// How many cross-file references import evidence actually narrowed.
+    ///
+    /// Zero on a snapshot whose files carry no paths or no imports — the honest reading of "the
+    /// ranking did nothing here", and the first thing to check when a body is unexpectedly missing
+    /// from a focused skeleton.
+    pub fn narrowed_count(&self) -> usize {
+        self.narrowed
     }
 
     /// Resolve each symbol's referenced names to file-scoped target symbols. A name defined in the
     /// **same file** resolves there (the precise, scope-aware case); otherwise it resolves to every
     /// other file that defines it (the cross-file fallback — kept because the budget loop links
     /// across files that share no `use`/`import`). A name defined nowhere is dropped.
-    fn link(per_file: Vec<Vec<(String, HashSet<String>)>>) -> Self {
+    fn link(per_file: Vec<FileInfo>) -> Self {
         let file_count = per_file.len();
         // name → the files that define it, for cross-file fallback resolution.
         let mut defined_in: HashMap<&str, Vec<usize>> = HashMap::new();
-        for (fi, defs) in per_file.iter().enumerate() {
-            for (name, _) in defs {
+        for (fi, info) in per_file.iter().enumerate() {
+            for (name, _) in &info.defs {
                 defined_in.entry(name.as_str()).or_default().push(fi);
             }
         }
         let mut edges: HashMap<Sym, HashSet<Sym>> = HashMap::new();
-        for (fi, defs) in per_file.iter().enumerate() {
-            let local: HashSet<&str> = defs.iter().map(|(n, _)| n.as_str()).collect();
-            for (name, refs) in defs {
+        let mut narrowed = 0usize;
+        for (fi, info) in per_file.iter().enumerate() {
+            let local: HashSet<&str> = info.defs.iter().map(|(n, _)| n.as_str()).collect();
+            for (name, refs) in &info.defs {
                 let entry = edges.entry((fi, name.clone())).or_default();
                 for r in refs {
                     if r == name {
@@ -94,14 +214,34 @@ impl SymbolGraph {
                     if local.contains(r.as_str()) {
                         entry.insert((fi, r.clone())); // same-file definition wins
                     } else if let Some(files) = defined_in.get(r.as_str()) {
-                        for &tf in files {
-                            entry.insert((tf, r.clone())); // cross-file fallback (by name)
+                        // Rank the candidates by how much of their path this file's imports
+                        // mention, keeping only the best tier. With no evidence every candidate
+                        // ties at zero, which is the unranked behaviour.
+                        let best = files
+                            .iter()
+                            .map(|&tf| import_score(info, &per_file[tf]))
+                            .max()
+                            .unwrap_or(0);
+                        let kept: Vec<usize> = files
+                            .iter()
+                            .copied()
+                            .filter(|&tf| import_score(info, &per_file[tf]) == best)
+                            .collect();
+                        if kept.len() < files.len() {
+                            narrowed += 1;
+                        }
+                        for tf in kept {
+                            entry.insert((tf, r.clone()));
                         }
                     }
                 }
             }
         }
-        SymbolGraph { edges, file_count }
+        SymbolGraph {
+            edges,
+            file_count,
+            narrowed,
+        }
     }
 
     /// The set of symbol **names** within `radius` reference-hops of `target` (inclusive of
@@ -239,6 +379,15 @@ pub fn skeleton_with_radius(source: &str, lang: Lang, target: &str, radius: u8) 
 /// resolved from the parse tree (identifier nodes), not raw text, and exclude the symbol's own
 /// locals — so names appearing in strings/comments, and locals shadowing a top-level symbol, no
 /// longer create spurious edges.
+/// How much of `target`'s path the `referrer`'s imports mention.
+fn import_score(referrer: &FileInfo, target: &FileInfo) -> usize {
+    referrer
+        .imports
+        .iter()
+        .filter(|seg| target.path_tokens.contains(*seg))
+        .count()
+}
+
 fn collect_symbol_refs(source: &str, lang: Lang, out: &mut Vec<(String, HashSet<String>)>) {
     let Some(tree) = parse(source, lang) else {
         return;
@@ -501,5 +650,130 @@ fn dep() -> i32 { 9 }
         assert_eq!(per_file.len(), 2);
         assert!(per_file[0].contains("target") && !per_file[0].contains("repo"));
         assert!(per_file[1].contains("repo") && !per_file[1].contains("target"));
+    }
+}
+
+#[cfg(test)]
+mod import_ranking_tests {
+    use super::*;
+
+    /// Two files define `helper`; a third calls it and imports only one of them.
+    fn fixture() -> (String, String, String) {
+        let a = "pub fn helper() -> u32 { 1 }\n".to_string();
+        let b = "pub fn helper() -> u32 { 2 }\n".to_string();
+        let caller = "use crate::alpha::helper;\npub fn caller() -> u32 { helper() }\n".to_string();
+        (a, b, caller)
+    }
+
+    #[test]
+    fn imports_narrow_the_cross_file_candidates() {
+        let (a, b, caller) = fixture();
+        let files = [
+            SourceFile {
+                path: "src/alpha.rs",
+                lang: Lang::Rust,
+                source: &a,
+            },
+            SourceFile {
+                path: "src/beta.rs",
+                lang: Lang::Rust,
+                source: &b,
+            },
+            SourceFile {
+                path: "src/caller.rs",
+                lang: Lang::Rust,
+                source: &caller,
+            },
+        ];
+        let g = SymbolGraph::from_files(&files);
+        assert!(
+            g.narrowed_count() > 0,
+            "the import should have narrowed something"
+        );
+
+        // The caller must link to alpha's helper (file 0) and NOT beta's (file 1).
+        let targets = g
+            .edges
+            .get(&(2usize, "caller".to_string()))
+            .expect("caller node");
+        assert!(
+            targets.contains(&(0usize, "helper".to_string())),
+            "expected an edge to alpha::helper, got {targets:?}"
+        );
+        assert!(
+            !targets.contains(&(1usize, "helper".to_string())),
+            "beta::helper is not imported and must be ranked out: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn with_no_evidence_it_degrades_to_linking_every_definer() {
+        // The whole design point: ranking never *resolves*. Without an import there is no positive
+        // evidence, so every definer stays linked — a missing edge is invisible and therefore the
+        // worse failure.
+        let (a, b, _) = fixture();
+        let caller = "pub fn caller() -> u32 { helper() }\n".to_string();
+        let files = [
+            SourceFile {
+                path: "src/alpha.rs",
+                lang: Lang::Rust,
+                source: &a,
+            },
+            SourceFile {
+                path: "src/beta.rs",
+                lang: Lang::Rust,
+                source: &b,
+            },
+            SourceFile {
+                path: "src/caller.rs",
+                lang: Lang::Rust,
+                source: &caller,
+            },
+        ];
+        let g = SymbolGraph::from_files(&files);
+        assert_eq!(g.narrowed_count(), 0, "no imports ⇒ nothing to narrow");
+        let targets = g
+            .edges
+            .get(&(2usize, "caller".to_string()))
+            .expect("caller node");
+        assert!(
+            targets.contains(&(0usize, "helper".to_string())),
+            "{targets:?}"
+        );
+        assert!(
+            targets.contains(&(1usize, "helper".to_string())),
+            "{targets:?}"
+        );
+    }
+
+    #[test]
+    fn from_sources_is_unchanged_because_it_carries_no_paths() {
+        let (a, b, caller) = fixture();
+        let g = SymbolGraph::from_sources([
+            (Lang::Rust, a.as_str()),
+            (Lang::Rust, b.as_str()),
+            (Lang::Rust, caller.as_str()),
+        ]);
+        assert_eq!(g.narrowed_count(), 0);
+    }
+
+    #[test]
+    fn hyphens_fold_so_a_crate_dir_matches_its_import_spelling() {
+        // `lvz-context/` on disk is `lvz_context` in a `use`. Without the fold almost no real
+        // import matches anything.
+        let toks = path_tokens("crates/lvz-context/src/symbols.rs");
+        assert!(toks.contains("lvz_context"), "{toks:?}");
+        assert!(toks.contains("symbols"), "{toks:?}");
+        assert!(toks.contains("crates"), "{toks:?}");
+    }
+
+    #[test]
+    fn import_segments_skip_the_keywords_every_language_sprinkles_in() {
+        let segs = collect_import_segments("use crate::alpha::helper;\n", Lang::Rust);
+        assert!(segs.contains("alpha"), "{segs:?}");
+        assert!(segs.contains("helper"), "{segs:?}");
+        // `use`/`crate` are noise present in every import and would match nothing useful.
+        assert!(!segs.contains("use"), "{segs:?}");
+        assert!(!segs.contains("crate"), "{segs:?}");
     }
 }

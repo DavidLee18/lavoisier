@@ -27,8 +27,16 @@ goal at every layer:
 - **File-skeleton extraction** — send signatures, elide bodies; Python docstrings kept.
 - **AST-resolved symbol-dependency graph** drives the skeleton-radius knob `N` ("include full
   bodies for symbols within `N` hops of the edit target") — references resolved from identifier
-  nodes, scope-aware (string/comment mentions and shadowing locals don't create edges).
-- **Hash-anchored edits** and **token-efficient diffs** instead of re-emitting whole files.
+  nodes, scope-aware (string/comment mentions and shadowing locals don't create edges). Cross-file
+  edges are **import-ranked**: a candidate definer scores by how much of its path the referencing
+  file's imports mention, and only the best tier survives. It ranks, it does not resolve — with no
+  evidence it degrades to linking every definer, because a wrong resolver drops a true edge and a
+  missing edge is invisible. `outline_files --focus` builds one graph across the given paths, so a
+  dependency in another file is followed rather than lost at the boundary.
+- **Hash-anchored edits** and **token-efficient diffs** instead of re-emitting whole files. A
+  repeated edit target is addressable via an `after` landmark (a unique nearby line/snippet, on both
+  `edit_anchored` and `str_replace`) — deliberately *not* a line number or occurrence index, which
+  fail silently once the file shifts.
 - **Multi-file batching** — `read_files`/`outline_files` fetch several files in one round-trip.
 - **Adaptive Token Optimisation (ATO)** — an online tuner that learns per-archetype knob settings
   from realised outcomes (ε-greedy hill-climb or Thompson sampling), gated by a real success signal.

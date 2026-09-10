@@ -6,11 +6,12 @@
 use async_trait::async_trait;
 use lvz_context::anchor::{apply_edits, render_anchored, Edit, EditOp};
 use lvz_context::diff::unified_diff;
-use lvz_context::symbols::skeleton_with_radius;
+use lvz_context::symbols::{skeleton_with_radius, SourceFile, SymbolGraph};
 use lvz_context::{skeleton, Lang};
 use lvz_protocol::{Tool, ToolError, ToolOutput};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 fn parse_args<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, ToolError> {
     serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))
@@ -113,7 +114,9 @@ impl Tool for OutlineFilesTool {
         "Return token-efficient skeletons of several source files at once, concatenated under \
          per-file headers. Prefer this over multiple outline_file calls when surveying more than \
          one file — one round-trip instead of several. Optional `focus`/`radius` apply to each \
-         file. A failure to read one file is reported inline; the rest still return."
+         file, and `focus` follows dependencies ACROSS the given files — so passing the whole \
+         set you care about keeps the callee's body even when it lives in another file. A failure \
+         to read one file is reported inline; the rest still return."
     }
 
     fn schema(&self) -> Value {
@@ -138,14 +141,69 @@ impl Tool for OutlineFilesTool {
             focus,
             radius,
         } = parse_args(args)?;
-        let mut sections = Vec::with_capacity(paths.len());
+        // Read everything first: a focused outline builds ONE graph across all the given paths,
+        // so a dependency in another file is followed rather than lost at the file boundary. That
+        // cross-file reach is the whole reason to pass several paths with a focus.
+        let mut loaded: Vec<(String, Result<String, String>)> = Vec::with_capacity(paths.len());
         for path in paths {
-            let body = match tokio::fs::read_to_string(&path).await {
-                Ok(source) => outline_source(&path, &source, focus.as_deref(), radius.unwrap_or(1)),
-                Err(e) => format!("[error: {e}]"),
-            };
-            sections.push(format!("===== {path} =====\n{body}"));
+            let read = tokio::fs::read_to_string(&path)
+                .await
+                .map_err(|e| e.to_string());
+            loaded.push((path, read));
         }
+
+        let radius = radius.unwrap_or(1);
+        let sections: Vec<String> = match focus.as_deref() {
+            // Unfocused: each file's skeleton is independent, so no graph is needed.
+            None => loaded
+                .iter()
+                .map(|(path, read)| {
+                    let body = match read {
+                        Ok(source) => outline_source(path, source, None, radius),
+                        Err(e) => format!("[error: {e}]"),
+                    };
+                    format!("===== {path} =====\n{body}")
+                })
+                .collect(),
+            Some(target) => {
+                let files: Vec<SourceFile<'_>> = loaded
+                    .iter()
+                    .filter_map(|(path, read)| {
+                        let source = read.as_ref().ok()?;
+                        let lang = Lang::from_path(path)?;
+                        Some(SourceFile { path, lang, source })
+                    })
+                    .collect();
+                let graph = SymbolGraph::from_files(&files);
+                let per_file = graph.neighbors_within_by_file(target, radius);
+                let mut keep_by_path: std::collections::HashMap<&str, &HashSet<String>> =
+                    std::collections::HashMap::new();
+                for (i, f) in files.iter().enumerate() {
+                    if let Some(keep) = per_file.get(i) {
+                        keep_by_path.insert(f.path, keep);
+                    }
+                }
+                loaded
+                    .iter()
+                    .map(|(path, read)| {
+                        let body = match read {
+                            Err(e) => format!("[error: {e}]"),
+                            Ok(source) => {
+                                match (Lang::from_path(path), keep_by_path.get(path.as_str())) {
+                                    (Some(lang), Some(keep)) => {
+                                        skeleton::skeletonize(source, lang, keep)
+                                    }
+                                    // Unknown language: the raw file, as before.
+                                    (None, _) => source.clone(),
+                                    (Some(lang), None) => skeleton::skeleton(source, lang),
+                                }
+                            }
+                        };
+                        format!("===== {path} =====\n{body}")
+                    })
+                    .collect()
+            }
+        };
         Ok(ToolOutput::ok(sections.join("\n\n")))
     }
 }
@@ -198,6 +256,10 @@ struct EditSpec {
     op: String,
     #[serde(default)]
     text: Option<String>,
+    /// Anchor of a unique landmark line above the target; the edit lands on the first matching
+    /// line after it. Only needed when `anchor` matches several identical lines.
+    #[serde(default)]
+    after: Option<String>,
 }
 
 impl EditSpec {
@@ -219,6 +281,7 @@ impl EditSpec {
             }
         };
         Ok(Edit {
+            after: self.after,
             anchor: self.anchor,
             op,
         })
@@ -234,9 +297,11 @@ impl Tool for EditAnchoredTool {
     fn description(&self) -> &str {
         "Apply one or more anchored edits to a file (see read_anchored for anchors) and write \
          it back. Each edit targets a line by its anchor with op replace|insert_after|\
-         insert_before|delete (replace/insert require `text`). The batch is atomic: if any \
-         anchor is missing or ambiguous, nothing is written. Returns a unified diff of the \
-         change."
+         insert_before|delete (replace/insert require `text`). If an anchor matches several \
+         identical lines, add `after`: the anchor of a unique line just above the one you mean, \
+         and the edit lands on the first match past it — do NOT guess, and do not use line \
+         numbers. The batch is atomic: if any anchor is missing or ambiguous, nothing is \
+         written. Returns a unified diff of the change."
     }
 
     fn schema(&self) -> Value {
@@ -255,7 +320,11 @@ impl Tool for EditAnchoredTool {
                                 "type": "string",
                                 "enum": ["replace", "insert_after", "insert_before", "delete"]
                             },
-                            "text": { "type": "string", "description": "Replacement/inserted text (omit for delete)" }
+                            "text": { "type": "string", "description": "Replacement/inserted text (omit for delete)" },
+                            "after": {
+                                "type": "string",
+                                "description": "Anchor of a UNIQUE line above the target; the edit lands on the first matching line after it. Use when `anchor` is repeated."
+                            }
                         },
                         "required": ["anchor", "op"]
                     }
@@ -442,6 +511,58 @@ struct StrReplaceArgs {
     /// Replace every occurrence instead of requiring a unique match.
     #[serde(default)]
     replace_all: bool,
+    /// A snippet that occurs exactly once; the edit applies to the first `old` after it.
+    #[serde(default)]
+    after: Option<String>,
+    /// A snippet that occurs exactly once; the edit applies to the last `old` before it.
+    #[serde(default)]
+    before: Option<String>,
+}
+
+/// Narrow `haystack` to the region a landmark selects, returning the byte offset the region starts
+/// at plus the region itself.
+///
+/// The landmark must itself occur **exactly once** — a repeated landmark pins nothing, so it is a
+/// refusal, not a best guess. This is what makes a repeated `old` addressable without ever becoming
+/// positional: an occurrence index or a line range would silently hit the wrong text once the file
+/// shifts, whereas a content landmark either matches uniquely or fails loudly.
+fn narrow<'a>(
+    haystack: &'a str,
+    after: Option<&str>,
+    before: Option<&str>,
+) -> Result<(usize, &'a str), String> {
+    let mut start = 0usize;
+    let mut end = haystack.len();
+    if let Some(a) = after {
+        let n = haystack.matches(a).count();
+        if n == 0 {
+            return Err("`after` snippet not found".into());
+        }
+        if n > 1 {
+            return Err(format!(
+                "`after` snippet occurs {n}x — it must be unique to pin the edit"
+            ));
+        }
+        let i = haystack.find(a).expect("counted above");
+        start = i + a.len();
+    }
+    if let Some(b) = before {
+        let n = haystack.matches(b).count();
+        if n == 0 {
+            return Err("`before` snippet not found".into());
+        }
+        if n > 1 {
+            return Err(format!(
+                "`before` snippet occurs {n}x — it must be unique to pin the edit"
+            ));
+        }
+        let i = haystack.find(b).expect("counted above");
+        if i < start {
+            return Err("`before` snippet precedes `after` — they select an empty region".into());
+        }
+        end = i;
+    }
+    Ok((start, &haystack[start..end]))
 }
 
 #[async_trait]
@@ -456,7 +577,10 @@ impl Tool for StrReplaceTool {
          missing or non-unique match is an error — add surrounding context to disambiguate). Pass \
          `replace_all: true` to replace every occurrence (e.g. a rename), and `paths` (instead of \
          `path`) to apply the same replacement across several files in one call — ideal for a \
-         project-wide rename after find_references. Returns a per-file count."
+         project-wide rename after find_references. When `old` legitimately repeats and you mean \
+         ONE of them, pass `after` (and/or `before`): a snippet that itself occurs exactly once, \
+         which narrows the edit to the region past/before it. Prefer that over replace_all when \
+         you mean a single occurrence. Returns a per-file count."
     }
 
     fn schema(&self) -> Value {
@@ -467,7 +591,9 @@ impl Tool for StrReplaceTool {
                 "paths": { "type": "array", "items": { "type": "string" }, "description": "Files to apply the same edit to (use this or path)" },
                 "old": { "type": "string", "description": "Exact text to find (verbatim)" },
                 "new": { "type": "string", "description": "Replacement text" },
-                "replace_all": { "type": "boolean", "description": "Replace every occurrence (default false: require a unique match)" }
+                "replace_all": { "type": "boolean", "description": "Replace every occurrence (default false: require a unique match)" },
+                "after": { "type": "string", "description": "A snippet occurring EXACTLY ONCE; edit the first `old` after it. Use to disambiguate a repeated `old`." },
+                "before": { "type": "string", "description": "A snippet occurring EXACTLY ONCE; edit the last `old` before it." }
             },
             "required": ["old", "new"]
         })
@@ -480,6 +606,8 @@ impl Tool for StrReplaceTool {
             old,
             new,
             replace_all,
+            after,
+            before,
         } = parse_args(args)?;
         if old.is_empty() {
             return Ok(ToolOutput::error("str_replace: `old` must not be empty"));
@@ -506,24 +634,50 @@ impl Tool for StrReplaceTool {
                     continue;
                 }
             };
-            let count = original.matches(&old).count();
+            // Narrow to the landmark-selected region first, so `old`'s uniqueness is judged
+            // inside the region the caller actually meant.
+            let (offset, region) = match narrow(&original, after.as_deref(), before.as_deref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    any_error = true;
+                    lines.push(format!("{p}: {e}"));
+                    continue;
+                }
+            };
+            let count = region.matches(&old).count();
             if count == 0 {
                 any_error = true;
-                lines.push(format!("{p}: `old` not found"));
+                let scoped = if after.is_some() || before.is_some() {
+                    " in the region selected by `after`/`before`"
+                } else {
+                    ""
+                };
+                lines.push(format!("{p}: `old` not found{scoped}"));
                 continue;
             }
             if count > 1 && !replace_all {
                 any_error = true;
                 lines.push(format!(
-                    "{p}: `old` occurs {count}× — pass replace_all, or include more context to make it unique"
+                    "{p}: `old` occurs {count}× — pass `after`/`before` (a snippet occurring once) \
+                     to pick one, or replace_all to change them all, or include more context to \
+                     make `old` itself unique"
                 ));
                 continue;
             }
-            let updated = if replace_all {
-                original.replace(&old, &new)
+            // Rebuild around the region, so `after`/`before` actually confine the edit. Replacing
+            // in `original` here would edit the first match in the FILE, which is exactly the
+            // wrong-occurrence bug the landmark exists to prevent.
+            let edited_region = if replace_all {
+                region.replace(&old, &new)
             } else {
-                original.replacen(&old, &new, 1)
+                region.replacen(&old, &new, 1)
             };
+            let updated = format!(
+                "{}{}{}",
+                &original[..offset],
+                edited_region,
+                &original[offset + region.len()..]
+            );
             if updated == original {
                 lines.push(format!("{p}: no change (replacement equals original)"));
                 continue;
@@ -777,5 +931,158 @@ mod tests {
         assert!(!tokio::fs::read_to_string(&a).await.unwrap().contains("old"));
         assert_eq!(tokio::fs::read_to_string(&b).await.unwrap(), "new()\n");
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+}
+
+#[cfg(test)]
+mod str_replace_landmark_tests {
+    use super::*;
+
+    #[test]
+    fn a_unique_landmark_narrows_the_region() {
+        let src = "x = 1\nMARK\nx = 1\n";
+        let (offset, region) = narrow(src, Some("MARK"), None).expect("unique landmark");
+        assert_eq!(region, "\nx = 1\n");
+        assert_eq!(&src[..offset], "x = 1\nMARK");
+    }
+
+    #[test]
+    fn a_repeated_landmark_pins_nothing() {
+        let src = "a\nDUP\nb\nDUP\nc\n";
+        let err = narrow(src, Some("DUP"), None).expect_err("a repeated landmark must refuse");
+        assert!(err.contains("must be unique"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_landmark_is_refused() {
+        assert!(narrow("abc", Some("zzz"), None).is_err());
+        assert!(narrow("abc", None, Some("zzz")).is_err());
+    }
+
+    #[test]
+    fn before_bounds_the_region_from_the_right() {
+        let src = "x = 1\nSTOP\nx = 1\n";
+        let (offset, region) = narrow(src, None, Some("STOP")).expect("unique landmark");
+        assert_eq!(offset, 0);
+        assert_eq!(region, "x = 1\n");
+    }
+
+    #[test]
+    fn after_and_before_can_bracket_a_region() {
+        let src = "x = 1\nA\nx = 1\nB\nx = 1\n";
+        let (_, region) = narrow(src, Some("A"), Some("B")).expect("both unique");
+        assert_eq!(region, "\nx = 1\n");
+    }
+
+    #[test]
+    fn a_before_that_precedes_after_is_refused_rather_than_yielding_an_empty_region() {
+        let src = "B\nmid\nA\n";
+        let err = narrow(src, Some("A"), Some("B")).expect_err("inverted range must refuse");
+        assert!(err.contains("precedes"), "{err}");
+    }
+
+    /// The whole point: without the landmark this edit would hit the FIRST occurrence in the file.
+    #[tokio::test]
+    async fn the_landmark_edits_the_meant_occurrence_not_the_first() {
+        let dir = std::env::temp_dir().join(format!("lvz-sr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.txt");
+        std::fs::write(&path, "val = 0\nSECTION_B\nval = 0\n").unwrap();
+
+        let out = StrReplaceTool
+            .invoke(json!({
+                "path": path.to_str().unwrap(),
+                "old": "val = 0",
+                "new": "val = 9",
+                "after": "SECTION_B",
+            }))
+            .await
+            .expect("invoke");
+        assert!(!out.is_error, "{out:?}");
+
+        let got = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            got, "val = 0\nSECTION_B\nval = 9\n",
+            "the landmark must confine the edit to the region after it"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_repeated_old_without_a_landmark_still_refuses_and_suggests_one() {
+        let dir = std::env::temp_dir().join(format!("lvz-sr2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.txt");
+        std::fs::write(&path, "v\nv\n").unwrap();
+
+        let out = StrReplaceTool
+            .invoke(json!({ "path": path.to_str().unwrap(), "old": "v", "new": "w" }))
+            .await
+            .expect("invoke");
+        assert!(out.is_error, "{out:?}");
+        assert!(out.content.contains("after"), "{}", out.content);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod outline_files_focus_tests {
+    use super::*;
+
+    /// `focus` must follow a dependency into ANOTHER file. Before one shared graph, each file was
+    /// skeletonised alone, so the callee's body was lost at the file boundary — the caller got a
+    /// focused outline that silently omitted the thing it depended on.
+    #[tokio::test]
+    async fn focus_keeps_a_dependency_that_lives_in_another_file() {
+        let dir = std::env::temp_dir().join(format!("lvz-of-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let callee = dir.join("callee.rs");
+        let caller = dir.join("caller.rs");
+        std::fs::write(&callee, "pub fn helper() -> u32 {\n    40 + 2\n}\n").unwrap();
+        std::fs::write(
+            &caller,
+            "use crate::callee::helper;\npub fn entry() -> u32 {\n    helper() + 0\n}\n",
+        )
+        .unwrap();
+
+        let out = OutlineFilesTool
+            .invoke(json!({
+                "paths": [caller.to_str().unwrap(), callee.to_str().unwrap()],
+                "focus": "entry",
+                "radius": 1,
+            }))
+            .await
+            .expect("invoke");
+        assert!(!out.is_error, "{out:?}");
+
+        // The focus symbol keeps its own body...
+        assert!(out.content.contains("helper() + 0"), "{}", out.content);
+        // ...and so does the cross-file dependency it reaches.
+        assert!(
+            out.content.contains("40 + 2"),
+            "the callee's body should survive a cross-file focus:\n{}",
+            out.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_file_is_reported_inline_and_the_rest_still_return() {
+        let dir = std::env::temp_dir().join(format!("lvz-of2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.rs");
+        std::fs::write(&good, "pub fn kept() -> u32 { 1 }\n").unwrap();
+
+        let missing = dir.join("nope.rs");
+        let out = OutlineFilesTool
+            .invoke(json!({
+                "paths": [good.to_str().unwrap(), missing.to_str().unwrap()],
+                "focus": "kept",
+            }))
+            .await
+            .expect("invoke");
+        assert!(out.content.contains("[error:"), "{}", out.content);
+        assert!(out.content.contains("kept"), "{}", out.content);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
