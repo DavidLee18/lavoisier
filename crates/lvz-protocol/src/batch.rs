@@ -1,0 +1,87 @@
+//! Unified **auto-batch** abstraction: run many independent one-shot completions at a provider's
+//! discounted batch price (≈50%), polling the whole create→wait→fetch lifecycle behind one call.
+//!
+//! For non-interactive workloads — bulk classification, offline evals, the benchmark suite — where
+//! latency doesn't matter but token cost does. Not for the interactive agent loop (each turn there
+//! depends on the previous one, so it can't be batched). Providers without a batch API simply don't
+//! implement the trait.
+
+use async_trait::async_trait;
+
+use crate::{ChatRequest, ProviderError, Usage};
+
+/// One request in an auto-batch run: a caller-chosen `custom_id` (echoed back to correlate the
+/// result) plus the request itself.
+pub struct BatchTask {
+    /// Caller-chosen id echoed back on the matching [`BatchItem`] to correlate the result.
+    pub custom_id: String,
+    /// The one-shot completion request to run.
+    pub request: ChatRequest,
+}
+
+impl BatchTask {
+    /// A task pairing `custom_id` with the `request` to run under it.
+    pub fn new(custom_id: impl Into<String>, request: ChatRequest) -> Self {
+        Self {
+            custom_id: custom_id.into(),
+            request,
+        }
+    }
+}
+
+/// The outcome of one batched request, correlated by `custom_id`.
+///
+/// Build one with [`batch_item`] rather than the positional literal: `notices` is easy to forget,
+/// and a batch that drops them loses the only channel it has for reporting a degraded request.
+#[derive(Debug, Clone)]
+pub struct BatchItem {
+    /// The `custom_id` of the [`BatchTask`] this result belongs to.
+    pub custom_id: String,
+    /// Concatenated answer text (empty when `error` is set).
+    pub text: String,
+    /// Token usage for this request (billed at the batch discount).
+    pub usage: Usage,
+    /// Set if the request failed, was canceled, or expired.
+    pub error: Option<String>,
+    /// Capability notices raised when this task was negotiated at submit time — the knobs the
+    /// provider does not support and so did not honour.
+    ///
+    /// A streaming turn delivers these as [`Event::Notice`](crate::Event::Notice), but a batch has
+    /// no event stream, so they are correlated back by `custom_id` and carried here. Without this
+    /// the caller pays for a batch silently stripped of the features they asked for.
+    pub notices: Vec<String>,
+}
+
+/// Build a [`BatchItem`]. Prefer this over the struct literal so a new field cannot be silently
+/// omitted at one of the several construction sites.
+pub fn batch_item(
+    custom_id: impl Into<String>,
+    text: impl Into<String>,
+    usage: Usage,
+    error: Option<String>,
+) -> BatchItem {
+    BatchItem {
+        custom_id: custom_id.into(),
+        text: text.into(),
+        usage,
+        error,
+        notices: Vec::new(),
+    }
+}
+
+impl BatchItem {
+    /// Attach the capability notices raised for this task at submit time.
+    pub fn with_notices(mut self, notices: Vec<String>) -> Self {
+        self.notices = notices;
+        self
+    }
+}
+
+/// A provider offering a discounted asynchronous **batch** API. [`run_batch`](BatchProvider::run_batch)
+/// submits every task, polls until the batch finishes, and returns one [`BatchItem`] per task — the
+/// entire lifecycle behind a single call ("auto-batch"). Trades latency for ≈50% lower token cost.
+#[async_trait]
+pub trait BatchProvider: Send + Sync {
+    /// Run all `tasks` as one batch and return their results once the batch completes.
+    async fn run_batch(&self, tasks: Vec<BatchTask>) -> Result<Vec<BatchItem>, ProviderError>;
+}

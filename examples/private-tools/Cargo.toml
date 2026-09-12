@@ -1,0 +1,19 @@
+[package]
+name = "lavoisier-private-tools-example"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Template only — never published. Copy this crate into your own private repo.
+publish = false
+
+[[bin]]
+name = "my-lav"
+path = "src/main.rs"
+
+[dependencies]
+# In your real (private) crate, depend on the published engine instead of this path:
+#   lavoisier = "0.4"
+lavoisier = { path = "../../crates/lvz-cli" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }

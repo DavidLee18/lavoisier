@@ -1,19 +1,6 @@
-# Rust build output — the retired implementation lives on the `rust` branch; a worktree of it here
-# would drop a target/
 /target
 **/*.rs.bk
 *.pdb
-
-# Unrelated project directory that lives alongside this repo (never track it)
-/42_webserv/
-
-# Haskell / Cabal build output
-dist-newstyle/
-*.hi
-*.o
-# Per-machine / per-runner cabal overrides (the release workflow generates cabal.project.dist.local)
-cabal.project.local
-cabal.project.*.local
 
 # Secrets — never commit keys (RECIPE.md §10)
 .env
@@ -25,5 +12,5 @@ cabal.project.*.local
 bench/results/
 bench/*.out
 
-# proto-lens-protoc plugin (installed into ~/.cabal/store; regenerate gen/ with it)
-.protoc-plugins/
+# Unrelated project directory that lives alongside this repo (never track it)
+/42_webserv/

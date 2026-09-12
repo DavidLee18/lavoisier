@@ -1,16 +1,17 @@
 # Dependabot scope for this repo.
 #
-# Cargo is deliberately absent. Lavoisier was a Rust workspace through v0.15.0; `main` is Haskell and
-# carries no Cargo manifest, so cargo updates have nothing to act on — one such run failed here after
-# the swap (`cargo in / for quinn-proto`). The retired Rust tree lives on the `rust` branch, which
-# Dependabot does not scan: it only ever looks at the default branch.
+# Cargo is ENABLED again. It was deliberately absent while `main` was the Haskell tree — that version
+# of this file explained that `main` carried no Cargo manifest, so cargo updates had nothing to act
+# on and one such run failed outright (`cargo in / for quinn-proto`). `main` is a Rust workspace
+# again as of the v0.18.0 merge, so the reason for the exclusion is gone and the exclusion with it.
 #
-# Haskell/Cabal is not a supported ecosystem, so dependency bumps for the package itself stay manual.
+# Dependabot only ever scans the DEFAULT branch, which is why this file has to track whatever `main`
+# currently is rather than covering both trees. The retired Haskell tree is reachable by tag
+# (v0.16.0..v0.17.0) and is not scanned.
 #
-# GitHub Actions is supported and worth having: CLAUDE.md requires every action to be pinned to a
-# full commit SHA with the version in a trailing comment, and Dependabot updates both together —
-# which is exactly the maintenance that otherwise rots (CI currently warns about actions still on
-# Node 20).
+# GitHub Actions is worth having regardless: CLAUDE.md requires every action to be pinned to a full
+# commit SHA with the version in a trailing comment, and Dependabot updates both together — which is
+# exactly the maintenance that otherwise rots.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -23,3 +24,22 @@ updates:
       codeql-action:
         patterns:
           - github/codeql-action*
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    # One PR per group rather than per crate: the workspace pins ~20 internal `lvz-*` members plus a
+    # wide dependency tree, and ungrouped updates would open enough PRs to drown the signal.
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    # MSRV is pinned at 1.88 in the root Cargo.toml; a major bump can silently raise it, so those
+    # arrive as individual PRs to be read rather than folded into the group above.
+    open-pull-requests-limit: 5

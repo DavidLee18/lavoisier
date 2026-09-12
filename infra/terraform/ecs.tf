@@ -30,9 +30,7 @@ resource "aws_ecs_task_definition" "app" {
       name      = var.name
       image     = local.image_uri
       essential = true
-      # `--serve` takes a bare port; Warp binds 0.0.0.0 by default. (The retired Rust CLI took a
-      # host:port pair here — passing one now fails to parse and the task crashloops.)
-      command   = ["--serve", "8080"]
+      command   = ["--serve", "0.0.0.0:8080"]
 
       portMappings = [
         { containerPort = 8080, protocol = "tcp" }

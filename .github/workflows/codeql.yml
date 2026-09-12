@@ -1,76 +1,75 @@
 name: codeql
 
-# Advanced (workflow-based) CodeQL setup.
+# Static security analysis of the Rust workspace. Separate from `ci` because it is slower and
+# runs on a schedule as well as on changes — a finding can appear from an updated query pack
+# without the code moving at all, which a push-only trigger would never surface.
 #
-# ⚠️ CodeQL CANNOT ANALYSE HASKELL. It has no Haskell extractor, and Haskell is ~75 of this repo's
-# source files — the whole program. Nothing below looks at `src/`, `app/`, or `test/`. Read this
-# workflow as supply-chain and FFI-boundary cover, NOT as coverage of Lavoisier itself; `-Wall
-# -Werror`, the tasty suite, and the budget ceilings remain the only gates on the Haskell.
-#
-# Two languages are analysed, and the other two GitHub's starter template proposed are deliberately
-# dropped:
-#   actions  — the workflows themselves. Worth real attention: `release.yml` holds `contents: write`
-#              and publishes binaries, so an injection here is a supply-chain problem.
-#   c-cpp    — restricted by .github/codeql-config.yml to `cbits/lvz_ts_shim.c|h`, the 132-line FFI
-#              shim we wrote. The other ~430k lines under `cbits/ts-*/` are GENERATED tree-sitter
-#              parsers, vendored verbatim; scanning them is slow and can only ever produce alerts
-#              against code we do not own and would not patch.
-#   rust     — dropped. The only .rs files are the synthetic budget fixtures under `tests/budget/`,
-#              written to exercise the skeletoniser. Alerts on them would be pure noise.
-#   js/ts    — dropped. The only .js files are tree-sitter's grammar DSL, vendored, not application
-#              code.
-#
-# Actions are pinned to a full commit SHA per CLAUDE.md — a security workflow is the last place to
-# trust a mutable tag.
+# Third-party actions are pinned to a full commit SHA per CLAUDE.md; the trailing comment records
+# the version.
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-  # New queries ship continuously, so re-scan unchanged code on a schedule; push-only analysis goes
-  # stale the moment the repo goes quiet.
   schedule:
-    - cron: "27 3 * * 1"
+    # Weekly, Monday 07:00 UTC. Catches query-pack updates against unchanged code.
+    - cron: "0 7 * * 1"
 
 permissions:
   contents: read
 
 jobs:
   analyze:
-    name: analyze (${{ matrix.language }})
-    runs-on: ubuntu-latest
+    name: analyze (rust)
+    runs-on: ubuntu-22.04
     permissions:
+      # Required to upload the SARIF results to the Security tab.
       security-events: write
-      packages: read
-      actions: read
       contents: read
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - language: actions
-            build-mode: none
-          - language: c-cpp
-            build-mode: none
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # CodeQL builds the workspace itself, and `lvz-xai`'s build script needs protoc. Same
+      # SHA-256-pinned direct download as ci.yml — no JS action, so no Node runtime and no token.
+      - name: Install protoc
+        shell: bash
+        env:
+          PROTOC_VERSION: "29.3"
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)   asset=linux-x86_64;   sha=3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a ;;
+            Linux-ARM64) asset=linux-aarch_64; sha=6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32 ;;
+            *) echo "unsupported runner ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+          esac
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${asset}.zip"
+          curl -fsSL -o protoc.zip "$url"
+          echo "${sha}  protoc.zip" | shasum -a 256 -c -
+          unzip -q protoc.zip -d "$HOME/.protoc"
+          echo "$HOME/.protoc/bin" >> "$GITHUB_PATH"
+          "$HOME/.protoc/bin/protoc" --version
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master @ 2026-06-18
+        with:
+          toolchain: stable
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
+        uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         with:
-          languages: ${{ matrix.language }}
-          build-mode: ${{ matrix.build-mode }}
+          languages: rust
+          # Scope exclusions (generated prost output, vendored protos, budget fixtures) live in the
+          # config file so they are one list rather than inline duplication.
           config-file: ./.github/codeql-config.yml
-          # `security-extended` is the point of an advanced setup — the default pack is a subset.
-          # `security-and-quality` additionally adds maintainability rules; not enabled, because on a
-          # vendored-C + workflows surface those would be noise rather than signal.
+          # `security-extended` over the default pack: this is an agent that runs shell commands
+          # and edits files on a user's machine, so the extra taint queries earn their runtime.
           queries: security-extended
 
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         with:
-          category: "/language:${{ matrix.language }}"
+          category: "/language:rust"

@@ -1,10 +1,16 @@
-# CodeQL scope. See .github/workflows/codeql.yml for why each exclusion exists.
+# CodeQL scope. See .github/workflows/codeql.yml for why the analysis runs at all.
+#
+# The Haskell-era version of this file excluded `cbits/ts-*`, `gen` and `tests/budget`. None of those
+# paths exist in the Rust tree — the tree-sitter grammars are ordinary crates.io dependencies here
+# rather than vendored C — so the exclusions below are the Rust equivalents, not a copy.
 name: lavoisier
 
 paths-ignore:
-  # Generated tree-sitter parsers and scanners, vendored verbatim (~430k lines). Not ours to fix.
-  - cbits/ts-*
-  # Committed proto-lens bindings for the xAI gRPC API, generated from the vendored .proto.
-  - gen
-  # Synthetic fixtures for the budget/skeleton tests — deliberately odd code, not shipped.
-  - tests/budget
+  # Committed prost/tonic output, generated from the vendored xAI protos and regenerated only under
+  # LVZ_XAI_REGEN=1. It is checked in so that `cargo install` and docs.rs need no protoc — findings
+  # in it are the generator's, not ours, and cannot be fixed here.
+  - crates/lvz-xai/src/generated
+  # Vendored verbatim from xai-org/xai-proto; ours to build against, not to author.
+  - crates/lvz-xai/proto
+  # Synthetic fixtures for the budget/skeleton tests — deliberately odd code, never shipped.
+  - crates/lvz-context/tests/budget

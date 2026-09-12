@@ -1,0 +1,917 @@
+//! TOML configuration file for long-running deployments.
+//!
+//! A `lavoisier.toml` (or `--config <PATH>`) sets defaults for most flags, so a `--serve` /
+//! `--serve-matrix` / `--cron` process can be configured from a file instead of a long command
+//! line. **Precedence: an explicit CLI flag (or env var) always wins over the file, which wins
+//! over the built-in default.** The file is split into `[provider]`, `[agent]`, `[memory]`,
+//! `[gateway]`, `[legion]`, and `[log]` sections; unknown keys are rejected so typos surface
+//! immediately.
+//!
+//! Memory in particular is configured here: the in-memory store is unbounded by default, but
+//! `[memory]` can cap it (`max_messages`, `max_sessions`) or switch to a durable file store.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use lvz_memory::{FileStore, InMemoryStore, SessionStore};
+use lvz_protocol::ServerTool;
+use serde::Deserialize;
+
+use crate::{Cli, ModelRef, ProviderKind};
+
+/// The parsed `lavoisier.toml`. Every field is optional; a missing file yields all-default.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    pub provider: ProviderSection,
+    pub agent: AgentSection,
+    pub memory: MemorySection,
+    pub gateway: GatewaySection,
+    pub legion: LegionSection,
+    pub mcp: McpSection,
+    pub log: LogSection,
+    /// Where this config was read from, or `None` if no file was found.
+    ///
+    /// Recorded rather than logged at load time on purpose: `[log] level` lives *in* this file, so
+    /// loading necessarily happens before the collector is installed and an event emitted here
+    /// would be dropped. The caller logs it once logging is up.
+    #[serde(skip)]
+    pub source: Option<PathBuf>,
+}
+
+/// `[log]` — structured logging to stderr. Absent ⇒ no collector is installed.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogSection {
+    /// `RUST_LOG`-style filter: a bare level (`info`) or per-target directives
+    /// (`lvz_gw_matrix=debug,warn`). `--log-level` / `LVZ_LOG_LEVEL` take precedence.
+    pub level: Option<String>,
+}
+
+/// `[legion]` — a multi-model council that argues the task out before the agent acts. Absent ⇒
+/// no council (the single `--advisor-model` pre-pass, if any, applies instead).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LegionSection {
+    /// Debater specs, each `provider:model` (e.g. `anthropic:claude-opus-4-8`, `xai:grok-4`). Two
+    /// or more required to convene. `--legion-debater` (repeatable) takes precedence.
+    ///
+    /// Typed, so a bad spec fails at config load rather than when the council first convenes.
+    pub debaters: Option<Vec<ModelRef>>,
+    /// The judge spec, `provider:model`; defaults to the first debater. `--legion-judge` takes
+    /// precedence.
+    pub judge: Option<ModelRef>,
+    /// Critique rounds after the draft (default 1; 0 = draft then judge). `--legion-rounds` /
+    /// `LVZ_LEGION_ROUNDS` take precedence.
+    pub rounds: Option<usize>,
+}
+
+/// `[mcp]` — external Model Context Protocol servers whose tools Lavoisier connects to and exposes.
+/// Absent ⇒ no MCP servers.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpSection {
+    /// Server specs, each `label: target` (a spawn command for stdio, or an `http(s)://` URL) —
+    /// the same grammar as `--mcp-server`, which takes precedence.
+    pub servers: Option<Vec<String>>,
+}
+
+/// `[provider]` — which model/provider to drive.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderSection {
+    /// Which provider to drive. A real enum, so an unknown name is a *load* error listing the
+    /// valid ones — as free text, `parse_provider` returned `None` and the value was silently
+    /// ignored, leaving the default provider running under a config that plainly said otherwise.
+    pub provider: Option<ProviderKind>,
+    pub model: Option<String>,
+    /// Ordered fallback chain, each `provider:model`. If the primary is unresponsive or errors
+    /// before streaming output, the agent retries on the next. `--fallback` (repeatable) wins.
+    ///
+    /// Deserialised as [`ModelRef`], so an unknown provider or a missing `:model` half is a
+    /// **config-load** error naming the entry, rather than surfacing the first time the primary
+    /// model fails — which is the rare path, mid-run, and the worst moment to discover a typo.
+    pub fallback: Option<Vec<ModelRef>>,
+    /// Seconds a failed fallback model stays demoted before re-probe (circuit breaker; default 60).
+    /// `--fallback-cooldown` / `LVZ_FALLBACK_COOLDOWN` take precedence.
+    pub fallback_cooldown: Option<u64>,
+    /// **Provider-run (server-side) tools** to offer every turn. Deserialised as the real
+    /// [`ServerTool`] enum, tagged by `kind`, so a misspelled name or a filter on the wrong tool is
+    /// a *config load* error rather than a field the program ignores:
+    ///
+    /// ```toml
+    /// [[provider.server_tools]]
+    /// kind = "web_search"
+    /// max_uses = 5
+    /// allowed_domains = ["docs.rs"]
+    ///
+    /// [[provider.server_tools]]
+    /// kind = "code_execution"
+    /// ```
+    ///
+    /// `--server-tools` (names only, each with its defaults) wins wholesale when non-empty; this is
+    /// the surface for the filters the flag cannot express. A tool the chosen provider does not
+    /// declare is refused at negotiation, not silently dropped.
+    pub server_tools: Option<Vec<ServerTool>>,
+}
+
+/// The keys each `[[provider.server_tools]]` entry accepts, by `kind`.
+///
+/// Kept next to the [`ServerTool`] variants it mirrors. It exists because serde's
+/// `deny_unknown_fields` is **inert on internally-tagged enums** — with `#[serde(tag = "kind")]`
+/// an unrecognised key is silently discarded, so `kind = "code_execution"` with an
+/// `allowed_domains` filter would load fine and then quietly do nothing. That is precisely the
+/// "field the program ignores" failure this typed surface exists to remove, so the check is done
+/// by hand rather than left to an attribute that does not fire.
+fn server_tool_keys(kind: &str) -> Option<&'static [&'static str]> {
+    Some(match kind {
+        "web_search" => &["kind", "max_uses", "allowed_domains", "blocked_domains"],
+        "web_fetch" => &["kind", "max_uses"],
+        "code_execution" => &["kind"],
+        "x_search" => &[
+            "kind",
+            "allowed_handles",
+            "blocked_handles",
+            "from_date",
+            "to_date",
+        ],
+        "collections_search" => &["kind", "collection_ids", "limit"],
+        "url_context" => &["kind"],
+        _ => return None,
+    })
+}
+
+/// Reject a filter set on a tool that has no such filter. Runs after the typed parse, which has
+/// already rejected an unknown `kind`.
+fn validate_server_tools(text: &str) -> Result<(), String> {
+    let Ok(root) = toml::from_str::<toml::Value>(text) else {
+        return Ok(()); // the typed parse reports the syntax error
+    };
+    let Some(entries) = root
+        .get("provider")
+        .and_then(|p| p.get("server_tools"))
+        .and_then(|v| v.as_array())
+    else {
+        return Ok(());
+    };
+    for entry in entries {
+        let Some(table) = entry.as_table() else {
+            continue;
+        };
+        let Some(kind) = table.get("kind").and_then(|k| k.as_str()) else {
+            continue;
+        };
+        let Some(allowed) = server_tool_keys(kind) else {
+            continue;
+        };
+        for key in table.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(format!(
+                    "[[provider.server_tools]] kind = \"{kind}\" has no `{key}` \
+                     (accepted: {})",
+                    allowed.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `[agent]` — the tool loop, compaction, routing, and accuracy levers.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentSection {
+    pub summary_model: Option<String>,
+    pub compact_after: Option<usize>,
+    pub context_limit: Option<usize>,
+    pub max_steps: Option<usize>,
+    pub max_tokens: Option<u32>,
+    pub budget: Option<u64>,
+    pub cheap_model: Option<String>,
+    pub escalate_after: Option<usize>,
+    pub advisor_model: Option<String>,
+    pub repo_skeleton: Option<usize>,
+    pub thinking: Option<String>,
+    pub persona: Option<PathBuf>,
+    pub system: Option<String>,
+    pub require_edit: Option<bool>,
+    pub verify_and_fix: Option<bool>,
+    pub verify_cmd: Option<String>,
+}
+
+/// `[memory]` — session-store kind and bounds.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemorySection {
+    /// `memory` (default, process-local) or `file` (durable; needs `path`).
+    ///
+    /// A real enum, so a typo is a *load* error listing the valid values rather than one caught by
+    /// a `match` arm buried in store construction — and impossible to reach at all from the
+    /// `deny_unknown_fields` sections around it.
+    pub store: Option<StoreKind>,
+    /// Directory for the `file` store.
+    pub path: Option<PathBuf>,
+    /// Cap each session to its most recent N messages.
+    pub max_messages: Option<usize>,
+    /// Keep at most N sessions (LRU eviction); in-memory store only.
+    pub max_sessions: Option<usize>,
+}
+
+/// Which session store `[memory]` describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreKind {
+    /// Process-local, lost on restart. The default.
+    Memory,
+    /// Durable, on disk; requires `memory.path`.
+    File,
+}
+
+/// `[gateway]` — serve addresses, auth, and rate limit.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GatewaySection {
+    pub serve: Option<String>,
+    pub serve_matrix: Option<bool>,
+    pub serve_slack: Option<bool>,
+    /// A2A server bind address (`host:port`). `--serve-a2a` / `LVZ_SERVE_A2A` take precedence.
+    pub serve_a2a: Option<String>,
+    /// Run as a Zed Agent Client Protocol agent over stdio (see `--acp`). `--acp` takes precedence.
+    pub acp: Option<bool>,
+    /// Launch the interactive inline terminal UI (see `--tui`). `--tui` takes precedence.
+    pub tui: Option<bool>,
+    /// Skip TUI tool-approval prompts (see `--tui-auto-approve`). The flag takes precedence.
+    pub tui_auto_approve: Option<bool>,
+    pub api_keys: Option<Vec<String>>,
+    pub rate_limit: Option<u32>,
+    /// Auto-accept Matrix room invites (default `true`).
+    pub matrix_auto_join: Option<bool>,
+    /// Only answer these Matrix senders (`@user:server`); empty/unset ⇒ answer everyone. The
+    /// `MATRIX_ALLOWED_USERS` env var (comma-separated) takes precedence.
+    pub matrix_allowed_users: Option<Vec<String>>,
+    /// Directory persisting the Matrix session (token + device id) and the E2EE crypto store, for
+    /// a stable identity across restarts. `MATRIX_STATE_DIR` takes precedence.
+    pub matrix_state_dir: Option<PathBuf>,
+    /// Refuse to start when Matrix E2EE cannot be initialised, instead of degrading to plaintext.
+    ///
+    /// Default `false` (degrade), which suits a gateway serving a mix of plaintext and encrypted
+    /// rooms. Set it in an all-encrypted deployment: otherwise a bad `MATRIX_CRYPTO_STORE_KEY` or a
+    /// crypto store at the wrong path leaves the bot up, healthy-looking and unable to read or write
+    /// a single message. `--require-e2ee` / `LVZ_REQUIRE_E2EE` take precedence.
+    pub matrix_require_e2ee: Option<bool>,
+    /// Only act in these Matrix rooms (room ids); empty/unset ⇒ any room the bot is in. Combined
+    /// with `matrix_allowed_users` as a conjunction. The `MATRIX_ALLOWED_ROOMS` env var
+    /// (comma-separated) takes precedence.
+    pub matrix_allowed_rooms: Option<Vec<String>>,
+    /// Per-room tool permissions: `room_id` → the tool names permitted in that room. A room absent
+    /// from the map is unconstrained. Intersected with `matrix_user_tools`.
+    pub matrix_room_tools: Option<HashMap<String, Vec<String>>>,
+    /// Per-member tool permissions: `user_id` → the tool names permitted to that member. A user
+    /// absent from the map is unconstrained. Intersected with `matrix_room_tools`.
+    pub matrix_user_tools: Option<HashMap<String, Vec<String>>>,
+    /// The Matrix "home" room that receives the shutdown notice on SIGTERM / Ctrl-C. The
+    /// `MATRIX_HOME_ROOM` env var takes precedence.
+    pub matrix_home_room: Option<String>,
+    /// Directory inbound Matrix media (images/files) is downloaded to. Setting it **enables** media
+    /// ingest — an engaged image/file message is fetched here and its local path handed to the agent
+    /// so a tool can act on it. Unset ⇒ media messages are ignored. `MATRIX_MEDIA_DIR` takes
+    /// precedence.
+    pub matrix_media_dir: Option<PathBuf>,
+    /// Only answer these Slack user ids; empty/unset ⇒ answer everyone. The `SLACK_ALLOWED_USERS`
+    /// env var (comma-separated) takes precedence.
+    pub slack_allowed_users: Option<Vec<String>>,
+    /// Default max retries after a failed cron fire before waiting for the next slot (`0` ⇒ no
+    /// retry). A per-job `retry_max` in `--cron-file` overrides this. `--cron-retry-max` /
+    /// `LVZ_CRON_RETRY_MAX` take precedence.
+    pub cron_retry_max: Option<u32>,
+    /// Seconds to wait between cron retries. A per-job `retry_wait` in `--cron-file` overrides this.
+    /// `--cron-retry-wait` / `LVZ_CRON_RETRY_WAIT` take precedence.
+    pub cron_retry_wait: Option<u64>,
+    /// Path to the Matrix schedule file (see `--schedule-file`). Requires `serve_matrix`.
+    pub schedule_file: Option<PathBuf>,
+    /// Default room for schedule reports, for jobs that name none. Falls back to `matrix_home_room`.
+    pub schedule_room: Option<String>,
+    /// Default max retries after a failed scheduled fire. A per-job `retry_max` overrides this.
+    pub schedule_retry_max: Option<u32>,
+    /// Seconds between scheduled-job retries. A per-job `retry_wait` overrides this.
+    pub schedule_retry_wait: Option<u64>,
+}
+
+impl Config {
+    /// Load from an explicit `--config` path (a missing file is an error), else auto-discover
+    /// `./lavoisier.toml` (absent ⇒ all-default, silently).
+    pub fn load(explicit: Option<&Path>) -> Result<Self, String> {
+        let path = match explicit {
+            Some(p) => p.to_path_buf(),
+            None => {
+                let default = PathBuf::from("lavoisier.toml");
+                if !default.is_file() {
+                    return Ok(Self::default());
+                }
+                default
+            }
+        };
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("reading config {}: {e}", path.display()))?;
+        let mut config: Config =
+            toml::from_str(&text).map_err(|e| format!("parsing config {}: {e}", path.display()))?;
+        validate_server_tools(&text)
+            .map_err(|e| format!("parsing config {}: {e}", path.display()))?;
+        config.source = Some(path);
+        Ok(config)
+    }
+
+    /// Fill any CLI field the user did not set from the config file (CLI/env wins over the file).
+    pub fn apply_to(&self, cli: &mut Cli) {
+        // [provider]
+        if cli.provider.is_none() {
+            cli.provider = self.provider.provider;
+        }
+        merge(&mut cli.model, &self.provider.model);
+        // A Vec flag: the file supplies it only when the CLI passed none (CLI wins wholesale).
+        if cli.fallback.is_empty() {
+            if let Some(fallback) = &self.provider.fallback {
+                cli.fallback = fallback.clone();
+            }
+        }
+        merge_copy(&mut cli.fallback_cooldown, self.provider.fallback_cooldown);
+        // Provider-run tools: a non-empty `--server-tools` wins **wholesale** (it is a set, not a
+        // field to merge item-by-item), otherwise take the file's list. The flag carries names with
+        // their defaults; the file is where the domain/handle/date filters live, so mixing the two
+        // would silently drop whichever half lost.
+        cli.resolved_server_tools = if cli.server_tools.is_empty() {
+            self.provider.server_tools.clone().unwrap_or_default()
+        } else {
+            cli.server_tools.iter().copied().map(Into::into).collect()
+        };
+
+        // [agent]
+        merge(&mut cli.summary_model, &self.agent.summary_model);
+        merge_copy(&mut cli.compact_after, self.agent.compact_after);
+        merge_copy(&mut cli.context_limit, self.agent.context_limit);
+        merge_copy(&mut cli.max_steps, self.agent.max_steps);
+        merge_copy(&mut cli.max_tokens, self.agent.max_tokens);
+        merge_copy(&mut cli.budget, self.agent.budget);
+        merge(&mut cli.cheap_model, &self.agent.cheap_model);
+        merge_copy(&mut cli.escalate_after, self.agent.escalate_after);
+        merge(&mut cli.advisor_model, &self.agent.advisor_model);
+        merge_copy(&mut cli.repo_skeleton, self.agent.repo_skeleton);
+        merge(&mut cli.thinking, &self.agent.thinking);
+        merge(&mut cli.persona, &self.agent.persona);
+        merge(&mut cli.system, &self.agent.system);
+        merge(&mut cli.verify_cmd, &self.agent.verify_cmd);
+        // Boolean accuracy levers: the file can turn them on; an explicit `--flag` also turns
+        // them on, so OR is the correct merge (neither can force-disable the other).
+        cli.require_edit |= self.agent.require_edit.unwrap_or(false);
+        cli.verify_and_fix |= self.agent.verify_and_fix.unwrap_or(false);
+
+        // [gateway]
+        merge(&mut cli.serve, &self.gateway.serve);
+        cli.serve_matrix |= self.gateway.serve_matrix.unwrap_or(false);
+        cli.serve_slack |= self.gateway.serve_slack.unwrap_or(false);
+        merge(&mut cli.serve_a2a, &self.gateway.serve_a2a);
+        cli.acp |= self.gateway.acp.unwrap_or(false);
+        cli.tui |= self.gateway.tui.unwrap_or(false);
+        cli.tui_auto_approve |= self.gateway.tui_auto_approve.unwrap_or(false);
+        merge_copy(&mut cli.rate_limit, self.gateway.rate_limit);
+        merge_copy(&mut cli.cron_retry_max, self.gateway.cron_retry_max);
+        merge_copy(&mut cli.cron_retry_wait, self.gateway.cron_retry_wait);
+        merge(&mut cli.schedule_file, &self.gateway.schedule_file);
+        merge(&mut cli.schedule_room, &self.gateway.schedule_room);
+        merge_copy(&mut cli.schedule_retry_max, self.gateway.schedule_retry_max);
+        merge_copy(
+            &mut cli.schedule_retry_wait,
+            self.gateway.schedule_retry_wait,
+        );
+        if cli.api_key.is_empty() {
+            if let Some(keys) = &self.gateway.api_keys {
+                cli.api_key = keys.clone();
+            }
+        }
+
+        // [legion]
+        if cli.legion_debater.is_empty() {
+            if let Some(debaters) = &self.legion.debaters {
+                cli.legion_debater = debaters.clone();
+            }
+        }
+        merge(&mut cli.legion_judge, &self.legion.judge);
+        merge_copy(&mut cli.legion_rounds, self.legion.rounds);
+
+        // [mcp] — a Vec flag: the file supplies it only when the CLI passed none (CLI wins wholesale).
+        if cli.mcp_server.is_empty() {
+            if let Some(servers) = &self.mcp.servers {
+                cli.mcp_server = servers.clone();
+            }
+        }
+
+        // [log]
+        merge(&mut cli.log_level, &self.log.level);
+    }
+
+    /// Build the session store described by `[memory]` (`memory` store unless `store = "file"`).
+    pub fn build_session_store(&self) -> Result<Arc<dyn SessionStore>, String> {
+        // No unknown-value arm: an invalid `store` can no longer reach here, because serde
+        // rejects it at load with the accepted values named.
+        match self.memory.store.unwrap_or(StoreKind::Memory) {
+            StoreKind::Memory => Ok(Arc::new(InMemoryStore::with_limits(
+                self.memory.max_messages,
+                self.memory.max_sessions,
+            ))),
+            StoreKind::File => {
+                let dir =
+                    self.memory.path.clone().ok_or_else(|| {
+                        "memory.store = \"file\" requires memory.path".to_string()
+                    })?;
+                Ok(Arc::new(
+                    FileStore::new(dir).with_max_messages(self.memory.max_messages),
+                ))
+            }
+        }
+    }
+}
+
+/// Fill `target` from `from` only if the user left it unset.
+fn merge<T: Clone>(target: &mut Option<T>, from: &Option<T>) {
+    if target.is_none() {
+        target.clone_from(from);
+    }
+}
+
+/// `merge` for `Copy` values passed by value.
+fn merge_copy<T>(target: &mut Option<T>, from: Option<T>) {
+    if target.is_none() {
+        *target = from;
+    }
+}
+
+/// Parse a `[provider] provider` string into a [`ProviderKind`] (matching the CLI value names).
+/// Deserialised through [`parse_provider`] rather than derived, so the underscore/compact aliases
+/// (`claude_cli`, `claudecli`, `xai_responses`) an existing config may already use keep working —
+/// a derive would have quietly started rejecting them. An unknown name now names the valid set
+/// instead of being ignored.
+impl<'de> serde::Deserialize<'de> for ProviderKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        parse_provider(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown provider {s:?} (expected xai|xai-responses|anthropic|google|claude-cli)"
+            ))
+        })
+    }
+}
+
+fn parse_provider(s: &str) -> Option<ProviderKind> {
+    match s.to_ascii_lowercase().as_str() {
+        "xai" => Some(ProviderKind::Xai),
+        "xai-responses" | "xai_responses" | "xairesponses" => Some(ProviderKind::XaiResponses),
+        "anthropic" => Some(ProviderKind::Anthropic),
+        "google" => Some(ProviderKind::Google),
+        "claude-cli" | "claude_cli" | "claudecli" => Some(ProviderKind::ClaudeCli),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_sections_and_rejects_unknown_keys() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [provider]
+            provider = "anthropic"
+            model = "claude-x"
+
+            [agent]
+            compact_after = 50000
+            require_edit = true
+
+            [memory]
+            store = "file"
+            path = "/var/lib/lav/sessions"
+            max_messages = 200
+
+            [gateway]
+            serve = "0.0.0.0:8080"
+            api_keys = ["k1", "k2"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.provider.provider, Some(ProviderKind::Anthropic));
+        assert_eq!(cfg.agent.compact_after, Some(50000));
+        assert_eq!(cfg.agent.require_edit, Some(true));
+        assert_eq!(cfg.memory.store, Some(StoreKind::File));
+        assert_eq!(
+            cfg.gateway.api_keys.as_deref(),
+            Some(&["k1".to_string(), "k2".to_string()][..])
+        );
+
+        assert!(toml::from_str::<Config>("[agent]\nnonsense = 1\n").is_err());
+    }
+
+    #[test]
+    fn load_records_its_source_instead_of_logging_it() {
+        // Regression guard: `[log] level` lives in this file, so loading happens *before* the
+        // collector is installed. An event emitted inside `load` would be silently dropped — the
+        // path must be recorded for the caller to log once logging is up.
+        let dir = std::env::temp_dir().join(format!("lvz-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lavoisier.toml");
+        std::fs::write(&path, "[log]\nlevel = \"warn\"\n").unwrap();
+
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.source.as_deref(), Some(path.as_path()));
+        assert_eq!(cfg.log.level.as_deref(), Some("warn"));
+
+        // No file discovered ⇒ nothing to report.
+        assert_eq!(Config::default().source, None);
+        // `source` is not a TOML key — it's derived, and must not be settable from the file.
+        assert!(toml::from_str::<Config>("source = \"x\"\n").is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parses_log_section_and_rejects_unknown_keys() {
+        let cfg: Config = toml::from_str("[log]\nlevel = \"lvz_gw_matrix=debug,warn\"\n").unwrap();
+        assert_eq!(cfg.log.level.as_deref(), Some("lvz_gw_matrix=debug,warn"));
+
+        // Absent `[log]` ⇒ no level ⇒ no collector installed (the no-op default).
+        let empty: Config = toml::from_str("").unwrap();
+        assert_eq!(empty.log.level, None);
+
+        assert!(toml::from_str::<Config>("[log]\nlevl = \"info\"\n").is_err());
+    }
+
+    #[test]
+    fn cli_log_level_wins_over_the_file() {
+        use clap::Parser;
+        let cfg: Config = toml::from_str("[log]\nlevel = \"warn\"\n").unwrap();
+
+        // Unset on the CLI ⇒ the file fills it in.
+        let mut cli = Cli::parse_from(["lav"]);
+        cli.log_level = None; // ignore any ambient LVZ_LOG_LEVEL in the test environment
+        cfg.apply_to(&mut cli);
+        assert_eq!(cli.log_level.as_deref(), Some("warn"));
+
+        // Explicit on the CLI ⇒ the file must not override it.
+        let mut cli = Cli::parse_from(["lav", "--log-level", "trace"]);
+        cfg.apply_to(&mut cli);
+        assert_eq!(cli.log_level.as_deref(), Some("trace"));
+    }
+
+    #[test]
+    fn parses_gateway_matrix_and_slack_knobs() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [gateway]
+            serve_matrix = true
+            serve_slack = true
+            matrix_state_dir = "/var/lib/lav/matrix"
+            matrix_allowed_users = ["@a:hs", "@b:hs"]
+            matrix_allowed_rooms = ["!ops:hs", "!general:hs"]
+            matrix_home_room = "!ops:hs"
+            matrix_media_dir = "/var/lib/lav/media"
+            slack_allowed_users = ["U_A"]
+
+            [gateway.matrix_room_tools]
+            "!ops:hs" = ["shell", "read_file"]
+
+            [gateway.matrix_user_tools]
+            "@a:hs" = ["read_file"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.gateway.serve_matrix, Some(true));
+        assert_eq!(cfg.gateway.serve_slack, Some(true));
+        assert_eq!(
+            cfg.gateway.matrix_state_dir.as_deref(),
+            Some(Path::new("/var/lib/lav/matrix"))
+        );
+        assert_eq!(
+            cfg.gateway.matrix_allowed_users.as_deref(),
+            Some(&["@a:hs".to_string(), "@b:hs".to_string()][..])
+        );
+        assert_eq!(
+            cfg.gateway.matrix_allowed_rooms.as_deref(),
+            Some(&["!ops:hs".to_string(), "!general:hs".to_string()][..])
+        );
+        assert_eq!(cfg.gateway.matrix_home_room.as_deref(), Some("!ops:hs"));
+        assert_eq!(
+            cfg.gateway.matrix_media_dir.as_deref(),
+            Some(Path::new("/var/lib/lav/media"))
+        );
+        assert_eq!(
+            cfg.gateway.matrix_room_tools.as_ref().unwrap()["!ops:hs"],
+            vec!["shell".to_string(), "read_file".to_string()]
+        );
+        assert_eq!(
+            cfg.gateway.matrix_user_tools.as_ref().unwrap()["@a:hs"],
+            vec!["read_file".to_string()]
+        );
+        assert_eq!(
+            cfg.gateway.slack_allowed_users.as_deref(),
+            Some(&["U_A".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn parses_legion_section_and_rejects_unknown_keys() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [legion]
+            debaters = ["anthropic:claude-opus-4-8", "xai:grok-4"]
+            judge = "anthropic:claude-opus-4-8"
+            rounds = 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.legion.debaters.as_deref(),
+            Some(
+                &[
+                    "anthropic:claude-opus-4-8".parse().unwrap(),
+                    "xai:grok-4".parse().unwrap()
+                ][..]
+            )
+        );
+        assert_eq!(
+            cfg.legion.judge.as_ref(),
+            Some(&"anthropic:claude-opus-4-8".parse::<ModelRef>().unwrap())
+        );
+        assert_eq!(cfg.legion.rounds, Some(2));
+
+        // Absent `[legion]` ⇒ no council.
+        let empty: Config = toml::from_str("").unwrap();
+        assert_eq!(empty.legion.debaters, None);
+
+        assert!(toml::from_str::<Config>("[legion]\ndebators = []\n").is_err());
+    }
+
+    #[test]
+    fn cli_legion_flags_win_over_the_file() {
+        use clap::Parser;
+        let cfg: Config = toml::from_str(
+            "[legion]\ndebaters = [\"anthropic:opus\", \"xai:grok-4\"]\nrounds = 3\n",
+        )
+        .unwrap();
+
+        // Unset on the CLI ⇒ the file fills them in.
+        let mut cli = Cli::parse_from(["lav"]);
+        cli.legion_rounds = None; // ignore any ambient LVZ_LEGION_ROUNDS
+        cfg.apply_to(&mut cli);
+        assert_eq!(cli.legion_debater, vec!["anthropic:opus", "xai:grok-4"]);
+        assert_eq!(cli.legion_rounds, Some(3));
+
+        // Explicit on the CLI ⇒ the file must not override.
+        let mut cli = Cli::parse_from(["lav", "--legion-debater", "google:gemini-3"]);
+        cli.legion_rounds = None;
+        cfg.apply_to(&mut cli);
+        assert_eq!(cli.legion_debater, vec!["google:gemini-3"]);
+    }
+
+    #[test]
+    fn cli_fallback_flags_win_over_the_file() {
+        use clap::Parser;
+        let cfg: Config = toml::from_str(
+            "[provider]\nfallback = [\"anthropic:claude-sonnet-4-6\", \"google:gemini-3-flash-preview\"]\nfallback_cooldown = 120\n",
+        )
+        .unwrap();
+
+        // Unset on the CLI ⇒ the file supplies the whole chain (and the cooldown).
+        let mut cli = Cli::parse_from(["lav"]);
+        cli.fallback_cooldown = None; // ignore any ambient LVZ_FALLBACK_COOLDOWN
+        cfg.apply_to(&mut cli);
+        assert_eq!(
+            cli.fallback,
+            vec![
+                "anthropic:claude-sonnet-4-6",
+                "google:gemini-3-flash-preview"
+            ]
+        );
+        assert_eq!(cli.fallback_cooldown, Some(120));
+
+        // Explicit on the CLI ⇒ the file must not override.
+        let mut cli = Cli::parse_from(["lav", "--fallback", "xai:grok-4"]);
+        cfg.apply_to(&mut cli);
+        assert_eq!(cli.fallback, vec!["xai:grok-4"]);
+
+        // Unknown key still rejected.
+        assert!(toml::from_str::<Config>("[provider]\nfalback = []\n").is_err());
+    }
+
+    #[test]
+    fn file_store_requires_path() {
+        let cfg: Config = toml::from_str("[memory]\nstore = \"file\"\n").unwrap();
+        assert!(cfg.build_session_store().is_err());
+        let cfg: Config = toml::from_str("[memory]\nstore = \"memory\"\n").unwrap();
+        assert!(cfg.build_session_store().is_ok());
+    }
+
+    #[test]
+    fn provider_parsing() {
+        assert_eq!(parse_provider("Anthropic"), Some(ProviderKind::Anthropic));
+        assert_eq!(parse_provider("claude-cli"), Some(ProviderKind::ClaudeCli));
+        assert_eq!(parse_provider("bogus"), None);
+    }
+}
+
+#[cfg(test)]
+mod server_tool_tests {
+    use super::*;
+
+    fn cfg(toml_src: &str) -> Config {
+        toml::from_str(toml_src).expect("config must parse")
+    }
+
+    #[test]
+    fn server_tools_deserialise_as_the_real_enum_with_their_filters() {
+        let c = cfg(r#"
+[[provider.server_tools]]
+kind = "web_search"
+max_uses = 5
+allowed_domains = ["docs.rs"]
+
+[[provider.server_tools]]
+kind = "code_execution"
+"#);
+        let tools = c.provider.server_tools.expect("server_tools present");
+        assert_eq!(tools.len(), 2);
+        match &tools[0] {
+            ServerTool::WebSearch {
+                max_uses,
+                allowed_domains,
+                blocked_domains,
+            } => {
+                assert_eq!(*max_uses, Some(5));
+                assert_eq!(allowed_domains, &["docs.rs"]);
+                assert!(blocked_domains.is_empty());
+            }
+            other => panic!("expected WebSearch, got {other:?}"),
+        }
+        assert_eq!(tools[1], ServerTool::CodeExecution);
+    }
+
+    #[test]
+    fn a_misspelled_tool_is_a_load_error_not_a_field_that_is_ignored() {
+        // As free text this would parse and then match nothing, so the tool would simply never be
+        // offered — the exact silent-drop failure the typed surface exists to prevent.
+        let err = toml::from_str::<Config>("[[provider.server_tools]]\nkind = \"web_serach\"\n")
+            .expect_err("a misspelled tool name must fail the load");
+        assert!(
+            err.to_string().contains("web_serach") || err.to_string().contains("unknown variant"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_filter_on_the_wrong_tool_is_rejected() {
+        // `allowed_domains` belongs to web_search, not code_execution. serde's
+        // deny_unknown_fields is inert on internally-tagged enums, so without the explicit check
+        // this would load and be dropped in silence.
+        let err = validate_server_tools(
+            "[[provider.server_tools]]\nkind = \"code_execution\"\nallowed_domains = [\"x\"]\n",
+        )
+        .expect_err("a filter on the wrong tool must fail the load");
+        assert!(
+            err.contains("allowed_domains") && err.contains("code_execution"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_filter_on_the_right_tool_is_accepted() {
+        validate_server_tools(
+            "[[provider.server_tools]]\nkind = \"web_search\"\nallowed_domains = [\"x\"]\n",
+        )
+        .expect("web_search does take allowed_domains");
+    }
+
+    #[test]
+    fn every_variant_key_list_matches_what_actually_deserialises() {
+        // Guards the hand-written key table against drift from the ServerTool variants: each
+        // listed key must be one the typed parse accepts for that kind.
+        for kind in [
+            "web_search",
+            "web_fetch",
+            "code_execution",
+            "x_search",
+            "collections_search",
+            "url_context",
+        ] {
+            let keys = server_tool_keys(kind).expect("known kind");
+            assert!(keys.contains(&"kind"), "{kind} must accept `kind`");
+            // collections_search has a *required* field (a search over no collections is
+            // meaningless), so give it one; every other kind parses bare.
+            let extra = if kind == "collections_search" {
+                "collection_ids = [\"c1\"]\n"
+            } else {
+                ""
+            };
+            let src = format!("[[provider.server_tools]]\nkind = \"{kind}\"\n{extra}");
+            let c: Config = toml::from_str(&src).expect("kind must parse");
+            assert_eq!(c.provider.server_tools.expect("present").len(), 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod typed_config_tests {
+    use super::*;
+
+    #[test]
+    fn a_bad_fallback_spec_fails_at_load_not_at_use() {
+        // As a packed String this parsed only when the primary model failed — the rare path,
+        // mid-run, the worst moment to discover a typo.
+        let err = toml::from_str::<Config>("[provider]\nfallback = [\"anthropc:claude\"]\n")
+            .expect_err("an unknown provider must fail the load");
+        assert!(err.to_string().contains("anthropc"), "{err}");
+
+        let err = toml::from_str::<Config>("[provider]\nfallback = [\"claude-opus-4-8\"]\n")
+            .expect_err("a spec with no provider half must fail the load");
+        assert!(err.to_string().contains("provider:model"), "{err}");
+
+        let err = toml::from_str::<Config>("[provider]\nfallback = [\"anthropic:\"]\n")
+            .expect_err("an empty model half must fail the load");
+        assert!(err.to_string().contains("empty model"), "{err}");
+    }
+
+    #[test]
+    fn a_good_fallback_chain_parses_to_typed_pairs() {
+        let c: Config = toml::from_str(
+            "[provider]\nfallback = [\"anthropic:claude-sonnet-4-6\", \"xai:grok-4\"]\n",
+        )
+        .expect("valid chain");
+        let chain = c.provider.fallback.expect("present");
+        assert_eq!(chain[0].provider, ProviderKind::Anthropic);
+        assert_eq!(chain[0].model, "claude-sonnet-4-6");
+        assert_eq!(chain[1].provider, ProviderKind::Xai);
+        // Round-trips through the canonical spelling.
+        assert_eq!(chain[1].to_string(), "xai:grok-4");
+    }
+
+    #[test]
+    fn legion_specs_are_typed_too() {
+        let err = toml::from_str::<Config>("[legion]\njudge = \"nope:m\"\n")
+            .expect_err("an unknown judge provider must fail the load");
+        assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_provider_name_is_rejected_rather_than_ignored() {
+        // As free text this returned None from `parse_provider` and was silently dropped, leaving
+        // the default provider running under a config that plainly said otherwise.
+        let err = toml::from_str::<Config>("[provider]\nprovider = \"antropic\"\n")
+            .expect_err("must fail");
+        assert!(err.to_string().contains("antropic"), "{err}");
+    }
+
+    #[test]
+    fn provider_aliases_still_parse() {
+        // These spellings predate the typed field; a derive would have started rejecting them.
+        for (src, want) in [
+            ("claude_cli", ProviderKind::ClaudeCli),
+            ("claudecli", ProviderKind::ClaudeCli),
+            ("claude-cli", ProviderKind::ClaudeCli),
+            ("xai_responses", ProviderKind::XaiResponses),
+            ("xai-responses", ProviderKind::XaiResponses),
+        ] {
+            let c: Config = toml::from_str(&format!("[provider]\nprovider = \"{src}\"\n"))
+                .unwrap_or_else(|e| panic!("{src} must parse: {e}"));
+            assert_eq!(c.provider.provider, Some(want), "{src}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_memory_store_is_rejected_at_load() {
+        let err = toml::from_str::<Config>("[memory]\nstore = \"redis\"\n").expect_err("must fail");
+        assert!(err.to_string().contains("redis") || err.to_string().contains("unknown variant"));
+    }
+}
+
+#[cfg(test)]
+mod require_e2ee_tests {
+    use super::*;
+
+    #[test]
+    fn require_e2ee_parses_and_defaults_to_absent() {
+        let on: Config = toml::from_str("[gateway]\nmatrix_require_e2ee = true\n").unwrap();
+        assert_eq!(on.gateway.matrix_require_e2ee, Some(true));
+
+        // Absent means "not specified", which the CLI resolves to false (degrade) — the right
+        // default for a gateway serving a mix of plaintext and encrypted rooms.
+        let off: Config = toml::from_str("[gateway]\n").unwrap();
+        assert_eq!(off.gateway.matrix_require_e2ee, None);
+    }
+
+    #[test]
+    fn a_misspelled_key_is_still_rejected() {
+        // `deny_unknown_fields` is the one guard that survived the Dhall->TOML move, and the infra
+        // repo explicitly asked that it stay on: every camelCase Dhall-era name must be a clean
+        // boot error rather than a silently ignored setting.
+        assert!(toml::from_str::<Config>("[gateway]\nmatrix_requires_e2ee = true\n").is_err());
+    }
+}
