@@ -556,7 +556,11 @@ fn build_messages(messages: &[Message], extended_ttl: bool) -> Value {
 /// Map a normalised [`ServerTool`] onto Anthropic's versioned built-in tool block. Returns `None`
 /// for tools Anthropic doesn't offer (xAI's X/collections search), which are silently skipped.
 fn build_server_tool(tool: &ServerTool) -> Option<Value> {
-    let v = match tool {
+    // `allowed_callers: ["direct"]` — the model invokes the tool itself, which is the only mode
+    // this agent uses. Found live (2026-09-12): without it, Anthropic 400s on any model that lacks
+    // "programmatic tool calling" (e.g. claude-haiku-4-5), naming the offending tool. Sending it
+    // explicitly works on every model rather than silently restricting the feature to the big ones.
+    let mut v = match tool {
         ServerTool::WebSearch {
             max_uses,
             allowed_domains,
@@ -589,6 +593,7 @@ fn build_server_tool(tool: &ServerTool) -> Option<Value> {
         | ServerTool::CollectionsSearch { .. }
         | ServerTool::UrlContext => return None,
     };
+    v["allowed_callers"] = json!(["direct"]);
     Some(v)
 }
 
@@ -1118,5 +1123,58 @@ mod tests {
             tail["ttl"].is_null(),
             "the volatile tail must not use the 1h TTL"
         );
+    }
+}
+
+#[cfg(test)]
+mod allowed_callers_tests {
+    use super::*;
+
+    /// Every mapped server tool must carry `allowed_callers: ["direct"]`.
+    ///
+    /// Found by LIVE verification on 2026-09-12, not by any offline test: without it Anthropic
+    /// 400s on models that lack "programmatic tool calling" (claude-haiku-4-5 among them) with
+    /// *"The following tools have `allowed_callers` that require it"*. Sending it explicitly also
+    /// turned out to be strictly better on models that do support it — the search results came
+    /// back as proper citation blocks rather than opaque ones, and better grounded.
+    #[test]
+    fn every_mapped_server_tool_declares_direct_callers() {
+        let mapped = [
+            ServerTool::WebSearch {
+                max_uses: None,
+                allowed_domains: vec![],
+                blocked_domains: vec![],
+            },
+            ServerTool::WebFetch { max_uses: None },
+            ServerTool::CodeExecution,
+        ];
+        for t in mapped {
+            let v = build_server_tool(&t).expect("Anthropic maps this tool");
+            assert_eq!(
+                v["allowed_callers"],
+                json!(["direct"]),
+                "{t:?} must declare allowed_callers"
+            );
+        }
+    }
+
+    #[test]
+    fn unmapped_tools_are_still_skipped_entirely() {
+        // The `allowed_callers` stamp must not resurrect a tool Anthropic cannot run; negotiate
+        // refuses these before they reach the mapper, and the mapper must agree.
+        for t in [
+            ServerTool::XSearch {
+                allowed_handles: vec![],
+                blocked_handles: vec![],
+                from_date: None,
+                to_date: None,
+            },
+            ServerTool::UrlContext,
+        ] {
+            assert!(
+                build_server_tool(&t).is_none(),
+                "{t:?} is not an Anthropic tool"
+            );
+        }
     }
 }
