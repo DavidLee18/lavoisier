@@ -4,6 +4,9 @@ name: release
 # common targets and attach them to the GitHub release, named to cargo-binstall's convention
 # (lavoisier-<rust-target>.tar.gz, binary at the archive root). `cargo binstall lavoisier` then
 # downloads these instead of compiling — so end users need no Rust toolchain or protoc.
+#
+# Two jobs, and the split is load-bearing: `build` produces artifacts, `publish` attaches them all
+# in ONE call. Never move the release step back into the matrix — see the comment above `publish`.
 
 on:
   push:
@@ -67,7 +70,52 @@ jobs:
       - name: Package
         run: tar czf lavoisier-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release lav
 
-      - name: Upload to release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+      - name: Upload build artifact (the publish job's input; also lets a dispatch run be inspected)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          files: lavoisier-${{ matrix.target }}.tar.gz
+          name: lavoisier-${{ matrix.target }}
+          path: lavoisier-${{ matrix.target }}.tar.gz
+
+  # The release is published ONCE, here, with every asset at the same time.
+  #
+  # It must not be done per-target. This repo has GitHub's *immutable releases* enabled: the first
+  # job to attach an asset also publishes the release, and every later upload is then refused with
+  # "Cannot upload asset ... to an immutable release". Worse, the tag name is burned permanently —
+  # deleting the half-finished release does not free it, so a botched release costs a version number.
+  # v0.16.0 was lost exactly this way, and v0.18.0 came within one job of the same fate: this branch
+  # was cut from the last Rust commit, which predates the fix, so the bug came back with it.
+  # One publish step, all files, no race.
+  publish:
+    name: publish the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Collect every target's tarball
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: lavoisier-*
+          merge-multiple: true
+
+      - name: List what will be published
+        run: ls -la dist
+
+      - name: Publish the GitHub release with all assets
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: dist/*.tar.gz
+          # Refuse to publish an empty or partial release rather than creating one that can never
+          # be corrected.
+          fail_on_unmatched_files: true
+          # Immutable releases mean the notes cannot be fixed after the fact either, so the body is
+          # generated here rather than written by hand at tag time.
+          generate_release_notes: true
+          body: |
+            Prebuilt binaries for `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu` and
+            `aarch64-unknown-linux-gnu`. Unpack and run `./lav`.
+
+            `cargo binstall lavoisier` downloads these instead of compiling, so no Rust
+            toolchain or `protoc` is needed.
