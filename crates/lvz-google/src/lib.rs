@@ -618,9 +618,14 @@ fn effective_max_output(model: &str, requested: u32, floor: u32) -> u32 {
 /// `high`, so `Medium` and `High` both request `high`).
 fn thinking_level_config(level: ThinkingLevel) -> Value {
     match level {
+        // `Off` is a budget, not a level: there is no `thinkingLevel` meaning "none".
         ThinkingLevel::Off => json!({ "thinkingBudget": 0 }),
         ThinkingLevel::Low => json!({ "thinkingLevel": "low" }),
-        ThinkingLevel::Medium | ThinkingLevel::High => json!({ "thinkingLevel": "high" }),
+        // Medium maps to medium. Gemini 3 accepts minimal|low|medium|high, so folding Medium into
+        // "high" silently bought MORE reasoning than was asked for — and on a cost-weighted metric
+        // where output is ~5x input, over-buying is the expensive direction to be wrong in.
+        ThinkingLevel::Medium => json!({ "thinkingLevel": "medium" }),
+        ThinkingLevel::High => json!({ "thinkingLevel": "high" }),
     }
 }
 
@@ -933,5 +938,38 @@ mod tests {
         // synthetic `#SIG` suffix never leaks into the functionCall itself.
         assert_eq!(part["thoughtSignature"], "SIG123");
         assert!(part["functionCall"]["name"].as_str() == Some("shell"));
+    }
+}
+
+#[cfg(test)]
+mod thinking_level_tests {
+    use super::*;
+
+    /// Each level maps to its own Gemini setting — in particular Medium must NOT fold into "high".
+    ///
+    /// Gemini 3 accepts `minimal|low|medium|high`, so collapsing Medium into High bought more
+    /// reasoning than the caller asked for. That is the expensive direction to err in: the
+    /// optimisation metric is cost-weighted with output at ~5x input, and the whole point of the
+    /// thinking dial is that mechanical archetypes think *less*. The xAI Responses transport makes
+    /// the same call in the other direction (it has only low/high, so Medium rounds DOWN).
+    #[test]
+    fn medium_maps_to_medium_not_high() {
+        assert_eq!(
+            thinking_level_config(ThinkingLevel::Medium),
+            json!({ "thinkingLevel": "medium" })
+        );
+        assert_eq!(
+            thinking_level_config(ThinkingLevel::High),
+            json!({ "thinkingLevel": "high" })
+        );
+        assert_eq!(
+            thinking_level_config(ThinkingLevel::Low),
+            json!({ "thinkingLevel": "low" })
+        );
+        // Off is a budget, not a level: no `thinkingLevel` value means "none".
+        assert_eq!(
+            thinking_level_config(ThinkingLevel::Off),
+            json!({ "thinkingBudget": 0 })
+        );
     }
 }
