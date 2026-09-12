@@ -55,7 +55,10 @@ deterministically, then a **successful** result is rewritten as prose for the ro
 act (this is what keeps it safe where `Action::Prompt` — which carries no room/sender and so escapes
 `matrix_room_tools` scoping — is not). The verdict stays the **tool's** (retry semantics untouched);
 only the posted body changes — the raw output is still stored in `Outcome.detail`/history. A **failure
-is never summarised** (its retry countdown must reach the room verbatim) and any summary failure
+is summarised too**, prefixed `FAILURE` so the model renders it in the register of a failure (the
+owner's 2026-08-10 amendment; successes-only originally) — the ❌ marker and `retry n/m` countdown
+stay structural in `report_body`, outside the prose slot, so a paraphrase can never hide a genuinely
+refused call. Any summary failure
 degrades to the raw output. `lvz-schedule` is a **leaf library** (no gateway→gateway edge); it owns the cron engine
 (moved here from `lvz-gw-cron`, which now re-exports `CronSchedule`/`CronError` unchanged), the job
 model, and the `ScheduleRegistry` holding live per-job state. Retry mirrors cron

@@ -253,6 +253,13 @@ pub struct GatewaySection {
     /// Directory persisting the Matrix session (token + device id) and the E2EE crypto store, for
     /// a stable identity across restarts. `MATRIX_STATE_DIR` takes precedence.
     pub matrix_state_dir: Option<PathBuf>,
+    /// Refuse to start when Matrix E2EE cannot be initialised, instead of degrading to plaintext.
+    ///
+    /// Default `false` (degrade), which suits a gateway serving a mix of plaintext and encrypted
+    /// rooms. Set it in an all-encrypted deployment: otherwise a bad `MATRIX_CRYPTO_STORE_KEY` or a
+    /// crypto store at the wrong path leaves the bot up, healthy-looking and unable to read or write
+    /// a single message. `--require-e2ee` / `LVZ_REQUIRE_E2EE` take precedence.
+    pub matrix_require_e2ee: Option<bool>,
     /// Only act in these Matrix rooms (room ids); empty/unset ⇒ any room the bot is in. Combined
     /// with `matrix_allowed_users` as a conjunction. The `MATRIX_ALLOWED_ROOMS` env var
     /// (comma-separated) takes precedence.
@@ -882,5 +889,29 @@ mod typed_config_tests {
     fn an_unknown_memory_store_is_rejected_at_load() {
         let err = toml::from_str::<Config>("[memory]\nstore = \"redis\"\n").expect_err("must fail");
         assert!(err.to_string().contains("redis") || err.to_string().contains("unknown variant"));
+    }
+}
+
+#[cfg(test)]
+mod require_e2ee_tests {
+    use super::*;
+
+    #[test]
+    fn require_e2ee_parses_and_defaults_to_absent() {
+        let on: Config = toml::from_str("[gateway]\nmatrix_require_e2ee = true\n").unwrap();
+        assert_eq!(on.gateway.matrix_require_e2ee, Some(true));
+
+        // Absent means "not specified", which the CLI resolves to false (degrade) — the right
+        // default for a gateway serving a mix of plaintext and encrypted rooms.
+        let off: Config = toml::from_str("[gateway]\n").unwrap();
+        assert_eq!(off.gateway.matrix_require_e2ee, None);
+    }
+
+    #[test]
+    fn a_misspelled_key_is_still_rejected() {
+        // `deny_unknown_fields` is the one guard that survived the Dhall->TOML move, and the infra
+        // repo explicitly asked that it stay on: every camelCase Dhall-era name must be a clean
+        // boot error rather than a silently ignored setting.
+        assert!(toml::from_str::<Config>("[gateway]\nmatrix_requires_e2ee = true\n").is_err());
     }
 }

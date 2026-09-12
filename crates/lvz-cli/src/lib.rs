@@ -239,6 +239,14 @@ struct Cli {
     #[arg(long = "server-tools", value_name = "NAMES", value_delimiter = ',')]
     server_tools: Vec<ServerToolArg>,
 
+    /// Refuse to start the Matrix gateway if E2EE cannot be initialised, instead of silently
+    /// continuing in plaintext. Use in a deployment whose rooms are all encrypted: without it a bad
+    /// `MATRIX_CRYPTO_STORE_KEY`, a crypto store at the wrong path, or a corrupt database leaves the
+    /// bot running and apparently healthy while unable to read or write anything. Also
+    /// `[gateway] matrix_require_e2ee`.
+    #[arg(long = "require-e2ee", env = "LVZ_REQUIRE_E2EE")]
+    require_e2ee: bool,
+
     /// Resolved provider-run tools: the `--server-tools` names expanded to their defaults when the
     /// flag was given, else the config file's `[[provider.server_tools]]` verbatim. Filled by
     /// `Config::apply_to`; not a flag itself, which is why the precedence rule lives in exactly one
@@ -969,6 +977,12 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
                 if let Some(dir) = &config.gateway.matrix_state_dir {
                     matrix = matrix.with_state_dir(dir.clone());
                 }
+            }
+            // Mandatory E2EE: the flag (which also reads LVZ_REQUIRE_E2EE via clap) wins, else the
+            // config file. Off by default — degrading is right for a mixed-modality gateway and
+            // wrong for an all-encrypted one, so it is the deployment that must say which it is.
+            if cli.require_e2ee || config.gateway.matrix_require_e2ee.unwrap_or(false) {
+                matrix = matrix.with_require_e2ee(true);
             }
             if std::env::var_os("MATRIX_ALLOWED_USERS").is_none() {
                 if let Some(users) = &config.gateway.matrix_allowed_users {

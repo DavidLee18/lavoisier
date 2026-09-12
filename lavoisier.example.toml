@@ -95,8 +95,10 @@
 #    {"id":"build","schedule":"*/15 * * * *","prompt":"check the build"}]
 # A tool job may add "summarize":"<instruction>" to post prose instead of the tool's raw output: the
 # tool still runs deterministically, then a *tool-less* turn (empty allowlist — it can only write
-# text) rewrites a SUCCESSFUL result under the instruction. A failure is never summarised (its retry
-# countdown must reach the room verbatim), and a provider outage degrades to the raw output. Set the
+# text) rewrites the result under the instruction. BOTH outcomes are summarised — the prose is
+# prefixed SUCCESS/FAILURE so the model renders a failure in the register of a failure — and the ❌
+# marker plus the `retry n/m` countdown stay structural, outside the prose slot, so a paraphrase can
+# never hide or soften a genuinely refused call. A provider outage degrades to the raw output. Set the
 # job's "session" to the report room id so a reply to the summary has the room's conversation context.
 #   [{"id":"wake","schedule":"25 10 * * 2,3,4","room":"!ops:hs","session":"!ops:hs",
 #     "tool":"server_wake","args":{},"summarize":"Say what happened in one plain sentence."}]
@@ -110,6 +112,18 @@
 #                                              # store here so identity is stable across restarts
 #                                              # (env MATRIX_STATE_DIR wins). Auth via env:
 #                                              # MATRIX_ACCESS_TOKEN or MATRIX_USER+MATRIX_PASSWORD.
+#   LAYOUT: `session.json` sits directly in this dir; the SQLite crypto store is ONE LEVEL DOWN at
+#   `<matrix_state_dir>/crypto`. Anything opening the store directly (a migration tool, a backup, a
+#   manual `sqlite3`) needs the subdirectory — and getting it wrong is NOT an error: the store is
+#   CREATED when absent, so pointing at the state dir yields an empty store and, with an injected
+#   MATRIX_ACCESS_TOKEN, a fresh Olm account published under the EXISTING device id. Homeservers
+#   refuse that, and the bot ends up undecryptable in both directions.
+# matrix_require_e2ee = true     # refuse to start if E2EE cannot be initialised, instead of
+#                                # degrading to plaintext. OFF by default, which suits a gateway
+#                                # serving a mix of plaintext and encrypted rooms; set it when every
+#                                # room is encrypted, or a bad MATRIX_CRYPTO_STORE_KEY / a store at
+#                                # the wrong path leaves the bot up, healthy-looking, and unable to
+#                                # read or write a single message. --require-e2ee / LVZ_REQUIRE_E2EE win.
 # matrix_allowed_users = ["@alice:hs", "@bob:hs"]   # only answer these senders (env
 #                                                   # MATRIX_ALLOWED_USERS wins; empty = everyone)
 # matrix_allowed_rooms = ["!ops:hs", "!general:hs"] # only act in these rooms (env

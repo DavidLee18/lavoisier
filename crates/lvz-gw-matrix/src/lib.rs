@@ -93,6 +93,15 @@ pub struct MatrixGateway {
     state_dir: Option<PathBuf>,
     /// Passphrase encrypting the E2EE crypto store at rest (`MATRIX_CRYPTO_STORE_KEY`).
     crypto_passphrase: Option<String>,
+    /// Refuse to start when E2EE cannot be initialised, instead of degrading to plaintext.
+    ///
+    /// Off by default, because for a general-purpose gateway serving a mix of plaintext and
+    /// encrypted rooms, continuing without encryption is the useful behaviour. It is the **wrong**
+    /// default for a deployment whose rooms are all encrypted: the process stays up, the task
+    /// reports healthy, `/sync` runs — and the bot is silently unable to read or write anything in
+    /// the rooms it exists to serve. A wrong `MATRIX_CRYPTO_STORE_KEY`, a store at the wrong path
+    /// or a corrupt database all land in that one degrade arm.
+    require_e2ee: bool,
     http: reqwest::Client,
     txn: AtomicU64,
     /// Auto-accept room invites for the bot account (on by default).
@@ -141,6 +150,7 @@ impl MatrixGateway {
             device_id: None,
             state_dir: None,
             crypto_passphrase: None,
+            require_e2ee: false,
             http: reqwest::Client::new(),
             // Seed the transaction counter from the process-start time (nanos since the epoch) so
             // txn ids never reset to a value used by a prior run. Matrix dedupes sends by
@@ -205,6 +215,16 @@ impl MatrixGateway {
     /// Set the passphrase used to encrypt the E2EE crypto store at rest.
     pub fn with_crypto_passphrase(mut self, passphrase: impl Into<String>) -> Self {
         self.crypto_passphrase = Some(passphrase.into());
+        self
+    }
+
+    /// Make E2EE **mandatory**: a failure to initialise the crypto store aborts the gateway with
+    /// the underlying error rather than degrading to plaintext.
+    ///
+    /// For an all-encrypted deployment this converts "boots clean, cannot decrypt" — which looks
+    /// healthy to ECS and to any liveness check — into a loud startup failure.
+    pub fn with_require_e2ee(mut self, required: bool) -> Self {
+        self.require_e2ee = required;
         self
     }
 
@@ -1360,8 +1380,19 @@ impl MatrixGateway {
                 info!("e2ee: matrix E2EE enabled");
                 Some(c)
             }
+            Err(e) if self.require_e2ee => {
+                // Asked for mandatory E2EE and we cannot provide it: fail loudly at startup rather
+                // than run deaf in encrypted rooms.
+                error!(error = %e, "e2ee: init failed and require_e2ee is set — refusing to start");
+                return Err(GatewayError::Bind(format!(
+                    "matrix E2EE is required but could not be initialised: {e}"
+                )));
+            }
             Err(e) => {
-                warn!(error = %e, "e2ee: init failed, continuing without encryption");
+                // Degrading is only safe where some rooms are plaintext. `error!`, not `warn!`:
+                // in an encrypted deployment this single line is the whole signal that the bot is
+                // about to be silently unable to read or write anything.
+                error!(error = %e, "e2ee: init failed, continuing WITHOUT encryption (set require_e2ee to make this fatal)");
                 None
             }
         };
