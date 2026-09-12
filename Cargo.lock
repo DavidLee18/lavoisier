@@ -1484,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "lavoisier"
-version = "0.15.0"
+version = "0.18.0"
 dependencies = [
  "clap",
  "futures",
