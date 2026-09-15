@@ -296,6 +296,13 @@ pub struct GatewaySection {
     pub schedule_retry_max: Option<u32>,
     /// Seconds between scheduled-job retries. A per-job `retry_wait` overrides this.
     pub schedule_retry_wait: Option<u64>,
+    /// Fallback polling budget, in seconds, for a schedule tool that returns a **pending** result
+    /// without its own `estimated_seconds`. The deadline is 2x this; a tool's own estimate wins.
+    ///
+    /// Only reached by tools that dispatch long-running work and report completion via a poll tool
+    /// (the `run_build`/`get_build_result` shape). Default 600. `--schedule-pending-timeout` /
+    /// `LVZ_SCHEDULE_PENDING_TIMEOUT` take precedence.
+    pub schedule_pending_timeout: Option<u64>,
 }
 
 impl Config {
@@ -383,6 +390,10 @@ impl Config {
         merge_copy(
             &mut cli.schedule_retry_wait,
             self.gateway.schedule_retry_wait,
+        );
+        merge_copy(
+            &mut cli.schedule_pending_timeout,
+            self.gateway.schedule_pending_timeout,
         );
         if cli.api_key.is_empty() {
             if let Some(keys) = &self.gateway.api_keys {

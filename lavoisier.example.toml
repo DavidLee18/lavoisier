@@ -106,6 +106,18 @@
 # schedule_room       = "!ops:example.org"     # default report room (falls back to matrix_home_room)
 # schedule_retry_max  = 2        # global default max retries (0 = no retry); a job overrides it
 # schedule_retry_wait = 60       # seconds between retries. env LVZ_SCHEDULE_RETRY_MAX/_WAIT win
+# A tool that ACCEPTS long-running work rather than finishing it (waking a machine, a remote build)
+# may return a PENDING result naming a poll tool and a handle. The scheduler then does NOT report
+# success — it polls until a terminal Ok/Err and reports THAT, so `job fired ok` means *completed*,
+# never merely *dispatched*. The room stays silent until the outcome is real: a provisional success
+# later contradicted is worse than silence, because the first message is the one people act on.
+# While work is in flight the cron slot and any retry are suppressed, so the next tick cannot
+# double-dispatch it, and a terminal failure retries exactly like any other failure. Polling is a
+# flat 30s cadence; the deadline below bounds the total, not the interval.
+# schedule_pending_timeout = 600 # fallback polling budget (s) for a tool that gives no
+#                                # `estimated_seconds`; the deadline is 2x this, after which the job
+#                                # is reported as a TIMEOUT rather than holding its slot forever.
+#                                # A tool's own estimate wins. env LVZ_SCHEDULE_PENDING_TIMEOUT wins.
 # Matrix gateway:
 # matrix_auto_join    = true     # auto-accept Matrix room invites (default true)
 # matrix_state_dir    = "./.lavoisier/matrix"  # persist session (token + device id) + E2EE crypto

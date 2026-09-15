@@ -46,6 +46,21 @@ const HISTORY_CAP: usize = 20;
 /// flooding a room or ballooning the tool output the model reads back.
 const DETAIL_CAP: usize = 600;
 
+/// Floor on the polling budget for accepted-but-unfinished work, so a tool reporting an
+/// implausibly small estimate still gets a usable window.
+const MIN_PENDING_BUDGET: u64 = 60;
+
+/// Polling budget when neither the tool nor the deployment says how long the work takes.
+pub const DEFAULT_PENDING_TIMEOUT: u64 = 600;
+
+/// How long between polls of accepted-but-unfinished work.
+///
+/// Flat, deliberately. An earlier version waited out the tool's own `estimated_seconds` before the
+/// first poll to avoid redundant calls; a fixed cadence is simpler to reason about and to predict
+/// in the operator log, and the cost is a handful of cheap local tool calls. `estimated_seconds`
+/// still sets the DEADLINE — it just no longer paces the polling.
+const POLL_INTERVAL: u64 = 30;
+
 /// What a job does when it fires.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -217,6 +232,37 @@ pub struct Outcome {
     pub attempt: u32,
 }
 
+impl FireReport {
+    /// A placeholder for the **operator log only** when a fire ended in accepted-but-unfinished
+    /// work. It is never posted to a room: `fire` returns `None` in that case precisely so the
+    /// room hears nothing until the outcome is real.
+    fn pending(job: &ScheduleJob) -> Self {
+        FireReport {
+            job_id: job.id.clone(),
+            room: job.room.clone(),
+            ok: false,
+            body: format!("⏳ `{}` · accepted, awaiting completion", job.id),
+            attempt: 0,
+        }
+    }
+}
+
+/// Work a tool accepted but has not finished, which the scheduler is polling to completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWork {
+    /// Opaque token from the dispatching tool, passed to `poll_with` as `{"handle": …}`.
+    pub handle: String,
+    /// The tool that reports the terminal outcome.
+    pub poll_with: String,
+    /// When to poll next (unix seconds).
+    pub poll_at: u64,
+    /// Give up and report a timeout after this instant. Derived from the tool's own estimate so a
+    /// job that never completes is *reported*, rather than holding its slot forever.
+    pub deadline: u64,
+    /// How many polls have been made, for the operator log.
+    pub polls: u32,
+}
+
 /// Live state for one job. Read by the `schedule_*` tools.
 #[derive(Debug, Clone, Default)]
 pub struct JobState {
@@ -225,6 +271,12 @@ pub struct JobState {
     pub next_due: Option<u64>,
     /// When the in-flight retry should run.
     pub retry_at: Option<u64>,
+    /// When to next poll an accepted-but-unfinished action, and what to poll.
+    ///
+    /// Set when a tool returned [`ToolOutput::pending`]. While this is `Some`, the job is **not**
+    /// idle: the cron slot is suppressed exactly as a retry suppresses it, so the next tick cannot
+    /// double-dispatch work that is still running.
+    pub pending: Option<PendingWork>,
     /// Attempts used in the current chain (0 when idle).
     pub attempt: u32,
     /// Unix seconds of the most recent fire, or `None` if never fired.
@@ -262,6 +314,9 @@ pub struct FireReport {
 /// Carries the **untruncated** output and (for a prompt job) the turn's token usage, so the
 /// operator log can record what the chat summary necessarily drops.
 struct ActionOutcome {
+    /// Set when the tool accepted work that is still running, so the scheduler must poll for the
+    /// terminal outcome before reporting anything.
+    accepted: Option<lvz_protocol::Pending>,
     result: Result<String, String>,
     usage: Option<Usage>,
     /// Prose rendering of the tool action's outcome (success or failure), when the job set
@@ -275,6 +330,9 @@ struct ActionOutcome {
 /// The jobs, their live state, and the wait/fire loop. Shared as an `Arc` between the gateway
 /// driving it and the `schedule_*` tools reporting on it.
 pub struct ScheduleRegistry {
+    /// Fallback polling budget for a tool that returned `pending` with no `estimated_seconds`.
+    /// Set from `[gateway] schedule_pending_timeout`.
+    pending_timeout: u64,
     jobs: Vec<ScheduleJob>,
     state: RwLock<HashMap<String, JobState>>,
     /// Manual `schedule_run` requests, as job indices.
@@ -298,10 +356,18 @@ impl ScheduleRegistry {
         }
         Self {
             jobs,
+            pending_timeout: DEFAULT_PENDING_TIMEOUT,
             state: RwLock::new(state),
             requested: Mutex::new(VecDeque::new()),
             notify: Notify::new(),
         }
+    }
+
+    /// Override the fallback polling budget for tools that return `pending` without an estimate
+    /// (`[gateway] schedule_pending_timeout`). A tool's own `estimated_seconds` still wins.
+    pub fn with_pending_timeout(mut self, seconds: u64) -> Self {
+        self.pending_timeout = seconds.max(MIN_PENDING_BUDGET);
+        self
     }
 
     /// The jobs, in registration order (the index the `schedule_*` tools address).
@@ -342,11 +408,21 @@ impl ScheduleRegistry {
         true
     }
 
-    /// The effective next fire time for a job: a pending retry supersedes the cron slot.
+    /// The effective next fire time for a job, in precedence order: an in-flight **pending poll**
+    /// beats a retry, which beats the cron slot.
+    ///
+    /// Polling rides this existing timer rather than awaiting inline, and that is the load-bearing
+    /// choice: schedule jobs share a task with the Matrix `/sync` loop (the crypto state is not
+    /// `Send`), so blocking `fire` for the ~minutes a wake takes would make the bot deaf for the
+    /// duration. As a timer it costs nothing — `wait_due` already sleeps until the soonest.
     fn due_at(&self, job: &ScheduleJob) -> Option<u64> {
         let state = self.state.read().ok()?;
         let s = state.get(&job.id)?;
-        s.retry_at.or(s.next_due)
+        s.pending
+            .as_ref()
+            .map(|p| p.poll_at)
+            .or(s.retry_at)
+            .or(s.next_due)
     }
 
     /// Wait until at least one job is due (scheduled or manually requested) and return their
@@ -404,11 +480,65 @@ impl ScheduleRegistry {
     ) -> Option<FireReport> {
         let job = self.jobs.get(idx)?.clone();
         let started = std::time::Instant::now();
-        let outcome = run_action(&job, tools, agent).await;
+
+        // If work from an earlier fire is still running, this tick polls it rather than
+        // dispatching again — that is what stops a cron slot double-firing a wake in progress.
+        let in_flight = self.take_pending(&job.id);
+        let outcome = match in_flight {
+            Some(p) => poll_pending(&job, p, tools, agent, self.pending_timeout).await,
+            None => run_action(&job, tools, agent).await,
+        };
         let elapsed = started.elapsed();
+
+        // Still unfinished: arm the next poll and report NOTHING. The room stays silent until the
+        // terminal outcome — a provisional "started" message that is later contradicted is worse
+        // than silence, because the first message is the one an operator acts on.
+        if let Some(acc) = &outcome.accepted {
+            self.arm_pending(&job, acc);
+            log_verbose(&job, &outcome, &FireReport::pending(&job), elapsed);
+            return None;
+        }
+
         let report = self.record(&job, &outcome.result, outcome.summary.as_deref());
         log_verbose(&job, &outcome, &report, elapsed);
         Some(report)
+    }
+
+    /// Take any in-flight pending work off the job, so this tick polls it instead of dispatching.
+    fn take_pending(&self, id: &str) -> Option<PendingWork> {
+        let mut guard = self.state.write().ok()?;
+        guard.get_mut(id).and_then(|s| s.pending.take())
+    }
+
+    /// Record accepted-but-unfinished work and arm the next poll.
+    ///
+    /// The cron slot and any retry timer are cleared for the duration, mirroring how a retry chain
+    /// suppresses the slot: while work is in flight the job is not idle, and the next tick must not
+    /// dispatch a second copy of it.
+    fn arm_pending(&self, job: &ScheduleJob, acc: &lvz_protocol::Pending) {
+        let now = now_unix();
+        let Ok(mut guard) = self.state.write() else {
+            return;
+        };
+        let s = guard.entry(job.id.clone()).or_default();
+        let prior = s.pending.as_ref();
+        // Deadline is set once, on the first acceptance, so repeated polls cannot extend it.
+        let deadline = prior.map(|p| p.deadline).unwrap_or_else(|| {
+            let budget = acc.estimated_seconds.unwrap_or(self.pending_timeout);
+            // 2x the tool's own estimate: generous enough that a merely slow run is not cut off,
+            // bounded enough that a hung one is reported.
+            now + budget.saturating_mul(2).max(MIN_PENDING_BUDGET)
+        });
+        let polls = prior.map(|p| p.polls + 1).unwrap_or(0);
+        s.pending = Some(PendingWork {
+            handle: acc.handle.clone(),
+            poll_with: acc.poll_with.clone(),
+            poll_at: now + POLL_INTERVAL,
+            deadline,
+            polls,
+        });
+        s.retry_at = None;
+        s.next_due = None;
     }
 
     /// Fold one attempt's result into the job's state and build its report.
@@ -502,6 +632,96 @@ impl ScheduleRegistry {
 /// the model. For a prompt turn the rule matches the cron gateway: a rejected submit or a mid-turn
 /// stream error fails, while a *completed* turn succeeds even if the answer is weak (that is
 /// semantic, and not knowable here).
+/// Poll accepted-but-unfinished work for its terminal outcome.
+///
+/// Three outcomes: still running (re-arm), finished (report it), or past the deadline (report a
+/// timeout). A timeout is a **failure**, so it retries like any other — the request asked for a
+/// failure at second 200 to behave like any other failure.
+async fn poll_pending(
+    job: &ScheduleJob,
+    p: PendingWork,
+    tools: &ToolRegistry,
+    agent: &Arc<dyn AgentHandle>,
+    _pending_timeout: u64,
+) -> ActionOutcome {
+    let now = now_unix();
+    if now >= p.deadline {
+        let waited = p.deadline.saturating_sub(now.min(p.deadline));
+        let _ = waited;
+        return finish(
+            job,
+            agent,
+            Err(format!(
+                "tool `{}` accepted work (handle {}) that did not complete before its deadline \
+                 after {} poll(s) — reporting a timeout rather than holding the slot",
+                p.poll_with, p.handle, p.polls
+            )),
+            vec![p.poll_with.clone()],
+            None,
+        )
+        .await;
+    }
+
+    let args = serde_json::json!({ "handle": p.handle });
+    match tools.invoke(&p.poll_with, args).await {
+        Err(e) => {
+            // The poll tool itself is broken. Terminal: retrying the poll forever would hide it.
+            finish(
+                job,
+                agent,
+                Err(format!("poll tool `{}` failed: {e}", p.poll_with)),
+                vec![p.poll_with.clone()],
+                None,
+            )
+            .await
+        }
+        Ok(out) if out.pending.is_some() => {
+            // Still running. Re-arm from the fresh handle the poll returned.
+            ActionOutcome {
+                result: Ok(out.content),
+                usage: None,
+                summary: None,
+                tools_used: vec![p.poll_with.clone()],
+                accepted: out.pending,
+            }
+        }
+        Ok(out) if out.is_error => {
+            let e = format!("tool `{}` reported: {}", p.poll_with, out.content);
+            finish(job, agent, Err(e), vec![p.poll_with.clone()], None).await
+        }
+        Ok(out) => finish(job, agent, Ok(out.content), vec![p.poll_with.clone()], None).await,
+    }
+}
+
+/// Render the terminal outcome of an action, applying `summarize` exactly as a direct call would.
+///
+/// Shared by the direct path and the polled path so a pending job's report is indistinguishable
+/// from an immediate one — same SUCCESS/FAILURE labelling, same degrade-to-raw on a failed render.
+async fn finish(
+    job: &ScheduleJob,
+    agent: &Arc<dyn AgentHandle>,
+    result: Result<String, String>,
+    tools_used: Vec<String>,
+    usage: Option<lvz_protocol::Usage>,
+) -> ActionOutcome {
+    let (summary, sum_usage) = match (&result, job.summarize.as_deref()) {
+        (Ok(raw), Some(instruction)) => {
+            summarise(job, agent, instruction, &format!("SUCCESS\n{raw}")).await
+        }
+        (Err(err), Some(instruction)) => {
+            summarise(job, agent, instruction, &format!("FAILURE\n{err}")).await
+        }
+        _ => (None, None),
+    };
+    ActionOutcome {
+        result,
+        usage: usage.or(sum_usage),
+        summary,
+        tools_used,
+        accepted: None,
+    }
+}
+
 async fn run_action(
     job: &ScheduleJob,
     tools: &ToolRegistry,
@@ -509,10 +729,17 @@ async fn run_action(
 ) -> ActionOutcome {
     match &job.action {
         Action::Tool { name, args } => {
+            let mut accepted = None;
             let result = match tools.invoke(name, args.clone()).await {
                 Err(e) => Err(format!("tool `{name}` failed: {e}")),
                 Ok(out) if out.is_error => Err(format!("tool `{name}` reported: {}", out.content)),
-                Ok(out) => Ok(out.content),
+                Ok(out) => {
+                    // A pending result is NOT a success. `Ok` here would mean "dispatched", and a
+                    // job whose whole purpose is "the machine is up before the service starts"
+                    // must not assert that from an acceptance.
+                    accepted = out.pending.clone();
+                    Ok(out.content)
+                }
             };
             // Summarise either outcome, labelling which it is (a leading SUCCESS/FAILURE line) so the
             // model renders a failure in the register of a failure — the owner's 2026-08-10 amendment;
@@ -535,6 +762,7 @@ async fn run_action(
                 usage,
                 summary,
                 tools_used: vec![name.clone()],
+                accepted,
             }
         }
         Action::Prompt { text } => {
@@ -547,7 +775,9 @@ async fn run_action(
                         usage: None,
                         summary: None,
                         tools_used: Vec::new(),
-                    }
+                        // A prompt turn has no dispatch/poll split; it runs to completion here.
+                        accepted: None,
+                    };
                 }
             };
             let mut answer = String::new();
@@ -582,6 +812,7 @@ async fn run_action(
                 // A prompt turn is already prose; there is nothing to re-render.
                 summary: None,
                 tools_used: used,
+                accepted: None,
             }
         }
     }
@@ -1313,5 +1544,145 @@ mod tests {
         assert_eq!(turn.allowed_tools, Some(Vec::new()));
         assert!(turn.input.contains("FAILURE"));
         assert!(turn.input.contains("ATX call refused"));
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+
+    /// A job on a DAILY cron, so the pending poll is demonstrably sooner than the next slot.
+    fn job(id: &str) -> ScheduleJob {
+        ScheduleJob {
+            id: id.into(),
+            expr: "0 9 * * *".into(),
+            schedule: CronSchedule::parse("0 9 * * *").unwrap(),
+            action: Action::Tool {
+                name: "server_wake".into(),
+                args: serde_json::json!({}),
+            },
+            room: Some("!ops:hs".into()),
+            session: id.into(),
+            summarize: None,
+            retry_max: 2,
+            retry_wait: 60,
+        }
+    }
+
+    fn accepted() -> lvz_protocol::Pending {
+        lvz_protocol::Pending {
+            handle: "d63b23".into(),
+            poll_with: "server_wake_result".into(),
+            estimated_seconds: Some(218),
+        }
+    }
+
+    /// The core guard: while work is in flight the cron slot and any retry are suppressed, so the
+    /// next tick polls rather than dispatching a second wake.
+    #[test]
+    fn pending_work_suppresses_the_cron_slot_and_any_retry() {
+        let reg = ScheduleRegistry::new(vec![job("wake")]);
+        let j = reg.jobs()[0].clone();
+        reg.arm_pending(&j, &accepted());
+
+        let s = reg.state_of("wake").unwrap();
+        assert!(s.pending.is_some(), "pending must be recorded");
+        assert!(s.next_due.is_none(), "the cron slot must be suppressed");
+        assert!(
+            s.retry_at.is_none(),
+            "a retry must not race the in-flight work"
+        );
+    }
+
+    /// A pending poll outranks a retry, which outranks the cron slot.
+    #[test]
+    fn the_poll_is_the_highest_precedence_timer() {
+        let reg = ScheduleRegistry::new(vec![job("wake")]);
+        let j = reg.jobs()[0].clone();
+        let cron_only = reg
+            .due_at(&j)
+            .expect("a fresh job is armed on its cron slot");
+
+        reg.arm_pending(&j, &accepted());
+        let while_pending = reg.due_at(&j).expect("pending work is due for a poll");
+        assert!(
+            while_pending < cron_only,
+            "the poll ({while_pending}) must come before the cron slot ({cron_only})"
+        );
+    }
+
+    /// The deadline is fixed at first acceptance. Re-arming on each poll must not extend it, or a
+    /// tool that keeps saying "still working" would hold its slot forever — the exact failure the
+    /// bound exists to prevent.
+    #[test]
+    fn repeated_polls_do_not_extend_the_deadline() {
+        let reg = ScheduleRegistry::new(vec![job("wake")]);
+        let j = reg.jobs()[0].clone();
+        reg.arm_pending(&j, &accepted());
+        let first = reg.state_of("wake").unwrap().pending.unwrap();
+
+        reg.arm_pending(&j, &accepted());
+        let second = reg.state_of("wake").unwrap().pending.unwrap();
+
+        assert_eq!(first.deadline, second.deadline, "deadline must be set once");
+        assert_eq!(second.polls, first.polls + 1, "poll count advances");
+    }
+
+    /// Taking the pending work clears it, so a tick polls at most once.
+    #[test]
+    fn take_pending_is_a_one_shot() {
+        let reg = ScheduleRegistry::new(vec![job("wake")]);
+        let j = reg.jobs()[0].clone();
+        reg.arm_pending(&j, &accepted());
+        assert!(reg.take_pending("wake").is_some());
+        assert!(reg.take_pending("wake").is_none());
+    }
+
+    /// Polling is a flat 30s cadence; the DEADLINE bounds the total, not the interval.
+    #[test]
+    fn polling_is_a_flat_cadence() {
+        let reg = ScheduleRegistry::new(vec![job("wake")]);
+        let j = reg.jobs()[0].clone();
+        let before = now_unix();
+        reg.arm_pending(&j, &accepted());
+        let p = reg.state_of("wake").unwrap().pending.unwrap();
+        assert!(
+            p.poll_at >= before + POLL_INTERVAL && p.poll_at <= before + POLL_INTERVAL + 2,
+            "first poll is one interval out, not paced by the 218s estimate"
+        );
+
+        // A later poll uses the same interval — no backoff to reason about.
+        let mid = now_unix();
+        reg.arm_pending(&j, &accepted());
+        let q = reg.state_of("wake").unwrap().pending.unwrap();
+        assert!(q.poll_at >= mid + POLL_INTERVAL && q.poll_at <= mid + POLL_INTERVAL + 2);
+    }
+
+    /// A tool with no estimate falls back to the configured budget, floored.
+    #[test]
+    fn the_configured_timeout_backs_an_estimate_less_tool() {
+        let reg = ScheduleRegistry::new(vec![job("wake")]).with_pending_timeout(100);
+        let j = reg.jobs()[0].clone();
+        let mut acc = accepted();
+        acc.estimated_seconds = None;
+        reg.arm_pending(&j, &acc);
+        let p = reg.state_of("wake").unwrap().pending.unwrap();
+        assert!(p.deadline >= now_unix() + 200, "2x the configured budget");
+
+        // And the floor applies to the setting itself.
+        let floored = ScheduleRegistry::new(vec![job("w2")]).with_pending_timeout(1);
+        assert_eq!(floored.pending_timeout, MIN_PENDING_BUDGET);
+    }
+
+    /// An ordinary tool is untouched: no pending field, no behaviour change.
+    #[test]
+    fn a_terminal_result_carries_no_pending_state() {
+        let out = lvz_protocol::ToolOutput::ok("done");
+        assert!(out.pending.is_none());
+        let err = lvz_protocol::ToolOutput::error("nope");
+        assert!(
+            err.pending.is_none(),
+            "an error is terminal by construction"
+        );
     }
 }

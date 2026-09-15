@@ -263,6 +263,7 @@ impl Tool for ShellTool {
             // The shell is not one of the agent's tracked edit tools, so its mutation (if any) is
             // not used as a convergence signal; leave `changed` false.
             changed: false,
+            pending: None,
         })
     }
 }

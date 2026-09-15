@@ -69,7 +69,19 @@ not commands — `schedule_list`/`schedule_status`/`schedule_run` are registered
 report room is encrypted** (under the `e2ee` feature), else sent in the clear — like the shutdown
 notice, a scheduled fire has no inbound event to infer modality from, so the gateway consults the
 room's `m.room.encryption` state (`room_encrypted` → `send_gateway_message`) to decide. Their event
-ids go into `RecentIds`, so **replying to a report re-engages the bot** via the existing reply gate. `build_tool_registry` in `lvz-cli` is the composition root: the *same* registry goes to
+ids go into `RecentIds`, so **replying to a report re-engages the bot** via the existing reply gate. A tool may instead return a **pending** result
+([`ToolOutput::pending`] — a typed field, not a JSON convention in `content`, so a mis-spelled key
+cannot be silently treated as terminal): it names a `poll_with` tool and a `handle`, and the
+scheduler polls that to a terminal Ok/Err before reporting anything. `job fired ok` then means
+*completed*, not *dispatched* — the gap that let a `server_wake` report green for a wake that had
+already aborted. Polling rides the existing `due_at` timer (`pending` > `retry_at` > `next_due`)
+rather than awaiting inline, which is load-bearing: schedule jobs share a task with the Matrix
+`/sync` loop, so blocking for the ~218 s a wake takes would make the bot deaf. In-flight work
+suppresses the cron slot exactly as a retry does, so a tick cannot double-dispatch; the deadline is
+fixed at first acceptance (2x the tool's estimate, or `[gateway] schedule_pending_timeout`) so
+repeated "still working" answers cannot extend it, and expiry is a **failure** that retries normally.
+Polling is a flat 30 s cadence — the deadline bounds the total, not the interval. The room hears
+nothing until the outcome is terminal. `build_tool_registry` in `lvz-cli` is the composition root: the *same* registry goes to
 the agent and to the gateway's scheduler. Job state is in-memory (history resets on restart). The
 room report is a *summary* (600-char cap); the **full account goes to stderr** per fire via
 `log_verbose` — untruncated output, duration, attempt, tools used, and token usage (kept even when a

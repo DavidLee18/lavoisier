@@ -483,6 +483,7 @@ impl Tool for EditFilesTool {
             content,
             is_error: failed > 0,
             changed: any_changed,
+            pending: None,
         })
     }
 }
@@ -694,6 +695,7 @@ impl Tool for StrReplaceTool {
             content: format!("str_replace:\n{}", lines.join("\n")),
             is_error: any_error,
             changed: any_changed,
+            pending: None,
         })
     }
 }

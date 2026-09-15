@@ -394,6 +394,17 @@ struct Cli {
     )]
     schedule_retry_wait: Option<u64>,
 
+    /// Fallback polling budget (seconds) for a schedule tool that accepts long-running work and
+    /// reports completion via a poll tool, but gives no estimate of its own. The scheduler gives up
+    /// and reports a TIMEOUT at twice this, rather than holding the job's slot indefinitely. A
+    /// tool's own `estimated_seconds` wins over it. Also `[gateway] schedule_pending_timeout`.
+    #[arg(
+        long = "schedule-pending-timeout",
+        value_name = "SECS",
+        env = "LVZ_SCHEDULE_PENDING_TIMEOUT"
+    )]
+    schedule_pending_timeout: Option<u64>,
+
     /// Enable adaptive token optimisation (ATO, experimental): an online tuner that learns
     /// per-archetype knob settings from realised outcomes (most useful in a long-running
     /// `--serve` process). Pair with `--verify-cmd` for a real quality-gated success signal,
@@ -919,7 +930,13 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
         let store = config.build_session_store()?;
         // Schedules run inside the Matrix gateway, but the registry is built here: the agent needs
         // the `schedule_*` tools, and the gateway needs the same registry to fire jobs against.
-        let schedule = schedule_jobs.map(|jobs| Arc::new(ScheduleRegistry::new(jobs)));
+        let schedule = schedule_jobs.map(|jobs| {
+            let mut reg = ScheduleRegistry::new(jobs);
+            if let Some(secs) = cli.schedule_pending_timeout {
+                reg = reg.with_pending_timeout(secs);
+            }
+            Arc::new(reg)
+        });
         let tools = build_tool_registry(
             &cli,
             batch_provider,

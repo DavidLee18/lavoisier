@@ -37,6 +37,33 @@ pub struct ToolOutput {
     /// convergence levers on this, not merely on which tool was called, so a failed/empty edit
     /// can't be mistaken for progress (§6.6 convergence). Default `false`.
     pub changed: bool,
+    /// Set when the tool **accepted** work that is still running, rather than finishing it.
+    ///
+    /// A long-running action (waking a machine, a remote build) cannot block: it would hold a
+    /// scheduler slot for minutes, collide with a retry window shorter than its own runtime, and
+    /// make an interactive caller wait. So it returns immediately — but then `Ok` means *dispatched*,
+    /// not *succeeded*, and anything reporting on it asserts something it does not know.
+    ///
+    /// `pending` closes that gap: the caller polls [`Pending::poll_with`] until a terminal result
+    /// arrives, and reports THAT. `None` (the default) is an ordinary terminal result, so every
+    /// existing tool is unaffected.
+    ///
+    /// A **typed field, not a JSON convention** in `content`: a tool that mis-spelled a magic key
+    /// would silently be treated as terminal, which is the failure this exists to remove.
+    pub pending: Option<Pending>,
+}
+
+/// A handle to work a tool started but has not finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    /// Opaque token identifying this run, passed back to the polling tool as `{"handle": …}`.
+    pub handle: String,
+    /// Name of the tool that reports the terminal outcome for `handle`.
+    pub poll_with: String,
+    /// The tool's own estimate of how long the work takes. Used to derive a polling deadline, so a
+    /// job that never completes is reported as a timeout rather than holding a slot forever.
+    /// `None` falls back to the caller's configured default.
+    pub estimated_seconds: Option<u64>,
 }
 
 impl ToolOutput {
@@ -46,6 +73,27 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             changed: false,
+            pending: None,
+        }
+    }
+
+    /// Report that the work was **accepted and is still running**; the caller must poll
+    /// `poll_with` with `handle` for the terminal outcome.
+    pub fn pending(
+        content: impl Into<String>,
+        handle: impl Into<String>,
+        poll_with: impl Into<String>,
+        estimated_seconds: Option<u64>,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            changed: false,
+            pending: Some(Pending {
+                handle: handle.into(),
+                poll_with: poll_with.into(),
+                estimated_seconds,
+            }),
         }
     }
 
@@ -55,6 +103,8 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             changed: false,
+            // An error is terminal by construction: there is nothing to poll for.
+            pending: None,
         }
     }
 
