@@ -711,7 +711,7 @@ impl ProviderKind {
 
 /// Tool-authoring types, re-exported so a private downstream crate can implement [`Tool`] by
 /// depending only on `lavoisier` (no direct `lvz-protocol` dependency needed).
-pub use lvz_protocol::{Tool, ToolError, ToolOutput};
+pub use lvz_protocol::{Pending, Tool, ToolError, ToolOutput};
 
 /// The [`tracing`] facade, re-exported so a private downstream crate can instrument its own tools
 /// (`lavoisier::tracing::info!(…)`) without taking a direct `tracing` dependency or having to match
