@@ -657,12 +657,30 @@ fn build_content_block(block: &ContentBlock, extended_ttl: bool) -> Option<Value
             tool_use_id,
             content,
             is_error,
+            images,
         } => {
             let mut v = json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
-                "content": content,
             });
+            // An image lives inside this tool_result, where the tool_use id can see it.
+            // A neighbouring user image would not be tied to the call.
+            if images.is_empty() {
+                v["content"] = json!(content);
+            } else {
+                let mut blocks = vec![json!({ "type": "text", "text": content })];
+                for image in images {
+                    blocks.push(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image.media_type,
+                            "data": image.data,
+                        }
+                    }));
+                }
+                v["content"] = json!(blocks);
+            }
             if *is_error {
                 v["is_error"] = json!(true);
             }
@@ -744,6 +762,7 @@ mod tests {
                 tool_use_id: "toolu_9".into(),
                 content: "ok".into(),
                 is_error: false,
+                images: Vec::new(),
             }],
         };
         let body = nb(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
@@ -751,6 +770,37 @@ mod tests {
         assert_eq!(block["type"], "tool_result");
         assert_eq!(block["tool_use_id"], "toolu_9");
         assert!(block["is_error"].is_null()); // omitted when false
+        assert_eq!(block["content"], "ok");
+    }
+
+    #[test]
+    fn a_tool_image_is_inside_the_tool_result_not_a_sibling_message() {
+        let msg = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_9".into(),
+                content: "desktop".into(),
+                is_error: false,
+                images: vec![lvz_protocol::ToolImage {
+                    media_type: "image/jpeg".into(),
+                    data: "abcd".into(),
+                }],
+            }],
+        };
+        let body = nb(&ChatRequest::new("claude-sonnet-4-6").push(msg), false);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "the image must not become a second user message"
+        );
+        let block = &messages[0]["content"][0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["content"][0]["type"], "text");
+        assert_eq!(block["content"][0]["text"], "desktop");
+        assert_eq!(block["content"][1]["type"], "image");
+        assert_eq!(block["content"][1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(block["content"][1]["source"]["data"], "abcd");
     }
 
     #[test]

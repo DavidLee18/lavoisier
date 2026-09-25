@@ -264,6 +264,7 @@ impl Tool for ShellTool {
             // not used as a convergence signal; leave `changed` false.
             changed: false,
             pending: None,
+            images: Vec::new(),
         })
     }
 }

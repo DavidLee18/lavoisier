@@ -660,7 +660,7 @@ fn build_contents(messages: &[Message]) -> Value {
             let parts: Vec<Value> = m
                 .content
                 .iter()
-                .map(|b| content_part(b, &id_to_name))
+                .flat_map(|b| content_parts(b, &id_to_name))
                 .collect();
             json!({ "role": role, "parts": parts })
         })
@@ -682,15 +682,15 @@ fn gemini_media_part(source: &MediaSource) -> Value {
     }
 }
 
-fn content_part(block: &ContentBlock, id_to_name: &HashMap<&str, &str>) -> Value {
+fn content_parts(block: &ContentBlock, id_to_name: &HashMap<&str, &str>) -> Vec<Value> {
     match block {
-        ContentBlock::Text { text, .. } => json!({ "text": text }),
+        ContentBlock::Text { text, .. } => vec![json!({ "text": text })],
         // Gemini has no inbound "thinking" part; echo it as text (rare on the outbound path).
-        ContentBlock::Thinking { text } => json!({ "text": text }),
+        ContentBlock::Thinking { text } => vec![json!({ "text": text })],
         // Images and documents (PDF) both map to a Gemini data part: inlineData for base64,
         // fileData for a URL. Gemini accepts a PDF the same way as an image.
         ContentBlock::Image { source } | ContentBlock::Document { source, .. } => {
-            gemini_media_part(source)
+            vec![gemini_media_part(source)]
         }
         ContentBlock::ToolUse { id, name, input } => {
             let mut part = json!({ "functionCall": { "name": name, "args": input } });
@@ -699,12 +699,13 @@ fn content_part(block: &ContentBlock, id_to_name: &HashMap<&str, &str>) -> Value
             if let Some((_, sig)) = id.split_once('#') {
                 part["thoughtSignature"] = json!(sig);
             }
-            part
+            vec![part]
         }
         ContentBlock::ToolResult {
             tool_use_id,
             content,
             is_error,
+            images,
         } => {
             let name = id_to_name.get(tool_use_id.as_str()).copied().unwrap_or("");
             let response = if *is_error {
@@ -712,7 +713,15 @@ fn content_part(block: &ContentBlock, id_to_name: &HashMap<&str, &str>) -> Value
             } else {
                 json!({ "result": content })
             };
-            json!({ "functionResponse": { "name": name, "response": response } })
+            let mut parts =
+                vec![json!({ "functionResponse": { "name": name, "response": response } })];
+            for image in images {
+                parts.push(gemini_media_part(&MediaSource::Base64 {
+                    media_type: image.media_type.clone(),
+                    data: image.data.clone(),
+                }));
+            }
+            parts
         }
     }
 }
@@ -900,6 +909,7 @@ mod tests {
                     tool_use_id: "call_0".into(),
                     content: "fn main() {}".into(),
                     is_error: false,
+                    images: Vec::new(),
                 }],
             },
         ];

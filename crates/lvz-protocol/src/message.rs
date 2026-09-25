@@ -410,6 +410,10 @@ pub enum ContentBlock {
         /// Whether the tool reported a (recoverable) error.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+        /// Images that belong to this result. Empty when the tool returned text only.
+        /// `#[serde(default)]` so a transcript saved before this field still loads.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<crate::ToolImage>,
     },
 }
 

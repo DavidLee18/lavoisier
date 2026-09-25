@@ -740,13 +740,24 @@ fn push_user(m: &Message, out: &mut Vec<pb::Message>) {
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
+                images,
                 ..
-            } => tool_results.push(pb::Message {
-                content: vec![text_content(content.clone())],
-                role: pb::MessageRole::RoleTool as i32,
-                tool_call_id: Some(tool_use_id.clone()),
-                ..Default::default()
-            }),
+            } => {
+                tool_results.push(pb::Message {
+                    content: vec![text_content(content.clone())],
+                    role: pb::MessageRole::RoleTool as i32,
+                    tool_call_id: Some(tool_use_id.clone()),
+                    ..Default::default()
+                });
+                // A ROLE_TOOL message is text only. The image rides the user turn's media list,
+                // which is where this adapter already sends vision.
+                for image in images {
+                    media.push(image_content(&MediaSource::Base64 {
+                        media_type: image.media_type.clone(),
+                        data: image.data.clone(),
+                    }));
+                }
+            }
             ContentBlock::ToolUse { .. } => {} // not valid on a user turn
         }
     }
@@ -968,6 +979,7 @@ mod tests {
                 tool_use_id: "call_1".into(),
                 content: "files".into(),
                 is_error: false,
+                images: Vec::new(),
             }],
         };
         let req = ChatRequest::new("grok-4")
@@ -990,6 +1002,32 @@ mod tests {
         assert_eq!(tool.role, pb::MessageRole::RoleTool as i32);
         assert_eq!(tool.tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(content_text(&tool.content[0]), "files");
+    }
+
+    #[test]
+    fn a_tool_image_is_on_the_user_turn_because_role_tool_is_text() {
+        let result = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".into(),
+                content: "desktop".into(),
+                is_error: false,
+                images: vec![lvz_protocol::ToolImage {
+                    media_type: "image/jpeg".into(),
+                    data: "abcd".into(),
+                }],
+            }],
+        };
+        let g = nr(ChatRequest::new("grok-4").push(result));
+        let tool = &g.messages[0];
+        assert_eq!(tool.role, pb::MessageRole::RoleTool as i32);
+        assert_eq!(content_text(&tool.content[0]), "desktop");
+        let user = &g.messages[1];
+        assert_eq!(user.role, pb::MessageRole::RoleUser as i32);
+        let Some(pb::content::Content::ImageUrl(img)) = &user.content[0].content else {
+            panic!("expected the screenshot on the user turn: {user:?}");
+        };
+        assert_eq!(img.image_url, "data:image/jpeg;base64,abcd");
     }
 
     #[test]

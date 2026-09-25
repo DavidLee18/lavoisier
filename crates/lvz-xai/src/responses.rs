@@ -325,6 +325,7 @@ fn input_items(msgs: &[Message]) -> Value {
                 ContentBlock::ToolResult {
                     tool_use_id,
                     content,
+                    images,
                     ..
                 } => {
                     out.push(json!({
@@ -332,6 +333,27 @@ fn input_items(msgs: &[Message]) -> Value {
                         "call_id": tool_use_id,
                         "output": content,
                     }));
+                    // `function_call_output.output` is a string. The image is a following user
+                    // input so the model still receives it.
+                    if !images.is_empty() {
+                        let parts: Vec<Value> = images
+                            .iter()
+                            .map(|image| {
+                                json!({
+                                    "type": "input_image",
+                                    "image_url": format!(
+                                        "data:{};base64,{}",
+                                        image.media_type, image.data
+                                    ),
+                                })
+                            })
+                            .collect();
+                        out.push(json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": parts,
+                        }));
+                    }
                 }
                 _ => {}
             }
@@ -414,6 +436,7 @@ mod tests {
                     tool_use_id: "call-1".into(),
                     content: "contents".into(),
                     is_error: false,
+                    images: Vec::new(),
                 }],
             },
         ];
@@ -426,6 +449,34 @@ mod tests {
         assert_eq!(items[2]["type"], "function_call_output");
         assert_eq!(items[2]["call_id"], "call-1");
         assert_eq!(items[2]["output"], "contents");
+    }
+
+    #[test]
+    fn a_tool_image_follows_the_function_call_output_as_an_input_image() {
+        let mut r = base();
+        r.messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call-1".into(),
+                content: "desktop".into(),
+                is_error: false,
+                images: vec![lvz_protocol::ToolImage {
+                    media_type: "image/jpeg".into(),
+                    data: "abcd".into(),
+                }],
+            }],
+        }];
+        let items = build_body(&negotiated(r))["input"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(items[0]["type"], "function_call_output");
+        assert_eq!(items[0]["output"], "desktop");
+        assert_eq!(items[1]["content"][0]["type"], "input_image");
+        assert_eq!(
+            items[1]["content"][0]["image_url"],
+            "data:image/jpeg;base64,abcd"
+        );
     }
 
     #[test]

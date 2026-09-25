@@ -1176,6 +1176,7 @@ async fn run_loop(
                         call.name
                     ),
                     is_error: true,
+                    images: Vec::new(),
                 }
             } else if let Some(ToolDecision::Deny(reason)) = match &tool_gate {
                 // Interactive approval (e.g. the TUI's "allow this edit?"). A denial is fed back to
@@ -1188,6 +1189,7 @@ async fn run_loop(
                     tool_use_id: call.id.clone(),
                     content: format!("tool `{}` denied: {reason}", call.name),
                     is_error: true,
+                    images: Vec::new(),
                 }
             } else {
                 match invoke_forwarding(&tools, &call.name, args, tx).await {
@@ -1204,16 +1206,20 @@ async fn run_loop(
                         let len = out.content.len();
                         max_result_bytes = Some(max_result_bytes.map_or(len, |m| m.max(len)));
                         made_real_edit |= out.changed && is_edit_tool(&call.name);
+                        let mut content = truncate(&out.content, knobs.truncate_bytes);
+                        let images = admit_tool_images(&mut content, out.images);
                         ContentBlock::ToolResult {
                             tool_use_id: call.id.clone(),
-                            content: truncate(&out.content, knobs.truncate_bytes),
+                            content,
                             is_error: out.is_error,
+                            images,
                         }
                     }
                     Err(e) => ContentBlock::ToolResult {
                         tool_use_id: call.id.clone(),
                         content: format!("tool error: {e}"),
                         is_error: true,
+                        images: Vec::new(),
                     },
                 }
             };
@@ -1898,6 +1904,7 @@ fn mark_stale_reads(history: &mut [Message]) {
                 tool_use_id,
                 content,
                 is_error,
+                images: _,
             } = block
             {
                 if *is_error || content.len() < DEDUP_MIN_BYTES || content.starts_with('[') {
@@ -2458,6 +2465,34 @@ impl TurnAccumulator {
     }
 }
 
+/// Base64 larger than this is dropped whole. Slicing it would hand the model a broken image.
+const MAX_TOOL_IMAGE_BASE64: usize = 5 * 1024 * 1024;
+
+/// Keep images that fit. An image over the cap is omitted and named in `content`, never sliced.
+fn admit_tool_images(
+    content: &mut String,
+    images: Vec<lvz_protocol::ToolImage>,
+) -> Vec<lvz_protocol::ToolImage> {
+    let mut kept = Vec::new();
+    for image in images {
+        if image.data.len() > MAX_TOOL_IMAGE_BASE64 {
+            content.push_str(&format!(
+                "\n[image omitted: {} bytes of {} base64 exceeds the {MAX_TOOL_IMAGE_BASE64} byte limit]",
+                image.data.len(),
+                image.media_type
+            ));
+        } else if image.data.is_empty() {
+            content.push_str(&format!(
+                "\n[image omitted: empty {} payload]",
+                image.media_type
+            ));
+        } else {
+            kept.push(image);
+        }
+    }
+    kept
+}
+
 /// Head/tail truncation for oversized tool output, preserving both ends with a byte count.
 fn truncate(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
@@ -2481,6 +2516,32 @@ mod tests {
     use lvz_protocol::{Capability, Tool, ToolError, ToolOutput};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    #[test]
+    fn oversized_image_is_omitted_whole() {
+        let mut content = "desktop".to_string();
+        let huge = "a".repeat(MAX_TOOL_IMAGE_BASE64 + 1);
+        let kept = admit_tool_images(
+            &mut content,
+            vec![
+                lvz_protocol::ToolImage {
+                    media_type: "image/jpeg".into(),
+                    data: huge,
+                },
+                lvz_protocol::ToolImage {
+                    media_type: "image/jpeg".into(),
+                    data: "abcd".into(),
+                },
+            ],
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].data, "abcd");
+        assert!(content.contains("image omitted"));
+        assert!(
+            !content.contains(&"a".repeat(100)),
+            "the oversized payload must not be copied into the text"
+        );
+    }
 
     /// A provider that replays a fixed script of event lists, one per successive call.
     struct ScriptedProvider {
@@ -3601,6 +3662,7 @@ fn target() -> u32 { helper() + 10 }
                 tool_use_id: id.into(),
                 content: big.clone(),
                 is_error: false,
+                images: Vec::new(),
             }],
         };
         // task + 4 (assistant, result) pairs = 9 messages; KEEP_RECENT_TURNS=2 protects the
@@ -3651,6 +3713,7 @@ fn target() -> u32 { helper() + 10 }
                 tool_use_id: id.into(),
                 content: c.to_string(),
                 is_error: false,
+                images: Vec::new(),
             }],
         };
         let mut history = vec![
@@ -3698,6 +3761,7 @@ fn target() -> u32 { helper() + 10 }
                 tool_use_id: id.into(),
                 content: big.clone(),
                 is_error: err,
+                images: Vec::new(),
             }],
         };
         let mut history = vec![
@@ -3744,6 +3808,7 @@ fn target() -> u32 { helper() + 10 }
                     tool_use_id: "r1".into(),
                     content: big.clone(),
                     is_error: false,
+                    images: Vec::new(),
                 }],
             },
             Message {
@@ -3760,6 +3825,7 @@ fn target() -> u32 { helper() + 10 }
                     tool_use_id: "e1".into(),
                     content: "anchor not found".into(),
                     is_error: true, // the edit FAILED → file unchanged → read still valid
+                    images: Vec::new(),
                 }],
             },
         ];

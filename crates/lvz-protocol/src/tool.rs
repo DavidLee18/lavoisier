@@ -3,6 +3,7 @@
 //! (§5.4).
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 /// A capability the model can invoke. Implementors expose a name, a JSON Schema for their
 /// arguments, and an async `invoke`.
@@ -65,6 +66,19 @@ pub struct ToolOutput {
     /// A **typed field, not a JSON convention** in `content`: a tool that mis-spelled a magic key
     /// would silently be treated as terminal, which is the failure this exists to remove.
     pub pending: Option<Pending>,
+    /// Images the model should see along with [`content`](ToolOutput::content). Empty for every
+    /// tool that returns text only. The bytes are base64, not a file path: a path would depend on
+    /// a later `read_file`, and that read is text-only.
+    pub images: Vec<ToolImage>,
+}
+
+/// One image attached to a [`ToolOutput`]. `data` is the base64 payload, never a sliced prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolImage {
+    /// MIME type, e.g. `image/jpeg`.
+    pub media_type: String,
+    /// Base64-encoded bytes. Adapters send this whole string or omit the image.
+    pub data: String,
 }
 
 /// A handle to work a tool started but has not finished.
@@ -88,7 +102,17 @@ impl ToolOutput {
             is_error: false,
             changed: false,
             pending: None,
+            images: Vec::new(),
         }
+    }
+
+    /// Attach an image. `data` is base64. The text in `content` stays the tool result.
+    pub fn with_image(mut self, media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        self.images.push(ToolImage {
+            media_type: media_type.into(),
+            data: data.into(),
+        });
+        self
     }
 
     /// Report that the work was **accepted and is still running**; the caller must poll
@@ -108,6 +132,7 @@ impl ToolOutput {
                 poll_with: poll_with.into(),
                 estimated_seconds,
             }),
+            images: Vec::new(),
         }
     }
 
@@ -119,6 +144,7 @@ impl ToolOutput {
             changed: false,
             // An error is terminal by construction: there is nothing to poll for.
             pending: None,
+            images: Vec::new(),
         }
     }
 

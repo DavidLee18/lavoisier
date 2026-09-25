@@ -484,6 +484,7 @@ impl Tool for EditFilesTool {
             is_error: failed > 0,
             changed: any_changed,
             pending: None,
+            images: Vec::new(),
         })
     }
 }
@@ -696,6 +697,7 @@ impl Tool for StrReplaceTool {
             is_error: any_error,
             changed: any_changed,
             pending: None,
+            images: Vec::new(),
         })
     }
 }

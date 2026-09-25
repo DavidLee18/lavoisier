@@ -238,12 +238,24 @@ fn push_user_message(m: &lvz_protocol::Message, out: &mut Vec<Value>) {
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
+                images: shots,
                 ..
-            } => tool_results.push(json!({
-                "role": "tool",
-                "tool_call_id": tool_use_id,
-                "content": content,
-            })),
+            } => {
+                tool_results.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_use_id,
+                    "content": content,
+                }));
+                // The tool role is text. The shot goes on the user turn, with any other images.
+                for image in shots {
+                    images.push(json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:{};base64,{}", image.media_type, image.data)
+                        },
+                    }));
+                }
+            }
             ContentBlock::ToolUse { .. } => {} // not valid on a user turn
         }
     }
@@ -666,6 +678,7 @@ mod tests {
                 tool_use_id: "call_1".into(),
                 content: "files".into(),
                 is_error: false,
+                images: Vec::new(),
             }],
         };
         let req = ChatRequest::new("grok-4")

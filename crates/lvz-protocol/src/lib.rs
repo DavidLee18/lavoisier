@@ -43,7 +43,7 @@ pub use provider::{
 };
 pub use retry::{is_transient_status, retry_transient};
 pub use telemetry::{TaskTelemetry, TelemetrySink};
-pub use tool::{Pending, Tool, ToolError, ToolOutput};
+pub use tool::{Pending, Tool, ToolError, ToolImage, ToolOutput};
 pub use tune::{Archetype, Knobs, ModelTier, NoopTuner, Outcome, RepoProfile, TaskContext, Tuner};
 
 #[cfg(test)]
