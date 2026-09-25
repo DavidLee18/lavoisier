@@ -1,6 +1,6 @@
 [package]
 name = "lvz-google"
-version = "0.1.0"
+version = "0.2.0"
 description = "Google Gemini provider for Lavoisier: native Generative Language API over SSE with configurable thinking effort."
 edition.workspace = true
 rust-version.workspace = true
