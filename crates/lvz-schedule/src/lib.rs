@@ -233,15 +233,24 @@ pub struct Outcome {
 }
 
 impl FireReport {
-    /// A placeholder for the **operator log only** when a fire ended in accepted-but-unfinished
-    /// work. It is never posted to a room: `fire` returns `None` in that case precisely so the
-    /// room hears nothing until the outcome is real.
-    fn pending(job: &ScheduleJob) -> Self {
+    /// The room line for the moment a job **accepts** work and the scheduler starts waiting.
+    ///
+    /// Posted once, on the first acceptance. Later polls that are still running return `None`
+    /// from `fire`, so the room is not told "still waiting" every 30 s. `ok` is false because
+    /// this is not a verdict — the ✅/❌ line is the later, terminal report.
+    fn waiting(job: &ScheduleJob, acc: &lvz_protocol::Pending) -> Self {
+        let eta = acc
+            .estimated_seconds
+            .map(|s| format!(", ~{s}s"))
+            .unwrap_or_default();
         FireReport {
             job_id: job.id.clone(),
             room: job.room.clone(),
             ok: false,
-            body: format!("⏳ `{}` · accepted, awaiting completion", job.id),
+            body: format!(
+                "⏳ `{}` · started, waiting on `{}` (handle {}{eta})",
+                job.id, acc.poll_with, acc.handle
+            ),
             attempt: 0,
         }
     }
@@ -484,19 +493,27 @@ impl ScheduleRegistry {
         // If work from an earlier fire is still running, this tick polls it rather than
         // dispatching again — that is what stops a cron slot double-firing a wake in progress.
         let in_flight = self.take_pending(&job.id);
-        let outcome = match in_flight {
+        let first_accept = in_flight.is_none();
+        let outcome = match in_flight.clone() {
             Some(p) => poll_pending(&job, p, tools, agent, self.pending_timeout).await,
             None => run_action(&job, tools, agent).await,
         };
         let elapsed = started.elapsed();
 
-        // Still unfinished: arm the next poll and report NOTHING. The room stays silent until the
-        // terminal outcome — a provisional "started" message that is later contradicted is worse
-        // than silence, because the first message is the one an operator acts on.
+        // Still unfinished. The first acceptance is posted (`⏳ started, waiting`); a later poll
+        // that is still running is not, so the room gets two messages for the job — waiting, then
+        // the verdict — and not one per 30 s poll. The waiting line is not a success: `record` is
+        // not called, so history and the retry counter stay untouched until the outcome is real.
         if let Some(acc) = &outcome.accepted {
+            if let Some(prior) = in_flight {
+                // `take_pending` removed the record so this tick could poll. Put it back before
+                // re-arming, or the deadline (fixed at first acceptance) and the poll count reset.
+                self.restore_pending(&job.id, prior);
+            }
             self.arm_pending(&job, acc);
-            log_verbose(&job, &outcome, &FireReport::pending(&job), elapsed);
-            return None;
+            let report = FireReport::waiting(&job, acc);
+            log_verbose(&job, &outcome, &report, elapsed);
+            return first_accept.then_some(report);
         }
 
         let report = self.record(&job, &outcome.result, outcome.summary.as_deref());
@@ -508,6 +525,15 @@ impl ScheduleRegistry {
     fn take_pending(&self, id: &str) -> Option<PendingWork> {
         let mut guard = self.state.write().ok()?;
         guard.get_mut(id).and_then(|s| s.pending.take())
+    }
+
+    /// Put a record removed by [`take_pending`](Self::take_pending) back, so a still-running poll
+    /// re-arms against the original deadline instead of starting a new one.
+    fn restore_pending(&self, id: &str, prior: PendingWork) {
+        let Ok(mut guard) = self.state.write() else {
+            return;
+        };
+        guard.entry(id.to_string()).or_default().pending = Some(prior);
     }
 
     /// Record accepted-but-unfinished work and arm the next poll.
@@ -748,14 +774,19 @@ async fn run_action(
             // degrades to the raw output (see `record`/`summarise`), and the ❌ marker + retry
             // countdown stay structural in `report_body`, outside the prose slot — so a paraphrase can
             // never hide or soften a genuinely refused ATX power call.
-            let (summary, usage) = match (&result, job.summarize.as_deref()) {
-                (Ok(raw), Some(instruction)) => {
-                    summarise(job, agent, instruction, &format!("SUCCESS\n{raw}")).await
+            // An acceptance is not an outcome: skip the summary turn until the poll is terminal.
+            let (summary, usage) = if accepted.is_some() {
+                (None, None)
+            } else {
+                match (&result, job.summarize.as_deref()) {
+                    (Ok(raw), Some(instruction)) => {
+                        summarise(job, agent, instruction, &format!("SUCCESS\n{raw}")).await
+                    }
+                    (Err(err), Some(instruction)) => {
+                        summarise(job, agent, instruction, &format!("FAILURE\n{err}")).await
+                    }
+                    _ => (None, None),
                 }
-                (Err(err), Some(instruction)) => {
-                    summarise(job, agent, instruction, &format!("FAILURE\n{err}")).await
-                }
-                _ => (None, None),
             };
             ActionOutcome {
                 result,
@@ -888,6 +919,14 @@ fn log_verbose(
         })
         .unwrap_or_default();
 
+    if outcome.accepted.is_some() {
+        tracing::info!(
+            job = %job.id,
+            duration_ms = ms,
+            "job accepted, waiting{tools_note}"
+        );
+        return;
+    }
     match &outcome.result {
         Ok(output) => {
             let output = output.trim();
@@ -1672,6 +1711,112 @@ mod pending_tests {
         // And the floor applies to the setting itself.
         let floored = ScheduleRegistry::new(vec![job("w2")]).with_pending_timeout(1);
         assert_eq!(floored.pending_timeout, MIN_PENDING_BUDGET);
+    }
+
+    /// The room hears the wait once, then the verdict. A poll that is still running posts nothing
+    /// and does not count as an attempt.
+    #[tokio::test]
+    async fn a_pending_job_reports_waiting_once_then_the_verdict() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Wake;
+        #[async_trait::async_trait]
+        impl lvz_protocol::Tool for Wake {
+            fn name(&self) -> &str {
+                "server_wake"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn invoke(
+                &self,
+                _args: serde_json::Value,
+            ) -> Result<lvz_protocol::ToolOutput, lvz_protocol::ToolError> {
+                Ok(lvz_protocol::ToolOutput::pending(
+                    "powered on",
+                    "h1",
+                    "server_wake_result",
+                    Some(218),
+                ))
+            }
+        }
+        struct WakeResult {
+            polls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl lvz_protocol::Tool for WakeResult {
+            fn name(&self) -> &str {
+                "server_wake_result"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn invoke(
+                &self,
+                _args: serde_json::Value,
+            ) -> Result<lvz_protocol::ToolOutput, lvz_protocol::ToolError> {
+                // The first poll is still running; the second is the terminal success.
+                if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(lvz_protocol::ToolOutput::pending(
+                        "still logging in",
+                        "h1",
+                        "server_wake_result",
+                        Some(218),
+                    ))
+                } else {
+                    Ok(lvz_protocol::ToolOutput::ok("desktop up"))
+                }
+            }
+        }
+        struct DeadAgent;
+        #[async_trait::async_trait]
+        impl AgentHandle for DeadAgent {
+            async fn submit(
+                &self,
+                _turn: TurnRequest,
+            ) -> Result<
+                futures::stream::BoxStream<'static, Result<Event, lvz_protocol::AgentError>>,
+                lvz_protocol::AgentError,
+            > {
+                Err(lvz_protocol::AgentError::Provider("unused".into()))
+            }
+        }
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(Wake));
+        tools.register(Arc::new(WakeResult { polls }));
+        let agent: Arc<dyn AgentHandle> = Arc::new(DeadAgent);
+        let reg = ScheduleRegistry::new(vec![job("wake")]);
+
+        let waiting = reg
+            .fire(0, &tools, &agent)
+            .await
+            .expect("first accept posts");
+        assert!(!waiting.ok, "waiting is not a success");
+        assert!(waiting.body.contains("⏳"));
+        assert!(waiting.body.contains("started, waiting"));
+        assert!(waiting.body.contains("server_wake_result"));
+        assert!(waiting.body.contains("h1"));
+        assert!(waiting.body.contains("~218s"));
+        let after_accept = reg.state_of("wake").unwrap();
+        assert!(after_accept.history.is_empty(), "waiting is not an attempt");
+        assert_eq!(after_accept.runs, 0);
+        let deadline = after_accept.pending.unwrap().deadline;
+
+        assert!(
+            reg.fire(0, &tools, &agent).await.is_none(),
+            "a poll that is still running posts nothing"
+        );
+        let after_poll = reg.state_of("wake").unwrap();
+        assert!(after_poll.history.is_empty());
+        assert_eq!(after_poll.pending.unwrap().deadline, deadline);
+
+        let done = reg.fire(0, &tools, &agent).await.expect("terminal posts");
+        assert!(done.ok);
+        assert!(done.body.contains("✅"));
+        assert!(done.body.contains("desktop up"));
+        assert!(reg.state_of("wake").unwrap().pending.is_none());
     }
 
     /// An ordinary tool is untouched: no pending field, no behaviour change.

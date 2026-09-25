@@ -170,7 +170,7 @@ async fn text_thinking_citations_and_server_tools_decode() {
     let uses: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
-            Event::ServerToolUse { id, name } => Some((id.as_str(), name.as_str())),
+            Event::ServerToolUse { id, name, .. } => Some((id.as_str(), name.as_str())),
             _ => None,
         })
         .collect();

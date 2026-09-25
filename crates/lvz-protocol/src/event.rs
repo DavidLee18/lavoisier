@@ -45,6 +45,11 @@ pub enum Event {
         id: String,
         /// The server-side tool being run.
         name: String,
+        /// A short glimpse of the call's target — a search query, the first line of code — never
+        /// the tool's output. Empty when the provider didn't report one. `#[serde(default)]` so a
+        /// stream recorded before this field still decodes.
+        #[serde(default)]
+        hint: String,
     },
     /// The result of a provider-executed tool, as a serialized JSON string (search hits, code
     /// stdout/stderr, fetched page, …), correlated by `id`.

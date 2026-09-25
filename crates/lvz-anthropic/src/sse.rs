@@ -90,7 +90,8 @@ impl AnthropicSseDecoder {
                     Some("server_tool_use") => {
                         let id = cb["id"].as_str().unwrap_or_default().to_string();
                         let name = cb["name"].as_str().unwrap_or_default().to_string();
-                        out.push_back(Ok(Event::ServerToolUse { id, name }));
+                        let hint = input_glimpse(&cb["input"]);
+                        out.push_back(Ok(Event::ServerToolUse { id, name, hint }));
                     }
                     // The server's result for a built-in tool arrives whole in the start block
                     // (it's computed server-side, not token-streamed).
@@ -200,6 +201,34 @@ fn citation_source(c: &Value) -> String {
     String::new()
 }
 
+/// First-line glimpse of a server tool's `input` object (the query, not the hits).
+fn input_glimpse(input: &Value) -> String {
+    let Some(obj) = input.as_object() else {
+        return String::new();
+    };
+    for key in ["query", "code", "command", "url", "input"] {
+        if let Some(s) = obj
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return glimpse_line(s);
+        }
+    }
+    String::new()
+}
+
+fn glimpse_line(s: &str) -> String {
+    let line = s.lines().next().unwrap_or(s).trim();
+    const MAX: usize = 80;
+    if line.chars().count() <= MAX {
+        line.to_string()
+    } else {
+        let kept: String = line.chars().take(MAX).collect();
+        format!("{kept}…")
+    }
+}
+
 fn map_stop(reason: &str) -> StopReason {
     match reason {
         "end_turn" => StopReason::EndTurn,
@@ -285,7 +314,8 @@ mod tests {
             events[0],
             Event::ServerToolUse {
                 id: "srvtoolu_1".into(),
-                name: "web_search".into()
+                name: "web_search".into(),
+                hint: String::new(),
             }
         );
         match &events[1] {

@@ -747,6 +747,7 @@ const DEFAULT_LOG_FILTER: &str = "warn,\
     lvz_memory=info,\
     lvz_protocol=info,\
     lvz_schedule=info,\
+    lvz_buildlog=info,\
     lvz_tools=info,\
     lvz_tune=info,\
     lvz_xai=info";
@@ -865,6 +866,22 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
     // Install the logging collector as early as possible — right after precedence is resolved, so
     // `[log] level` counts, and before any work worth logging happens.
     init_logging(cli.log_level.as_deref(), cli.tui);
+    // Builder tasks push compile output here. Absent ⇒ no listener, and a build tool has nothing
+    // to follow. The bind address is what gets handed to the builder as LVZ_BUILDLOG_ADDR.
+    if let Ok(bind) = std::env::var("LVZ_BUILDLOG_BIND") {
+        match bind.parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                let hub = lvz_buildlog::install();
+                tracing::info!(%addr, "build log listener");
+                tokio::spawn(async move {
+                    if let Err(e) = lvz_buildlog::serve(hub, addr).await {
+                        tracing::error!(error = %e, "build log listener stopped");
+                    }
+                });
+            }
+            Err(e) => tracing::error!(bind, error = %e, "LVZ_BUILDLOG_BIND is not a socket address"),
+        }
+    }
     // Deferred from `Config::load`: the file carries `[log] level`, so it is necessarily read
     // before the collector exists and an event emitted there would be dropped.
     if let Some(path) = &config.source {
@@ -1724,7 +1741,13 @@ impl Renderer {
                     }
                 }
             }
-            Event::ServerToolUse { name, .. } => eprintln!("\n[server tool] {name}"),
+            Event::ServerToolUse { name, hint, .. } => {
+                if hint.is_empty() {
+                    eprintln!("\n[server tool] {name}");
+                } else {
+                    eprintln!("\n[server tool] {name} · {hint}");
+                }
+            }
             Event::ServerToolResult { .. } => eprintln!("[server tool result]"),
             Event::Citation { cited_text, source } => {
                 eprintln!("[citation: {source}] {cited_text}")
@@ -1777,6 +1800,7 @@ mod tests {
             "lvz_legion",
             "lvz_mcp",
             "lvz_schedule",
+            "lvz_buildlog",
             "lvz_memory",
             "lvz_tools",
         ] {

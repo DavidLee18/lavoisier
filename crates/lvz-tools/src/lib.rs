@@ -98,6 +98,22 @@ impl ToolRegistry {
             .ok_or_else(|| ToolError::Unknown(name.to_string()))?;
         tool.invoke(args).await
     }
+
+    /// [`invoke`](Self::invoke), forwarding any progress lines the tool emits while it runs.
+    pub async fn invoke_reporting(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        logs: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Result<ToolOutput, ToolError> {
+        let tool = self
+            .tools
+            .iter()
+            .rev()
+            .find(|t| t.name() == name)
+            .ok_or_else(|| ToolError::Unknown(name.to_string()))?;
+        tool.invoke_reporting(args, logs).await
+    }
 }
 
 #[cfg(test)]

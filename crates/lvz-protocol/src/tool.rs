@@ -21,6 +21,20 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool against parsed argument JSON.
     async fn invoke(&self, args: serde_json::Value) -> Result<ToolOutput, ToolError>;
+
+    /// [`invoke`](Tool::invoke), and push progress lines while the work runs.
+    ///
+    /// The default drops `logs` and calls `invoke`, so existing tools are unchanged. A tool
+    /// that can see its work as it happens (a build's compiler output) overrides this and sends
+    /// one line at a time. The agent posts each line and also keeps them for the model.
+    async fn invoke_reporting(
+        &self,
+        args: serde_json::Value,
+        logs: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Result<ToolOutput, ToolError> {
+        drop(logs);
+        self.invoke(args).await
+    }
 }
 
 /// The successful result of a tool invocation. `is_error` lets a tool report a recoverable

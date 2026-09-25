@@ -678,6 +678,60 @@ impl AgentHandle for Agent {
 
 type Sink = mpsc::UnboundedSender<Result<Event, AgentError>>;
 
+/// Run a tool, posting each progress line as it arrives and keeping the lines on the result
+/// the model reads back.
+async fn invoke_forwarding(
+    tools: &lvz_tools::ToolRegistry,
+    name: &str,
+    args: serde_json::Value,
+    tx: &Sink,
+) -> Result<lvz_protocol::ToolOutput, lvz_protocol::ToolError> {
+    let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Keep one sender so `recv` stays open until the tool returns, even if the tool drops its copy.
+    let invoke = tools.invoke_reporting(name, args, log_tx.clone());
+    tokio::pin!(invoke);
+    let mut captured = String::new();
+    let take = |line: String, captured: &mut String| {
+        let _ = tx.unbounded_send(Ok(Event::Notice(line.clone())));
+        captured.push_str(&line);
+        captured.push('\n');
+    };
+    let out = loop {
+        tokio::select! {
+            biased;
+            line = log_rx.recv() => {
+                if let Some(line) = line {
+                    take(line, &mut captured);
+                }
+            }
+            result = &mut invoke => break result,
+        }
+    };
+    drop(log_tx);
+    while let Ok(line) = log_rx.try_recv() {
+        take(line, &mut captured);
+    }
+    out.map(|mut output| {
+        if !captured.is_empty() {
+            output.content = format!("{captured}{}", output.content);
+        }
+        output
+    })
+}
+
+/// Room line for a tool that accepted work and has not finished. The chat path posts this;
+/// a schedule job posts its own from `fire`, because that call never enters the agent loop.
+fn pending_notice(name: &str, pending: &lvz_protocol::Pending) -> String {
+    let eta = pending
+        .estimated_seconds
+        .map(|s| format!(", ~{s}s"))
+        .unwrap_or_default();
+    format!(
+        "⏳ `{name}` started, waiting on `{}` (handle {}{eta})",
+        pending.poll_with, pending.handle
+    )
+}
+
 // The agent's owned, already-cloned dependencies threaded in once per task; grouping them into a
 // struct would just move the same fields behind an extra indirection without aiding clarity.
 #[allow(clippy::too_many_arguments)]
@@ -1136,8 +1190,17 @@ async fn run_loop(
                     is_error: true,
                 }
             } else {
-                match tools.invoke(&call.name, args).await {
+                match invoke_forwarding(&tools, &call.name, args, tx).await {
                     Ok(out) => {
+                        if let Some(pending) = &out.pending {
+                            // The tool accepted the work and returned. Say so before the model
+                            // writes. This is the chat path; a schedule job reports the same fact
+                            // from `fire` because it never enters this loop.
+                            let _ = tx.unbounded_send(Ok(Event::Notice(pending_notice(
+                                &call.name,
+                                pending,
+                            ))));
+                        }
                         // Record the pre-truncation size for counterfactual truncate-knob crediting.
                         let len = out.content.len();
                         max_result_bytes = Some(max_result_bytes.map_or(len, |m| m.max(len)));
@@ -3054,6 +3117,7 @@ mod tests {
                 Event::ServerToolUse {
                     id: "s1".into(),
                     name: "web_search".into(),
+                    hint: String::new(),
                 },
                 Event::Usage(Usage {
                     input_tokens: 10,

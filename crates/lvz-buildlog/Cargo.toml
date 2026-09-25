@@ -1,0 +1,28 @@
+[package]
+name = "lvz-buildlog"
+version = "0.1.0"
+description = "gRPC build-log stream: the builder pushes lines, the agent follows them."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "lvz-buildlog"
+path = "src/bin/lvz-buildlog.rs"
+
+[dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+tonic = { workspace = true, features = ["server", "router"] }
+tonic-prost.workspace = true
+prost.workspace = true
+tracing.workspace = true
+tokio-stream = "0.1"
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

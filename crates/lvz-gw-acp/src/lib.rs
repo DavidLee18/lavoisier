@@ -273,13 +273,27 @@ fn event_to_update(event: &Event, tool_args: &mut HashMap<String, String>) -> Op
             "sessionUpdate": "agent_thought_chunk",
             "content": { "type": "text", "text": t },
         })),
-        Event::ToolUseStart { id, name } | Event::ServerToolUse { id, name } => Some(json!({
+        Event::ToolUseStart { id, name } => Some(json!({
             "sessionUpdate": "tool_call",
             "toolCallId": id,
             "title": name,
             "kind": tool_kind(name),
             "status": "in_progress",
         })),
+        Event::ServerToolUse { id, name, hint } => {
+            let title = if hint.is_empty() {
+                name.clone()
+            } else {
+                format!("{name}: {hint}")
+            };
+            Some(json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": id,
+                "title": title,
+                "kind": tool_kind(name),
+                "status": "in_progress",
+            }))
+        }
         Event::ToolUseDelta { id, json } => {
             tool_args.entry(id.clone()).or_default().push_str(json);
             None

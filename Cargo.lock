@@ -1484,12 +1484,13 @@ dependencies = [
 
 [[package]]
 name = "lavoisier"
-version = "0.18.1"
+version = "0.18.2"
 dependencies = [
  "clap",
  "futures",
  "lvz-agent",
  "lvz-anthropic",
+ "lvz-buildlog",
  "lvz-claude-cli",
  "lvz-google",
  "lvz-gw-a2a",
@@ -1627,6 +1628,20 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "lvz-buildlog"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "prost",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
 ]
 
 [[package]]
@@ -1819,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-protocol"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "futures",
@@ -1831,7 +1846,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-schedule"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1846,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-tools"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "lvz-context",
@@ -3658,8 +3673,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
 dependencies = [
  "async-trait",
+ "axum",
  "base64",
  "bytes",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -3668,6 +3685,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
+ "socket2",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

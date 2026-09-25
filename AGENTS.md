@@ -81,7 +81,9 @@ suppresses the cron slot exactly as a retry does, so a tick cannot double-dispat
 fixed at first acceptance (2x the tool's estimate, or `[gateway] schedule_pending_timeout`) so
 repeated "still working" answers cannot extend it, and expiry is a **failure** that retries normally.
 Polling is a flat 30 s cadence — the deadline bounds the total, not the interval. The room hears
-nothing until the outcome is terminal. `build_tool_registry` in `lvz-cli` is the composition root: the *same* registry goes to
+two posts for a pending job: `⏳ started, waiting` once, when the tool accepts the work, and the
+✅/❌ verdict when a poll comes back terminal (or the deadline expires). Polls that are still
+running post nothing. The waiting line is not a success and is not stored in the job's history. `build_tool_registry` in `lvz-cli` is the composition root: the *same* registry goes to
 the agent and to the gateway's scheduler. Job state is in-memory (history resets on restart). The
 room report is a *summary* (600-char cap); the **full account goes to stderr** per fire via
 `log_verbose` — untruncated output, duration, attempt, tools used, and token usage (kept even when a

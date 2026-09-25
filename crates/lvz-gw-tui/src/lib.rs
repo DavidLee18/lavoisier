@@ -446,7 +446,13 @@ fn on_event(term: &mut Term, app: &mut App, ev: Event) -> io::Result<()> {
                 scrollback::emit_notice(term, "(refused)")?;
             }
         }
-        Event::ServerToolUse { name, .. } => app.status = format!("running {name}… (server)"),
+        Event::ServerToolUse { name, hint, .. } => {
+            app.status = if hint.is_empty() {
+                format!("running {name}… (server)")
+            } else {
+                format!("running {name} · {hint}")
+            };
+        }
         Event::ServerToolResult { .. } => app.status.clear(),
     }
     Ok(())

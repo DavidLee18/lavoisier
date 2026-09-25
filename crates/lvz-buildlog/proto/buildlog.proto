@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package buildlog;
+
+// The builder pushes one build's stdout/stderr to the agent. The agent is the server so the
+// builder only needs an outbound connection. `eof` closes the build; `exit_code` is meaningful
+// only on that last chunk.
+service BuildLog {
+  rpc Publish(stream LogChunk) returns (PublishAck);
+}
+
+message LogChunk {
+  string build_id = 1;
+  string line = 2;
+  bool eof = 3;
+  int32 exit_code = 4;
+}
+
+message PublishAck {}

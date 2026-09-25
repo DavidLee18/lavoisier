@@ -1212,19 +1212,23 @@ impl MatrixGateway {
                         }
                         Ok(Event::ToolUseEnd { id }) => {
                             if let Some((name, args)) = tool_args.remove(&id) {
-                                let notice = match tool_hint(&args) {
-                                    Some(hint) => format!("🔧 `{name}` · {hint}"),
-                                    None => format!("🔧 `{name}`"),
-                                };
-                                match self.send_via(reply, token, &room, notice).await {
-                                    Ok(eid) => {
-                                        sent.insert(eid);
-                                    }
-                                    Err(e) => error!(%room, error = %e, "tool notice failed"),
-                                }
-                                // Re-assert typing so the indicator survives a long multi-tool turn.
-                                let _ = self.set_typing(token, &room, self_user, true).await;
+                                self.post_tool_notice(reply, token, &room, self_user, sent, &name, &args)
+                                    .await;
                             }
+                        }
+                        // Provider-run tools (xAI web search, code interpreter, …) never become a
+                        // client `ToolUse*`. Without this arm a Grok turn that searched or ran code
+                        // on the provider side posts no 🔧 line, so the room cannot tell a tool ran.
+                        Ok(Event::ServerToolUse { name, hint, .. }) => {
+                            // The hint is the glimpse (a query, a first line of code), shaped as
+                            // argument JSON so `tool_hint` truncates it the same way as a client call.
+                            let args = if hint.is_empty() {
+                                String::new()
+                            } else {
+                                serde_json::json!({ "query": hint }).to_string()
+                            };
+                            self.post_tool_notice(reply, token, &room, self_user, sent, &name, &args)
+                                .await;
                         }
                         Ok(_) => {}
                         Err(e) => {
@@ -1239,6 +1243,15 @@ impl MatrixGateway {
                     let _ = self.set_typing(token, &room, self_user, true).await;
                 }
             }
+        }
+
+        // A call that streamed a start but never an end (a provider that delivers the tool call
+        // whole, or a stream that died mid-call) is still a call the room should see. Post it
+        // before the answer so it isn't buried under the final text.
+        let leftover: Vec<(String, String)> = tool_args.into_values().collect();
+        for (name, args) in leftover {
+            self.post_tool_notice(reply, token, &room, self_user, sent, &name, &args)
+                .await;
         }
 
         // 4. Stop typing and send the answer.
@@ -1257,6 +1270,30 @@ impl MatrixGateway {
         // 5. Swap the 👀 ack for a ✅/❌ outcome indicator on the original message.
         self.finish_reaction(token, &room, &msg.event_id, ack.as_deref(), ok)
             .await;
+    }
+
+    /// Post one `🔧 name · hint` line and keep the typing indicator alive. Best-effort.
+    #[allow(clippy::too_many_arguments)]
+    async fn post_tool_notice(
+        &self,
+        reply: &Reply<'_>,
+        token: &str,
+        room: &str,
+        self_user: &str,
+        sent: &mut RecentIds,
+        name: &str,
+        args_json: &str,
+    ) {
+        match self
+            .send_via(reply, token, room, tool_notice(name, args_json))
+            .await
+        {
+            Ok(eid) => {
+                sent.insert(eid);
+            }
+            Err(e) => error!(%room, error = %e, "tool notice failed"),
+        }
+        let _ = self.set_typing(token, room, self_user, true).await;
     }
 
     /// Retract the transient 👀 ack (if it was sent) and react to the original message with a
@@ -1738,6 +1775,15 @@ fn message_triggers(
     ours: &RecentIds,
 ) -> bool {
     is_dm || mentions_bot || in_reply_to.is_some_and(|id| ours.contains(id))
+}
+
+/// The room line for one tool call: `🔧 \`name\`` plus a short target hint when the arguments
+/// carry one.
+fn tool_notice(name: &str, args_json: &str) -> String {
+    match tool_hint(args_json) {
+        Some(hint) => format!("🔧 `{name}` · {hint}"),
+        None => format!("🔧 `{name}`"),
+    }
 }
 
 /// A short, human-readable hint at a tool call's target, pulled from its argument JSON — the first
@@ -2315,6 +2361,20 @@ mod tests {
         assert!(message_triggers(false, false, Some("$mine"), &ours));
         // Reply to a message that isn't ours doesn't engage.
         assert!(!message_triggers(false, false, Some("$other"), &ours));
+    }
+
+    #[test]
+    fn tool_notice_names_the_call_and_its_target() {
+        assert_eq!(
+            tool_notice("read_file", r#"{"path":"src/lib.rs"}"#),
+            "🔧 `read_file` · src/lib.rs"
+        );
+        // A provider-run tool has no client arguments; the name alone is the signal.
+        assert_eq!(tool_notice("web_search", ""), "🔧 `web_search`");
+        assert_eq!(
+            tool_notice("web_search", r#"{"query":"grok 4.7 release"}"#),
+            "🔧 `web_search` · grok 4.7 release"
+        );
     }
 
     #[test]

@@ -244,10 +244,20 @@ struct Decoder {
     pending: VecDeque<Result<Event, ProviderError>>,
     /// Tool-call ids in first-seen order, so we can close them all at the end.
     seen_tools: Vec<String>,
+    /// Provider-run calls (`web_search`, …). These are not client tools: the agent must not
+    /// try to invoke them, and the room notice wants the query rather than the search hits.
+    server_calls: Vec<OpenServerCall>,
     /// Last id seen, to attribute argument-only chunks that omit the id.
     last_tool_id: Option<String>,
     stop: Option<StopReason>,
     done_emitted: bool,
+}
+
+struct OpenServerCall {
+    id: String,
+    name: String,
+    hint: String,
+    announced: bool,
 }
 
 impl Decoder {
@@ -285,6 +295,14 @@ impl Decoder {
         if id.is_empty() {
             return;
         }
+        if let Some(name) = server_tool_name(tc.r#type) {
+            let args = match &tc.tool {
+                Some(pb::tool_call::Tool::Function(f)) => f.arguments.clone(),
+                None => String::new(),
+            };
+            self.note_server_call(&id, name, &args_glimpse(&args));
+            return;
+        }
         let (name, args) = match &tc.tool {
             Some(pb::tool_call::Tool::Function(f)) => (f.name.clone(), f.arguments.clone()),
             None => (String::new(), String::new()),
@@ -303,10 +321,61 @@ impl Decoder {
         }
     }
 
+    /// Remember a provider-run call. Announce it as soon as its arguments carry a glimpse; a call
+    /// whose arguments never arrive is announced from [`finish`](Self::finish) so the name still shows.
+    fn note_server_call(&mut self, id: &str, name: &str, hint: &str) {
+        let emit = if let Some(call) = self.server_calls.iter_mut().find(|c| c.id == id) {
+            if call.hint.is_empty() && !hint.is_empty() {
+                call.hint = hint.to_string();
+            }
+            if !call.announced && !call.hint.is_empty() {
+                call.announced = true;
+                Some(Event::ServerToolUse {
+                    id: id.to_string(),
+                    name: call.name.clone(),
+                    hint: call.hint.clone(),
+                })
+            } else {
+                None
+            }
+        } else {
+            let announced = !hint.is_empty();
+            let event = announced.then(|| Event::ServerToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                hint: hint.to_string(),
+            });
+            self.server_calls.push(OpenServerCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                hint: hint.to_string(),
+                announced,
+            });
+            event
+        };
+        if let Some(event) = emit {
+            self.pending.push_back(Ok(event));
+        }
+    }
+
     /// Close every open tool call (in first-seen order), then emit the single `Done`.
     fn finish(&mut self) {
         if self.done_emitted {
             return;
+        }
+        for call in std::mem::take(&mut self.server_calls) {
+            if !call.announced {
+                self.pending.push_back(Ok(Event::ServerToolUse {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    hint: call.hint.clone(),
+                }));
+            }
+            self.pending.push_back(Ok(Event::ServerToolResult {
+                id: call.id,
+                content: serde_json::json!({ "tool": call.name, "status": "completed" })
+                    .to_string(),
+            }));
         }
         for id in std::mem::take(&mut self.seen_tools) {
             self.pending.push_back(Ok(Event::ToolUseEnd { id }));
@@ -362,24 +431,7 @@ fn events_from_response(resp: pb::GetChatCompletionResponse) -> Vec<Event> {
                 events.push(Event::Thinking(msg.reasoning_content));
             }
             for tc in msg.tool_calls {
-                if tc.id.is_empty() {
-                    continue;
-                }
-                let (name, args) = match &tc.tool {
-                    Some(pb::tool_call::Tool::Function(f)) => (f.name.clone(), f.arguments.clone()),
-                    None => (String::new(), String::new()),
-                };
-                events.push(Event::ToolUseStart {
-                    id: tc.id.clone(),
-                    name,
-                });
-                if !args.is_empty() {
-                    events.push(Event::ToolUseDelta {
-                        id: tc.id.clone(),
-                        json: args,
-                    });
-                }
-                events.push(Event::ToolUseEnd { id: tc.id });
+                push_grpc_tool(&mut events, tc);
             }
         }
     }
@@ -388,6 +440,87 @@ fn events_from_response(resp: pb::GetChatCompletionResponse) -> Vec<Event> {
     }
     events.push(Event::Done(stop));
     events
+}
+
+/// One tool call from a finished (non-streaming) response, in the same shape the stream emits.
+fn push_grpc_tool(events: &mut Vec<Event>, tc: pb::ToolCall) {
+    if tc.id.is_empty() {
+        return;
+    }
+    let args = match &tc.tool {
+        Some(pb::tool_call::Tool::Function(f)) => f.arguments.clone(),
+        None => String::new(),
+    };
+    if let Some(name) = server_tool_name(tc.r#type) {
+        events.push(Event::ServerToolUse {
+            id: tc.id.clone(),
+            name: name.to_string(),
+            hint: args_glimpse(&args),
+        });
+        events.push(Event::ServerToolResult {
+            id: tc.id,
+            content: serde_json::json!({ "tool": name, "status": "completed" }).to_string(),
+        });
+        return;
+    }
+    let name = match &tc.tool {
+        Some(pb::tool_call::Tool::Function(f)) => f.name.clone(),
+        None => String::new(),
+    };
+    events.push(Event::ToolUseStart {
+        id: tc.id.clone(),
+        name,
+    });
+    if !args.is_empty() {
+        events.push(Event::ToolUseDelta {
+            id: tc.id.clone(),
+            json: args,
+        });
+    }
+    events.push(Event::ToolUseEnd { id: tc.id });
+}
+
+/// `ToolCall.type` for a provider-run tool. `None` for a client function call (including the
+/// proto3 default, which the proto documents as client-side).
+fn server_tool_name(ty: i32) -> Option<&'static str> {
+    Some(
+        match pb::ToolCallType::try_from(ty).unwrap_or(pb::ToolCallType::Invalid) {
+            pb::ToolCallType::WebSearchTool => "web_search",
+            pb::ToolCallType::XSearchTool => "x_search",
+            pb::ToolCallType::CodeExecutionTool => "code_interpreter",
+            pb::ToolCallType::CollectionsSearchTool => "collections_search",
+            pb::ToolCallType::McpTool => "mcp",
+            pb::ToolCallType::AttachmentSearchTool => "attachment_search",
+            pb::ToolCallType::Invalid | pb::ToolCallType::ClientSideTool => return None,
+        },
+    )
+}
+
+/// First salient string in a tool-call's argument JSON, capped to one line. Empty when the
+/// arguments are missing or carry nothing worth showing.
+fn args_glimpse(args: &str) -> String {
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str(args) else {
+        return String::new();
+    };
+    const KEYS: &[&str] = &[
+        "query", "q", "code", "command", "cmd", "input", "path", "pattern",
+    ];
+    let pick = KEYS
+        .iter()
+        .find_map(|k| obj.get(*k).and_then(serde_json::Value::as_str))
+        .or_else(|| obj.values().find_map(serde_json::Value::as_str));
+    pick.map(glimpse_line).unwrap_or_default()
+}
+
+fn glimpse_line(s: &str) -> String {
+    let line = s.lines().next().unwrap_or(s).trim();
+    const MAX: usize = 80;
+    if line.chars().count() <= MAX {
+        line.to_string()
+    } else {
+        let kept: String = line.chars().take(MAX).collect();
+        format!("{kept}…")
+    }
 }
 
 fn status_to_err(status: tonic::Status) -> ProviderError {
@@ -948,6 +1081,47 @@ mod tests {
             }
         );
         assert_eq!(events[3], Event::Done(StopReason::ToolUse));
+    }
+
+    #[test]
+    fn a_server_side_web_search_is_not_a_client_tool_and_keeps_its_query() {
+        let mut d = Decoder::default();
+        d.chunk(pb::GetChatCompletionChunk {
+            outputs: vec![pb::CompletionOutputChunk {
+                delta: Some(pb::Delta {
+                    tool_calls: vec![pb::ToolCall {
+                        id: "ws_1".into(),
+                        r#type: pb::ToolCallType::WebSearchTool as i32,
+                        tool: Some(pb::tool_call::Tool::Function(pb::FunctionCall {
+                            name: "web_search".into(),
+                            arguments: "{\"query\":\"grok 4.7 release\"}".into(),
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                finish_reason: pb::FinishReason::ReasonStop as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        d.finish();
+        let events = drain(d);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::ToolUseStart { .. })),
+            "a server-side search must not enter the client tool loop: {events:?}"
+        );
+        assert_eq!(
+            events[0],
+            Event::ServerToolUse {
+                id: "ws_1".into(),
+                name: "web_search".into(),
+                hint: "grok 4.7 release".into(),
+            }
+        );
+        assert!(matches!(events[1], Event::ServerToolResult { .. }));
     }
 
     #[test]
