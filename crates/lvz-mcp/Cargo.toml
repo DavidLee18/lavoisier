@@ -1,6 +1,6 @@
 [package]
 name = "lvz-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Model Context Protocol (MCP) client for Lavoisier: connect to external MCP servers (stdio or HTTP) and expose their tools as Lavoisier tools."
 edition.workspace = true
 rust-version.workspace = true

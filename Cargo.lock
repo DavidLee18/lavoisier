@@ -1646,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-claude-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1711,7 +1711,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-cron"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -1726,7 +1726,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-http"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1760,7 +1760,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-slack"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1791,7 +1791,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-legion"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "futures",
@@ -1805,7 +1805,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1820,7 +1820,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-memory"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "futures",
