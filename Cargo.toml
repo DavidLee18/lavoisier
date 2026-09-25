@@ -65,7 +65,7 @@ lvz-tools = { path = "crates/lvz-tools", version = "0.1.1" }
 lvz-agent = { path = "crates/lvz-agent", version = "0.1.7" }
 lvz-context = { path = "crates/lvz-context", version = "0.2.0" }
 lvz-memory = { path = "crates/lvz-memory", version = "0.3.1" }
-lvz-tune = { path = "crates/lvz-tune", version = "0.1.0" }
+lvz-tune = { path = "crates/lvz-tune", version = "0.2.0" }
 lvz-legion = { path = "crates/lvz-legion", version = "0.1.4" }
 lvz-mcp = { path = "crates/lvz-mcp", version = "0.1.0" }
 lvz-schedule = { path = "crates/lvz-schedule", version = "0.4.1" }
