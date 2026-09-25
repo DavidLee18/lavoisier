@@ -879,7 +879,9 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
                     }
                 });
             }
-            Err(e) => tracing::error!(bind, error = %e, "LVZ_BUILDLOG_BIND is not a socket address"),
+            Err(e) => {
+                tracing::error!(bind, error = %e, "LVZ_BUILDLOG_BIND is not a socket address")
+            }
         }
     }
     // Deferred from `Config::load`: the file carries `[log] level`, so it is necessarily read

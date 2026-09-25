@@ -1,6 +1,6 @@
 [package]
 name = "lvz-gw-acp"
-version = "0.2.0"
+version = "0.2.1"
 description = "Zed Agent Client Protocol (ACP) agent gateway for Lavoisier: drives the shared agent over JSON-RPC 2.0 on stdio so any ACP-capable editor (Zed, Neovim, …) can run it as a subprocess."
 edition.workspace = true
 rust-version.workspace = true

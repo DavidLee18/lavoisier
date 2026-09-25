@@ -1197,8 +1197,7 @@ async fn run_loop(
                             // writes. This is the chat path; a schedule job reports the same fact
                             // from `fire` because it never enters this loop.
                             let _ = tx.unbounded_send(Ok(Event::Notice(pending_notice(
-                                &call.name,
-                                pending,
+                                &call.name, pending,
                             ))));
                         }
                         // Record the pre-truncation size for counterfactual truncate-knob crediting.

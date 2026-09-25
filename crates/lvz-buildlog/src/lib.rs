@@ -77,8 +77,7 @@ impl BuildLog for Svc {
                     },
                 );
             } else if !chunk.line.is_empty() {
-                self.0
-                    .fanout(&chunk.build_id, LogUpdate::Line(chunk.line));
+                self.0.fanout(&chunk.build_id, LogUpdate::Line(chunk.line));
             }
         }
         Ok(tonic::Response::new(PublishAck {}))
@@ -138,10 +137,7 @@ pub async fn publish(
         })
         .await;
     drop(tx);
-    client
-        .publish(ReceiverStream::new(rx))
-        .await
-        .map(|_| ())
+    client.publish(ReceiverStream::new(rx)).await.map(|_| ())
 }
 
 #[cfg(test)]
@@ -165,10 +161,18 @@ mod tests {
         let mut rx = hub.subscribe("b1");
         // Give the listener a moment to accept.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        publish(addr, "b1", &["compiling crate".into(), "finished".into()], 0)
-            .await
-            .unwrap();
-        assert_eq!(rx.recv().await, Some(LogUpdate::Line("compiling crate".into())));
+        publish(
+            addr,
+            "b1",
+            &["compiling crate".into(), "finished".into()],
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rx.recv().await,
+            Some(LogUpdate::Line("compiling crate".into()))
+        );
         assert_eq!(rx.recv().await, Some(LogUpdate::Line("finished".into())));
         assert_eq!(rx.recv().await, Some(LogUpdate::End { exit_code: 0 }));
     }

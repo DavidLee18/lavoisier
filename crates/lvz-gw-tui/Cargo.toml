@@ -1,6 +1,6 @@
 [package]
 name = "lvz-gw-tui"
-version = "0.1.0"
+version = "0.1.1"
 description = "Inline terminal UI (TUI) frontend for Lavoisier: an interactive, scrollback-native REPL that drives the shared agent and renders its event stream — streaming text, tool-call cards, and Claude-Code-style tool-approval prompts."
 edition.workspace = true
 rust-version.workspace = true

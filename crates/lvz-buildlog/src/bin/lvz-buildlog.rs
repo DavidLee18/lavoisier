@@ -21,7 +21,9 @@ async fn main() {
     let command = std::env::var("BUILD_COMMAND").expect("BUILD_COMMAND is required");
     let workdir = std::env::var("BUILD_WORKDIR").unwrap_or_else(|_| "/root".into());
 
-    let mut client = BuildLogClient::connect(addr).await.expect("connect to agent");
+    let mut client = BuildLogClient::connect(addr)
+        .await
+        .expect("connect to agent");
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&command)
