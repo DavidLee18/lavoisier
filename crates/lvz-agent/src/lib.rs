@@ -92,6 +92,10 @@ const KEEP_RECENT_TURNS: usize = 2;
 /// edit task before accepting an empty result — so a genuinely no-edit task still terminates.
 const MAX_EDIT_NUDGES: usize = 2;
 
+/// Most times the false-tool-claim guard nudges a turn that narrated a tool check or result
+/// without a structured call. Same bound as the no-edit guard so it cannot loop forever.
+const MAX_TOOL_CLAIM_NUDGES: usize = MAX_EDIT_NUDGES;
+
 /// Most times the verify-and-fix gate ([`AgentConfig::verify_and_fix`]) feeds a failing verify back
 /// before giving up — bounds the extra cost so a never-passing verify can't loop forever.
 const MAX_FIX_ATTEMPTS: usize = 3;
@@ -822,10 +826,11 @@ async fn run_loop(
     let mut edit_free_streak: usize = 0;
     let mut nudged_at: Option<usize> = None;
     // Whether *any* turn this task actually changed a file, how many times the no-edit completion
-    // guard has nudged a disengaged finish, and how many times the verify-and-fix gate has bounced
-    // a failing finish back.
+    // guard has nudged a disengaged finish, how many times a false tool-claim was bounced back,
+    // and how many times the verify-and-fix gate has bounced a failing finish back.
     let mut task_edited = false;
     let mut edit_nudges: usize = 0;
+    let mut tool_claim_nudges: usize = 0;
     let mut fix_attempts: usize = 0;
     // Largest untruncated tool-result seen, for the learner's safe counterfactual crediting
     // (§6.6 / `ATO.md` §3). `None` until the first tool runs.
@@ -1083,6 +1088,28 @@ async fn run_loop(
         }
 
         if turn.tool_calls.is_empty() {
+            // False-tool-claim guard: Grok (and similar) often *write* that they checked a file
+            // or ran a tool in ordinary answer text, with no structured tool call on the wire.
+            // Log it so the claim is visible in CloudWatch, and bounce the turn back (bounded)
+            // rather than accepting a fabricated result. Never parse the prose into an invoke.
+            if let Some(claim) =
+                claimed_tool_use(&turn.text, tool_defs.iter().map(|d| d.name.as_str()))
+            {
+                tracing::warn!(
+                    tool = %claim.tool,
+                    excerpt = %claim.excerpt,
+                    "assistant claimed a tool result without a structured tool call"
+                );
+                if tool_claim_nudges < MAX_TOOL_CLAIM_NUDGES {
+                    tool_claim_nudges += 1;
+                    history.push(turn.to_assistant_message());
+                    history.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::text(FALSE_TOOL_CLAIM_NUDGE)],
+                    });
+                    continue;
+                }
+            }
             // No-edit completion guard (convergence): an edit task that finishes having changed
             // nothing is almost always disengagement — the model answered/planned instead of acting.
             // Nudge it to actually edit (bounded by MAX_EDIT_NUDGES) rather than accept an empty
@@ -1192,6 +1219,9 @@ async fn run_loop(
                     images: Vec::new(),
                 }
             } else {
+                // Log the real run (name only — never args, file contents, or secrets) so a
+                // structured call and a prose-only claim are distinguishable in CloudWatch.
+                tracing::info!(tool = %call.name, "running structured tool call");
                 match invoke_forwarding(&tools, &call.name, args, tx).await {
                     Ok(out) => {
                         if let Some(pending) = &out.pending {
@@ -1511,6 +1541,215 @@ const EDIT_TOOLS: [&str; 5] = [
 
 fn is_edit_tool(name: &str) -> bool {
     EDIT_TOOLS.contains(&name)
+}
+
+/// User-message body injected when the model narrates a tool check or result with no structured
+/// call. Tells it to actually invoke; does not try to recover a call from the prose.
+const FALSE_TOOL_CLAIM_NUDGE: &str =
+    "No tool ran this turn. You claimed a tool check or result in text. \
+Call the tool now; do not report a result you were not given.";
+
+/// A short, secret-free note that the assistant claimed a named tool ran.
+struct ToolClaim {
+    tool: String,
+    excerpt: String,
+}
+
+/// If `text` asserts it used (or reports a result of) one of `advertised` tools, return that
+/// claim. Does **not** reconstruct arguments or execute anything — detection only.
+fn claimed_tool_use<I, S>(text: &str, advertised: I) -> Option<ToolClaim>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut names: Vec<String> = advertised
+        .into_iter()
+        .map(|s| s.as_ref().to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
+    // Longer names first so `read_files` wins over `read_file` at the same offset.
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    names.dedup();
+
+    let mut hit: Option<(usize, String)> = None;
+    for name in &names {
+        let mut from = 0;
+        while let Some(pos) = find_token_from(text, name, from) {
+            if looks_like_tool_claim(text, pos, name) {
+                match &hit {
+                    None => hit = Some((pos, name.clone())),
+                    Some((p, existing))
+                        if pos < *p || (pos == *p && name.len() > existing.len()) =>
+                    {
+                        hit = Some((pos, name.clone()));
+                    }
+                    _ => {}
+                }
+                break;
+            }
+            from = pos + 1;
+        }
+    }
+    hit.map(|(pos, tool)| ToolClaim {
+        excerpt: excerpt_around(text, pos, tool.len()),
+        tool,
+    })
+}
+
+/// Byte offset of the next whole-token occurrence of `name` in `text` at or after `from`.
+/// Token edges are non-identifier characters (`[A-Za-z0-9_]`), so `read_file` does not match
+/// inside `read_files`.
+fn find_token_from(text: &str, name: &str, from: usize) -> Option<usize> {
+    if from > text.len() {
+        return None;
+    }
+    let hay = text[from..].to_ascii_lowercase();
+    let needle = name.to_ascii_lowercase();
+    let mut search = 0;
+    while let Some(rel) = hay[search..].find(&needle) {
+        let abs = from + search + rel;
+        let before = if abs == 0 {
+            None
+        } else {
+            text[..abs].chars().next_back()
+        };
+        let after = text.get(abs + name.len()..).and_then(|s| s.chars().next());
+        if is_ident_boundary(before) && is_ident_boundary(after) {
+            return Some(abs);
+        }
+        search += rel + 1;
+    }
+    None
+}
+
+fn is_ident_boundary(c: Option<char>) -> bool {
+    !matches!(c, Some(ch) if ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn looks_like_tool_claim(text: &str, pos: usize, name: &str) -> bool {
+    let start = floor_char_boundary(text, pos.saturating_sub(120));
+    let end = ceil_char_boundary(text, (pos + name.len() + 80).min(text.len()));
+    let window = text[start..end].to_ascii_lowercase();
+    let claimed =
+        has_result_language(&window) || has_first_person_use(&window) || has_checked_with(&window);
+    if !claimed {
+        return false;
+    }
+    // "you should use read_file" / "I will use read_file" are plans, not fabricated results.
+    // A window that also has a past-tense or result phrase still counts as a claim.
+    if is_advice_or_plan(&window) && !has_first_person_use(&window) && !has_result_language(&window)
+    {
+        return false;
+    }
+    true
+}
+
+fn is_advice_or_plan(w: &str) -> bool {
+    w.contains("i will")
+        || w.contains("i'll")
+        || w.contains("let me")
+        || w.contains("you should")
+        || w.contains("you can")
+        || w.contains("going to")
+}
+
+fn has_result_language(w: &str) -> bool {
+    w.contains("returned")
+        || w.contains("the output")
+        || w.contains("the result")
+        || w.contains("output was")
+        || w.contains("result was")
+        || w.contains("shows that")
+        || w.contains("showed that")
+        || w.contains("showed me")
+        || w.contains("contents of")
+        || w.contains("reported")
+        || w.contains("confirms")
+        || w.contains("i found")
+        || w.contains("found that")
+}
+
+fn has_first_person_use(w: &str) -> bool {
+    // Past / present-perfect only — "I will use" / "I'll use" / "let me use" are plans, not claims.
+    const PHRASES: &[&str] = &[
+        "i used",
+        "i've used",
+        "i have used",
+        "i ran",
+        "i've run",
+        "i have run",
+        "i called",
+        "i've called",
+        "i have called",
+        "i invoked",
+        "i've invoked",
+        "i checked",
+        "i've checked",
+        "i have checked",
+        "i inspected",
+        "i searched",
+        "i listed",
+        "i executed",
+        "i read ",
+        "i read`",
+        "i grepped",
+    ];
+    PHRASES.iter().any(|p| w.contains(p))
+}
+
+fn has_checked_with(w: &str) -> bool {
+    w.contains("checked with")
+        || w.contains("checked using")
+        || w.contains("checked via")
+        || w.contains("inspected with")
+        || w.contains("inspected using")
+        || w.contains("verified with")
+        || w.contains("verified using")
+        || w.contains("ran the ")
+        || w.contains("using the ")
+        || w.contains("using `")
+}
+
+/// A short window around the tool-name mention. Bounded so a fabricated file dump or a
+/// pasted secret in the surrounding prose cannot land in CloudWatch in full.
+fn excerpt_around(text: &str, pos: usize, name_len: usize) -> String {
+    const BEFORE: usize = 48;
+    const AFTER: usize = 24;
+    const MAX: usize = 96;
+    let start = floor_char_boundary(text, pos.saturating_sub(BEFORE));
+    let end = ceil_char_boundary(text, (pos + name_len + AFTER).min(text.len()));
+    let mut s: String = text[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if s.len() > MAX {
+        s.truncate(MAX);
+        while !s.is_empty() && !s.is_char_boundary(s.len()) {
+            s.pop();
+        }
+        s.push('…');
+    }
+    s
+}
+
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 /// The one-time nudge the no-progress circuit-breaker injects after `n` edit-free turns.
@@ -2585,6 +2824,73 @@ mod tests {
         out
     }
 
+    /// Thread-local tracing subscriber that records `lvz_agent` events as `"LEVEL target: fields"`.
+    /// Used with `#[tokio::test(flavor = "current_thread")]` so the spawned loop stays on this
+    /// thread and the capture sees the logs.
+    struct LogCapture {
+        lines: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct FieldDump(String);
+
+    impl tracing::field::Visit for FieldDump {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if !self.0.is_empty() {
+                self.0.push(' ');
+            }
+            self.0.push_str(&format!("{}={value:?}", field.name()));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if !self.0.is_empty() {
+                self.0.push(' ');
+            }
+            self.0.push_str(&format!("{}={value}", field.name()));
+        }
+    }
+
+    impl tracing::Subscriber for LogCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target().starts_with("lvz_agent")
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut dump = FieldDump(format!(
+                "{} {}:",
+                event.metadata().level(),
+                event.metadata().target()
+            ));
+            event.record(&mut dump);
+            self.lines.lock().unwrap().push(dump.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    impl LogCapture {
+        fn install() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<String>>>) {
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let guard = tracing::subscriber::set_default(LogCapture {
+                lines: lines.clone(),
+            });
+            (guard, lines)
+        }
+    }
+
+    fn joined_logs(lines: &Arc<Mutex<Vec<String>>>) -> String {
+        lines.lock().unwrap().join("\n")
+    }
+
     /// A provider whose stream yields one event then stalls forever (a hung/throttled connection).
     struct StallingProvider;
 
@@ -3064,6 +3370,178 @@ mod tests {
         let agent = Agent::new(provider.clone(), ToolRegistry::with_builtins(), config);
         let _ = collect(agent.run("what is 2 plus 2")).await;
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn claimed_tool_use_detects_a_check_and_a_result_but_not_a_plan() {
+        let tools = ["read_file", "shell", "str_replace"];
+        let claim = claimed_tool_use(
+            "I checked src/lib.rs with read_file and it looks fine.",
+            tools,
+        )
+        .expect("past-tense check is a claim");
+        assert_eq!(claim.tool, "read_file");
+        assert!(
+            claim.excerpt.contains("read_file"),
+            "excerpt should name the tool: {}",
+            claim.excerpt
+        );
+        assert!(
+            claimed_tool_use("read_file returned the old contents.", tools).is_some(),
+            "reporting a result is a claim"
+        );
+        assert!(
+            claimed_tool_use("I used the shell tool; all tests passed.", tools).is_some(),
+            "first-person use is a claim"
+        );
+        assert!(
+            claimed_tool_use("I will use read_file next.", tools).is_none(),
+            "a future plan is not a fabricated result"
+        );
+        assert!(
+            claimed_tool_use("The answer is 4.", tools).is_none(),
+            "plain text with no tool name is not a claim"
+        );
+        assert!(
+            claimed_tool_use("You should try using the read_file tool.", tools).is_none(),
+            "advice to use a tool is not a fabricated result"
+        );
+        assert!(
+            claimed_tool_use("You should try using the read_file tool.", ["grep"]).is_none(),
+            "an un-advertised tool name must not match"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn false_tool_claim_nudges_and_logs_when_prose_invents_a_result() {
+        let (_guard, logs) = LogCapture::install();
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                Event::TextDelta("I checked src/lib.rs with read_file and it looks fine.".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+            vec![
+                Event::TextDelta("ok".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+        ]);
+        let agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::with_builtins(),
+            AgentConfig::default(),
+        );
+        let _ = collect(agent.run("what's in src/lib.rs?")).await;
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "a prose claim with no structured call must be nudged, not accepted"
+        );
+        let dumped = joined_logs(&logs);
+        assert!(
+            dumped.contains("assistant claimed a tool result without a structured tool call"),
+            "the false claim must be logged: {dumped}"
+        );
+        assert!(
+            dumped.contains("read_file"),
+            "the log must name the claimed tool: {dumped}"
+        );
+        assert!(
+            dumped.contains("I checked") || dumped.contains("excerpt="),
+            "the log must carry a short excerpt of the claim: {dumped}"
+        );
+        assert!(
+            !dumped.contains("running structured tool call"),
+            "no structured call ran, so the real-run line must not appear: {dumped}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn false_tool_claim_after_the_cap_is_allowed_to_finish() {
+        let (_guard, logs) = LogCapture::install();
+        let claim = || {
+            vec![
+                Event::TextDelta("I used read_file; the file is empty.".into()),
+                Event::Done(StopReason::EndTurn),
+            ]
+        };
+        let provider = ScriptedProvider::new(vec![claim(), claim(), claim()]);
+        let agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::with_builtins(),
+            AgentConfig::default(),
+        );
+        let events = collect(agent.run("read src/lib.rs")).await;
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            MAX_TOOL_CLAIM_NUDGES + 1,
+            "two nudges then the third claim is accepted, matching the edit-nudge cap"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Done(StopReason::EndTurn))),
+            "the turn after the cap must finish: {events:?}"
+        );
+        let dumped = joined_logs(&logs);
+        let claims = dumped
+            .lines()
+            .filter(|l| l.contains("claimed a tool result without a structured tool call"))
+            .count();
+        assert!(
+            claims > MAX_TOOL_CLAIM_NUDGES,
+            "each fabricated finish is logged, including the one accepted after the cap: {dumped}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn structured_tool_call_is_logged_as_a_real_run_and_not_nudged() {
+        let (_guard, logs) = LogCapture::install();
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                Event::ToolUseStart {
+                    id: "t1".into(),
+                    name: "shell".into(),
+                },
+                Event::ToolUseDelta {
+                    id: "t1".into(),
+                    json: "{\"command\":\"echo lavoisier\"}".into(),
+                },
+                Event::ToolUseEnd { id: "t1".into() },
+                Event::Done(StopReason::ToolUse),
+            ],
+            vec![
+                Event::TextDelta("done".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+        ]);
+        let agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::with_builtins(),
+            AgentConfig::default(),
+        );
+        let _ = collect(agent.run("echo hello")).await;
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "a real structured call must not trigger the false-claim nudge"
+        );
+        let dumped = joined_logs(&logs);
+        assert!(
+            dumped.contains("running structured tool call"),
+            "a real invoke must be logged: {dumped}"
+        );
+        assert!(
+            dumped.contains("shell"),
+            "the real-run log must name the tool: {dumped}"
+        );
+        assert!(
+            !dumped.contains("claimed a tool result without a structured tool call"),
+            "a real call is not a false claim: {dumped}"
+        );
+        assert!(
+            !dumped.contains("echo lavoisier"),
+            "tool arguments must not be logged: {dumped}"
+        );
     }
 
     #[tokio::test]
