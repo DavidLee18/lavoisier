@@ -13,6 +13,11 @@
 //! Note that `max_output_tokens` does **not** bound reasoning tokens — a 512-token ceiling has been
 //! observed returning 1273 output tokens. The field is sent; the provider does not honour it as a
 //! ceiling. Budget accordingly.
+//!
+//! Each request logs an `info` summary (`model`, `reasoning` effort or `omitted`, advertised
+//! tool names, input item kinds) and a `debug` redacted JSON body. The stream logs `response.id`,
+//! each output item type/name, and the terminal usage. Encrypted reasoning and image payloads are
+//! replaced with a length marker; the API key is never in the body.
 
 use std::collections::VecDeque;
 
@@ -109,6 +114,7 @@ impl ResponsesTransport {
         nreq: Negotiated<XaiResponsesCaps>,
     ) -> Result<BoxStream<'static, Result<Event, ProviderError>>, ProviderError> {
         let body = build_body(&nreq);
+        log_request(&body);
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
 
         let max_retries: u32 = std::env::var("XAI_MAX_RETRIES")
@@ -128,9 +134,15 @@ impl ResponsesTransport {
             if status.is_success() {
                 Ok(resp)
             } else {
+                let message = resp.text().await.unwrap_or_default();
+                tracing::warn!(
+                    status = status.as_u16(),
+                    body = %truncate_chars(&message, 4_096),
+                    "xai responses http error"
+                );
                 Err(ProviderError::Api {
                     status: status.as_u16(),
-                    message: resp.text().await.unwrap_or_default(),
+                    message,
                 })
             }
         })
@@ -362,6 +374,119 @@ fn input_items(msgs: &[Message]) -> Value {
     json!(out)
 }
 
+/// CloudWatch / tracing event size cap. A Matrix turn's tools + history fits; a data-URL does not.
+const LOG_BODY_CHARS: usize = 96_000;
+
+fn log_request(body: &Value) {
+    let tools = tool_names(body);
+    let input_kinds = input_kinds(body);
+    let reasoning = body
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("omitted");
+    let tool_choice = body
+        .get("tool_choice")
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "omitted".into());
+    let model = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let max_output_tokens = body
+        .get("max_output_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    tracing::info!(
+        model,
+        reasoning,
+        tool_choice = %tool_choice,
+        n_tools = tools.len(),
+        tools = %tools.join(","),
+        n_input = input_kinds.len(),
+        input_kinds = %input_kinds.join(","),
+        max_output_tokens,
+        "xai responses request"
+    );
+    let redacted = redact_for_log(body);
+    let dumped = redacted.to_string();
+    tracing::debug!(
+        body = %truncate_chars(&dumped, LOG_BODY_CHARS),
+        "xai responses request body"
+    );
+}
+
+fn tool_names(body: &Value) -> Vec<String> {
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    tools
+        .iter()
+        .filter_map(|t| {
+            t.get("name")
+                .and_then(Value::as_str)
+                .or_else(|| t.get("type").and_then(Value::as_str))
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn input_kinds(body: &Value) -> Vec<String> {
+    let Some(items) = body.get("input").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .map(|i| {
+            i.get("type")
+                .and_then(Value::as_str)
+                .or_else(|| i.get("role").and_then(Value::as_str))
+                .unwrap_or("unknown")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Drop ciphertext and image payloads. Keep names, schemas, text, and tool args.
+fn redact_for_log(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, val) in map {
+                if is_blob_key(k) {
+                    out.insert(k.clone(), json!(omitted_blob(val)));
+                } else {
+                    out.insert(k.clone(), redact_for_log(val));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(a) => Value::Array(a.iter().map(redact_for_log).collect()),
+        other => other.clone(),
+    }
+}
+
+fn is_blob_key(k: &str) -> bool {
+    matches!(k, "encrypted_content" | "image_url" | "b64_json")
+}
+
+fn omitted_blob(v: &Value) -> String {
+    let n = match v {
+        Value::String(s) => s.len(),
+        other => other.to_string().len(),
+    };
+    format!("[omitted {n} chars]")
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push_str(&format!("…[truncated, {} chars total]", s.chars().count()));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +540,34 @@ mod tests {
         // chat/completions nests it.
         assert_eq!(t["name"], "read_file");
         assert!(t.get("function").is_none(), "{t}");
+    }
+
+    #[test]
+    fn redact_for_log_omits_encrypted_content_and_image_urls() {
+        let raw = json!({
+            "model": "grok-4.7",
+            "reasoning": { "effort": "low" },
+            "tools": [{ "type": "function", "name": "obs_info" }],
+            "input": [
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "AAAA".repeat(20),
+                },
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/jpeg;base64,qqqq",
+                }
+            ]
+        });
+        let redacted = redact_for_log(&raw);
+        assert_eq!(redacted["model"], "grok-4.7");
+        assert_eq!(redacted["tools"][0]["name"], "obs_info");
+        let enc = redacted["input"][0]["encrypted_content"].as_str().unwrap();
+        assert!(enc.starts_with("[omitted "), "{enc}");
+        assert!(!enc.contains("AAAA"));
+        let img = redacted["input"][1]["image_url"].as_str().unwrap();
+        assert!(img.starts_with("[omitted "), "{img}");
+        assert!(!img.contains("base64"));
     }
 
     #[test]

@@ -141,7 +141,11 @@ impl RespDecoder {
                     out.push_back(Ok(Event::Thinking(d.to_string())));
                 }
             }
-            "response.output_item.added" => self.item_added(v, out),
+            "response.created" => log_created(v),
+            "response.output_item.added" => {
+                log_output_item(v.get("item"));
+                self.item_added(v, out);
+            }
             "response.function_call_arguments.delta" => {
                 // Keyed by item id; translate to the call id before emitting.
                 if let (Some(item_id), Some(d)) =
@@ -178,11 +182,18 @@ impl RespDecoder {
                     }
                 }
             }
-            "response.completed" => self.terminal(v, None, out),
+            "response.completed" => {
+                log_terminal(v, "completed");
+                self.terminal(v, None, out);
+            }
             "response.incomplete" => {
+                log_terminal(v, "incomplete");
                 self.terminal(v, Some(StopReason::Other("incomplete".into())), out);
             }
-            "response.failed" => self.failed(v, out),
+            "response.failed" => {
+                log_terminal(v, "failed");
+                self.failed(v, out);
+            }
             _ => {
                 // A searching/in-progress frame sometimes carries the query before the item is done.
                 if let Some(item_id) = str_at(v, "item_id") {
@@ -546,6 +557,65 @@ pub(crate) fn parse_resp_usage(v: &Value) -> Usage {
             .map(|d| u64_at(d, "cached_tokens"))
             .unwrap_or(0),
     }
+}
+
+fn log_created(v: &Value) {
+    let resp = v.get("response").unwrap_or(v);
+    let response_id = str_at(resp, "id").unwrap_or("");
+    let model = str_at(resp, "model").unwrap_or("");
+    tracing::info!(response_id, model, "xai responses created");
+}
+
+fn log_output_item(item: Option<&Value>) {
+    let Some(item) = item else { return };
+    let item_type = str_at(item, "type").unwrap_or("");
+    let name = str_at(item, "name").unwrap_or("");
+    let call_id = str_at(item, "call_id").unwrap_or("");
+    tracing::info!(item_type, name, call_id, "xai responses output item");
+}
+
+fn log_terminal(v: &Value, status: &str) {
+    let resp = v.get("response").unwrap_or(v);
+    let output_types = resp
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|i| {
+                    let ty = str_at(i, "type").unwrap_or("unknown");
+                    match str_at(i, "name") {
+                        Some(n) if !n.is_empty() => format!("{ty}:{n}"),
+                        _ => ty.to_string(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let usage = resp.get("usage");
+    let reasoning_tokens = usage
+        .and_then(|u| u.get("output_tokens_details"))
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let response_id = str_at(resp, "id").unwrap_or("");
+    let input_tokens = usage.map(|u| u64_at(u, "input_tokens")).unwrap_or(0);
+    let output_tokens = usage.map(|u| u64_at(u, "output_tokens")).unwrap_or(0);
+    let cache_read_tokens = usage
+        .and_then(|u| u.get("input_tokens_details"))
+        .map(|d| u64_at(d, "cached_tokens"))
+        .unwrap_or(0);
+    tracing::info!(
+        response_id,
+        status,
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cache_read_tokens,
+        output_types = %output_types,
+        "xai responses terminal"
+    );
 }
 
 fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
