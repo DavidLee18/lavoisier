@@ -24,7 +24,10 @@
 //! the metric that matters (§6.4) and is enforced against an optional budget.
 //!
 //! A live OBS/PiKVM/schedule status ask that finishes with no structured tool call is retried
-//! once with [`ToolChoice::Required`] so grok-4.7 cannot answer from the last transcript line.
+//! once with [`ToolChoice::Required`]. If that retry is still message-only, the loop advances to
+//! the next fallback model (still required). An incomplete / max-token message with no tool call
+//! is an error, not the room answer. Text and thinking from a discarded round-trip are not
+//! forwarded.
 
 #![warn(missing_docs)]
 
@@ -937,6 +940,7 @@ async fn run_loop(
         // breaker (demote for a cooldown) and a success `reset`s it, so a persistently-down model is
         // skipped from turn start until re-probed.
         let mut turn = TurnAccumulator::default();
+        let mut held: Vec<Event> = Vec::new();
         let this_tool_choice = if require_tool_choice {
             Some(ToolChoice::Required)
         } else {
@@ -1026,6 +1030,7 @@ async fn run_loop(
             // wait. Bounds time *between* events, not total turn length, so a slow-but-progressing
             // stream is fine.
             let mut forwarded_any = false;
+            held.clear();
             loop {
                 let next = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await {
                     Ok(item) => item,
@@ -1042,6 +1047,7 @@ async fn run_loop(
                                 continue 'attempt;
                             }
                         }
+                        flush_held(tx, &mut held);
                         obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
                         let _ = tx.unbounded_send(Err(AgentError::Provider(format!(
                             "provider stream stalled (no data for {}s)",
@@ -1055,7 +1061,14 @@ async fn run_loop(
                     Ok(event) => {
                         if let Some(forward) = turn.observe(event) {
                             forwarded_any = true;
-                            let _ = tx.unbounded_send(Ok(forward));
+                            match &forward {
+                                // Hold prose until this round-trip is accepted. A live-ops retry
+                                // or fallback must not leak the discarded answer into the room.
+                                Event::TextDelta(_) | Event::Thinking(_) => held.push(forward),
+                                _ => {
+                                    let _ = tx.unbounded_send(Ok(forward));
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -1072,6 +1085,7 @@ async fn run_loop(
                                 continue 'attempt;
                             }
                         }
+                        flush_held(tx, &mut held);
                         obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
                         let _ = tx.unbounded_send(Err(AgentError::Provider(e.to_string())));
                         return;
@@ -1102,12 +1116,14 @@ async fn run_loop(
         // assistant turn; the agent reconstructs text + client tool calls only, so this is a
         // best-effort continue for the client-tool agent loop.)
         if turn.stop == Some(StopReason::PauseTurn) && turn.tool_calls.is_empty() {
+            flush_held(tx, &mut held);
             history.push(turn.to_assistant_message());
             continue;
         }
 
         if turn.tool_calls.is_empty() {
-            // Live-ops status ask with no structured call: grok-4.7 on Responses often answers
+            let truncated = is_truncated_stop(&turn.stop);
+            // Live-ops status ask with no structured call: grok on Responses often answers
             // from the last Korean line in history (LED off / not streaming) instead of emitting
             // a function_call. Bounce once with tool_choice=required. The false-claim guard
             // below never sees this path — the prose names no tool.
@@ -1115,15 +1131,42 @@ async fn run_loop(
                 live_ops_nudges += 1;
                 tracing::warn!(
                     nudge = live_ops_nudges,
+                    truncated,
                     "live-ops status ask finished without a structured tool call; retrying with tool_choice=required"
                 );
-                history.push(turn.to_assistant_message());
+                if !truncated {
+                    history.push(turn.to_assistant_message());
+                }
                 history.push(Message {
                     role: Role::User,
                     content: vec![ContentBlock::text(LIVE_OPS_NUDGE)],
                 });
                 require_tool_choice = true;
                 continue;
+            }
+            // Required retry still produced no call: hand the rest of this turn to the next
+            // fallback (typically Anthropic). Do not trip the circuit breaker — the primary did
+            // respond; the next Matrix turn still starts on it.
+            if live_ops_ask && model_cursor < fallbacks.len() {
+                tracing::warn!(
+                    truncated,
+                    "live-ops required retry still had no structured tool call; falling back to the next model"
+                );
+                model_cursor += 1;
+                require_tool_choice = true;
+                continue;
+            }
+            // Incomplete / max-token prose is not an answer. Drop the held text so the room
+            // never sees the ramble.
+            if truncated {
+                tracing::warn!(
+                    "turn ended incomplete or at max_tokens with no tool call; not accepting as the answer"
+                );
+                obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
+                let _ = tx.unbounded_send(Err(AgentError::Provider(
+                    "response incomplete (hit max_output_tokens) with no tool call".into(),
+                )));
+                return;
             }
             // False-tool-claim guard: Grok (and similar) often *write* that they checked a file
             // or ran a tool in ordinary answer text, with no structured tool call on the wire.
@@ -1186,6 +1229,7 @@ async fn run_loop(
                 }
             }
             let stop = turn.stop.unwrap_or(StopReason::EndTurn);
+            flush_held(tx, &mut held);
             // Real ATO success signal (§6.6): a clean completion is only counted successful if
             // the optional verify command also passes (exit 0). With no command set this is the
             // coarse "completed without erroring" fallback.
@@ -1203,6 +1247,7 @@ async fn run_loop(
         }
 
         // Echo the assistant's text + tool calls into history, then run the tools.
+        flush_held(tx, &mut held);
         history.push(turn.to_assistant_message());
 
         let mut results = Vec::with_capacity(turn.tool_calls.len());
@@ -1660,6 +1705,20 @@ where
         .into_iter()
         .any(|n| LIVE_OPS_TOOLS.contains(&n.as_ref()));
     has_ops && looks_like_live_ops_ask(text)
+}
+
+fn is_truncated_stop(stop: &Option<StopReason>) -> bool {
+    match stop {
+        Some(StopReason::MaxTokens) => true,
+        Some(StopReason::Other(s)) if s == "incomplete" => true,
+        _ => false,
+    }
+}
+
+fn flush_held(tx: &mpsc::UnboundedSender<Result<Event, AgentError>>, held: &mut Vec<Event>) {
+    for ev in held.drain(..) {
+        let _ = tx.unbounded_send(Ok(ev));
+    }
 }
 
 fn looks_like_live_ops_ask(text: &str) -> bool {
@@ -3791,6 +3850,101 @@ mod tests {
                 .any(|e| matches!(e, Event::Done(StopReason::EndTurn))),
             "the turn after the cap must finish: {events:?}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_ops_required_miss_falls_back_to_next_model() {
+        let primary = ScriptedProvider::new(vec![
+            vec![
+                Event::TextDelta("꺼져 있습니다.".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+            vec![
+                Event::TextDelta("RAMBLE FROM REQUIRED RETRY".into()),
+                Event::Done(StopReason::Other("incomplete".into())),
+            ],
+        ]);
+        let fallback = ScriptedProvider::new(vec![
+            vec![
+                Event::ToolUseStart {
+                    id: "t1".into(),
+                    name: "server_state".into(),
+                },
+                Event::ToolUseDelta {
+                    id: "t1".into(),
+                    json: "{\"location\":\"singil\"}".into(),
+                },
+                Event::ToolUseEnd { id: "t1".into() },
+                Event::Done(StopReason::ToolUse),
+            ],
+            vec![
+                Event::TextDelta("전원 LED가 켜져 있습니다.".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+        ]);
+        let agent = Agent::new(
+            primary.clone(),
+            registry_with_server_state(),
+            AgentConfig::default(),
+        )
+        .with_fallbacks(
+            vec![(fallback.clone(), "backup".into())],
+            Duration::from_secs(60),
+        );
+        let events = collect(agent.run("신길동 PC 상태 알려줘")).await;
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fallback.calls.load(Ordering::SeqCst), 2);
+        let fb_choices = fallback.tool_choices.lock().unwrap().clone();
+        assert_eq!(
+            fb_choices.as_slice(),
+            &[Some(ToolChoice::Required), None],
+            "fallback keeps required on the first call: {fb_choices:?}"
+        );
+        assert!(
+            !events.iter().any(|e| {
+                matches!(e, Event::TextDelta(t) if t.contains("RAMBLE") || t.contains("꺼져"))
+            }),
+            "discarded grok prose must not reach the caller: {events:?}"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::TextDelta(t) if t.contains("전원 LED"))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incomplete_message_without_tools_is_an_error() {
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                Event::TextDelta("꺼져 있습니다.".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+            vec![
+                Event::TextDelta("RAMBLE".into()),
+                Event::Done(StopReason::Other("incomplete".into())),
+            ],
+        ]);
+        let agent = Agent::new(
+            provider.clone(),
+            registry_with_server_state(),
+            AgentConfig::default(),
+        );
+        let mut s = agent.run("check atx_state of singil");
+        let mut events = Vec::new();
+        let mut saw_err = false;
+        while let Some(e) = s.next().await {
+            match e {
+                Ok(ev) => events.push(ev),
+                Err(_) => saw_err = true,
+            }
+        }
+        assert!(saw_err, "incomplete message-only must surface as an error");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::TextDelta(t) if t.contains("RAMBLE"))),
+            "the truncated ramble must not be the answer: {events:?}"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
