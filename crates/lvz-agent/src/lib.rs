@@ -22,6 +22,9 @@
 //!
 //! Token usage is summed across every round-trip — including the compaction call — which is
 //! the metric that matters (§6.4) and is enforced against an optional budget.
+//!
+//! A live OBS/PiKVM/schedule status ask that finishes with no structured tool call is retried
+//! once with [`ToolChoice::Required`] so grok-4.7 cannot answer from the last transcript line.
 
 #![warn(missing_docs)]
 
@@ -42,7 +45,8 @@ use lvz_protocol::{
     AgentError, AgentHandle, Archetype, Capabilities, ChatRequest, ContentBlock, CostWeights,
     DeliberationContext, Deliberator, Event, Knobs, Message, ModelTier, NoopTuner, Outcome,
     Provider, RepoProfile, Role, ServerTool, StopReason, SystemPrompt, TaskContext, TaskTelemetry,
-    TelemetrySink, ThinkingLevel, ToolDecision, ToolDef, ToolGate, Tuner, TurnRequest, Usage,
+    TelemetrySink, ThinkingLevel, ToolChoice, ToolDecision, ToolDef, ToolGate, Tuner, TurnRequest,
+    Usage,
 };
 use lvz_tools::ToolRegistry;
 use serde_json::{json, Value};
@@ -95,6 +99,11 @@ const MAX_EDIT_NUDGES: usize = 2;
 /// Most times the false-tool-claim guard nudges a turn that narrated a tool check or result
 /// without a structured call. Same bound as the no-edit guard so it cannot loop forever.
 const MAX_TOOL_CLAIM_NUDGES: usize = MAX_EDIT_NUDGES;
+
+/// A live OBS/PiKVM/schedule status ask that finishes with no structured call is retried once
+/// with [`ToolChoice::Required`]. One retry: the follow-up answer after the tool must be free
+/// to emit text.
+const MAX_LIVE_OPS_NUDGES: usize = 1;
 
 /// Most times the verify-and-fix gate ([`AgentConfig::verify_and_fix`]) feeds a failing verify back
 /// before giving up — bounds the extra cost so a never-passing verify can't loop forever.
@@ -831,7 +840,10 @@ async fn run_loop(
     let mut task_edited = false;
     let mut edit_nudges: usize = 0;
     let mut tool_claim_nudges: usize = 0;
+    let mut live_ops_nudges: usize = 0;
+    let mut require_tool_choice = false;
     let mut fix_attempts: usize = 0;
+    let live_ops_ask = live_ops_status_ask(&task_text, tool_defs.iter().map(|d| d.name.as_str()));
     // Largest untruncated tool-result seen, for the learner's safe counterfactual crediting
     // (§6.6 / `ATO.md` §3). `None` until the first tool runs.
     let mut max_result_bytes: Option<usize> = None;
@@ -925,6 +937,12 @@ async fn run_loop(
         // breaker (demote for a cooldown) and a success `reset`s it, so a persistently-down model is
         // skipped from turn start until re-probed.
         let mut turn = TurnAccumulator::default();
+        let this_tool_choice = if require_tool_choice {
+            Some(ToolChoice::Required)
+        } else {
+            None
+        };
+        require_tool_choice = false;
         'attempt: loop {
             // Resolve the candidate `(provider, model)` at the cursor. Cheap-model-first (§8) only
             // applies to the primary: fallbacks name their model explicitly.
@@ -953,6 +971,7 @@ async fn run_loop(
                 &history,
                 repo_skeleton,
                 task_thinking,
+                this_tool_choice.clone(),
             );
             // Bound the initial send too (connect + response headers): a connection that hangs before
             // the first byte must also fail fast, not block forever (no provider sets an HTTP timeout).
@@ -1088,6 +1107,24 @@ async fn run_loop(
         }
 
         if turn.tool_calls.is_empty() {
+            // Live-ops status ask with no structured call: grok-4.7 on Responses often answers
+            // from the last Korean line in history (LED off / not streaming) instead of emitting
+            // a function_call. Bounce once with tool_choice=required. The false-claim guard
+            // below never sees this path — the prose names no tool.
+            if live_ops_ask && live_ops_nudges < MAX_LIVE_OPS_NUDGES {
+                live_ops_nudges += 1;
+                tracing::warn!(
+                    nudge = live_ops_nudges,
+                    "live-ops status ask finished without a structured tool call; retrying with tool_choice=required"
+                );
+                history.push(turn.to_assistant_message());
+                history.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::text(LIVE_OPS_NUDGE)],
+                });
+                require_tool_choice = true;
+                continue;
+            }
             // False-tool-claim guard: Grok (and similar) often *write* that they checked a file
             // or ran a tool in ordinary answer text, with no structured tool call on the wire.
             // Log it so the claim is visible in CloudWatch, and bounce the turn back (bounded)
@@ -1548,6 +1585,111 @@ fn is_edit_tool(name: &str) -> bool {
 const FALSE_TOOL_CLAIM_NUDGE: &str =
     "No tool ran this turn. You claimed a tool check or result in text. \
 Call the tool now; do not report a result you were not given.";
+
+/// User-message body injected when a live OBS/PiKVM/schedule status ask finished with no
+/// structured call. The matching retry sets [`ToolChoice::Required`].
+const LIVE_OPS_NUDGE: &str =
+    "No tool ran this turn. Live OBS/PiKVM/schedule state from earlier messages is stale. \
+Call the matching tool now (server_state, obs_streaming, or schedule_list); \
+do not answer from memory.";
+
+/// Client tools whose advertised presence means this turn can read live broadcast/machine state.
+const LIVE_OPS_TOOLS: &[&str] = &[
+    "server_state",
+    "server_wake",
+    "server_poll_wake",
+    "server_shutdown",
+    "server_poll_shutdown",
+    "obs_info",
+    "obs_streaming",
+    "obs_scene_current",
+    "obs_scene_switch",
+    "obs_scene_collection_current",
+    "obs_scene_collection_switch",
+    "obs_audio",
+    "obs_scene_item",
+    "obs_macro",
+    "obs_upload_image",
+    "schedule_list",
+    "schedule_status",
+];
+
+/// Hangul / phrase needles for a live-ops status or control ask. English tokens use a
+/// whole-word match so `jobs` does not hit `obs`.
+const LIVE_OPS_PHRASES: &[&str] = &[
+    "상태",
+    "켜져",
+    "꺼져",
+    "켜졌",
+    "꺼졌",
+    "켜줘",
+    "꺼줘",
+    "부팅",
+    "전원",
+    "송출",
+    "방송",
+    "컴퓨터",
+    "서버",
+    "기기",
+    "스트리밍",
+    "장면",
+    "화면",
+    "atx_state",
+    "on air",
+];
+
+const LIVE_OPS_WORDS: &[&str] = &[
+    "status",
+    "atx",
+    "powered",
+    "broadcast",
+    "streaming",
+    "obs",
+    "boot",
+    "power",
+];
+
+/// True when this user ask is about live OBS/PiKVM/schedule state *and* those tools are
+/// advertised (so a coding-room question about "status" is left alone).
+fn live_ops_status_ask<I, S>(text: &str, advertised: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let has_ops = advertised
+        .into_iter()
+        .any(|n| LIVE_OPS_TOOLS.contains(&n.as_ref()));
+    has_ops && looks_like_live_ops_ask(text)
+}
+
+fn looks_like_live_ops_ask(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    LIVE_OPS_PHRASES.iter().any(|p| lower.contains(p))
+        || LIVE_OPS_WORDS
+            .iter()
+            .any(|w| contains_ascii_word(&lower, w))
+}
+
+fn contains_ascii_word(hay: &str, word: &str) -> bool {
+    let h = hay.as_bytes();
+    let w = word.as_bytes();
+    if w.is_empty() || h.len() < w.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + w.len() <= h.len() {
+        if &h[i..i + w.len()] == w {
+            let before_ok = i == 0 || !h[i - 1].is_ascii_alphanumeric();
+            let after = i + w.len();
+            let after_ok = after == h.len() || !h[after].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
 
 /// A short, secret-free note that the assistant claimed a named tool ran.
 struct ToolClaim {
@@ -2578,9 +2720,11 @@ fn build_request(
     history: &[Message],
     repo_skeleton: Option<&str>,
     thinking: Option<ThinkingLevel>,
+    tool_choice: Option<ToolChoice>,
 ) -> ChatRequest {
     let mut req = ChatRequest::new(model.to_string()).max_tokens(config.max_tokens);
     req.thinking = thinking;
+    req.tool_choice = tool_choice;
     req.system = Some(SystemPrompt {
         text: system_with_knobs(&config.system, knobs),
         cache: caps.prompt_caching(),
@@ -2786,6 +2930,7 @@ mod tests {
     struct ScriptedProvider {
         calls: AtomicUsize,
         scripts: Vec<Vec<Event>>,
+        tool_choices: Mutex<Vec<Option<ToolChoice>>>,
     }
 
     impl ScriptedProvider {
@@ -2793,6 +2938,7 @@ mod tests {
             Arc::new(Self {
                 calls: AtomicUsize::new(0),
                 scripts,
+                tool_choices: Mutex::new(Vec::new()),
             })
         }
     }
@@ -2801,11 +2947,15 @@ mod tests {
     impl Provider for ScriptedProvider {
         async fn stream(
             &self,
-            _req: ChatRequest,
+            req: ChatRequest,
         ) -> Result<
             BoxStream<'static, Result<Event, lvz_protocol::ProviderError>>,
             lvz_protocol::ProviderError,
         > {
+            self.tool_choices
+                .lock()
+                .unwrap()
+                .push(req.tool_choice.clone());
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             let events = self.scripts.get(n).cloned().unwrap_or_default();
             Ok(stream::iter(events.into_iter().map(Ok)).boxed())
@@ -3028,6 +3178,7 @@ mod tests {
             &h1,
             Some(skeleton),
             None,
+            None,
         );
         let r2 = build_request(
             &config,
@@ -3037,6 +3188,7 @@ mod tests {
             &knobs,
             &h2,
             Some(skeleton),
+            None,
             None,
         );
 
@@ -3541,6 +3693,143 @@ mod tests {
         assert!(
             !dumped.contains("echo lavoisier"),
             "tool arguments must not be logged: {dumped}"
+        );
+    }
+
+    #[test]
+    fn live_ops_ask_matches_status_questions_and_skips_chatter() {
+        assert!(looks_like_live_ops_ask("신길동 PC 상태 알려줘"));
+        assert!(looks_like_live_ops_ask("check the atx_state of singil"));
+        assert!(looks_like_live_ops_ask("is OBS streaming?"));
+        assert!(!looks_like_live_ops_ask("고마워"));
+        assert!(
+            !looks_like_live_ops_ask("the jobs failed"),
+            "`jobs` must not match the `obs` word"
+        );
+        assert!(!live_ops_status_ask(
+            "신길동 PC 상태 알려줘",
+            ["read_file", "shell"]
+        ));
+        assert!(live_ops_status_ask(
+            "신길동 PC 상태 알려줘",
+            ["read_file", "server_state"]
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_ops_status_ask_retries_with_tool_choice_required() {
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                Event::TextDelta("신길동 PC는 꺼져 있습니다.".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+            vec![
+                Event::ToolUseStart {
+                    id: "t1".into(),
+                    name: "server_state".into(),
+                },
+                Event::ToolUseDelta {
+                    id: "t1".into(),
+                    json: "{\"location\":\"singil\"}".into(),
+                },
+                Event::ToolUseEnd { id: "t1".into() },
+                Event::Done(StopReason::ToolUse),
+            ],
+            vec![
+                Event::TextDelta("전원 LED가 켜져 있습니다.".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+        ]);
+        let agent = Agent::new(
+            provider.clone(),
+            registry_with_server_state(),
+            AgentConfig::default(),
+        );
+        let _ = collect(agent.run("신길동 PC 상태 알려줘")).await;
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            3,
+            "prose finish, required retry that calls the tool, then the answer"
+        );
+        let choices = provider.tool_choices.lock().unwrap().clone();
+        assert_eq!(
+            choices.as_slice(),
+            &[None, Some(ToolChoice::Required), None],
+            "only the retry is required: {choices:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_ops_retry_cap_is_one() {
+        let finish = || {
+            vec![
+                Event::TextDelta("꺼져 있습니다.".into()),
+                Event::Done(StopReason::EndTurn),
+            ]
+        };
+        let provider = ScriptedProvider::new(vec![finish(), finish(), finish()]);
+        let agent = Agent::new(
+            provider.clone(),
+            registry_with_server_state(),
+            AgentConfig::default(),
+        );
+        let events = collect(agent.run("check atx_state of singil")).await;
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            MAX_LIVE_OPS_NUDGES + 1,
+            "one required retry, then the second prose finish is accepted"
+        );
+        let choices = provider.tool_choices.lock().unwrap().clone();
+        assert_eq!(
+            choices.as_slice(),
+            &[None, Some(ToolChoice::Required)],
+            "the accepted finish must not send required again: {choices:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Done(StopReason::EndTurn))),
+            "the turn after the cap must finish: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_ops_does_not_retry_a_coding_question() {
+        let provider = ScriptedProvider::new(vec![vec![
+            Event::TextDelta("looks fine".into()),
+            Event::Done(StopReason::EndTurn),
+        ]]);
+        let agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::with_builtins(),
+            AgentConfig::default(),
+        );
+        let _ = collect(agent.run("what's the status of this PR?")).await;
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "no live-ops tools advertised, so a status question is not retried"
+        );
+        let choices = provider.tool_choices.lock().unwrap().clone();
+        assert_eq!(choices.as_slice(), &[None]);
+    }
+
+    #[tokio::test]
+    async fn live_ops_does_not_retry_chatter_in_the_broadcast_room() {
+        let provider = ScriptedProvider::new(vec![vec![
+            Event::TextDelta("네.".into()),
+            Event::Done(StopReason::EndTurn),
+        ]]);
+        let agent = Agent::new(
+            provider.clone(),
+            registry_with_server_state(),
+            AgentConfig::default(),
+        );
+        let _ = collect(agent.run("고마워")).await;
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "thanks is not a status ask"
         );
     }
 
@@ -4482,6 +4771,7 @@ fn target() -> u32 { helper() + 10 }
             &history,
             Some("===== src/a.rs =====\npub fn alpha()"),
             None,
+            None,
         );
         // The skeleton is the first block of the first message, cached, ahead of the task text.
         let first = &req.messages[0].content;
@@ -4517,11 +4807,36 @@ fn target() -> u32 { helper() + 10 }
             &history,
             Some("skel"),
             None,
+            None,
         );
         match &req.messages[0].content[0] {
             ContentBlock::Text { cache, .. } => assert!(!cache, "no caching ⇒ no breakpoint"),
             other => panic!("expected a text block, got {other:?}"),
         }
+    }
+
+    /// Advertises `server_state` so live-ops tests can offer a broadcast tool without extra-tools.
+    struct ServerStateTool;
+    #[async_trait]
+    impl Tool for ServerStateTool {
+        fn name(&self) -> &str {
+            "server_state"
+        }
+        fn description(&self) -> &str {
+            "read PiKVM ATX state"
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        async fn invoke(&self, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok("powered_on=true"))
+        }
+    }
+
+    fn registry_with_server_state() -> ToolRegistry {
+        let mut registry = ToolRegistry::with_builtins();
+        registry.register(Arc::new(ServerStateTool));
+        registry
     }
 
     /// A tool that returns a fixed, sizeable string — used to grow history quickly so
