@@ -324,7 +324,7 @@ fn build_count_body(req: &ChatRequest) -> Value {
         body["tools"] = build_tools(&req.tools, false);
     }
     if let Some(tc) = req.tool_choice.as_ref() {
-        body["tool_choice"] = build_tool_choice(tc, req.disable_parallel_tool_use);
+        body["tool_choice"] = build_tool_choice(tc, req.disable_parallel_tool_use, &req.model);
     }
     body
 }
@@ -400,7 +400,7 @@ fn build_body(nreq: &Negotiated<AnthropicCaps>, extended_ttl: bool) -> Value {
         body["stop_sequences"] = json!(req.stop_sequences);
     }
     if let Some(tc) = req.tool_choice.as_ref() {
-        body["tool_choice"] = build_tool_choice(tc, req.disable_parallel_tool_use);
+        body["tool_choice"] = build_tool_choice(tc, req.disable_parallel_tool_use, &req.model);
     }
     if let Some(OutputFormat::JsonSchema { schema }) = req.output_format.as_ref() {
         body["output_config"]["format"] = json!({ "type": "json_schema", "schema": schema });
@@ -426,12 +426,24 @@ fn uses_legacy_thinking(model: &str) -> bool {
         .any(|m| model.contains(m))
 }
 
+/// Claude Sonnet 5.5 rejects forced `tool_choice` (`any` / named `tool`) and `thinking: disabled`
+/// / `budget_tokens`. See <https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5>.
+fn is_sonnet_5_5(model: &str) -> bool {
+    model.contains("sonnet-5-5")
+}
+
 /// Map the normalised [`ToolChoice`] onto Anthropic's `tool_choice` object.
-fn build_tool_choice(choice: &ToolChoice, disable_parallel: bool) -> Value {
+///
+/// Sonnet 5.5 returns HTTP 400 for `type: any` and `type: tool`. Those map onto `auto` (the only
+/// remaining "please use a tool" setting); `none` is still accepted. The token-counting endpoint
+/// applies the same check.
+fn build_tool_choice(choice: &ToolChoice, disable_parallel: bool, model: &str) -> Value {
     let mut v = match choice {
         ToolChoice::Auto => json!({ "type": "auto" }),
+        ToolChoice::Required if is_sonnet_5_5(model) => json!({ "type": "auto" }),
         ToolChoice::Required => json!({ "type": "any" }),
         ToolChoice::None => json!({ "type": "none" }),
+        ToolChoice::Tool(_) if is_sonnet_5_5(model) => json!({ "type": "auto" }),
         ToolChoice::Tool(name) => json!({ "type": "tool", "name": name }),
     };
     // `disable_parallel_tool_use` is valid on auto/any/tool (not none).
@@ -449,7 +461,17 @@ fn build_tool_choice(choice: &ToolChoice, disable_parallel: bool) -> Value {
 /// 400s on Opus 4.7/4.8/Fable. Legacy models (Sonnet 4.5, Haiku 4.5, Opus 4.0/4.1) use fixed-budget
 /// `thinking.budget_tokens`, where Anthropic requires `max_tokens > budget_tokens`. Either way a
 /// custom `temperature` is disallowed alongside thinking, so it's dropped.
+///
+/// Sonnet 5.5 is a third path: adaptive thinking is **on by default** (effort `high`),
+/// `thinking: {type: disabled}` 400s, and so does a manual `budget_tokens`. `Off`/`Low`/`None`
+/// therefore send `between_tools` (the lowest setting; no extra fields). `Medium`/`High` stay
+/// adaptive + effort. Prior-turn thinking is already omitted by [`build_content_block`], so the
+/// 5.5 thinking-block prefix-binding check never sees a replayed block.
 fn apply_thinking(body: &mut Value, thinking: Option<ThinkingLevel>, model: &str, max_tokens: u32) {
+    if is_sonnet_5_5(model) {
+        apply_sonnet_5_5_thinking(body, thinking);
+        return;
+    }
     let level = match thinking {
         Some(l @ (ThinkingLevel::Medium | ThinkingLevel::High)) => l,
         _ => return, // None / Off / Low ⇒ no thinking block
@@ -473,6 +495,27 @@ fn apply_thinking(body: &mut Value, thinking: Option<ThinkingLevel>, model: &str
             "medium"
         };
         body["output_config"]["effort"] = json!(effort);
+    }
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("temperature");
+    }
+}
+
+fn apply_sonnet_5_5_thinking(body: &mut Value, thinking: Option<ThinkingLevel>) {
+    match thinking {
+        Some(ThinkingLevel::Medium) => {
+            body["thinking"] = json!({ "type": "adaptive" });
+            body["output_config"]["effort"] = json!("medium");
+        }
+        Some(ThinkingLevel::High) => {
+            body["thinking"] = json!({ "type": "adaptive" });
+            body["output_config"]["effort"] = json!("high");
+        }
+        // None / Off / Low: turn off up-front thinking. `disabled` 400s; omit would default
+        // to adaptive + high. `between_tools` takes no display / budget_tokens / block_binding.
+        _ => {
+            body["thinking"] = json!({ "type": "between_tools" });
+        }
     }
     if let Some(obj) = body.as_object_mut() {
         obj.remove("temperature");
@@ -1141,6 +1184,72 @@ mod tests {
             body["temperature"].is_null(),
             "temperature must be dropped when thinking is enabled"
         );
+    }
+
+    #[test]
+    fn sonnet_5_5_maps_forced_tool_choice_to_auto() {
+        // `any` and named `tool` 400 on claude-sonnet-5-5; auto/none stay valid.
+        for choice in [
+            ToolChoice::Required,
+            ToolChoice::Tool("get_weather".into()),
+            ToolChoice::Auto,
+        ] {
+            let mut req = ChatRequest::new("claude-sonnet-5-5").push(Message::user("hi"));
+            req.tool_choice = Some(choice);
+            req.disable_parallel_tool_use = true;
+            let body = nb(&req, false);
+            assert_eq!(body["tool_choice"]["type"], "auto", "{body}");
+            assert!(body["tool_choice"]["name"].is_null());
+            assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], true);
+        }
+        let mut none = ChatRequest::new("claude-sonnet-5-5").push(Message::user("hi"));
+        none.tool_choice = Some(ToolChoice::None);
+        assert_eq!(nb(&none, false)["tool_choice"]["type"], "none");
+
+        // Older models keep the forced encoding.
+        let mut legacy = ChatRequest::new("claude-sonnet-5").push(Message::user("hi"));
+        legacy.tool_choice = Some(ToolChoice::Required);
+        assert_eq!(nb(&legacy, false)["tool_choice"]["type"], "any");
+        let mut named = ChatRequest::new("claude-sonnet-4-6").push(Message::user("hi"));
+        named.tool_choice = Some(ToolChoice::Tool("get_weather".into()));
+        assert_eq!(nb(&named, false)["tool_choice"]["type"], "tool");
+        assert_eq!(nb(&named, false)["tool_choice"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn sonnet_5_5_count_tokens_also_drops_forced_tool_choice() {
+        let mut req = ChatRequest::new("claude-sonnet-5-5").push(Message::user("hi"));
+        req.tool_choice = Some(ToolChoice::Required);
+        let body = build_count_body(&req);
+        assert_eq!(body["tool_choice"]["type"], "auto");
+    }
+
+    #[test]
+    fn sonnet_5_5_thinking_uses_between_tools_not_disabled() {
+        let mk = |level: Option<ThinkingLevel>| {
+            let mut req = ChatRequest::new("claude-sonnet-5-5").push(Message::user("hi"));
+            req.thinking = level;
+            req.temperature = Some(0.7);
+            nb(&req, false)
+        };
+        for level in [None, Some(ThinkingLevel::Off), Some(ThinkingLevel::Low)] {
+            let body = mk(level);
+            assert_eq!(
+                body["thinking"]["type"], "between_tools",
+                "omit/disabled 400 on 5.5; lowest setting is between_tools ({level:?})"
+            );
+            assert!(body["thinking"]["budget_tokens"].is_null());
+            assert!(body["thinking"]["display"].is_null());
+            assert!(body["temperature"].is_null());
+        }
+        let medium = mk(Some(ThinkingLevel::Medium));
+        assert_eq!(medium["thinking"]["type"], "adaptive");
+        assert_eq!(medium["output_config"]["effort"], "medium");
+        assert!(medium["thinking"]["budget_tokens"].is_null());
+        let high = mk(Some(ThinkingLevel::High));
+        assert_eq!(high["thinking"]["type"], "adaptive");
+        assert_eq!(high["output_config"]["effort"], "high");
+        assert!(high["thinking"]["budget_tokens"].is_null());
     }
 
     #[test]
