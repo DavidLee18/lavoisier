@@ -59,7 +59,7 @@ jobs:
       # rust-toolchain selects the toolchain from the ref name (`@stable`); pinned to a SHA, that
       # signal is gone, so the channel is passed explicitly via the `toolchain` input.
       - name: Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master @ 2026-06-18
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master @ 2026-06-18
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
