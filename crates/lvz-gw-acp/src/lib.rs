@@ -319,6 +319,20 @@ fn event_to_update(event: &Event, tool_args: &mut HashMap<String, String>) -> Op
             "status": "completed",
             "content": [{ "type": "content", "content": { "type": "text", "text": content } }],
         })),
+        Event::ToolResultImages { name, images, .. } => {
+            let n: usize = images.iter().map(|i| i.data.len()).sum();
+            let media = images
+                .first()
+                .map(|i| i.media_type.as_str())
+                .unwrap_or("image");
+            Some(json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {
+                    "type": "text",
+                    "text": format!("🖼 {name} · {media}, {n} bytes"),
+                },
+            }))
+        }
         // Usage/Citation/Done carry no user-visible update chunk of their own.
         _ => None,
     }

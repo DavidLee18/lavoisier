@@ -36,7 +36,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::stream::StreamExt;
-use lvz_protocol::{AgentHandle, Event, Gateway, GatewayError, TurnRequest};
+use lvz_protocol::{AgentHandle, Event, Gateway, GatewayError, ToolImage, TurnRequest};
 use lvz_schedule::ScheduleRegistry;
 use lvz_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,7 @@ use tracing::{error, info, warn};
 
 #[cfg(feature = "e2ee")]
 mod e2ee;
+mod media;
 
 /// Long-poll window for `/sync` (ms). The server holds the request open until an event
 /// arrives or this elapses.
@@ -623,13 +624,27 @@ impl MatrixGateway {
         room_id: &str,
         body: &str,
     ) -> Result<String, GatewayError> {
+        self.send_content(
+            token,
+            room_id,
+            serde_json::json!({ "msgtype": "m.text", "body": body }),
+        )
+        .await
+    }
+
+    /// Post an `m.room.message` with caller-supplied content (`m.text`, `m.image`, …).
+    async fn send_content(
+        &self,
+        token: &str,
+        room_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<String, GatewayError> {
         let txn = self.txn.fetch_add(1, Ordering::Relaxed);
         let path = format!(
             "/_matrix/client/v3/rooms/{}/send/m.room.message/lvz{}",
             urlencode(room_id),
             txn
         );
-        let payload = serde_json::json!({ "msgtype": "m.text", "body": body });
         let resp = self
             .http
             .put(self.url(&path))
@@ -648,6 +663,47 @@ impl MatrixGateway {
             .await
             .map_err(|e| GatewayError::Protocol(e.to_string()))?;
         Ok(parsed.event_id)
+    }
+
+    /// Upload raw bytes to the homeserver media repo (`POST /_matrix/client/v1/media/upload`).
+    /// Returns the `content_uri` (`mxc://…`).
+    async fn upload_media(
+        &self,
+        token: &str,
+        bytes: &[u8],
+        content_type: &str,
+        filename: &str,
+    ) -> Result<String, GatewayError> {
+        let path = format!(
+            "/_matrix/client/v1/media/upload?filename={}",
+            urlencode(filename)
+        );
+        let resp = self
+            .http
+            .post(self.url(&path))
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::Io(format!(
+                "matrix media upload {status}: {msg}"
+            )));
+        }
+        let parsed: UploadResponse = resp
+            .json()
+            .await
+            .map_err(|e| GatewayError::Protocol(e.to_string()))?;
+        if parsed.content_uri.is_empty() {
+            return Err(GatewayError::Protocol(
+                "matrix media upload missing content_uri".into(),
+            ));
+        }
+        Ok(parsed.content_uri)
     }
 
     /// Send a **gateway-initiated** message (the shutdown notice, a schedule report) to `room`,
@@ -672,6 +728,25 @@ impl MatrixGateway {
             }
         }
         self.send_message(token, room, &body).await
+    }
+
+    /// Gateway-initiated image (a schedule report JPEG). Encrypts the attachment when the room
+    /// is encrypted; otherwise uploads plaintext. Best-effort at the caller.
+    async fn send_gateway_image(
+        &self,
+        token: &str,
+        room: &str,
+        name: &str,
+        image: &ToolImage,
+        #[cfg(feature = "e2ee")] crypto: Option<&e2ee::Crypto>,
+    ) -> Result<String, GatewayError> {
+        #[cfg(feature = "e2ee")]
+        if let Some(c) = crypto {
+            if self.room_encrypted(token, room).await {
+                return self.send_encrypted_image(c, token, room, name, image).await;
+            }
+        }
+        self.send_plaintext_image(token, room, name, image).await
     }
 
     /// Whether `room` has encryption enabled — i.e. carries an `m.room.encryption` state event with
@@ -1033,26 +1108,51 @@ impl MatrixGateway {
                 continue;
             };
             match self.report_room(report.room.as_deref()) {
-                Some(room) => match self
-                    .send_gateway_message(
-                        token,
-                        &room,
-                        report.body,
-                        #[cfg(feature = "e2ee")]
-                        crypto,
-                    )
-                    .await
-                {
-                    Ok(eid) => sent.insert(eid),
-                    Err(e) => {
-                        error!(
-                            job = %report.job_id,
-                            %room,
-                            error = %e,
-                            "schedule: sending job report failed"
+                Some(room) => {
+                    match self
+                        .send_gateway_message(
+                            token,
+                            &room,
+                            report.body,
+                            #[cfg(feature = "e2ee")]
+                            crypto,
                         )
+                        .await
+                    {
+                        Ok(eid) => sent.insert(eid),
+                        Err(e) => {
+                            error!(
+                                job = %report.job_id,
+                                %room,
+                                error = %e,
+                                "schedule: sending job report failed"
+                            )
+                        }
                     }
-                },
+                    for image in &report.images {
+                        match self
+                            .send_gateway_image(
+                                token,
+                                &room,
+                                &report.job_id,
+                                image,
+                                #[cfg(feature = "e2ee")]
+                                crypto,
+                            )
+                            .await
+                        {
+                            Ok(eid) => sent.insert(eid),
+                            Err(e) => error!(
+                                job = %report.job_id,
+                                %room,
+                                media_type = %image.media_type,
+                                len = image.data.len(),
+                                error = %e,
+                                "schedule: sending job image failed"
+                            ),
+                        }
+                    }
+                }
                 // Nowhere to report: still surface the outcome so a misconfigured room can't
                 // silently swallow a failing job.
                 None => info!(
@@ -1083,6 +1183,115 @@ impl MatrixGateway {
                 .map_err(|e| GatewayError::Io(e.to_string())),
             #[cfg(not(feature = "e2ee"))]
             Reply::_Unused(_) => unreachable!(),
+        }
+    }
+
+    /// Decode, upload, and post one tool-result image. Best-effort at the caller.
+    async fn send_image_via(
+        &self,
+        reply: &Reply<'_>,
+        token: &str,
+        room: &str,
+        name: &str,
+        image: &ToolImage,
+    ) -> Result<String, GatewayError> {
+        #[cfg(feature = "e2ee")]
+        if let Reply::Encrypted(crypto) = reply {
+            return self
+                .send_encrypted_image(crypto, token, room, name, image)
+                .await;
+        }
+        let _ = reply;
+        self.send_plaintext_image(token, room, name, image).await
+    }
+
+    async fn send_plaintext_image(
+        &self,
+        token: &str,
+        room: &str,
+        name: &str,
+        image: &ToolImage,
+    ) -> Result<String, GatewayError> {
+        let bytes = media::decode_tool_image(image).ok_or_else(|| {
+            warn!(
+                tool = %name,
+                media_type = %image.media_type,
+                len = image.data.len(),
+                "tool image base64 did not decode"
+            );
+            GatewayError::Protocol("tool image base64 did not decode".into())
+        })?;
+        let filename = media::image_filename(name, &image.media_type);
+        let mxc = self
+            .upload_media(token, &bytes, &image.media_type, &filename)
+            .await?;
+        let content =
+            media::plaintext_image_content(&filename, &mxc, &image.media_type, bytes.len());
+        self.send_content(token, room, content).await
+    }
+
+    #[cfg(feature = "e2ee")]
+    async fn send_encrypted_image(
+        &self,
+        crypto: &e2ee::Crypto,
+        token: &str,
+        room: &str,
+        name: &str,
+        image: &ToolImage,
+    ) -> Result<String, GatewayError> {
+        let bytes = media::decode_tool_image(image).ok_or_else(|| {
+            warn!(
+                tool = %name,
+                media_type = %image.media_type,
+                len = image.data.len(),
+                "tool image base64 did not decode"
+            );
+            GatewayError::Protocol("tool image base64 did not decode".into())
+        })?;
+        let filename = media::image_filename(name, &image.media_type);
+        let enc = e2ee::encrypt_attachment(&bytes).map_err(|e| GatewayError::Io(e.to_string()))?;
+        let mxc = self
+            .upload_media(
+                token,
+                &enc.ciphertext,
+                "application/octet-stream",
+                &filename,
+            )
+            .await?;
+        let content = media::encrypted_image_content(
+            &filename,
+            enc.with_url(&mxc),
+            &image.media_type,
+            bytes.len(),
+        );
+        crypto
+            .encrypt_and_send_content(room.to_string(), content)
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))
+    }
+
+    /// Post each admitted tool-result image. Failures are logged; they never fail the turn.
+    async fn post_tool_images(
+        &self,
+        reply: &Reply<'_>,
+        token: &str,
+        room: &str,
+        sent: &mut RecentIds,
+        name: &str,
+        images: &[ToolImage],
+    ) {
+        for image in images {
+            match self.send_image_via(reply, token, room, name, image).await {
+                Ok(eid) => sent.insert(eid),
+                Err(e) => error!(
+                    %room,
+                    tool = %name,
+                    media_type = %image.media_type,
+                    len = image.data.len(),
+                    error = %e,
+                    "tool result image failed"
+                ),
+            }
         }
     }
 
@@ -1229,6 +1438,13 @@ impl MatrixGateway {
                             };
                             self.post_tool_notice(reply, token, &room, self_user, sent, &name, &args)
                                 .await;
+                        }
+                        Ok(Event::ToolResultImages { name, images, .. }) => {
+                            // JPEG on the human channel. A send failure is logged here and
+                            // does not flip `ok` — the model already has the image.
+                            self.post_tool_images(reply, token, &room, sent, &name, &images)
+                                .await;
+                            let _ = self.set_typing(token, &room, self_user, true).await;
                         }
                         Ok(_) => {}
                         Err(e) => {
@@ -1949,6 +2165,12 @@ struct LoginResponse {
 #[derive(Deserialize)]
 struct SendResponse {
     event_id: String,
+}
+
+/// `POST /_matrix/client/v1/media/upload` response.
+#[derive(Deserialize)]
+struct UploadResponse {
+    content_uri: String,
 }
 
 /// `GET …/joined_members` response — used only for its member count (DM detection).

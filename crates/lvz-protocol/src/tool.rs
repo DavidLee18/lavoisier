@@ -155,6 +155,32 @@ impl ToolOutput {
     }
 }
 
+/// Largest base64 payload kept on a [`ToolImage`]. Larger payloads are omitted whole.
+pub const MAX_TOOL_IMAGE_BASE64: usize = 5 * 1024 * 1024;
+
+/// Keep images that fit. An image over the cap, or an empty payload, is omitted and named in
+/// `content`, never sliced. Shared by the agent (model path) and the scheduler (room report).
+pub fn admit_tool_images(content: &mut String, images: Vec<ToolImage>) -> Vec<ToolImage> {
+    let mut kept = Vec::new();
+    for image in images {
+        if image.data.len() > MAX_TOOL_IMAGE_BASE64 {
+            content.push_str(&format!(
+                "\n[image omitted: {} bytes of {} base64 exceeds the {MAX_TOOL_IMAGE_BASE64} byte limit]",
+                image.data.len(),
+                image.media_type
+            ));
+        } else if image.data.is_empty() {
+            content.push_str(&format!(
+                "\n[image omitted: empty {} payload]",
+                image.media_type
+            ));
+        } else {
+            kept.push(image);
+        }
+    }
+    kept
+}
+
 /// A hard tool failure (the dispatcher could not run the tool at all).
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {

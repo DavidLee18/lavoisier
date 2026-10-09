@@ -264,6 +264,14 @@ async fn fire(job: &CronJob, agent: &Arc<dyn AgentHandle>) -> bool {
             Ok(Event::TextDelta(t)) => answer.push_str(&t),
             Ok(Event::Usage(u)) => usage = Some(u),
             Ok(Event::ToolUseStart { name, .. }) => tools.push(name),
+            Ok(Event::ToolResultImages { name, images, .. }) => {
+                tracing::info!(
+                    tool = %name,
+                    n = images.len(),
+                    bytes = images.iter().map(|i| i.data.len()).sum::<usize>(),
+                    "cron: tool result image"
+                );
+            }
             Ok(Event::Done(_)) => {}
             Ok(_) => {}
             Err(e) => {

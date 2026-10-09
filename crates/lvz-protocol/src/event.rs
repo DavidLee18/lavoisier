@@ -79,6 +79,21 @@ pub enum Event {
     /// [`TextDelta`](Event::TextDelta) (answer text) and [`Thinking`](Event::Thinking) (model
     /// chain-of-thought).
     Notice(String),
+    /// Images a tool attached to its result ([`crate::ToolOutput::with_image`]). The agent emits
+    /// this **after** invoke, once [`crate::admit_tool_images`] has kept them. Gateways upload/post
+    /// these onto the human channel; they are not part of the assistant answer. Distinct from
+    /// [`Notice`](Event::Notice), which is posted as text.
+    ToolResultImages {
+        /// The [`ToolUseEnd`](Event::ToolUseEnd) / `ToolUse.id` this result answers. Empty on a
+        /// scheduled tool fire (no model call). `#[serde(default)]` so older recordings still decode.
+        #[serde(default)]
+        id: String,
+        /// Tool name, so a room can label the image (`server_poll_wake`, …).
+        name: String,
+        /// Admitted images (media type + whole base64). Never a sliced JPEG.
+        #[serde(default)]
+        images: Vec<crate::ToolImage>,
+    },
     /// Terminal event: the turn finished for the given reason.
     Done(StopReason),
 }
@@ -254,6 +269,14 @@ mod tests {
                 cache_read_tokens: 4,
             }),
             Event::Notice("council convened".into()),
+            Event::ToolResultImages {
+                id: "call_1".into(),
+                name: "server_poll_wake".into(),
+                images: vec![crate::ToolImage {
+                    media_type: "image/jpeg".into(),
+                    data: "abcd".into(),
+                }],
+            },
             Event::Done(StopReason::EndTurn),
             Event::Done(StopReason::Other("time_limit".into())),
         ];
@@ -295,5 +318,18 @@ mod tests {
         let json = serde_json::to_value(Event::TextDelta("hi".into())).unwrap();
         assert_eq!(json["kind"], "text_delta");
         assert_eq!(json["data"], "hi");
+    }
+
+    #[test]
+    fn tool_result_images_kind_is_snake_case() {
+        let json = serde_json::to_value(Event::ToolResultImages {
+            id: "t1".into(),
+            name: "server_poll_wake".into(),
+            images: vec![],
+        })
+        .unwrap();
+        assert_eq!(json["kind"], "tool_result_images");
+        assert_eq!(json["data"]["name"], "server_poll_wake");
+        assert_eq!(json["data"]["id"], "t1");
     }
 }

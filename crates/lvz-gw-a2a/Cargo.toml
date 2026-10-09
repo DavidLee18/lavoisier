@@ -1,6 +1,6 @@
 [package]
 name = "lvz-gw-a2a"
-version = "0.1.0"
+version = "0.1.1"
 description = "A2A (Agent-to-Agent) server gateway for Lavoisier: exposes the shared agent as an A2A agent (Agent Card + JSON-RPC message/send + SSE message/stream)."
 edition.workspace = true
 rust-version.workspace = true

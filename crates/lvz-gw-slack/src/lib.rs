@@ -154,6 +154,184 @@ impl SlackGateway {
         }
     }
 
+    /// Upload a tool-result image into the channel (and thread). Best-effort.
+    async fn upload_image(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        name: &str,
+        image: &lvz_protocol::ToolImage,
+    ) {
+        let Some(bytes) = decode_base64(&image.data) else {
+            warn!(
+                tool = %name,
+                media_type = %image.media_type,
+                len = image.data.len(),
+                "slack: tool image base64 did not decode"
+            );
+            return;
+        };
+        let filename = slack_filename(name, &image.media_type);
+        if let Err(e) = self
+            .files_upload(channel, thread_ts, &filename, &image.media_type, bytes)
+            .await
+        {
+            error!(
+                error = %e,
+                tool = %name,
+                media_type = %image.media_type,
+                "slack file upload failed"
+            );
+        }
+    }
+
+    /// `files.getUploadURLExternal` + raw PUT + `files.completeUploadExternal`, falling back to
+    /// the older `files.upload` multipart call when v2 is refused.
+    async fn files_upload(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        filename: &str,
+        media_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), GatewayError> {
+        match self
+            .files_upload_v2(channel, thread_ts, filename, media_type, &bytes)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn!(error = %e, "files.uploadV2 failed; trying files.upload");
+                self.files_upload_legacy(channel, thread_ts, filename, media_type, bytes)
+                    .await
+            }
+        }
+    }
+
+    async fn files_upload_v2(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        filename: &str,
+        media_type: &str,
+        bytes: &[u8],
+    ) -> Result<(), GatewayError> {
+        let start = self
+            .web_post(
+                "files.getUploadURLExternal",
+                &serde_json::json!({
+                    "filename": filename,
+                    "length": bytes.len(),
+                }),
+            )
+            .await?;
+        if start.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(GatewayError::Protocol(format!(
+                "files.getUploadURLExternal: {}",
+                start
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            )));
+        }
+        let upload_url = start
+            .get("upload_url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                GatewayError::Protocol("getUploadURLExternal missing upload_url".into())
+            })?;
+        let file_id = start
+            .get("file_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| GatewayError::Protocol("getUploadURLExternal missing file_id".into()))?;
+
+        let put = self
+            .http
+            .post(upload_url)
+            .header(reqwest::header::CONTENT_TYPE, media_type)
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        if !put.status().is_success() {
+            let status = put.status();
+            let msg = put.text().await.unwrap_or_default();
+            return Err(GatewayError::Io(format!(
+                "slack upload PUT {status}: {msg}"
+            )));
+        }
+
+        let mut complete = serde_json::json!({
+            "files": [{ "id": file_id, "title": filename }],
+            "channel_id": channel,
+        });
+        if let Some(ts) = thread_ts {
+            complete["thread_ts"] = Value::String(ts.to_string());
+        }
+        let done = self
+            .web_post("files.completeUploadExternal", &complete)
+            .await?;
+        if done.get("ok").and_then(Value::as_bool) == Some(true) {
+            Ok(())
+        } else {
+            Err(GatewayError::Protocol(format!(
+                "files.completeUploadExternal: {}",
+                done.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            )))
+        }
+    }
+
+    async fn files_upload_legacy(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        filename: &str,
+        media_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), GatewayError> {
+        let mime = if media_type.contains('/') {
+            media_type
+        } else {
+            "application/octet-stream"
+        };
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename.to_string())
+            .mime_str(mime)
+            .map_err(|e| GatewayError::Protocol(e.to_string()))?;
+        let mut form = reqwest::multipart::Form::new()
+            .part("file", part)
+            .text("channels", channel.to_string())
+            .text("filename", filename.to_string());
+        if let Some(ts) = thread_ts {
+            form = form.text("thread_ts", ts.to_string());
+        }
+        let resp = self
+            .http
+            .post(format!("{WEB_API}/files.upload"))
+            .bearer_auth(&self.bot_token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        let value: Value = resp
+            .json()
+            .await
+            .map_err(|e| GatewayError::Protocol(e.to_string()))?;
+        if value.get("ok").and_then(Value::as_bool) == Some(true) {
+            Ok(())
+        } else {
+            Err(GatewayError::Protocol(format!(
+                "files.upload: {}",
+                value
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+            )))
+        }
+    }
+
     /// Run one inbound message through the agent and post the reply. Spawned per message so the
     /// read loop stays responsive (Socket Mode requires prompt acks + ping/pong keepalive while a
     /// turn — which can be slow — runs).
@@ -170,6 +348,12 @@ impl SlackGateway {
         while let Some(item) = stream.next().await {
             match item {
                 Ok(Event::TextDelta(t)) => answer.push_str(&t),
+                Ok(Event::ToolResultImages { name, images, .. }) => {
+                    for image in images {
+                        self.upload_image(&msg.channel, msg.thread_ts.as_deref(), &name, &image)
+                            .await;
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => {
                     error!(channel = %msg.channel, error = %e, "stream error");
@@ -354,6 +538,52 @@ fn parse_event(
     })
 }
 
+fn slack_filename(tool_name: &str, media_type: &str) -> String {
+    let ext = match media_type {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    };
+    let stem: String = tool_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(96)
+        .collect();
+    let stem = if stem.is_empty() {
+        "file".to_string()
+    } else {
+        stem
+    };
+    format!("{stem}.{ext}")
+}
+
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let s: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    if s.is_empty() {
+        return None;
+    }
+    let mut padded = s;
+    match padded.len() % 4 {
+        0 => {}
+        2 => padded.push_str("=="),
+        3 => padded.push('='),
+        _ => return None,
+    }
+    base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        padded.as_bytes(),
+    )
+    .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,5 +679,18 @@ mod tests {
         assert!(sender_allowed(None, "U_ANYONE"));
         assert!(sender_allowed(Some(&allowed), "U_A"));
         assert!(!sender_allowed(Some(&allowed), "U_B"));
+    }
+
+    #[test]
+    fn slack_filename_and_decode() {
+        assert_eq!(
+            slack_filename("server_poll_wake", "image/jpeg"),
+            "server_poll_wake.jpg"
+        );
+        assert_eq!(
+            decode_base64("YWJjZA==").as_deref(),
+            Some(b"abcd".as_slice())
+        );
+        assert!(decode_base64("@@@").is_none());
     }
 }

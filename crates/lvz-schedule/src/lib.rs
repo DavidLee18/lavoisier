@@ -252,6 +252,7 @@ impl FireReport {
                 job.id, acc.poll_with, acc.handle
             ),
             attempt: 0,
+            images: Vec::new(),
         }
     }
 }
@@ -316,6 +317,9 @@ pub struct FireReport {
     pub body: String,
     /// Which attempt in the current chain this was (1 = first try).
     pub attempt: u32,
+    /// Admitted images from a **terminal** tool result. Empty on the waiting line and on
+    /// still-pending polls. Posted to the report room after `body`.
+    pub images: Vec<lvz_protocol::ToolImage>,
 }
 
 /// One action's raw result, before it is summarised for a room.
@@ -334,6 +338,8 @@ struct ActionOutcome {
     summary: Option<String>,
     /// Tools the agent called, for a prompt job.
     tools_used: Vec<String>,
+    /// Admitted images from a terminal tool result. Empty while `accepted` is set.
+    images: Vec<lvz_protocol::ToolImage>,
 }
 
 /// The jobs, their live state, and the wait/fire loop. Shared as an `Arc` between the gateway
@@ -516,7 +522,12 @@ impl ScheduleRegistry {
             return first_accept.then_some(report);
         }
 
-        let report = self.record(&job, &outcome.result, outcome.summary.as_deref());
+        let report = self.record(
+            &job,
+            &outcome.result,
+            outcome.summary.as_deref(),
+            outcome.images.clone(),
+        );
         log_verbose(&job, &outcome, &report, elapsed);
         Some(report)
     }
@@ -578,6 +589,7 @@ impl ScheduleRegistry {
         job: &ScheduleJob,
         result: &Result<String, String>,
         summary: Option<&str>,
+        images: Vec<lvz_protocol::ToolImage>,
     ) -> FireReport {
         let now = now_unix();
         let ok = result.is_ok();
@@ -647,6 +659,7 @@ impl ScheduleRegistry {
             ok,
             body: report_body(job, ok, &shown, attempt, retry_in, gave_up),
             attempt,
+            images,
         }
     }
 }
@@ -684,6 +697,7 @@ async fn poll_pending(
             )),
             vec![p.poll_with.clone()],
             None,
+            Vec::new(),
         )
         .await;
     }
@@ -698,24 +712,39 @@ async fn poll_pending(
                 Err(format!("poll tool `{}` failed: {e}", p.poll_with)),
                 vec![p.poll_with.clone()],
                 None,
+                Vec::new(),
             )
             .await
         }
         Ok(out) if out.pending.is_some() => {
             // Still running. Re-arm from the fresh handle the poll returned.
+            // Intermediate polls do not carry a screenshot — that would flood the report room.
             ActionOutcome {
                 result: Ok(out.content),
                 usage: None,
                 summary: None,
                 tools_used: vec![p.poll_with.clone()],
                 accepted: out.pending,
+                images: Vec::new(),
             }
         }
         Ok(out) if out.is_error => {
+            let images = take_images(&out);
             let e = format!("tool `{}` reported: {}", p.poll_with, out.content);
-            finish(job, agent, Err(e), vec![p.poll_with.clone()], None).await
+            finish(job, agent, Err(e), vec![p.poll_with.clone()], None, images).await
         }
-        Ok(out) => finish(job, agent, Ok(out.content), vec![p.poll_with.clone()], None).await,
+        Ok(out) => {
+            let images = take_images(&out);
+            finish(
+                job,
+                agent,
+                Ok(out.content),
+                vec![p.poll_with.clone()],
+                None,
+                images,
+            )
+            .await
+        }
     }
 }
 
@@ -729,6 +758,7 @@ async fn finish(
     result: Result<String, String>,
     tools_used: Vec<String>,
     usage: Option<lvz_protocol::Usage>,
+    images: Vec<lvz_protocol::ToolImage>,
 ) -> ActionOutcome {
     let (summary, sum_usage) = match (&result, job.summarize.as_deref()) {
         (Ok(raw), Some(instruction)) => {
@@ -745,7 +775,14 @@ async fn finish(
         summary,
         tools_used,
         accepted: None,
+        images,
     }
+}
+
+/// Admit images from a tool result for the room report. Omit notes stay off the posted body.
+fn take_images(out: &lvz_protocol::ToolOutput) -> Vec<lvz_protocol::ToolImage> {
+    let mut scratch = String::new();
+    lvz_protocol::admit_tool_images(&mut scratch, out.images.clone())
 }
 
 async fn run_action(
@@ -756,14 +793,21 @@ async fn run_action(
     match &job.action {
         Action::Tool { name, args } => {
             let mut accepted = None;
+            let mut images = Vec::new();
             let result = match tools.invoke(name, args.clone()).await {
                 Err(e) => Err(format!("tool `{name}` failed: {e}")),
-                Ok(out) if out.is_error => Err(format!("tool `{name}` reported: {}", out.content)),
+                Ok(out) if out.is_error => {
+                    images = take_images(&out);
+                    Err(format!("tool `{name}` reported: {}", out.content))
+                }
                 Ok(out) => {
                     // A pending result is NOT a success. `Ok` here would mean "dispatched", and a
                     // job whose whole purpose is "the machine is up before the service starts"
                     // must not assert that from an acceptance.
                     accepted = out.pending.clone();
+                    if accepted.is_none() {
+                        images = take_images(&out);
+                    }
                     Ok(out.content)
                 }
             };
@@ -794,6 +838,7 @@ async fn run_action(
                 summary,
                 tools_used: vec![name.clone()],
                 accepted,
+                images,
             }
         }
         Action::Prompt { text } => {
@@ -808,6 +853,7 @@ async fn run_action(
                         tools_used: Vec::new(),
                         // A prompt turn has no dispatch/poll split; it runs to completion here.
                         accepted: None,
+                        images: Vec::new(),
                     };
                 }
             };
@@ -815,10 +861,12 @@ async fn run_action(
             let mut used: Vec<String> = Vec::new();
             let mut usage = None;
             let mut failed = None;
+            let mut images = Vec::new();
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(Event::TextDelta(t)) => answer.push_str(&t),
                     Ok(Event::ToolUseStart { name, .. }) => used.push(name),
+                    Ok(Event::ToolResultImages { images: imgs, .. }) => images.extend(imgs),
                     Ok(Event::Usage(u)) => usage = Some(u),
                     Ok(_) => {}
                     Err(e) => {
@@ -844,6 +892,7 @@ async fn run_action(
                 summary: None,
                 tools_used: used,
                 accepted: None,
+                images,
             }
         }
     }
@@ -935,6 +984,7 @@ fn log_verbose(
                 attempt = report.attempt,
                 duration_ms = ms,
                 bytes = output.len(),
+                images = outcome.images.len(),
                 output = %output,
                 summary = outcome.summary.as_deref().unwrap_or("-"),
                 "job fired ok{tools_note}{usage_note}",
@@ -1147,7 +1197,12 @@ mod tests {
     #[test]
     fn success_records_history_and_rearms() {
         let reg = ScheduleRegistry::new(vec![tool_job("a")]);
-        let report = reg.record(&reg.jobs[0].clone(), &Ok("all good".into()), None);
+        let report = reg.record(
+            &reg.jobs[0].clone(),
+            &Ok("all good".into()),
+            None,
+            Vec::new(),
+        );
         assert!(report.ok);
         assert!(report.body.starts_with("✅ `a`"));
         assert!(report.body.contains("all good"));
@@ -1164,7 +1219,7 @@ mod tests {
     #[test]
     fn failure_without_retries_gives_up_immediately() {
         let reg = ScheduleRegistry::new(vec![tool_job("a")]);
-        let report = reg.record(&reg.jobs[0].clone(), &Err("boom".into()), None);
+        let report = reg.record(&reg.jobs[0].clone(), &Err("boom".into()), None, Vec::new());
         assert!(!report.ok);
         assert!(report.body.starts_with("❌ `a` failed (attempt 1)"));
         assert!(report.body.contains("boom"));
@@ -1186,7 +1241,7 @@ mod tests {
         let j = reg.jobs[0].clone();
 
         // Attempt 1 fails → retry 1/2 queued, cron slot suppressed so it can't race the retry.
-        let r1 = reg.record(&j, &Err("boom".into()), None);
+        let r1 = reg.record(&j, &Err("boom".into()), None, Vec::new());
         assert!(r1.body.contains("↻ retry 1/2 in 30s"));
         let s = reg.state_of("a").unwrap();
         assert!(s.retry_at.is_some());
@@ -1194,12 +1249,12 @@ mod tests {
         assert_eq!(s.attempt, 1);
 
         // Attempt 2 fails → retry 2/2 queued.
-        let r2 = reg.record(&j, &Err("boom".into()), None);
+        let r2 = reg.record(&j, &Err("boom".into()), None, Vec::new());
         assert!(r2.body.contains("↻ retry 2/2 in 30s"));
         assert_eq!(reg.state_of("a").unwrap().attempt, 2);
 
         // Attempt 3 exhausts the budget → give up and re-arm the cron slot from now.
-        let r3 = reg.record(&j, &Err("boom".into()), None);
+        let r3 = reg.record(&j, &Err("boom".into()), None, Vec::new());
         assert!(r3.body.contains("⛔ gave up after 2 retries"));
         let s = reg.state_of("a").unwrap();
         assert!(s.retry_at.is_none());
@@ -1215,8 +1270,8 @@ mod tests {
         j.retry_wait = 5;
         let reg = ScheduleRegistry::new(vec![j]);
         let j = reg.jobs[0].clone();
-        reg.record(&j, &Err("boom".into()), None);
-        let ok = reg.record(&j, &Ok("recovered".into()), None);
+        reg.record(&j, &Err("boom".into()), None, Vec::new());
+        let ok = reg.record(&j, &Ok("recovered".into()), None, Vec::new());
         assert!(ok.ok);
         assert!(ok.body.contains("after 2 attempts"));
         let s = reg.state_of("a").unwrap();
@@ -1230,7 +1285,7 @@ mod tests {
         let reg = ScheduleRegistry::new(vec![tool_job("a")]);
         let j = reg.jobs[0].clone();
         for _ in 0..(HISTORY_CAP + 5) {
-            reg.record(&j, &Ok("x".into()), None);
+            reg.record(&j, &Ok("x".into()), None, Vec::new());
         }
         assert_eq!(reg.state_of("a").unwrap().history.len(), HISTORY_CAP);
     }
@@ -1240,14 +1295,19 @@ mod tests {
         let mut j = tool_job("a");
         j.room = Some("!ops:hs".into());
         let reg = ScheduleRegistry::new(vec![j]);
-        let report = reg.record(&reg.jobs[0].clone(), &Ok("x".into()), None);
+        let report = reg.record(&reg.jobs[0].clone(), &Ok("x".into()), None, Vec::new());
         assert_eq!(report.room.as_deref(), Some("!ops:hs"));
     }
 
     #[test]
     fn long_output_is_truncated() {
         let reg = ScheduleRegistry::new(vec![tool_job("a")]);
-        let report = reg.record(&reg.jobs[0].clone(), &Ok("x".repeat(5_000)), None);
+        let report = reg.record(
+            &reg.jobs[0].clone(),
+            &Ok("x".repeat(5_000)),
+            None,
+            Vec::new(),
+        );
         assert!(report.body.contains("[truncated]"));
         assert!(report.body.chars().count() < DETAIL_CAP + 100);
     }
@@ -1764,7 +1824,7 @@ mod pending_tests {
                         Some(218),
                     ))
                 } else {
-                    Ok(lvz_protocol::ToolOutput::ok("desktop up"))
+                    Ok(lvz_protocol::ToolOutput::ok("desktop up").with_image("image/jpeg", "abcd"))
                 }
             }
         }
@@ -1794,6 +1854,7 @@ mod pending_tests {
             .await
             .expect("first accept posts");
         assert!(!waiting.ok, "waiting is not a success");
+        assert!(waiting.images.is_empty(), "waiting has no screenshot");
         assert!(waiting.body.contains("⏳"));
         assert!(waiting.body.contains("started, waiting"));
         assert!(waiting.body.contains("server_wake_result"));
@@ -1816,7 +1877,94 @@ mod pending_tests {
         assert!(done.ok);
         assert!(done.body.contains("✅"));
         assert!(done.body.contains("desktop up"));
+        assert_eq!(done.images.len(), 1);
+        assert_eq!(done.images[0].media_type, "image/jpeg");
+        assert_eq!(done.images[0].data, "abcd");
         assert!(reg.state_of("wake").unwrap().pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_still_pending_poll_does_not_put_a_jpeg_on_a_report() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Wake;
+        #[async_trait::async_trait]
+        impl lvz_protocol::Tool for Wake {
+            fn name(&self) -> &str {
+                "server_wake"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn invoke(
+                &self,
+                _args: serde_json::Value,
+            ) -> Result<lvz_protocol::ToolOutput, lvz_protocol::ToolError> {
+                Ok(lvz_protocol::ToolOutput::pending(
+                    "powered on",
+                    "h1",
+                    "server_wake_result",
+                    Some(218),
+                ))
+            }
+        }
+        struct WakeResult {
+            polls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl lvz_protocol::Tool for WakeResult {
+            fn name(&self) -> &str {
+                "server_wake_result"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn invoke(
+                &self,
+                _args: serde_json::Value,
+            ) -> Result<lvz_protocol::ToolOutput, lvz_protocol::ToolError> {
+                let n = self.polls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Ok(lvz_protocol::ToolOutput::pending(
+                        "still logging in",
+                        "h1",
+                        "server_wake_result",
+                        Some(218),
+                    )
+                    .with_image("image/jpeg", "boot"))
+                } else {
+                    Ok(lvz_protocol::ToolOutput::ok("desktop up").with_image("image/jpeg", "desk"))
+                }
+            }
+        }
+        struct DeadAgent;
+        #[async_trait::async_trait]
+        impl AgentHandle for DeadAgent {
+            async fn submit(
+                &self,
+                _turn: TurnRequest,
+            ) -> Result<
+                futures::stream::BoxStream<'static, Result<Event, lvz_protocol::AgentError>>,
+                lvz_protocol::AgentError,
+            > {
+                Err(lvz_protocol::AgentError::Provider("unused".into()))
+            }
+        }
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(Wake));
+        tools.register(Arc::new(WakeResult { polls }));
+        let agent: Arc<dyn AgentHandle> = Arc::new(DeadAgent);
+        let reg = ScheduleRegistry::new(vec![job("wake")]);
+        let _ = reg.fire(0, &tools, &agent).await;
+        assert!(
+            reg.fire(0, &tools, &agent).await.is_none(),
+            "still-pending poll posts nothing, even with a JPEG on the output"
+        );
+        let done = reg.fire(0, &tools, &agent).await.expect("terminal");
+        assert_eq!(done.images.len(), 1);
+        assert_eq!(done.images[0].data, "desk");
     }
 
     /// An ordinary tool is untouched: no pending field, no behaviour change.

@@ -23,6 +23,11 @@ use std::fmt::{self, Display};
 use std::ops::Deref;
 use std::path::Path;
 
+use aes::cipher::{KeyIvInit, StreamCipher};
+use aes::Aes256;
+use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+use base64::Engine;
+use ctr::Ctr64BE;
 use matrix_sdk_crypto::{
     types::events::room::encrypted::EncryptedEvent, types::requests::AnyOutgoingRequest,
     DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement,
@@ -45,6 +50,7 @@ use ruma::{
     OneTimeKeyAlgorithm, OwnedDeviceId, OwnedUserId, RoomId, UInt, UserId,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
 /// An end-to-end-encryption error. We collapse the many `matrix-sdk-crypto`/`ruma` error types to
@@ -63,6 +69,51 @@ impl std::error::Error for E2eeError {}
 
 fn estr(e: impl Display) -> E2eeError {
     E2eeError(e.to_string())
+}
+
+type Aes256Ctr64Be = Ctr64BE<Aes256>;
+
+/// AES-256-CTR ciphertext plus the Matrix EncryptedFile v2 object (without `url`;
+/// the caller fills `url` after uploading the ciphertext).
+pub(crate) struct EncryptedAttachment {
+    pub ciphertext: Vec<u8>,
+    file: Value,
+}
+
+impl EncryptedAttachment {
+    /// Attach the mxc of the uploaded ciphertext.
+    pub(crate) fn with_url(mut self, mxc: &str) -> Value {
+        self.file["url"] = serde_json::json!(mxc);
+        self.file
+    }
+}
+
+/// Encrypt attachment bytes per the Matrix spec: AES-256-CTR, 16-byte IV (first 8 random,
+/// last 8 zero), SHA-256 of the ciphertext, JWK key as unpadded url-safe base64.
+pub(crate) fn encrypt_attachment(plaintext: &[u8]) -> Result<EncryptedAttachment, E2eeError> {
+    let mut key = [0u8; 32];
+    getrandom::getrandom(&mut key).map_err(estr)?;
+    let mut iv = [0u8; 16];
+    getrandom::getrandom(&mut iv[..8]).map_err(estr)?;
+
+    let mut ciphertext = plaintext.to_vec();
+    let mut cipher = Aes256Ctr64Be::new((&key).into(), (&iv).into());
+    cipher.apply_keystream(&mut ciphertext);
+
+    let hash = Sha256::digest(&ciphertext);
+    let file = serde_json::json!({
+        "v": "v2",
+        "key": {
+            "kty": "oct",
+            "key_ops": ["encrypt", "decrypt"],
+            "alg": "A256CTR",
+            "k": URL_SAFE_NO_PAD.encode(key),
+            "ext": true
+        },
+        "iv": STANDARD_NO_PAD.encode(iv),
+        "hashes": { "sha256": STANDARD_NO_PAD.encode(hash) }
+    });
+    Ok(EncryptedAttachment { ciphertext, file })
 }
 
 /// The crypto layer bound to a logged-in bot session.
@@ -310,6 +361,21 @@ impl Crypto {
         room_id: String,
         body: String,
     ) -> Result<String, E2eeError> {
+        self.encrypt_and_send_content(
+            room_id,
+            serde_json::json!({ "msgtype": "m.text", "body": body }),
+        )
+        .await
+    }
+
+    /// Encrypt arbitrary `m.room.message` content (text, `m.image` with a `file` object, …)
+    /// and send it as `m.room.encrypted`. Same session/key-sharing path as
+    /// [`Self::encrypt_and_send`].
+    pub async fn encrypt_and_send_content(
+        &self,
+        room_id: String,
+        content: Value,
+    ) -> Result<String, E2eeError> {
         let room = RoomId::parse(&room_id).map_err(estr)?;
         let users = self.joined_members(&room_id).await?;
         // Pass a fresh `&UserId` iterator per call (the `Deref::deref` fn item is lifetime-generic,
@@ -354,11 +420,8 @@ impl Crypto {
                 .map_err(estr)?;
         }
 
-        // Encrypt and send.
         let content: Raw<AnyMessageLikeEventContent> =
-            Raw::new(&serde_json::json!({ "msgtype": "m.text", "body": body }))
-                .map_err(estr)?
-                .cast_unchecked();
+            Raw::new(&content).map_err(estr)?.cast_unchecked();
         let encrypted = self
             .machine
             .encrypt_room_event_raw(&room, "m.room.message", &content)
@@ -622,5 +685,40 @@ mod tests {
         let att = msg.attachment.expect("attachment captured");
         assert_eq!(att.mxc, "mxc://hs/abc");
         assert_eq!(att.filename, "p.png");
+    }
+
+    #[test]
+    fn encrypt_attachment_is_encrypted_file_v2_and_roundtrips() {
+        let plain = b"jpeg-bytes";
+        let enc = encrypt_attachment(plain).expect("encrypt");
+        let ciphertext = enc.ciphertext.clone();
+        let file = enc.with_url("mxc://hs/abc");
+        assert_eq!(file["v"], "v2");
+        assert_eq!(file["url"], "mxc://hs/abc");
+        assert_eq!(file["key"]["alg"], "A256CTR");
+        assert_eq!(file["key"]["kty"], "oct");
+        assert_eq!(file["key"]["ext"], true);
+
+        let key = URL_SAFE_NO_PAD
+            .decode(file["key"]["k"].as_str().unwrap())
+            .unwrap();
+        let iv = STANDARD_NO_PAD
+            .decode(file["iv"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(key.len(), 32);
+        assert_eq!(iv.len(), 16);
+        assert!(iv[8..].iter().all(|&b| b == 0));
+
+        let hash = STANDARD_NO_PAD
+            .decode(file["hashes"]["sha256"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(hash, Sha256::digest(&ciphertext).as_slice());
+
+        let mut out = ciphertext;
+        let key: [u8; 32] = key.try_into().unwrap();
+        let iv: [u8; 16] = iv.try_into().unwrap();
+        let mut cipher = Aes256Ctr64Be::new((&key).into(), (&iv).into());
+        cipher.apply_keystream(&mut out);
+        assert_eq!(out, plain);
     }
 }

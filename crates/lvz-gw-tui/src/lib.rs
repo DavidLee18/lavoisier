@@ -436,6 +436,15 @@ fn on_event(term: &mut Term, app: &mut App, ev: Event) -> io::Result<()> {
             app.flush_pending(term)?;
             scrollback::emit_notice(term, &t)?;
         }
+        Event::ToolResultImages { name, images, .. } => {
+            app.flush_pending(term)?;
+            for img in &images {
+                scrollback::emit_notice(
+                    term,
+                    &format!("🖼 {name} · {}, {} bytes", img.media_type, img.data.len()),
+                )?;
+            }
+        }
         Event::Citation { source, cited_text } => {
             scrollback::emit_notice(term, &format!("[{source}] {cited_text}"))?;
         }

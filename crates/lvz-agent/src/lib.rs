@@ -1319,7 +1319,21 @@ async fn run_loop(
                         max_result_bytes = Some(max_result_bytes.map_or(len, |m| m.max(len)));
                         made_real_edit |= out.changed && is_edit_tool(&call.name);
                         let mut content = truncate(&out.content, knobs.truncate_bytes);
-                        let images = admit_tool_images(&mut content, out.images);
+                        let images = lvz_protocol::admit_tool_images(&mut content, out.images);
+                        if !images.is_empty() {
+                            tracing::info!(
+                                tool = %call.name,
+                                n = images.len(),
+                                media_type = images[0].media_type.as_str(),
+                                base64_len = images[0].data.len(),
+                                "tool result image admitted"
+                            );
+                            let _ = tx.unbounded_send(Ok(Event::ToolResultImages {
+                                id: call.id.clone(),
+                                name: call.name.clone(),
+                                images: images.clone(),
+                            }));
+                        }
                         ContentBlock::ToolResult {
                             tool_use_id: call.id.clone(),
                             content,
@@ -2877,6 +2891,7 @@ impl TurnAccumulator {
             // Progress notices are injected by the agent (never by a provider); forward for
             // visibility, they carry no turn state.
             Event::Notice(_) => Some(event),
+            Event::ToolResultImages { .. } => Some(event),
             Event::Usage(u) => {
                 self.usage = u; // providers emit one usage per turn; last wins
                 None
@@ -2907,34 +2922,6 @@ impl TurnAccumulator {
     }
 }
 
-/// Base64 larger than this is dropped whole. Slicing it would hand the model a broken image.
-const MAX_TOOL_IMAGE_BASE64: usize = 5 * 1024 * 1024;
-
-/// Keep images that fit. An image over the cap is omitted and named in `content`, never sliced.
-fn admit_tool_images(
-    content: &mut String,
-    images: Vec<lvz_protocol::ToolImage>,
-) -> Vec<lvz_protocol::ToolImage> {
-    let mut kept = Vec::new();
-    for image in images {
-        if image.data.len() > MAX_TOOL_IMAGE_BASE64 {
-            content.push_str(&format!(
-                "\n[image omitted: {} bytes of {} base64 exceeds the {MAX_TOOL_IMAGE_BASE64} byte limit]",
-                image.data.len(),
-                image.media_type
-            ));
-        } else if image.data.is_empty() {
-            content.push_str(&format!(
-                "\n[image omitted: empty {} payload]",
-                image.media_type
-            ));
-        } else {
-            kept.push(image);
-        }
-    }
-    kept
-}
-
 /// Head/tail truncation for oversized tool output, preserving both ends with a byte count.
 fn truncate(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
@@ -2962,8 +2949,8 @@ mod tests {
     #[test]
     fn oversized_image_is_omitted_whole() {
         let mut content = "desktop".to_string();
-        let huge = "a".repeat(MAX_TOOL_IMAGE_BASE64 + 1);
-        let kept = admit_tool_images(
+        let huge = "a".repeat(lvz_protocol::MAX_TOOL_IMAGE_BASE64 + 1);
+        let kept = lvz_protocol::admit_tool_images(
             &mut content,
             vec![
                 lvz_protocol::ToolImage {
@@ -2985,11 +2972,122 @@ mod tests {
         );
     }
 
+    struct ShotTool {
+        jpeg: String,
+    }
+
+    #[async_trait]
+    impl Tool for ShotTool {
+        fn name(&self) -> &str {
+            "shot"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn invoke(&self, _args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok("desktop").with_image("image/jpeg", self.jpeg.clone()))
+        }
+    }
+
+    fn shot_turn() -> Vec<Event> {
+        vec![
+            Event::ToolUseStart {
+                id: "c1".into(),
+                name: "shot".into(),
+            },
+            Event::ToolUseDelta {
+                id: "c1".into(),
+                json: "{}".into(),
+            },
+            Event::ToolUseEnd { id: "c1".into() },
+            Event::Done(StopReason::ToolUse),
+        ]
+    }
+
+    #[tokio::test]
+    async fn tool_result_image_is_emitted_and_placed_on_the_model_block() {
+        let provider = ScriptedProvider::new(vec![
+            shot_turn(),
+            vec![
+                Event::TextDelta("ok".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ShotTool {
+            jpeg: "abcd".into(),
+        }));
+        let agent = Agent::new(provider.clone(), tools, AgentConfig::default());
+        let events = collect(agent.run("wake")).await;
+        let images: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ToolResultImages { id, name, images } => {
+                    Some((id.as_str(), name.as_str(), images.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].0, "c1");
+        assert_eq!(images[0].1, "shot");
+        assert_eq!(images[0].2[0].media_type, "image/jpeg");
+        assert_eq!(images[0].2[0].data, "abcd");
+
+        let reqs = provider.requests.lock().unwrap();
+        assert!(reqs.len() >= 2, "tool result is resent to the model");
+        let found = reqs[1].messages.iter().any(|m| {
+            m.content.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::ToolResult { images, .. }
+                        if images.len() == 1 && images[0].data == "abcd"
+                )
+            })
+        });
+        assert!(found, "the same JPEG must sit on ContentBlock::ToolResult");
+    }
+
+    #[tokio::test]
+    async fn oversized_image_emits_no_event() {
+        let provider = ScriptedProvider::new(vec![
+            shot_turn(),
+            vec![
+                Event::TextDelta("ok".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ShotTool {
+            jpeg: "a".repeat(lvz_protocol::MAX_TOOL_IMAGE_BASE64 + 1),
+        }));
+        let agent = Agent::new(provider.clone(), tools, AgentConfig::default());
+        let events = collect(agent.run("wake")).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::ToolResultImages { .. })),
+            "oversize JPEG must not appear on the turn stream"
+        );
+        let reqs = provider.requests.lock().unwrap();
+        let omit = reqs[1].messages.iter().any(|m| {
+            m.content.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::ToolResult { content, images, .. }
+                        if content.contains("image omitted") && images.is_empty()
+                )
+            })
+        });
+        assert!(omit, "omit note must land in the tool-result text");
+    }
+
     /// A provider that replays a fixed script of event lists, one per successive call.
     struct ScriptedProvider {
         calls: AtomicUsize,
         scripts: Vec<Vec<Event>>,
         tool_choices: Mutex<Vec<Option<ToolChoice>>>,
+        requests: Mutex<Vec<ChatRequest>>,
     }
 
     impl ScriptedProvider {
@@ -2998,6 +3096,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 scripts,
                 tool_choices: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
             })
         }
     }
@@ -3011,6 +3110,7 @@ mod tests {
             BoxStream<'static, Result<Event, lvz_protocol::ProviderError>>,
             lvz_protocol::ProviderError,
         > {
+            self.requests.lock().unwrap().push(req.clone());
             self.tool_choices
                 .lock()
                 .unwrap()

@@ -337,6 +337,14 @@ async fn message_stream(state: &Arc<AppState>, id: Value, params: &Value) -> Res
                     let ev = artifact_update(&task_id, &ctx, &artifact_id, &t);
                     Some(Ok::<_, Infallible>(sse_data(&rpc_ok(rpc_id, ev))))
                 }
+                Ok(Event::ToolResultImages { name, images, .. }) => {
+                    tracing::info!(
+                        tool = %name,
+                        n = images.len(),
+                        "a2a: tool result image (no image artifact channel)"
+                    );
+                    None
+                }
                 _ => None,
             }
         }

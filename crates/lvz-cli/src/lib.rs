@@ -1755,6 +1755,15 @@ impl Renderer {
                 eprintln!("[citation: {source}] {cited_text}")
             }
             Event::Notice(text) => eprintln!("\n[notice] {text}"),
+            Event::ToolResultImages { name, images, .. } => {
+                for img in images {
+                    eprintln!(
+                        "\n[image] {name} · {} {} bytes",
+                        img.media_type,
+                        img.data.len()
+                    );
+                }
+            }
             Event::Usage(usage) => {
                 eprintln!(
                     "\n[usage] in={} out={} cache_read={} cache_creation={}",

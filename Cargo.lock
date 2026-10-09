@@ -1484,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "lavoisier"
-version = "0.18.8"
+version = "0.18.9"
 dependencies = [
  "clap",
  "futures",
@@ -1604,7 +1604,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lvz-agent"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-trait",
  "futures",
@@ -1684,7 +1684,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-a2a"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1699,7 +1699,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-acp"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -1711,7 +1711,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-cron"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "async-trait",
  "futures",
@@ -1740,10 +1740,14 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-matrix"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
+ "aes",
  "async-trait",
+ "base64",
+ "ctr",
  "futures",
+ "getrandom 0.2.17",
  "http",
  "lvz-protocol",
  "lvz-schedule",
@@ -1754,15 +1758,17 @@ dependencies = [
  "ruma",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "lvz-gw-slack"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
+ "base64",
  "futures",
  "lvz-protocol",
  "reqwest",
@@ -1775,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-tui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "crossterm",
@@ -1834,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-protocol"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "futures",
@@ -1846,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-schedule"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "futures",
