@@ -75,7 +75,7 @@ lvz-gw-a2a = { path = "crates/lvz-gw-a2a", version = "0.1.1" }
 lvz-gw-acp = { path = "crates/lvz-gw-acp", version = "0.2.2" }
 lvz-gw-tui = { path = "crates/lvz-gw-tui", version = "0.1.2" }
 lvz-gw-http = { path = "crates/lvz-gw-http", version = "0.1.1" }
-lvz-gw-matrix = { path = "crates/lvz-gw-matrix", version = "0.7.3" }
+lvz-gw-matrix = { path = "crates/lvz-gw-matrix", version = "0.7.4" }
 lvz-gw-cron = { path = "crates/lvz-gw-cron", version = "0.4.3" }
 lvz-gw-slack = { path = "crates/lvz-gw-slack", version = "0.2.2" }
 

@@ -1484,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "lavoisier"
-version = "0.18.9"
+version = "0.18.10"
 dependencies = [
  "clap",
  "futures",
@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-gw-matrix"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "aes",
  "async-trait",

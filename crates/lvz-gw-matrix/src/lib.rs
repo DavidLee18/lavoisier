@@ -665,8 +665,11 @@ impl MatrixGateway {
         Ok(parsed.event_id)
     }
 
-    /// Upload raw bytes to the homeserver media repo (`POST /_matrix/client/v1/media/upload`).
+    /// Upload raw bytes to the homeserver media repo (`POST /_matrix/media/v3/upload`).
     /// Returns the `content_uri` (`mxc://…`).
+    ///
+    /// Upload stayed on the media v3 route when MSC3916 moved **download** to
+    /// `/_matrix/client/v1/media/*`. Continuwuity has no client-v1 upload.
     async fn upload_media(
         &self,
         token: &str,
@@ -674,10 +677,7 @@ impl MatrixGateway {
         content_type: &str,
         filename: &str,
     ) -> Result<String, GatewayError> {
-        let path = format!(
-            "/_matrix/client/v1/media/upload?filename={}",
-            urlencode(filename)
-        );
+        let path = format!("/_matrix/media/v3/upload?filename={}", urlencode(filename));
         let resp = self
             .http
             .post(self.url(&path))
@@ -1225,8 +1225,7 @@ impl MatrixGateway {
         let mxc = self
             .upload_media(token, &bytes, &image.media_type, &filename)
             .await?;
-        let content =
-            media::plaintext_image_content(&filename, &mxc, &image.media_type, bytes.len());
+        let content = media::plaintext_image_content(&filename, &mxc, &image.media_type, &bytes);
         self.send_content(token, room, content).await
     }
 
@@ -1262,7 +1261,7 @@ impl MatrixGateway {
             &filename,
             enc.with_url(&mxc),
             &image.media_type,
-            bytes.len(),
+            &bytes,
         );
         crypto
             .encrypt_and_send_content(room.to_string(), content)
@@ -2167,7 +2166,7 @@ struct SendResponse {
     event_id: String,
 }
 
-/// `POST /_matrix/client/v1/media/upload` response.
+/// `POST /_matrix/media/v3/upload` response.
 #[derive(Deserialize)]
 struct UploadResponse {
     content_uri: String,
