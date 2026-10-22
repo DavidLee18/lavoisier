@@ -51,6 +51,13 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
+(`v0.18.11`): **Matrix member-tool fail-closed**. `lvz-gw-matrix` (0.7.4→**0.7.5** — when
+`matrix_user_tools` is non-empty, `tools_for` returns `Some([])` for a sender absent from the map,
+so no tools are advertised or callable; an empty or absent map is unchanged, listed members still
+intersect with the room policy, and scheduled jobs still bypass the member map) and `lavoisier`
+(0.18.10→**0.18.11** — republish so the binary picks up the fix). Both semver-compatible patches;
+publish order `lvz-gw-matrix` → `lavoisier`. The other crates stay put. Do not tag from this note.
+Earlier changed set
 (`v0.9.1`): **legion grounding fix** — the council was arguing in a vacuum (no persona, no tools), so a
 gateway bot with a `PERSONA.md` and real tools would deliberate, synthesise a *refusal* ("I'm not that
 bot / I can't do that"), and seed that into the executor — which then obeyed it instead of calling the

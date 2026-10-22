@@ -265,10 +265,14 @@ pub struct GatewaySection {
     /// (comma-separated) takes precedence.
     pub matrix_allowed_rooms: Option<Vec<String>>,
     /// Per-room tool permissions: `room_id` → the tool names permitted in that room. A room absent
-    /// from the map is unconstrained. Intersected with `matrix_user_tools`.
+    /// from the map is unconstrained. Intersected with a listed member's `matrix_user_tools` entry.
     pub matrix_room_tools: Option<HashMap<String, Vec<String>>>,
-    /// Per-member tool permissions: `user_id` → the tool names permitted to that member. A user
-    /// absent from the map is unconstrained. Intersected with `matrix_room_tools`.
+    /// Per-member tool permissions: `user_id` → the tool names permitted to that member.
+    ///
+    /// When this map is non-empty, a sender absent from it is granted no tools (fail closed),
+    /// including in a room with no `matrix_room_tools` entry. When it is empty or absent, members
+    /// stay unconstrained and only the room map applies. A listed member is intersected with
+    /// `matrix_room_tools` when the room is also listed. Scheduled jobs do not consult this map.
     pub matrix_user_tools: Option<HashMap<String, Vec<String>>>,
     /// The Matrix "home" room that receives the shutdown notice on SIGTERM / Ctrl-C. The
     /// `MATRIX_HOME_ROOM` env var takes precedence.

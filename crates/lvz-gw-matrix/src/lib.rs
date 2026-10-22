@@ -117,8 +117,10 @@ pub struct MatrixGateway {
     /// Per-room tool permissions: `room_id` → the tools permitted there. A room absent from the
     /// map is unconstrained. See [`Self::tools_for`].
     room_tools: HashMap<String, HashSet<String>>,
-    /// Per-member tool permissions: `user_id` → the tools permitted to them. A user absent from
-    /// the map is unconstrained. Combined with [`Self::room_tools`] by intersection.
+    /// Per-member tool permissions: `user_id` → the tools permitted to them. When this map is
+    /// non-empty, a sender absent from it is granted no tools (fail closed). When it is empty,
+    /// members stay unconstrained and only [`Self::room_tools`] applies. A listed member is
+    /// combined with the room policy by intersection. See [`Self::tools_for`].
     user_tools: HashMap<String, HashSet<String>>,
     /// The "home" room: the single room that receives the shutdown notice when the gateway is
     /// stopped (SIGTERM / Ctrl-C). `None` ⇒ no notice is sent.
@@ -274,7 +276,9 @@ impl MatrixGateway {
     }
 
     /// Set per-member tool permissions: each `user_id` maps to the tools permitted to that member.
-    /// Users absent from the map are unconstrained. Intersected with the room policy.
+    /// An empty map leaves members unconstrained (room policy only). A non-empty map is an
+    /// allowlist: a sender it does not name gets no tools. Listed members are intersected with
+    /// the room policy. See [`Self::tools_for`].
     pub fn with_user_tools(mut self, map: impl IntoIterator<Item = (String, Vec<String>)>) -> Self {
         self.user_tools = map
             .into_iter()
@@ -317,11 +321,24 @@ impl MatrixGateway {
             .or_else(|| self.home_room.clone())
     }
 
-    /// The effective per-turn tool allowlist for a `(room, sender)`, or `None` when neither a room
-    /// nor a member policy applies (⇒ the agent's full tool set). When both apply the result is
-    /// their **intersection** (a tool must be permitted by the room *and* the member); when only
-    /// one applies, that one is used. An empty result means "no tools".
+    /// The effective per-turn tool allowlist for a `(room, sender)`, or `None` when the turn is
+    /// unconstrained (the agent's full tool set).
+    ///
+    /// When [`Self::user_tools`] is empty, behaviour is unchanged: a room absent from
+    /// [`Self::room_tools`] yields `None`, and a listed room yields that room's set. When the
+    /// member map is non-empty and `sender` is absent from it, the result is `Some(Vec::new())`
+    /// — no tools are advertised or callable, including in a room with no room entry (fail
+    /// closed). A listed member is intersected with the room set when the room is also listed;
+    /// otherwise that member's own set is used. An empty `Some` means "no tools".
+    ///
+    /// Scheduled jobs do not call this. A tool job dispatches through the shared registry and a
+    /// prompt job carries no member identity, so both bypass the member map.
     fn tools_for(&self, room: &str, sender: &str) -> Option<Vec<String>> {
+        // A non-empty member map is an allowlist. A sender it does not name must not inherit the
+        // room's tools or the unconstrained catalogue.
+        if !self.user_tools.is_empty() && !self.user_tools.contains_key(sender) {
+            return Some(Vec::new());
+        }
         let room_set = self.room_tools.get(room);
         let user_set = self.user_tools.get(sender);
         match (room_set, user_set) {
@@ -1085,6 +1102,10 @@ impl MatrixGateway {
     }
 
     /// Fire every due scheduled job and post its report.
+    ///
+    /// Scheduled fires do not consult [`Self::tools_for`]. A tool job is dispatched through the
+    /// shared registry, and a prompt job is submitted with no member identity, so the member tool
+    /// map does not apply.
     ///
     /// A report is **encrypted when its report room is encrypted** (under the `e2ee` feature), else
     /// sent in the clear — unlike a reply, a scheduled fire has no inbound event to infer the room's
@@ -2461,8 +2482,14 @@ mod tests {
         assert!(!room_allowed(Some(&allowed), "!b:hs"));
     }
 
+    fn sorted_tools(gw: &MatrixGateway, room: &str, sender: &str) -> Vec<String> {
+        let mut t = gw.tools_for(room, sender).unwrap();
+        t.sort();
+        t
+    }
+
     #[test]
-    fn tool_policy_intersects_room_and_member() {
+    fn tool_policy_listed_member_intersects_room_set() {
         let gw = MatrixGateway::new("https://hs", "@bot:hs", "pw")
             .with_room_tools([(
                 "!ops:hs".to_string(),
@@ -2473,22 +2500,57 @@ mod tests {
                 vec!["read_file".to_string(), "write_file".to_string()],
             )]);
 
-        // Neither room nor member constrained ⇒ unrestricted (None).
-        assert!(gw.tools_for("!other:hs", "@guest:hs").is_none());
-
-        // Only the room is constrained ⇒ the room's set.
-        let mut t = gw.tools_for("!ops:hs", "@guest:hs").unwrap();
-        t.sort();
-        assert_eq!(t, vec!["read_file".to_string(), "shell".to_string()]);
-
-        // Only the member is constrained ⇒ the member's set.
-        let mut t = gw.tools_for("!other:hs", "@admin:hs").unwrap();
-        t.sort();
-        assert_eq!(t, vec!["read_file".to_string(), "write_file".to_string()]);
-
         // Both constrained ⇒ intersection (only read_file is in both).
-        let t = gw.tools_for("!ops:hs", "@admin:hs").unwrap();
-        assert_eq!(t, vec!["read_file".to_string()]);
+        assert_eq!(
+            sorted_tools(&gw, "!ops:hs", "@admin:hs"),
+            vec!["read_file".to_string()]
+        );
+        // Listed member, room absent from the room map ⇒ the member's own set.
+        assert_eq!(
+            sorted_tools(&gw, "!other:hs", "@admin:hs"),
+            vec!["read_file".to_string(), "write_file".to_string()]
+        );
+    }
+
+    #[test]
+    fn tool_policy_unlisted_member_with_nonempty_user_map_gets_no_tools() {
+        let gw = MatrixGateway::new("https://hs", "@bot:hs", "pw")
+            .with_room_tools([(
+                "!ops:hs".to_string(),
+                vec!["shell".to_string(), "read_file".to_string()],
+            )])
+            .with_user_tools([(
+                "@admin:hs".to_string(),
+                vec!["read_file".to_string(), "write_file".to_string()],
+            )]);
+
+        // The room would grant shell + read_file; the sender is not on the member map.
+        assert_eq!(gw.tools_for("!ops:hs", "@guest:hs"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn tool_policy_empty_user_map_keeps_room_set() {
+        let gw = MatrixGateway::new("https://hs", "@bot:hs", "pw").with_room_tools([(
+            "!ops:hs".to_string(),
+            vec!["shell".to_string(), "read_file".to_string()],
+        )]);
+
+        assert_eq!(
+            sorted_tools(&gw, "!ops:hs", "@guest:hs"),
+            vec!["read_file".to_string(), "shell".to_string()]
+        );
+        // No room entry and no member map ⇒ unconstrained.
+        assert!(gw.tools_for("!other:hs", "@guest:hs").is_none());
+    }
+
+    #[test]
+    fn tool_policy_unlisted_member_in_unmapped_room_gets_no_tools() {
+        let gw = MatrixGateway::new("https://hs", "@bot:hs", "pw")
+            .with_user_tools([("@admin:hs".to_string(), vec!["read_file".to_string()])]);
+
+        // No room policy, but the member map is non-empty and this sender is absent.
+        // `None` would advertise the full catalogue; the closed result is an empty allowlist.
+        assert_eq!(gw.tools_for("!other:hs", "@guest:hs"), Some(Vec::new()));
     }
 
     #[test]

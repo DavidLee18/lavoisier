@@ -149,9 +149,12 @@
 #                                                   # handed to the agent so a tool can act on it
 #                                                   # (env MATRIX_MEDIA_DIR / --matrix-media-dir win;
 #                                                   # unset = media messages ignored)
-# Per-room / per-member tool permissions (config-file only). A room/user absent from a map is
-# unconstrained; when both a room and a member policy apply, the effective set is their INTERSECTION
-# (a tool must be permitted by the room AND the member). Pair with matrix_allowed_rooms/_users for a
+# Per-room / per-member tool permissions (config-file only). A room absent from
+# matrix_room_tools is unconstrained. When matrix_user_tools is non-empty, a member absent
+# from it is granted no tools (fail closed), even in a room with no room entry. When that
+# map is empty or absent, only the room map applies. A listed member is intersected with the
+# room policy when both apply (a tool must be permitted by the room AND the member).
+# Scheduled jobs do not consult the member map. Pair with matrix_allowed_rooms/_users for a
 # deny-by-default perimeter.
 # [gateway.matrix_room_tools]
 # "!ops:hs"     = ["shell", "read_file", "write_file", "str_replace"]
