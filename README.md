@@ -164,10 +164,15 @@ plaintext and encrypted rooms:
   sender is allowed *and* the room is allowed — so an allowed user is answered only inside allowed rooms.
 - **Per-room / per-member tool permissions** — `[gateway.matrix_room_tools]` maps a room to the tools
   permitted there, and `[gateway.matrix_user_tools]` maps a member to the tools permitted to them
-  (config-file only; richer than env can express cleanly). A room/user absent from a map is
-  unconstrained; when both apply, the effective set is their **intersection** (a tool must be allowed
-  by the room *and* the member). Enforced in the agent core per turn, so a disallowed tool is neither
-  advertised to the model nor runnable. Pair with allowed-rooms/-users for a deny-by-default perimeter.
+  (config-file only; richer than env can express cleanly). A room absent from the room map is
+  unconstrained. When `matrix_user_tools` is non-empty, a sender absent from it is granted **no
+  tools** (fail closed) — nothing is advertised or callable, including in a room with no room entry.
+  When that map is empty or omitted, members stay unconstrained and only the room map applies. A
+  listed member's effective set is the **intersection** when the room is also listed (a tool must be
+  allowed by the room *and* the member), otherwise that member's own set. Enforced in the agent core
+  per turn, so a disallowed tool is neither advertised to the model nor runnable. Scheduled jobs do
+  not consult the member map: a tool job runs through the registry, and a prompt job has no sender.
+  Pair with allowed-rooms/-users for a deny-by-default perimeter.
 - **Home room** — `MATRIX_HOME_ROOM` (or `[gateway] matrix_home_room`) names one room that receives a
   friendly "going offline" notice when the gateway is stopped (SIGTERM / Ctrl-C); the process then exits
   cleanly. The notice is localised (Korean when `--lang`/`LANG` is `KO_KR`, English otherwise).
@@ -193,8 +198,9 @@ ANTHROPIC_API_KEY=… lav --serve-matrix --config lavoisier.toml
 
 ```toml
 # lavoisier.toml — per-room / per-member tool permissions (no env equivalent).
-# Absent from a map ⇒ unconstrained; when a room AND a member both apply, the effective
-# set is their INTERSECTION (a tool must be permitted by the room *and* the member).
+# A room absent from the room map is unconstrained. When matrix_user_tools is non-empty, a
+# sender it does not name gets no tools. When that map is empty or omitted, only the room
+# map applies. A listed member is the INTERSECTION of the two sets when both apply.
 [gateway.matrix_room_tools]
 "!ops:hs"     = ["shell", "read_file", "write_file", "str_replace"]
 "!general:hs" = ["read_file", "read_files", "outline_file"]   # read-only room

@@ -108,8 +108,12 @@ cleartext `sender`); empty ⇒ answer everyone.
 / `[gateway] matrix_allowed_rooms`) combines with the sender allowlist as a **conjunction** (a turn
 runs only if sender *and* room are allowed). **Per-room / per-member tool permissions**
 (`[gateway.matrix_room_tools]` / `[gateway.matrix_user_tools]`, config-file only) restrict which tools
-a turn may use; a room/user absent from a map is unconstrained, and when both apply the effective set
-is their **intersection**. The mechanism is a keystone change — a new
+a turn may use. A room absent from the room map is unconstrained. When `matrix_user_tools` is
+non-empty, a sender absent from it gets an empty allowlist (`Some(Vec::new())` from `tools_for` —
+nothing advertised or callable), including in a room with no room entry; when that map is empty or
+absent the old behaviour holds (room set, or unconstrained `None`). A listed member's effective set
+is the **intersection** when both maps apply, otherwise that member's own set. Scheduled jobs do not
+consult the member map (a tool job dispatches through the registry; a prompt job has no sender). The mechanism is a keystone change — a new
 `TurnRequest.allowed_tools: Option<Vec<String>>` enforced in the agent's `run_loop` (filters the
 advertised `tool_defs` *and* refuses a non-allowed `invoke`); the *policy* (`tools_for(room, sender)`)
 stays in the Matrix gateway. A **home room** (`MATRIX_HOME_ROOM` / `[gateway] matrix_home_room`) gets a
