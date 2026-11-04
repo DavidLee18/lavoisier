@@ -14,6 +14,10 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 - Gate G4 is `lav --matrix-probe` (send, then `/sync` read-back). Lattice
   `MATRIX_REGISTER` requires `MATRIX_REGISTRATION_TOKEN`
   (`m.login.registration_token`) and is refused without it.
+- `lav --matrix-probe` creates a room when `MATRIX_PROBE_ROOM` is unset or the send
+  is refused with `M_FORBIDDEN` / `not in room`, then reads that event back from
+  `/sync`. A room that accepts the send is not recreated (`createRoom` is not
+  idempotent). The image digest the lattice job runs is rolled separately.
 - The ECS spider42 path is unchanged when the lattice variables are unset.
 
 ## [0.18.11] — 2026-10-22

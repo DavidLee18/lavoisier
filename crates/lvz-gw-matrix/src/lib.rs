@@ -83,6 +83,43 @@ impl Language {
     }
 }
 
+/// Outcome of [`MatrixGateway::probe_send_sync`]: the event `/sync` read back, and the room it
+/// was sent into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeReceipt {
+    /// Homeserver event id confirmed present in a joined-room timeline.
+    pub event_id: String,
+    /// How the room was chosen.
+    pub room: ProbeRoom,
+}
+
+/// Room a G4 probe event was sent into.
+///
+/// `createRoom` on matrix-cs is not idempotent. A configured room that accepts the send is left
+/// alone. A new room is created only when no room was named, or when the send was refused with
+/// `M_FORBIDDEN` / `not in room`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeRoom {
+    /// The caller named this room and the homeserver accepted the send.
+    Configured {
+        /// Room id the caller passed in.
+        room_id: String,
+    },
+    /// No room was configured. `POST /createRoom` ran before the send.
+    Created {
+        /// Room id returned by `createRoom`.
+        room_id: String,
+    },
+    /// Send to `configured` returned `M_FORBIDDEN` / `not in room`. The probe created `room_id`
+    /// and sent there instead.
+    Replaced {
+        /// Room id that refused the send.
+        configured: String,
+        /// Room id returned by `createRoom`.
+        room_id: String,
+    },
+}
+
 /// A Matrix gateway bound to a homeserver and a bot account.
 pub struct MatrixGateway {
     homeserver: String,
@@ -628,18 +665,86 @@ impl MatrixGateway {
     /// Gate G4: log in, send one `m.text`, and `/sync` until that event id is in a joined
     /// timeline. The read-back includes the bot's own event (a normal turn would skip it).
     ///
+    /// `room_id` is the configured room (`MATRIX_PROBE_ROOM`). `None` or a blank id creates a
+    /// room first (`POST /_matrix/client/v3/createRoom`, empty body) and sends into that room.
+    /// A named room is tried first; only `M_FORBIDDEN` with error `not in room` falls through
+    /// to `createRoom`. Any other send failure is returned. `createRoom` is not idempotent and
+    /// is not retried: one successful send does not create a room, and a refusal creates at
+    /// most one new room. The new room id is logged (room ids only — no token or password).
+    ///
     /// Two sync rounds at most. The first is the baseline sync; the second uses `next_batch`
     /// if the send has not landed yet.
-    pub async fn probe_send_sync(&self, room_id: &str, body: &str) -> Result<String, GatewayError> {
+    pub async fn probe_send_sync(
+        &self,
+        room_id: Option<&str>,
+        body: &str,
+    ) -> Result<ProbeReceipt, GatewayError> {
         let session = self.resolve_session().await?;
-        let event_id = self
-            .send_message(&session.access_token, room_id, body)
-            .await?;
+        let token = session.access_token.as_str();
+        let configured = room_id.map(str::trim).filter(|id| !id.is_empty());
+
+        if let Some(room) = configured {
+            match self.send_message(token, room, body).await {
+                Ok(event_id) => {
+                    let event_id = self.read_back_probe_event(token, event_id).await?;
+                    return Ok(ProbeReceipt {
+                        event_id,
+                        room: ProbeRoom::Configured {
+                            room_id: room.to_string(),
+                        },
+                    });
+                }
+                Err(e) if is_not_in_room(&e) => {
+                    let created = self.create_room(token).await?;
+                    info!(
+                        configured_room = room,
+                        room_id = %created,
+                        "probe send refused with M_FORBIDDEN not in room; created a new room"
+                    );
+                    let event_id = self.send_and_read_back(token, &created, body).await?;
+                    return Ok(ProbeReceipt {
+                        event_id,
+                        room: ProbeRoom::Replaced {
+                            configured: room.to_string(),
+                            room_id: created,
+                        },
+                    });
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let created = self.create_room(token).await?;
+        info!(
+            room_id = %created,
+            "MATRIX_PROBE_ROOM unset; created a room for the probe"
+        );
+        let event_id = self.send_and_read_back(token, &created, body).await?;
+        Ok(ProbeReceipt {
+            event_id,
+            room: ProbeRoom::Created { room_id: created },
+        })
+    }
+
+    async fn send_and_read_back(
+        &self,
+        token: &str,
+        room_id: &str,
+        body: &str,
+    ) -> Result<String, GatewayError> {
+        let event_id = self.send_message(token, room_id, body).await?;
+        self.read_back_probe_event(token, event_id).await
+    }
+
+    /// `/sync` until `event_id` appears in some joined timeline, at most twice.
+    async fn read_back_probe_event(
+        &self,
+        token: &str,
+        event_id: String,
+    ) -> Result<String, GatewayError> {
         let mut since: Option<String> = None;
         for _ in 0..2 {
-            let raw = self
-                .sync_once(&session.access_token, since.as_deref())
-                .await?;
+            let raw = self.sync_once(token, since.as_deref()).await?;
             if sync_has_event(&raw, &event_id) {
                 return Ok(event_id);
             }
@@ -654,6 +759,38 @@ impl MatrixGateway {
         Err(GatewayError::Protocol(format!(
             "probe did not read back {event_id}"
         )))
+    }
+
+    /// `POST /_matrix/client/v3/createRoom` with an empty body. The creator is joined by the
+    /// homeserver as part of creation, which is what matrix-cs requires (it has no invite or
+    /// join route for the probe user to enter someone else's room). Not retried: a lost
+    /// response may already have created a room, and a second call would create another.
+    async fn create_room(&self, token: &str) -> Result<String, GatewayError> {
+        self.ensure_client().await?;
+        let resp = self
+            .call(reqwest::Method::POST, "/_matrix/client/v3/createRoom")?
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::Io(format!(
+                "matrix createRoom {status}: {msg}"
+            )));
+        }
+        let parsed: CreateRoomResponse = resp
+            .json()
+            .await
+            .map_err(|e| GatewayError::Protocol(format!("matrix createRoom body: {e}")))?;
+        if parsed.room_id.is_empty() {
+            return Err(GatewayError::Protocol(
+                "matrix createRoom missing room_id".into(),
+            ));
+        }
+        Ok(parsed.room_id)
     }
 
     /// Resolve the session to serve under, following the documented precedence: explicit access
@@ -2537,6 +2674,42 @@ fn interpret_register(resp: RegisterHttp) -> Result<Option<Session>, GatewayErro
 /// Classify a non-success HTTP status from the startup auth calls into a [`GatewayError`]:
 /// server errors (5xx) and `429 Too Many Requests` are *transient* (`Io` ⇒ retried with backoff);
 /// everything else (4xx — bad/expired token, wrong password) is fatal (`Bind` ⇒ surfaced).
+fn classify_status(status: reqwest::StatusCode, msg: String) -> GatewayError {
+    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        GatewayError::Io(msg)
+    } else {
+        GatewayError::Bind(msg)
+    }
+}
+
+/// True when `err` is a send refused with `M_FORBIDDEN` and an error text of `not in room`.
+/// Other 403s (power level, different errcode) do not qualify: those must not create a room.
+fn is_not_in_room(err: &GatewayError) -> bool {
+    let GatewayError::Io(msg) = err else {
+        return false;
+    };
+    is_not_in_room_send(msg)
+}
+
+fn is_not_in_room_send(msg: &str) -> bool {
+    // Only a send failure. A createRoom 403 with the same JSON must not look like one.
+    let Some(rest) = msg.strip_prefix("matrix send ") else {
+        return false;
+    };
+    let Some(json_at) = rest.find('{') else {
+        return false;
+    };
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&rest[json_at..]) else {
+        return false;
+    };
+    let errcode = body.get("errcode").and_then(serde_json::Value::as_str);
+    let error = body
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    errcode == Some("M_FORBIDDEN") && error.to_ascii_lowercase().contains("not in room")
+}
+
 fn sync_has_event(sync: &serde_json::Value, event_id: &str) -> bool {
     let Some(rooms) = sync
         .get("rooms")
@@ -2555,14 +2728,6 @@ fn sync_has_event(sync: &serde_json::Value, event_id: &str) -> bool {
                 })
             })
     })
-}
-
-fn classify_status(status: reqwest::StatusCode, msg: String) -> GatewayError {
-    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        GatewayError::Io(msg)
-    } else {
-        GatewayError::Bind(msg)
-    }
 }
 
 /// Seed value for the per-process transaction counter: nanoseconds since the Unix epoch, so a
@@ -2603,6 +2768,12 @@ struct LoginResponse {
 #[derive(Deserialize)]
 struct SendResponse {
     event_id: String,
+}
+
+/// `POST /createRoom` response.
+#[derive(Deserialize)]
+struct CreateRoomResponse {
+    room_id: String,
 }
 
 /// `POST /_matrix/media/v3/upload` response.
@@ -2734,6 +2905,7 @@ mod tests {
     }
 
     struct Hit {
+        method: String,
         host: String,
         path: String,
         body: String,
@@ -2785,6 +2957,8 @@ mod tests {
         let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
         let mut lines = head.split("\r\n");
         let req = lines.next()?.to_string();
+        let mut req_parts = req.split_whitespace();
+        let method = req_parts.next()?.to_string();
         let mut host = String::new();
         let mut content_len = 0usize;
         for line in lines {
@@ -2807,12 +2981,29 @@ mod tests {
             body.extend_from_slice(&tmp[..n]);
         }
         body.truncate(content_len);
-        let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+        let path = req_parts.next().unwrap_or("").to_string();
         Some(Hit {
+            method,
             host,
             path,
             body: String::from_utf8_lossy(&body).to_string(),
         })
+    }
+
+    fn hit_kind(path: &str) -> &'static str {
+        if path.contains("/login") {
+            "login"
+        } else if path.contains("/register") {
+            "register"
+        } else if path.contains("/createRoom") {
+            "create"
+        } else if path.contains("/send/") {
+            "send"
+        } else if path.contains("/sync") {
+            "sync"
+        } else {
+            "other"
+        }
     }
 
     fn lattice_client(addr: std::net::SocketAddr) -> reqwest::Client {
@@ -2842,6 +3033,7 @@ mod tests {
         let seen = hits.clone();
         let addr = spawn_matrix(move |hit| {
             seen.lock().unwrap().push(Hit {
+                method: hit.method.clone(),
                 host: hit.host.clone(),
                 path: hit.path.clone(),
                 body: hit.body.clone(),
@@ -2866,18 +3058,19 @@ mod tests {
         gw.install_client(lattice_client(addr));
         let event = tokio::time::timeout(
             Duration::from_secs(3),
-            gw.probe_send_sync("!room:davidlee18.dev", "g4"),
+            gw.probe_send_sync(Some("!room:davidlee18.dev"), "g4"),
         )
         .await
         .expect("probe timed out")
         .expect("probe");
-        assert_eq!(event, "$g4");
+        assert_eq!(event.event_id, "$g4");
+        assert!(matches!(
+            event.room,
+            ProbeRoom::Configured { ref room_id } if room_id == "!room:davidlee18.dev"
+        ));
         let hits = hits.lock().unwrap();
-        assert!(
-            hits.len() >= 3,
-            "expected login, send, sync; got {}",
-            hits.len()
-        );
+        let kinds: Vec<_> = hits.iter().map(|h| hit_kind(&h.path)).collect();
+        assert_eq!(kinds, ["login", "send", "sync"]);
         for hit in hits.iter() {
             assert_eq!(hit.host, LATTICE_HTTP_HOST, "path {}", hit.path);
             assert!(
@@ -2889,6 +3082,301 @@ mod tests {
         let login = hits.iter().find(|h| h.path.contains("/login")).unwrap();
         assert!(login.body.contains("LAVOISIER_LATTICE"), "{}", login.body);
         assert!(login.body.contains("@lav:davidlee18.dev"), "{}", login.body);
+    }
+
+    fn login_ok() -> (u16, String) {
+        (
+            200,
+            r#"{"access_token":"tok","user_id":"@lav:davidlee18.dev","device_id":"LAVOISIER_LATTICE"}"#
+                .into(),
+        )
+    }
+
+    fn sync_with(event_id: &str) -> String {
+        format!(
+            r#"{{"next_batch":"s1","rooms":{{"join":{{"!ignored:davidlee18.dev":{{"timeline":{{"events":[{{"event_id":"{event_id}"}}]}}}}}}}}}}"#
+        )
+    }
+
+    /// `MATRIX_PROBE_ROOM` unset (and blank) creates a room before the send, then reads the
+    /// event id back from `/sync`. `createRoom` is not called when a configured room accepts
+    /// the send — see [`lattice_probe_dials_with_wasmcloud_host_and_reads_back`].
+    #[tokio::test]
+    async fn lattice_probe_creates_room_when_unset_then_reads_sync() {
+        for configured in [None, Some(""), Some("   ")] {
+            let hits = Arc::new(Mutex::new(Vec::<Hit>::new()));
+            let seen = hits.clone();
+            let syncs = Arc::new(Mutex::new(0u32));
+            let syncs_hit = syncs.clone();
+            let addr = spawn_matrix(move |hit| {
+                seen.lock().unwrap().push(Hit {
+                    method: hit.method.clone(),
+                    host: hit.host.clone(),
+                    path: hit.path.clone(),
+                    body: hit.body.clone(),
+                });
+                if hit.path.contains("/login") {
+                    login_ok()
+                } else if hit.path.contains("/createRoom") {
+                    (200, r#"{"room_id":"!made:davidlee18.dev"}"#.into())
+                } else if hit.path.contains("/send/") {
+                    (200, r#"{"event_id":"$made"}"#.into())
+                } else if hit.path.contains("/sync") {
+                    let n = {
+                        let mut n = syncs_hit.lock().unwrap();
+                        *n += 1;
+                        *n
+                    };
+                    if n == 1 {
+                        (200, r#"{"next_batch":"s0","rooms":{"join":{}}}"#.into())
+                    } else {
+                        (200, sync_with("$made"))
+                    }
+                } else {
+                    (404, r#"{"errcode":"M_UNRECOGNIZED"}"#.into())
+                }
+            });
+            let gw = lattice_gw("@lav:davidlee18.dev").with_connect_port(addr.port());
+            gw.install_client(lattice_client(addr));
+            let event = tokio::time::timeout(
+                Duration::from_secs(3),
+                gw.probe_send_sync(configured, "probe-body"),
+            )
+            .await
+            .expect("probe timed out")
+            .unwrap_or_else(|e| panic!("configured {configured:?}: {e}"));
+            assert_eq!(event.event_id, "$made");
+            assert!(
+                matches!(event.room, ProbeRoom::Created { ref room_id } if room_id == "!made:davidlee18.dev"),
+                "{configured:?} => {:?}",
+                event.room
+            );
+            let hits = hits.lock().unwrap();
+            let kinds: Vec<_> = hits.iter().map(|h| hit_kind(&h.path)).collect();
+            assert_eq!(
+                kinds,
+                ["login", "create", "send", "sync", "sync"],
+                "{configured:?}"
+            );
+            let create = hits.iter().find(|h| hit_kind(&h.path) == "create").unwrap();
+            assert_eq!(create.method, "POST");
+            assert_eq!(create.body, "{}");
+            assert!(
+                !create.body.contains("pw"),
+                "createRoom body must not carry the password"
+            );
+            assert!(
+                !create.body.contains("tok"),
+                "createRoom body must not carry the token"
+            );
+            let send = hits.iter().find(|h| hit_kind(&h.path) == "send").unwrap();
+            assert_eq!(send.method, "PUT");
+            assert!(
+                send.path.contains("%21made%3Adavidlee18.dev"),
+                "send must target the created room, path {}",
+                send.path
+            );
+            assert!(send.body.contains("probe-body"), "{}", send.body);
+            assert_eq!(
+                *syncs.lock().unwrap(),
+                2,
+                "event must be confirmed on a later sync"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lattice_probe_creates_room_when_send_is_not_in_room() {
+        let hits = Arc::new(Mutex::new(Vec::<Hit>::new()));
+        let seen = hits.clone();
+        let addr = spawn_matrix(move |hit| {
+            seen.lock().unwrap().push(Hit {
+                method: hit.method.clone(),
+                host: hit.host.clone(),
+                path: hit.path.clone(),
+                body: hit.body.clone(),
+            });
+            if hit.path.contains("/login") {
+                login_ok()
+            } else if hit.path.contains("/createRoom") {
+                (200, r#"{"room_id":"!new:davidlee18.dev"}"#.into())
+            } else if hit.path.contains("/send/") && hit.path.contains("%21new%3A") {
+                (200, r#"{"event_id":"$replaced"}"#.into())
+            } else if hit.path.contains("/send/") {
+                (
+                    403,
+                    r#"{"errcode":"M_FORBIDDEN","error":"not in room"}"#.into(),
+                )
+            } else if hit.path.contains("/sync") {
+                (200, sync_with("$replaced"))
+            } else {
+                (404, r#"{"errcode":"M_UNRECOGNIZED"}"#.into())
+            }
+        });
+        let gw = lattice_gw("@lav:davidlee18.dev").with_connect_port(addr.port());
+        gw.install_client(lattice_client(addr));
+        let event = tokio::time::timeout(
+            Duration::from_secs(3),
+            gw.probe_send_sync(Some("!old:davidlee18.dev"), "again"),
+        )
+        .await
+        .expect("probe timed out")
+        .expect("probe");
+        assert_eq!(event.event_id, "$replaced");
+        assert!(matches!(
+            event.room,
+            ProbeRoom::Replaced { ref configured, ref room_id }
+                if configured == "!old:davidlee18.dev" && room_id == "!new:davidlee18.dev"
+        ));
+        let hits = hits.lock().unwrap();
+        let kinds: Vec<_> = hits.iter().map(|h| hit_kind(&h.path)).collect();
+        assert_eq!(kinds, ["login", "send", "create", "send", "sync"]);
+        let create = hits.iter().find(|h| hit_kind(&h.path) == "create").unwrap();
+        assert_eq!(create.method, "POST");
+        assert_eq!(create.body, "{}");
+        let sends: Vec<_> = hits
+            .iter()
+            .filter(|h| hit_kind(&h.path) == "send")
+            .collect();
+        assert_eq!(sends.len(), 2);
+        assert!(sends[0].path.contains("%21old%3A"), "{}", sends[0].path);
+        assert!(sends[1].path.contains("%21new%3A"), "{}", sends[1].path);
+        assert!(sends[1].body.contains("again"), "{}", sends[1].body);
+    }
+
+    #[tokio::test]
+    async fn lattice_probe_does_not_create_room_on_other_forbidden() {
+        let hits = Arc::new(Mutex::new(Vec::<Hit>::new()));
+        let seen = hits.clone();
+        let addr = spawn_matrix(move |hit| {
+            seen.lock().unwrap().push(Hit {
+                method: hit.method.clone(),
+                host: hit.host.clone(),
+                path: hit.path.clone(),
+                body: hit.body.clone(),
+            });
+            if hit.path.contains("/login") {
+                login_ok()
+            } else if hit.path.contains("/createRoom") {
+                (200, r#"{"room_id":"!should-not:davidlee18.dev"}"#.into())
+            } else if hit.path.contains("/send/") {
+                (
+                    403,
+                    r#"{"errcode":"M_FORBIDDEN","error":"You cannot post"}"#.into(),
+                )
+            } else {
+                (200, sync_with("$nope"))
+            }
+        });
+        let gw = lattice_gw("@lav:davidlee18.dev").with_connect_port(addr.port());
+        gw.install_client(lattice_client(addr));
+        let err = tokio::time::timeout(
+            Duration::from_secs(3),
+            gw.probe_send_sync(Some("!old:davidlee18.dev"), "x"),
+        )
+        .await
+        .expect("timed out")
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("M_FORBIDDEN"), "{err}");
+        assert!(err.contains("You cannot post"), "{err}");
+        let hits = hits.lock().unwrap();
+        let kinds: Vec<_> = hits.iter().map(|h| hit_kind(&h.path)).collect();
+        assert_eq!(kinds, ["login", "send"]);
+    }
+
+    #[tokio::test]
+    async fn lattice_probe_create_room_failure_is_surfaced() {
+        let hits = Arc::new(Mutex::new(Vec::<Hit>::new()));
+        let seen = hits.clone();
+        let addr = spawn_matrix(move |hit| {
+            seen.lock().unwrap().push(Hit {
+                method: hit.method.clone(),
+                host: hit.host.clone(),
+                path: hit.path.clone(),
+                body: hit.body.clone(),
+            });
+            if hit.path.contains("/login") {
+                login_ok()
+            } else if hit.path.contains("/createRoom") {
+                (500, r#"{"errcode":"M_UNKNOWN","error":"nope"}"#.into())
+            } else if hit.path.contains("/send/") {
+                (200, r#"{"event_id":"$no"}"#.into())
+            } else {
+                (200, sync_with("$no"))
+            }
+        });
+        let gw = lattice_gw("@lav:davidlee18.dev").with_connect_port(addr.port());
+        gw.install_client(lattice_client(addr));
+        let err = tokio::time::timeout(Duration::from_secs(3), gw.probe_send_sync(None, "x"))
+            .await
+            .expect("timed out")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("createRoom"), "{err}");
+        let hits = hits.lock().unwrap();
+        let kinds: Vec<_> = hits.iter().map(|h| hit_kind(&h.path)).collect();
+        assert_eq!(kinds, ["login", "create"]);
+    }
+
+    #[tokio::test]
+    async fn lattice_probe_missing_sync_event_is_an_error_after_create() {
+        let hits = Arc::new(Mutex::new(Vec::<Hit>::new()));
+        let seen = hits.clone();
+        let addr = spawn_matrix(move |hit| {
+            seen.lock().unwrap().push(Hit {
+                method: hit.method.clone(),
+                host: hit.host.clone(),
+                path: hit.path.clone(),
+                body: hit.body.clone(),
+            });
+            if hit.path.contains("/login") {
+                login_ok()
+            } else if hit.path.contains("/createRoom") {
+                (200, r#"{"room_id":"!made:davidlee18.dev"}"#.into())
+            } else if hit.path.contains("/send/") {
+                (200, r#"{"event_id":"$miss"}"#.into())
+            } else if hit.path.contains("/sync") {
+                (200, r#"{"next_batch":"s","rooms":{"join":{}}}"#.into())
+            } else {
+                (404, r#"{"errcode":"M_UNRECOGNIZED"}"#.into())
+            }
+        });
+        let gw = lattice_gw("@lav:davidlee18.dev").with_connect_port(addr.port());
+        gw.install_client(lattice_client(addr));
+        let err = tokio::time::timeout(Duration::from_secs(3), gw.probe_send_sync(None, "x"))
+            .await
+            .expect("timed out")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("probe did not read back"), "{err}");
+        assert!(err.contains("$miss"), "{err}");
+        let hits = hits.lock().unwrap();
+        let syncs = hits.iter().filter(|h| hit_kind(&h.path) == "sync").count();
+        assert_eq!(syncs, 2);
+    }
+
+    #[test]
+    fn not_in_room_matches_forbidden_send_only() {
+        let forbidden =
+            r#"matrix send 403 Forbidden: {"errcode":"M_FORBIDDEN","error":"not in room"}"#;
+        assert!(is_not_in_room_send(forbidden));
+        assert!(is_not_in_room(&GatewayError::Io(forbidden.into())));
+        assert!(is_not_in_room_send(
+            r#"matrix send 403 Forbidden: {"errcode":"M_FORBIDDEN","error":"Not In Room"}"#
+        ));
+        assert!(!is_not_in_room_send(
+            r#"matrix send 403 Forbidden: {"errcode":"M_FORBIDDEN","error":"You cannot post"}"#
+        ));
+        assert!(!is_not_in_room_send(
+            r#"matrix send 400 Bad Request: {"errcode":"M_UNKNOWN","error":"not in room"}"#
+        ));
+        assert!(!is_not_in_room_send(
+            r#"matrix createRoom 403 Forbidden: {"errcode":"M_FORBIDDEN","error":"not in room"}"#
+        ));
+        assert!(!is_not_in_room(&GatewayError::Protocol(
+            "not in room".into()
+        )));
     }
 
     #[tokio::test]
@@ -2922,12 +3410,13 @@ mod tests {
         gw.install_client(lattice_client(addr));
         let event = tokio::time::timeout(
             Duration::from_secs(3),
-            gw.probe_send_sync("!r:davidlee18.dev", "again"),
+            gw.probe_send_sync(Some("!r:davidlee18.dev"), "again"),
         )
         .await
         .expect("probe timed out")
         .unwrap();
-        assert_eq!(event, "$back");
+        assert_eq!(event.event_id, "$back");
+        assert!(matches!(event.room, ProbeRoom::Configured { .. }));
         let hits = hits.lock().unwrap();
         let register = hits
             .iter()
@@ -2966,7 +3455,7 @@ mod tests {
         gw.install_client(lattice_client(addr));
         let err = tokio::time::timeout(
             Duration::from_secs(3),
-            gw.probe_send_sync("!r:davidlee18.dev", "x"),
+            gw.probe_send_sync(Some("!r:davidlee18.dev"), "x"),
         )
         .await
         .expect("timed out")
