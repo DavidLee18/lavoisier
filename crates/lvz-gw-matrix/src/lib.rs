@@ -2750,10 +2750,7 @@ mod tests {
                 let Ok(mut sock) = conn else { break };
                 let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
                 let handler = handler.clone();
-                loop {
-                    let Some(hit) = read_http(&mut sock) else {
-                        break;
-                    };
+                while let Some(hit) = read_http(&mut sock) {
                     let (code, body) = handler(&hit);
                     let reason = if code == 200 { "OK" } else { "ERR" };
                     let resp = format!(

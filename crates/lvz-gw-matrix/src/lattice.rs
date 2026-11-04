@@ -131,7 +131,7 @@ impl DialContract {
             ));
         }
         if let Some(dir) = &self.state_dir {
-            if dir.contains(ECS_EFS_VOLUME_ID) {
+            if state_dir_uses_ecs_efs(Path::new(dir)) {
                 return Err(GatewayError::Bind(format!(
                     "lattice MATRIX_STATE_DIR must not use ECS volume {ECS_EFS_VOLUME_ID}"
                 )));
