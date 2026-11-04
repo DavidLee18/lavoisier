@@ -1,9 +1,10 @@
 //! `lvz-gw-matrix` — a Matrix gateway (§7.2): a chat-driven frontend for the
 //! shared agent on your homeserver (e.g. Continuwuity).
 //!
-//! Deliberately a **thin** client over the Matrix client-server REST API (`reqwest` + JSON),
+//! Deliberately a small client over the Matrix client-server REST API (`reqwest` + JSON),
 //! not the heavyweight `matrix-sdk` — mirroring the hand-rolled provider adapters and the
-//! project's minimal-dependency convention. It logs in with a password, long-polls `/sync`,
+//! project's minimal-dependency convention. The lattice Phase 4 Port is this same client
+//! pointed at `matrix-cs` (see `lattice`). It logs in with a password, long-polls `/sync`,
 //! and for each inbound `m.room.message` (`m.text`) from another user runs an agent turn
 //! (session = room id, so `lvz-memory` keeps per-room continuity) and posts the answer back.
 //!
@@ -31,7 +32,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -44,7 +45,12 @@ use tracing::{error, info, warn};
 
 #[cfg(feature = "e2ee")]
 mod e2ee;
+mod lattice;
 mod media;
+
+pub use lattice::{
+    DialContract, ECS_EFS_VOLUME_ID, LATTICE_HOMESERVER, LATTICE_HTTP_HOST, LATTICE_SERVER_NAME,
+};
 
 /// Long-poll window for `/sync` (ms). The server holds the request open until an event
 /// arrives or this elapses.
@@ -80,6 +86,15 @@ impl Language {
 /// A Matrix gateway bound to a homeserver and a bot account.
 pub struct MatrixGateway {
     homeserver: String,
+    /// HTTP `Host` when it must differ from [`Self::homeserver`]'s authority. Lattice:
+    /// [`LATTICE_HTTP_HOST`]. `None` leaves the header to the URL (the ECS path).
+    http_host: Option<String>,
+    /// When set, a resolved MXID must be on this server. Lattice: [`LATTICE_SERVER_NAME`].
+    server_name: Option<String>,
+    /// Opt-in `POST /register` before password login. Off by default.
+    register: bool,
+    /// `m.login.registration_token` secret. Env `MATRIX_REGISTRATION_TOKEN` only.
+    registration_token: Option<String>,
     user: String,
     /// Password for the `m.login.password` fallback. `None` when authenticating by access token.
     password: Option<String>,
@@ -103,7 +118,12 @@ pub struct MatrixGateway {
     /// the rooms it exists to serve. A wrong `MATRIX_CRYPTO_STORE_KEY`, a store at the wrong path
     /// or a corrupt database all land in that one degrade arm.
     require_e2ee: bool,
-    http: reqwest::Client,
+    /// Built on first use. A lattice `http_host` resolves the dial host and pins `Host`.
+    http_client: OnceLock<reqwest::Client>,
+    /// Test-only URL port so a listener on a high port can stand in for `:80`.
+    /// Production dials the URL port (80 on the lattice plane).
+    #[cfg(test)]
+    connect_port: Option<u16>,
     txn: AtomicU64,
     /// Auto-accept room invites for the bot account (on by default).
     auto_join: bool,
@@ -147,6 +167,10 @@ impl MatrixGateway {
     fn base(homeserver: impl Into<String>, user: impl Into<String>) -> Self {
         Self {
             homeserver: homeserver.into().trim_end_matches('/').to_string(),
+            http_host: None,
+            server_name: None,
+            register: false,
+            registration_token: None,
             user: user.into(),
             password: None,
             access_token: None,
@@ -154,7 +178,9 @@ impl MatrixGateway {
             state_dir: None,
             crypto_passphrase: None,
             require_e2ee: false,
-            http: reqwest::Client::new(),
+            http_client: OnceLock::new(),
+            #[cfg(test)]
+            connect_port: None,
             // Seed the transaction counter from the process-start time (nanos since the epoch) so
             // txn ids never reset to a value used by a prior run. Matrix dedupes sends by
             // (device, txn id); a counter that restarted at 0 each boot could collide with an
@@ -205,6 +231,43 @@ impl MatrixGateway {
     /// restarts.
     pub fn with_device_id(mut self, device_id: impl Into<String>) -> Self {
         self.device_id = Some(device_id.into());
+        self
+    }
+
+    /// Send this `Host` header instead of the homeserver URL's authority.
+    ///
+    /// Lattice sets [`LATTICE_HTTP_HOST`] while [`MATRIX_HOMESERVER`](Self::from_env) stays the
+    /// ClusterIP dial URL. The client resolves that dial host and requests the `Host` name.
+    pub fn with_http_host(mut self, host: impl Into<String>) -> Self {
+        self.http_host = Some(host.into());
+        self
+    }
+
+    /// Require the logged-in MXID to be `@localpart:<server_name>`.
+    pub fn with_server_name(mut self, server_name: impl Into<String>) -> Self {
+        self.server_name = Some(server_name.into());
+        self
+    }
+
+    /// Try `POST /_matrix/client/v3/register` before password login.
+    ///
+    /// `M_USER_IN_USE` falls through to login, so a scripted boot is idempotent. Off unless
+    /// `MATRIX_REGISTER` / `[gateway] matrix_register` says so. An access token still wins and
+    /// skips registration.
+    pub fn with_register(mut self, register: bool) -> Self {
+        self.register = register;
+        self
+    }
+
+    /// Registration-token auth (`m.login.registration_token`) for [`Self::with_register`].
+    pub fn with_registration_token(mut self, token: impl Into<String>) -> Self {
+        self.registration_token = Some(token.into());
+        self
+    }
+
+    /// Replace the login user (localpart or MXID).
+    pub fn with_user(mut self, user: impl Into<String>) -> Self {
+        self.user = user.into();
         self
     }
 
@@ -354,14 +417,39 @@ impl MatrixGateway {
     /// `MATRIX_DEVICE_ID`, `MATRIX_STATE_DIR`, `MATRIX_CRYPTO_STORE_KEY`,
     /// `MATRIX_ALLOWED_USERS`, `MATRIX_ALLOWED_ROOMS` (comma-separated), `MATRIX_HOME_ROOM`,
     /// `MATRIX_MEDIA_DIR` (enables downloading inbound images/files for tool use).
+    /// Lattice Port (optional, off unless set): `MATRIX_HTTP_HOST`, `MATRIX_SERVER_NAME`,
+    /// `MATRIX_REGISTER`, `MATRIX_REGISTRATION_TOKEN`. See [`DialContract`].
     /// Per-room/per-member tool permissions are richer than env can cleanly express and are set
     /// only via the TOML config (`with_room_tools`/`with_user_tools`).
     pub fn from_env() -> Result<Self, GatewayError> {
-        let require =
-            |k: &str| std::env::var(k).map_err(|_| GatewayError::Bind(format!("{k} is not set")));
+        let homeserver = std::env::var("MATRIX_HOMESERVER")
+            .map_err(|_| GatewayError::Bind("MATRIX_HOMESERVER is not set".into()))?;
+        let gw = Self::from_env_with_homeserver(homeserver)?;
+        gw.ensure_login_user()?;
+        Ok(gw)
+    }
+
+    /// Password login needs a user. Access-token auth does not. Called after the config file
+    /// has had a chance to supply `matrix_user`.
+    pub fn ensure_login_user(&self) -> Result<(), GatewayError> {
+        if self.access_token.is_none() && self.user.is_empty() {
+            return Err(GatewayError::Bind(
+                "MATRIX_USER is required for password login".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// [`Self::from_env`], with the homeserver URL supplied by the caller.
+    ///
+    /// The CLI uses this so `[gateway] matrix_homeserver` can fill in when
+    /// `MATRIX_HOMESERVER` is unset. Every other `MATRIX_*` variable is still read from the
+    /// environment. Lattice completeness is checked by [`Self::revalidate_lattice`] after the
+    /// config file overlays, not here.
+    pub fn from_env_with_homeserver(homeserver: impl Into<String>) -> Result<Self, GatewayError> {
         let opt = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
 
-        let homeserver = require("MATRIX_HOMESERVER")?;
+        let homeserver = homeserver.into();
         let access_token = opt("MATRIX_ACCESS_TOKEN");
         let password = opt("MATRIX_PASSWORD");
         let user = opt("MATRIX_USER").unwrap_or_default();
@@ -371,17 +459,24 @@ impl MatrixGateway {
                 "set MATRIX_ACCESS_TOKEN, or MATRIX_USER + MATRIX_PASSWORD".into(),
             ));
         }
-        if access_token.is_none() && user.is_empty() {
-            return Err(GatewayError::Bind(
-                "MATRIX_USER is required for password login".into(),
-            ));
-        }
 
         let mut gw = Self::base(homeserver, user);
         gw.access_token = access_token;
         gw.password = password;
         gw.device_id = opt("MATRIX_DEVICE_ID");
         gw.state_dir = opt("MATRIX_STATE_DIR").map(PathBuf::from);
+        if let Some(host) = opt("MATRIX_HTTP_HOST") {
+            lattice::check_http_host(&host)?;
+            gw.http_host = Some(host);
+        }
+        if let Some(name) = opt("MATRIX_SERVER_NAME") {
+            lattice::check_server_name(&name)?;
+            gw.server_name = Some(name);
+        }
+        if let Some(flag) = opt("MATRIX_REGISTER") {
+            gw.register = lattice::parse_register_flag(&flag)?.unwrap_or(false);
+        }
+        gw.registration_token = opt("MATRIX_REGISTRATION_TOKEN");
         gw.crypto_passphrase = opt("MATRIX_CRYPTO_STORE_KEY");
         gw.media_dir = opt("MATRIX_MEDIA_DIR").map(PathBuf::from);
         if let Some(users) = opt("MATRIX_ALLOWED_USERS") {
@@ -396,28 +491,179 @@ impl MatrixGateway {
         Ok(gw)
     }
 
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", self.homeserver, path)
+    /// Lattice completeness, after env and the config file have both been applied.
+    ///
+    /// A deployment that sets none of the lattice markers skips the check, so the ECS
+    /// spider42 path is unchanged. Any one marker requires the full pin.
+    pub fn revalidate_lattice(&self) -> Result<(), GatewayError> {
+        self.dial_contract().validate()
+    }
+
+    fn dial_contract(&self) -> lattice::DialContract {
+        lattice::DialContract {
+            homeserver: self.homeserver.clone(),
+            http_host: self.http_host.clone(),
+            server_name: self.server_name.clone(),
+            user: self.user.clone(),
+            device_id: self.device_id.clone(),
+            state_dir: self.state_dir.as_ref().map(|p| p.display().to_string()),
+            has_access_token: self.access_token.is_some(),
+            has_password: self.password.is_some(),
+        }
+    }
+
+    fn enforce_server_name(&self, user_id: &str) -> Result<(), GatewayError> {
+        if let Some(name) = &self.server_name {
+            lattice::user_on_server(user_id, name)?;
+        }
+        Ok(())
+    }
+
+    /// Base URL for client-server requests. Lattice rewrites the authority to [`Self::http_host`]
+    /// so the `Host` header is the wasmCloud host, while [`Self::homeserver`] stays the dial URL
+    /// recorded in `session.json`.
+    fn request_base(&self) -> Result<String, GatewayError> {
+        let base = lattice::request_base(&self.homeserver, self.http_host.as_deref())?;
+        #[cfg(test)]
+        if let Some(port) = self.connect_port {
+            let Some((scheme, rest)) = base.split_once("://") else {
+                return Ok(base);
+            };
+            let host = rest.split_once('/').map(|(h, _)| h).unwrap_or(rest);
+            let host = host.split_once(':').map(|(h, _)| h).unwrap_or(host);
+            return Ok(format!("{scheme}://{host}:{port}"));
+        }
+        Ok(base)
+    }
+
+    /// Point request URLs at a test listener. The `Host` header stays [`Self::http_host`].
+    #[cfg(test)]
+    fn with_connect_port(mut self, port: u16) -> Self {
+        self.connect_port = Some(port);
+        self
+    }
+
+    fn url(&self, path: &str) -> Result<String, GatewayError> {
+        Ok(format!("{}{path}", self.request_base()?))
+    }
+
+    async fn ensure_client(&self) -> Result<(), GatewayError> {
+        if self.http_client.get().is_some() {
+            return Ok(());
+        }
+        let client = self.build_client().await?;
+        let _ = self.http_client.set(client);
+        Ok(())
+    }
+
+    fn http(&self) -> Result<&reqwest::Client, GatewayError> {
+        self.http_client
+            .get()
+            .ok_or_else(|| GatewayError::Io("matrix http client used before it was built".into()))
+    }
+
+    /// Build a request. [`Self::ensure_client`] must have finished; the builder borrows the
+    /// stored client, which an `async` fn cannot return across an `.await`.
+    fn call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> Result<reqwest::RequestBuilder<'_>, GatewayError> {
+        let url = self.url(path)?;
+        let mut req = self.http()?.request(method, url);
+        if let Some(host) = &self.http_host {
+            req = req.header(reqwest::header::HOST, host.as_str());
+        }
+        Ok(req)
+    }
+
+    async fn build_client(&self) -> Result<reqwest::Client, GatewayError> {
+        let Some(host) = self.http_host.clone() else {
+            return Ok(reqwest::Client::new());
+        };
+        let (dial_host, dial_port) = lattice::dial_host_port(&self.homeserver)?;
+        // `std` DNS, off the runtime. The workspace tokio features do not include `net`,
+        // and a lattice boot resolves one name.
+        let lookup_name = dial_host.clone();
+        let addrs = tokio::task::spawn_blocking(move || {
+            use std::net::ToSocketAddrs;
+            (lookup_name.as_str(), dial_port)
+                .to_socket_addrs()
+                .map(|iter| iter.collect::<Vec<_>>())
+        })
+        .await
+        .map_err(|e| GatewayError::Io(format!("resolving {dial_host}: {e}")))?
+        .map_err(|e| GatewayError::Io(format!("resolving {dial_host}: {e}")))?;
+        if addrs.is_empty() {
+            return Err(GatewayError::Io(format!("no addresses for {dial_host}")));
+        }
+        let mut headers = reqwest::header::HeaderMap::new();
+        let value = reqwest::header::HeaderValue::from_str(&host).map_err(|e| {
+            GatewayError::Bind(format!("MATRIX_HTTP_HOST is not a header value: {e}"))
+        })?;
+        headers.insert(reqwest::header::HOST, value);
+        // `resolve` replaces the list; pass every address in one call. The URL port
+        // still wins over these ports (reqwest), which is port 80 for the lattice dial.
+        let builder = reqwest::Client::builder()
+            .default_headers(headers)
+            .resolve_to_addrs(&host, &addrs);
+        builder
+            .build()
+            .map_err(|e| GatewayError::Io(format!("matrix http client: {e}")))
+    }
+
+    /// Install a client that already resolves [`Self::http_host`]. Tests use this so they do
+    /// not need cluster DNS.
+    #[cfg(test)]
+    fn install_client(&self, client: reqwest::Client) {
+        let _ = self.http_client.set(client);
+    }
+
+    /// Gate G4: log in, send one `m.text`, and `/sync` until that event id is in a joined
+    /// timeline. The read-back includes the bot's own event (a normal turn would skip it).
+    ///
+    /// Two sync rounds at most. The first is the baseline sync; the second uses `next_batch`
+    /// if the send has not landed yet.
+    pub async fn probe_send_sync(&self, room_id: &str, body: &str) -> Result<String, GatewayError> {
+        let session = self.resolve_session().await?;
+        let event_id = self
+            .send_message(&session.access_token, room_id, body)
+            .await?;
+        let mut since: Option<String> = None;
+        for _ in 0..2 {
+            let raw = self
+                .sync_once(&session.access_token, since.as_deref())
+                .await?;
+            if sync_has_event(&raw, &event_id) {
+                return Ok(event_id);
+            }
+            since = raw
+                .get("next_batch")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if since.is_none() {
+                break;
+            }
+        }
+        Err(GatewayError::Protocol(format!(
+            "probe did not read back {event_id}"
+        )))
     }
 
     /// Resolve the session to serve under, following the documented precedence: explicit access
-    /// token → persisted session → password login. The chosen session is persisted to the state
-    /// dir (if configured) so a later restart reuses the same device.
+    /// token → persisted session → optional registration → password login. The chosen session
+    /// is persisted to the state dir (if configured) so a later restart reuses the same device.
     async fn resolve_session(&self) -> Result<Session, GatewayError> {
+        self.revalidate_lattice()?;
         // 1. Explicit access token: resolve the identity via whoami (no login).
         if let Some(token) = &self.access_token {
             let who = self.whoami(token).await?;
-            let device_id = who
-                .device_id
-                .or_else(|| self.device_id.clone())
-                .unwrap_or_default();
-            let session = Session {
+            let device_id = self.pick_device(who.device_id);
+            return self.accept_session(Session {
                 access_token: token.clone(),
                 user_id: who.user_id,
                 device_id,
-            };
-            self.save_session(&session);
-            return Ok(session);
+            });
         }
 
         // 2. Persisted session from a previous run (validated against whoami). On success the
@@ -427,12 +673,12 @@ impl MatrixGateway {
         if let Some(saved) = &persisted {
             match self.whoami(&saved.access_token).await {
                 Ok(who) => {
-                    let device_id = who
-                        .device_id
-                        .filter(|d| !d.is_empty())
-                        .unwrap_or_else(|| saved.device_id.clone());
+                    let device_id = match who.device_id.filter(|d| !d.is_empty()) {
+                        Some(got) => self.pick_device(Some(got)),
+                        None => saved.device_id.clone(),
+                    };
                     info!(%device_id, "reusing persisted session");
-                    return Ok(Session {
+                    return self.accept_session(Session {
                         access_token: saved.access_token.clone(),
                         user_id: who.user_id,
                         device_id,
@@ -444,13 +690,42 @@ impl MatrixGateway {
             }
         }
 
-        // 3. Password login. Reuse a configured or previously-persisted device id so the device
-        //    stays stable, then persist the issued session.
+        // 3. Optional registration, then password login. Reuse a configured or previously
+        //    persisted device id so the device stays stable. `M_USER_IN_USE` is not a failure:
+        //    the account already exists and login below reuses it.
         let reuse_device = self
             .device_id
             .clone()
             .or_else(|| persisted.as_ref().map(|s| s.device_id.clone()));
+        if self.register {
+            if let Some(session) = self.register(reuse_device.as_deref()).await? {
+                return self.accept_session(session);
+            }
+        }
         let session = self.login(reuse_device.as_deref()).await?;
+        self.accept_session(session)
+    }
+
+    /// Prefer the homeserver-reported device. Fall back to the configured id when whoami omits
+    /// one (the lattice pin). A disagreement is logged; the token's device wins.
+    fn pick_device(&self, reported: Option<String>) -> String {
+        match (reported.filter(|d| !d.is_empty()), self.device_id.clone()) {
+            (Some(got), Some(want)) if got != want => {
+                warn!(
+                    got = %got,
+                    configured = %want,
+                    "whoami device id differs from MATRIX_DEVICE_ID; using the homeserver's"
+                );
+                got
+            }
+            (Some(got), _) => got,
+            (None, Some(want)) => want,
+            (None, None) => String::new(),
+        }
+    }
+
+    fn accept_session(&self, session: Session) -> Result<Session, GatewayError> {
+        self.enforce_server_name(&session.user_id)?;
         self.save_session(&session);
         Ok(session)
     }
@@ -464,9 +739,9 @@ impl MatrixGateway {
     /// One `GET /account/whoami` attempt. A 5xx/429/transport failure is classified `Io`
     /// (transient ⇒ retried); a 4xx (e.g. an invalid/expired token) is `Bind` (fatal ⇒ surfaced).
     async fn whoami_once(&self, token: &str) -> Result<WhoAmI, GatewayError> {
+        self.ensure_client().await?;
         let resp = self
-            .http
-            .get(self.url("/_matrix/client/v3/account/whoami"))
+            .call(reqwest::Method::GET, "/_matrix/client/v3/account/whoami")?
             .bearer_auth(token)
             .send()
             .await
@@ -505,9 +780,9 @@ impl MatrixGateway {
         if let Some(d) = device_id {
             body["device_id"] = serde_json::Value::String(d.to_string());
         }
+        self.ensure_client().await?;
         let resp = self
-            .http
-            .post(self.url("/_matrix/client/v3/login"))
+            .call(reqwest::Method::POST, "/_matrix/client/v3/login")?
             .json(&body)
             .send()
             .await
@@ -529,6 +804,80 @@ impl MatrixGateway {
             user_id: login.user_id,
             device_id: login.device_id,
         })
+    }
+
+    /// `POST /register`, then fall through on `M_USER_IN_USE`. `Some` is a fresh session.
+    async fn register(&self, device_id: Option<&str>) -> Result<Option<Session>, GatewayError> {
+        self.with_retry("register", || self.register_once(device_id))
+            .await
+    }
+
+    async fn register_once(
+        &self,
+        device_id: Option<&str>,
+    ) -> Result<Option<Session>, GatewayError> {
+        let first = self.post_register(device_id, None).await?;
+        if first.status == reqwest::StatusCode::UNAUTHORIZED {
+            if let Some(session) = first
+                .body
+                .get("session")
+                .and_then(serde_json::Value::as_str)
+            {
+                let second = self.post_register(device_id, Some(session)).await?;
+                return interpret_register(second);
+            }
+        }
+        interpret_register(first)
+    }
+
+    async fn post_register(
+        &self,
+        device_id: Option<&str>,
+        uia_session: Option<&str>,
+    ) -> Result<RegisterHttp, GatewayError> {
+        let password = self.password.as_deref().ok_or_else(|| {
+            GatewayError::Bind(
+                "MATRIX_REGISTER requires MATRIX_PASSWORD (an access token skips registration)"
+                    .into(),
+            )
+        })?;
+        let localpart = lattice::register_localpart(&self.user);
+        if localpart.is_empty() {
+            return Err(GatewayError::Bind(
+                "MATRIX_REGISTER requires MATRIX_USER".into(),
+            ));
+        }
+        let mut auth = if let Some(token) = &self.registration_token {
+            serde_json::json!({ "type": "m.login.registration_token", "token": token })
+        } else {
+            serde_json::json!({ "type": "m.login.dummy" })
+        };
+        if let Some(session) = uia_session {
+            auth["session"] = serde_json::Value::String(session.to_string());
+        }
+        let mut body = serde_json::json!({
+            "username": localpart,
+            "password": password,
+            "initial_device_display_name": "Lavoisier lattice",
+            "auth": auth,
+        });
+        if let Some(d) = device_id {
+            body["device_id"] = serde_json::Value::String(d.to_string());
+        }
+        self.ensure_client().await?;
+        let resp = self
+            .call(reqwest::Method::POST, "/_matrix/client/v3/register")?
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| GatewayError::Io(e.to_string()))?;
+        let body = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        Ok(RegisterHttp { status, body, text })
     }
 
     /// Run a startup operation, retrying *transient* failures (`GatewayError::Io` — transport
@@ -611,9 +960,9 @@ impl MatrixGateway {
         token: &str,
         since: Option<&str>,
     ) -> Result<serde_json::Value, GatewayError> {
+        self.ensure_client().await?;
         let mut req = self
-            .http
-            .get(self.url("/_matrix/client/v3/sync"))
+            .call(reqwest::Method::GET, "/_matrix/client/v3/sync")?
             .bearer_auth(token)
             .query(&[("timeout", SYNC_TIMEOUT_MS.to_string())]);
         if let Some(since) = since {
@@ -662,9 +1011,9 @@ impl MatrixGateway {
             urlencode(room_id),
             txn
         );
+        self.ensure_client().await?;
         let resp = self
-            .http
-            .put(self.url(&path))
+            .call(reqwest::Method::PUT, &path)?
             .bearer_auth(token)
             .json(&payload)
             .send()
@@ -695,9 +1044,9 @@ impl MatrixGateway {
         filename: &str,
     ) -> Result<String, GatewayError> {
         let path = format!("/_matrix/media/v3/upload?filename={}", urlencode(filename));
+        self.ensure_client().await?;
         let resp = self
-            .http
-            .post(self.url(&path))
+            .call(reqwest::Method::POST, &path)?
             .bearer_auth(token)
             .header(reqwest::header::CONTENT_TYPE, content_type)
             .body(bytes.to_vec())
@@ -776,13 +1125,13 @@ impl MatrixGateway {
             "/_matrix/client/v3/rooms/{}/state/m.room.encryption/",
             urlencode(room)
         );
-        let Ok(resp) = self
-            .http
-            .get(self.url(&path))
-            .bearer_auth(token)
-            .send()
-            .await
-        else {
+        if self.ensure_client().await.is_err() {
+            return false;
+        }
+        let Ok(req) = self.call(reqwest::Method::GET, &path) else {
+            return false;
+        };
+        let Ok(resp) = req.bearer_auth(token).send().await else {
             return false;
         };
         if !resp.status().is_success() {
@@ -822,9 +1171,9 @@ impl MatrixGateway {
             urlencode(server),
             urlencode(media_id)
         );
+        self.ensure_client().await?;
         let resp = self
-            .http
-            .get(self.url(&path))
+            .call(reqwest::Method::GET, &path)?
             .bearer_auth(token)
             .send()
             .await
@@ -873,9 +1222,9 @@ impl MatrixGateway {
         let payload = serde_json::json!({
             "m.relates_to": { "rel_type": "m.annotation", "event_id": event_id, "key": emoji }
         });
+        self.ensure_client().await?;
         let resp = self
-            .http
-            .put(self.url(&path))
+            .call(reqwest::Method::PUT, &path)?
             .bearer_auth(token)
             .json(&payload)
             .send()
@@ -904,9 +1253,9 @@ impl MatrixGateway {
             urlencode(event_id),
             txn
         );
+        self.ensure_client().await?;
         let resp = self
-            .http
-            .put(self.url(&path))
+            .call(reqwest::Method::PUT, &path)?
             .bearer_auth(token)
             .json(&serde_json::json!({}))
             .send()
@@ -939,9 +1288,9 @@ impl MatrixGateway {
         } else {
             serde_json::json!({ "typing": false })
         };
+        self.ensure_client().await?;
         let resp = self
-            .http
-            .put(self.url(&path))
+            .call(reqwest::Method::PUT, &path)?
             .bearer_auth(token)
             .json(&payload)
             .send()
@@ -981,9 +1330,9 @@ impl MatrixGateway {
             "/_matrix/client/v3/rooms/{}/joined_members",
             urlencode(room_id)
         );
+        self.ensure_client().await?;
         let resp = self
-            .http
-            .get(self.url(&path))
+            .call(reqwest::Method::GET, &path)?
             .bearer_auth(token)
             .send()
             .await
@@ -1031,9 +1380,9 @@ impl MatrixGateway {
     /// Accept a room invite (join the room).
     async fn join_room(&self, token: &str, room_id: &str) -> Result<(), GatewayError> {
         let path = format!("/_matrix/client/v3/join/{}", urlencode(room_id));
+        self.ensure_client().await?;
         let resp = self
-            .http
-            .post(self.url(&path))
+            .call(reqwest::Method::POST, &path)?
             .bearer_auth(token)
             .json(&serde_json::json!({}))
             .send()
@@ -1589,6 +1938,7 @@ impl MatrixGateway {
             user_id = %session.user_id,
             device_id = %session.device_id,
             homeserver = %self.homeserver,
+            http_host = self.http_host.as_deref().unwrap_or(""),
             "matrix gateway online"
         );
         if let Some(allowed) = &self.allowed_users {
@@ -1640,12 +1990,14 @@ impl MatrixGateway {
         // crypto identity survives restarts; without one the machine is in-memory (single-session).
         #[cfg(feature = "e2ee")]
         let crypto = match e2ee::Crypto::new(
-            self.homeserver.clone(),
+            self.request_base()?,
             token.clone(),
             &session.user_id,
             &session.device_id,
             self.state_dir.as_ref().map(|d| d.join("crypto")).as_deref(),
             self.crypto_passphrase.as_deref(),
+            self.http()?.clone(),
+            self.http_host.clone(),
         )
         .await
         {
@@ -2136,9 +2488,62 @@ async fn shutdown_signal() {
     }
 }
 
+struct RegisterHttp {
+    status: reqwest::StatusCode,
+    body: serde_json::Value,
+    text: String,
+}
+
+/// `Some` is a new session. `None` means the localpart is already registered (`M_USER_IN_USE`),
+/// which the caller treats as "log in instead".
+fn interpret_register(resp: RegisterHttp) -> Result<Option<Session>, GatewayError> {
+    if resp.status.is_success() {
+        let login: LoginResponse = serde_json::from_value(resp.body).map_err(|e| {
+            GatewayError::Protocol(format!("matrix register body: {e}; {}", resp.text))
+        })?;
+        return Ok(Some(Session {
+            access_token: login.access_token,
+            user_id: login.user_id,
+            device_id: login.device_id,
+        }));
+    }
+    let errcode = resp
+        .body
+        .get("errcode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if errcode == "M_USER_IN_USE" {
+        return Ok(None);
+    }
+    Err(classify_status(
+        resp.status,
+        format!("matrix register {}: {}", resp.status, resp.text),
+    ))
+}
+
 /// Classify a non-success HTTP status from the startup auth calls into a [`GatewayError`]:
 /// server errors (5xx) and `429 Too Many Requests` are *transient* (`Io` ⇒ retried with backoff);
 /// everything else (4xx — bad/expired token, wrong password) is fatal (`Bind` ⇒ surfaced).
+fn sync_has_event(sync: &serde_json::Value, event_id: &str) -> bool {
+    let Some(rooms) = sync
+        .get("rooms")
+        .and_then(|r| r.get("join"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    rooms.values().any(|room| {
+        room.get("timeline")
+            .and_then(|t| t.get("events"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|events| {
+                events.iter().any(|ev| {
+                    ev.get("event_id").and_then(serde_json::Value::as_str) == Some(event_id)
+                })
+            })
+    })
+}
+
 fn classify_status(status: reqwest::StatusCode, msg: String) -> GatewayError {
     if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         GatewayError::Io(msg)
@@ -2307,9 +2712,266 @@ struct InReplyTo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     fn sync_from(json: serde_json::Value) -> SyncResponse {
         serde_json::from_value(json).unwrap()
+    }
+
+    struct Hit {
+        host: String,
+        path: String,
+        body: String,
+    }
+
+    fn spawn_matrix(
+        handler: impl Fn(&Hit) -> (u16, String) + Send + Sync + 'static,
+    ) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handler = Arc::new(handler);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { break };
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                let handler = handler.clone();
+                loop {
+                    let Some(hit) = read_http(&mut sock) else {
+                        break;
+                    };
+                    let (code, body) = handler(&hit);
+                    let reason = if code == 200 { "OK" } else { "ERR" };
+                    let resp = format!(
+                        "HTTP/1.1 {code} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if sock.write_all(resp.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        addr
+    }
+
+    fn read_http(sock: &mut std::net::TcpStream) -> Option<Hit> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 2048];
+        let header_end = loop {
+            let n = sock.read(&mut tmp).ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+            if buf.len() > 128 * 1024 {
+                return None;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        let mut lines = head.split("\r\n");
+        let req = lines.next()?.to_string();
+        let mut host = String::new();
+        let mut content_len = 0usize;
+        for line in lines {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            if k.eq_ignore_ascii_case("host") {
+                host = v.trim().to_string();
+            }
+            if k.eq_ignore_ascii_case("content-length") {
+                content_len = v.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = buf[header_end..].to_vec();
+        while body.len() < content_len {
+            let n = sock.read(&mut tmp).ok()?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&tmp[..n]);
+        }
+        body.truncate(content_len);
+        let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+        Some(Hit {
+            host,
+            path,
+            body: String::from_utf8_lossy(&body).to_string(),
+        })
+    }
+
+    fn lattice_client(addr: std::net::SocketAddr) -> reqwest::Client {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::HOST,
+            reqwest::header::HeaderValue::from_static(LATTICE_HTTP_HOST),
+        );
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .resolve(LATTICE_HTTP_HOST, addr)
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+    }
+
+    fn lattice_gw(user: &str) -> MatrixGateway {
+        MatrixGateway::new(LATTICE_HOMESERVER, user, "pw")
+            .with_device_id("LAVOISIER_LATTICE")
+            .with_http_host(LATTICE_HTTP_HOST)
+            .with_server_name(LATTICE_SERVER_NAME)
+    }
+
+    #[tokio::test]
+    async fn lattice_probe_dials_with_wasmcloud_host_and_reads_back() {
+        let hits = Arc::new(Mutex::new(Vec::<Hit>::new()));
+        let seen = hits.clone();
+        let addr = spawn_matrix(move |hit| {
+            seen.lock().unwrap().push(Hit {
+                host: hit.host.clone(),
+                path: hit.path.clone(),
+                body: hit.body.clone(),
+            });
+            if hit.path.contains("/login") {
+                (
+                    200,
+                    r#"{"access_token":"tok","user_id":"@lav:davidlee18.dev","device_id":"LAVOISIER_LATTICE"}"#.into(),
+                )
+            } else if hit.path.contains("/send/") {
+                (200, r#"{"event_id":"$g4"}"#.into())
+            } else if hit.path.contains("/sync") {
+                (
+                    200,
+                    r#"{"next_batch":"s1","rooms":{"join":{"!room:davidlee18.dev":{"timeline":{"events":[{"type":"m.room.message","sender":"@lav:davidlee18.dev","event_id":"$g4","content":{"msgtype":"m.text","body":"g4"}}]}}}}}"#.into(),
+                )
+            } else {
+                (404, r#"{"errcode":"M_UNRECOGNIZED"}"#.into())
+            }
+        });
+        let gw = lattice_gw("@lav:davidlee18.dev").with_connect_port(addr.port());
+        gw.install_client(lattice_client(addr));
+        let event = tokio::time::timeout(
+            Duration::from_secs(3),
+            gw.probe_send_sync("!room:davidlee18.dev", "g4"),
+        )
+        .await
+        .expect("probe timed out")
+        .expect("probe");
+        assert_eq!(event, "$g4");
+        let hits = hits.lock().unwrap();
+        assert!(
+            hits.len() >= 3,
+            "expected login, send, sync; got {}",
+            hits.len()
+        );
+        for hit in hits.iter() {
+            assert_eq!(hit.host, LATTICE_HTTP_HOST, "path {}", hit.path);
+            assert!(
+                !hit.path.contains("cluster.local"),
+                "request URL must use the hostInterfaces host, path {}",
+                hit.path
+            );
+        }
+        let login = hits.iter().find(|h| h.path.contains("/login")).unwrap();
+        assert!(login.body.contains("LAVOISIER_LATTICE"), "{}", login.body);
+        assert!(login.body.contains("@lav:davidlee18.dev"), "{}", login.body);
+    }
+
+    #[tokio::test]
+    async fn lattice_register_falls_through_when_user_exists_then_syncs() {
+        let hits = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let seen = hits.clone();
+        let addr = spawn_matrix(move |hit| {
+            seen.lock()
+                .unwrap()
+                .push((hit.path.clone(), hit.body.clone()));
+            if hit.path.contains("/register") {
+                (400, r#"{"errcode":"M_USER_IN_USE","error":"taken"}"#.into())
+            } else if hit.path.contains("/login") {
+                (
+                    200,
+                    r#"{"access_token":"tok","user_id":"@lav:davidlee18.dev","device_id":"LAVOISIER_LATTICE"}"#.into(),
+                )
+            } else if hit.path.contains("/send/") {
+                (200, r#"{"event_id":"$back"}"#.into())
+            } else {
+                (
+                    200,
+                    r#"{"next_batch":"s","rooms":{"join":{"!r:davidlee18.dev":{"timeline":{"events":[{"event_id":"$back"}]}}}}}"#.into(),
+                )
+            }
+        });
+        let gw = lattice_gw("@lav:davidlee18.dev")
+            .with_register(true)
+            .with_connect_port(addr.port());
+        gw.install_client(lattice_client(addr));
+        let event = tokio::time::timeout(
+            Duration::from_secs(3),
+            gw.probe_send_sync("!r:davidlee18.dev", "again"),
+        )
+        .await
+        .expect("probe timed out")
+        .unwrap();
+        assert_eq!(event, "$back");
+        let hits = hits.lock().unwrap();
+        let register = hits
+            .iter()
+            .find(|(path, _)| path.contains("/register"))
+            .expect("register");
+        assert!(
+            register.1.contains("\"username\":\"lav\""),
+            "{}",
+            register.1
+        );
+        assert!(register.1.contains("LAVOISIER_LATTICE"), "{}", register.1);
+        assert!(hits.iter().any(|(path, _)| path.contains("/login")));
+    }
+
+    #[tokio::test]
+    async fn lattice_rejects_spider42_identity_from_whoami() {
+        let hosts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = hosts.clone();
+        let addr = spawn_matrix(move |hit| {
+            seen.lock().unwrap().push(hit.host.clone());
+            (
+                200,
+                r#"{"user_id":"@lav:matrix.spider42.com","device_id":"DEV"}"#.into(),
+            )
+        });
+        let gw = lattice_gw("@lav:davidlee18.dev")
+            .with_access_token("tok")
+            .with_connect_port(addr.port());
+        gw.install_client(lattice_client(addr));
+        let err = tokio::time::timeout(
+            Duration::from_secs(3),
+            gw.probe_send_sync("!r:davidlee18.dev", "x"),
+        )
+        .await
+        .expect("timed out")
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("matrix.spider42.com"), "{err}");
+        assert!(err.contains(LATTICE_SERVER_NAME), "{err}");
+        let hosts = hosts.lock().unwrap();
+        assert_eq!(hosts.as_slice(), [LATTICE_HTTP_HOST]);
+    }
+
+    #[test]
+    fn ecs_gateway_does_not_grow_lattice_requirements() {
+        let gw = MatrixGateway::new(
+            "https://matrix.spider42.com",
+            "@lav:matrix.spider42.com",
+            "pw",
+        )
+        .with_state_dir(format!("/mnt/{ECS_EFS_VOLUME_ID}/matrix"));
+        assert!(gw.revalidate_lattice().is_ok());
+        assert!(gw.http_host.is_none());
+        assert!(gw.server_name.is_none());
+        assert!(!gw.register);
     }
 
     #[test]

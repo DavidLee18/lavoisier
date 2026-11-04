@@ -284,8 +284,16 @@ struct Cli {
     /// `MATRIX_HOMESERVER` plus either `MATRIX_ACCESS_TOKEN` or (`MATRIX_USER` + `MATRIX_PASSWORD`).
     /// Optional: `MATRIX_DEVICE_ID`, `MATRIX_STATE_DIR` (stable identity + E2EE crypto store across
     /// restarts), `MATRIX_CRYPTO_STORE_KEY`, `MATRIX_ALLOWED_USERS`.
+    /// Lattice Port also reads `MATRIX_HTTP_HOST`, `MATRIX_SERVER_NAME`, `MATRIX_REGISTER`,
+    /// and `MATRIX_REGISTRATION_TOKEN` (see `docs/PHASE4-PORT.md`).
     #[arg(long)]
     serve_matrix: bool,
+
+    /// Lattice gate G4: log in, send one message to `MATRIX_PROBE_ROOM`, `/sync` until that
+    /// event is read back, print the event id, and exit. Does not start the agent. Optional
+    /// body: `MATRIX_PROBE_BODY`.
+    #[arg(long)]
+    matrix_probe: bool,
 
     /// Don't auto-accept Matrix room invites (the gateway joins invited rooms by default). Can
     /// also be set via `[gateway] matrix_auto_join = false`.
@@ -890,6 +898,10 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
         tracing::info!(path = %path.display(), "loaded config");
     }
 
+    if cli.matrix_probe {
+        return run_matrix_probe(&config).await;
+    }
+
     let provider_kind = cli.provider.unwrap_or(ProviderKind::Xai);
     tracing::debug!(
         provider = ?provider_kind,
@@ -1008,12 +1020,7 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             // `from_env` already applied any MATRIX_* env vars (incl. state dir / allowlist);
             // fall back to the config file only where the corresponding env var is absent so the
             // documented precedence (env > file) holds.
-            let mut matrix = MatrixGateway::from_env()?.with_auto_join(auto_join);
-            if std::env::var_os("MATRIX_STATE_DIR").is_none() {
-                if let Some(dir) = &config.gateway.matrix_state_dir {
-                    matrix = matrix.with_state_dir(dir.clone());
-                }
-            }
+            let mut matrix = matrix_gateway_from_config(&config)?.with_auto_join(auto_join);
             // Mandatory E2EE: the flag (which also reads LVZ_REQUIRE_E2EE via clap) wins, else the
             // config file. Off by default — degrading is right for a mixed-modality gateway and
             // wrong for an all-encrypted one, so it is the deployment that must say which it is.
@@ -1181,6 +1188,71 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
         }
     }
 
+    Ok(())
+}
+
+/// Matrix gateway from `MATRIX_*` env, with `[gateway]` filling any lattice/identity field the
+/// environment left unset. Env wins. Secrets (`MATRIX_ACCESS_TOKEN`, `MATRIX_PASSWORD`,
+/// `MATRIX_REGISTRATION_TOKEN`, `MATRIX_CRYPTO_STORE_KEY`) stay env-only.
+fn matrix_gateway_from_config(
+    config: &Config,
+) -> Result<MatrixGateway, lvz_protocol::GatewayError> {
+    let homeserver = std::env::var("MATRIX_HOMESERVER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| config.gateway.matrix_homeserver.clone())
+        .ok_or_else(|| lvz_protocol::GatewayError::Bind("MATRIX_HOMESERVER is not set".into()))?;
+    let mut gw = MatrixGateway::from_env_with_homeserver(homeserver)?;
+    let file = &config.gateway;
+    if std::env::var_os("MATRIX_HTTP_HOST").is_none() {
+        if let Some(host) = &file.matrix_http_host {
+            gw = gw.with_http_host(host.clone());
+        }
+    }
+    if std::env::var_os("MATRIX_SERVER_NAME").is_none() {
+        if let Some(name) = &file.matrix_server_name {
+            gw = gw.with_server_name(name.clone());
+        }
+    }
+    if std::env::var_os("MATRIX_USER").is_none() {
+        if let Some(user) = &file.matrix_user {
+            gw = gw.with_user(user.clone());
+        }
+    }
+    if std::env::var_os("MATRIX_DEVICE_ID").is_none() {
+        if let Some(id) = &file.matrix_device_id {
+            gw = gw.with_device_id(id.clone());
+        }
+    }
+    if std::env::var_os("MATRIX_STATE_DIR").is_none() {
+        if let Some(dir) = &file.matrix_state_dir {
+            gw = gw.with_state_dir(dir.clone());
+        }
+    }
+    if std::env::var_os("MATRIX_REGISTER").is_none() && file.matrix_register.unwrap_or(false) {
+        gw = gw.with_register(true);
+    }
+    gw.ensure_login_user()?;
+    gw.revalidate_lattice()?;
+    Ok(gw)
+}
+
+/// Gate G4. Prints the event id that `/sync` read back. No model provider is contacted.
+async fn run_matrix_probe(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let gw = matrix_gateway_from_config(config)?;
+    let room = std::env::var("MATRIX_PROBE_ROOM").map_err(|_| "MATRIX_PROBE_ROOM is not set")?;
+    let body = std::env::var("MATRIX_PROBE_BODY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("lavoisier lattice probe {nanos}")
+        });
+    let event_id = gw.probe_send_sync(&room, &body).await?;
+    println!("{event_id}");
     Ok(())
 }
 

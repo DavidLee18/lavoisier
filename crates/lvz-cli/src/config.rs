@@ -252,7 +252,25 @@ pub struct GatewaySection {
     pub matrix_allowed_users: Option<Vec<String>>,
     /// Directory persisting the Matrix session (token + device id) and the E2EE crypto store, for
     /// a stable identity across restarts. `MATRIX_STATE_DIR` takes precedence.
+    ///
+    /// Lattice Port may point this at an empty directory. It must not name the ECS volume
+    /// `fs-0966896c7d24d7b20`.
     pub matrix_state_dir: Option<PathBuf>,
+    /// Matrix client-server base URL when `MATRIX_HOMESERVER` is unset. Lattice:
+    /// `http://matrix-cs.wasmcloud.svc.cluster.local:80`. Env wins.
+    pub matrix_homeserver: Option<String>,
+    /// HTTP `Host` header when it differs from the homeserver URL. Lattice:
+    /// `matrix-cs.wasmcloud.svc`. `MATRIX_HTTP_HOST` wins.
+    pub matrix_http_host: Option<String>,
+    /// Required server name of the logged-in MXID. Lattice: `davidlee18.dev`.
+    /// `MATRIX_SERVER_NAME` wins.
+    pub matrix_server_name: Option<String>,
+    /// Login user (localpart or `@user:server`) when `MATRIX_USER` is unset.
+    pub matrix_user: Option<String>,
+    /// Pinned Matrix device id when `MATRIX_DEVICE_ID` is unset. Required on the lattice dial.
+    pub matrix_device_id: Option<String>,
+    /// Try `POST /register` before password login. `MATRIX_REGISTER` wins. Off by default.
+    pub matrix_register: Option<bool>,
     /// Refuse to start when Matrix E2EE cannot be initialised, instead of degrading to plaintext.
     ///
     /// Default `false` (degrade), which suits a gateway serving a mix of plaintext and encrypted
@@ -586,6 +604,12 @@ mod tests {
             serve_matrix = true
             serve_slack = true
             matrix_state_dir = "/var/lib/lav/matrix"
+            matrix_homeserver = "http://matrix-cs.wasmcloud.svc.cluster.local:80"
+            matrix_http_host = "matrix-cs.wasmcloud.svc"
+            matrix_server_name = "davidlee18.dev"
+            matrix_user = "@lav:davidlee18.dev"
+            matrix_device_id = "LAVOISIER_LATTICE"
+            matrix_register = false
             matrix_allowed_users = ["@a:hs", "@b:hs"]
             matrix_allowed_rooms = ["!ops:hs", "!general:hs"]
             matrix_home_room = "!ops:hs"
@@ -606,6 +630,27 @@ mod tests {
             cfg.gateway.matrix_state_dir.as_deref(),
             Some(Path::new("/var/lib/lav/matrix"))
         );
+        assert_eq!(
+            cfg.gateway.matrix_homeserver.as_deref(),
+            Some("http://matrix-cs.wasmcloud.svc.cluster.local:80")
+        );
+        assert_eq!(
+            cfg.gateway.matrix_http_host.as_deref(),
+            Some("matrix-cs.wasmcloud.svc")
+        );
+        assert_eq!(
+            cfg.gateway.matrix_server_name.as_deref(),
+            Some("davidlee18.dev")
+        );
+        assert_eq!(
+            cfg.gateway.matrix_user.as_deref(),
+            Some("@lav:davidlee18.dev")
+        );
+        assert_eq!(
+            cfg.gateway.matrix_device_id.as_deref(),
+            Some("LAVOISIER_LATTICE")
+        );
+        assert_eq!(cfg.gateway.matrix_register, Some(false));
         assert_eq!(
             cfg.gateway.matrix_allowed_users.as_deref(),
             Some(&["@a:hs".to_string(), "@b:hs".to_string()][..])

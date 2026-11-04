@@ -3,6 +3,17 @@
 Notable changes to Lavoisier. Older release notes are in the git history and in
 [`PUBLISHING.md`](PUBLISHING.md).
 
+## [Unreleased]
+
+### Lattice Phase 4 Port
+
+- The Matrix gateway can dial the in-cluster wasmCloud homeserver
+  `http://matrix-cs.wasmcloud.svc.cluster.local:80` with HTTP `Host`
+  `matrix-cs.wasmcloud.svc` and server name `davidlee18.dev`. See
+  [`docs/PHASE4-PORT.md`](docs/PHASE4-PORT.md). No image publish. No version bump.
+- `lav --matrix-probe` sends one message and reads it back with `/sync` (gate G4).
+- The ECS spider42 path is unchanged when the lattice variables are unset.
+
 ## [0.18.11] — 2026-10-22
 
 ### Security
