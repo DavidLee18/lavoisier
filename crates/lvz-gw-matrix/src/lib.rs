@@ -568,13 +568,13 @@ impl MatrixGateway {
             .ok_or_else(|| GatewayError::Io("matrix http client used before it was built".into()))
     }
 
-    /// Build a request. [`Self::ensure_client`] must have finished; the builder borrows the
-    /// stored client, which an `async` fn cannot return across an `.await`.
+    /// Build a request. [`Self::ensure_client`] must have finished. `RequestBuilder` in
+    /// reqwest 0.12 owns its client (no lifetime parameter).
     fn call(
         &self,
         method: reqwest::Method,
         path: &str,
-    ) -> Result<reqwest::RequestBuilder<'_>, GatewayError> {
+    ) -> Result<reqwest::RequestBuilder, GatewayError> {
         let url = self.url(path)?;
         let mut req = self.http()?.request(method, url);
         if let Some(host) = &self.http_host {
