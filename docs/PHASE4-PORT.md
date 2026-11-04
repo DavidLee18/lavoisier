@@ -6,7 +6,7 @@ not a new gateway and not a wasm guest.
 
 ## Locked
 
-- **G4 is `lav --matrix-probe`.** It sends one `m.text` and `/sync`s until that event is read back. `--serve-matrix` is the resident client. It is not G4.
+- **G4 is `lav --matrix-probe`.** It sends one `m.text` and `/sync`s until that event is read back. `--serve-matrix` is the resident client. It is not G4. When `MATRIX_PROBE_ROOM` is unset, or the send is refused with `M_FORBIDDEN` / `not in room`, the probe creates a room first (matrix-cs is creator-only; it has no join route). See Gate G4 below.
 - **G4 registration is `m.login.registration_token`.** The secret is `MATRIX_REGISTRATION_TOKEN`. On a lattice dial, `MATRIX_REGISTER` without that secret is refused. `m.login.dummy` is not the G4 path. It remains only for a non-lattice lab that sets `MATRIX_REGISTER` without the lattice markers.
 
 **HOLD APPLY.** Do not apply Terraform. Do not push an image. Do not change Continuwuity, Phase D,
@@ -56,7 +56,7 @@ default. Secrets are environment-only. They are not toml keys.
 | `MATRIX_REGISTRATION_TOKEN` | — | when `MATRIX_REGISTER` is on | G4 auth type `m.login.registration_token`. A lattice register without it is refused. A 401 that carries a UIA `session` is retried once with that session. |
 | `MATRIX_STATE_DIR` | `matrix_state_dir` | no | See state below. |
 | `MATRIX_CRYPTO_STORE_KEY` | — | no | E2EE at-rest passphrase. Not required for G4. |
-| `MATRIX_PROBE_ROOM` | — | for `--matrix-probe` | Room id to send into. |
+| `MATRIX_PROBE_ROOM` | — | no | Room id to send into. Unset or blank: `createRoom` first, then send into the new room. Set: send there, and only a `M_FORBIDDEN` / `not in room` refusal creates a new room and retries the send in it. Other send errors are returned. `createRoom` is not idempotent, so a room that accepts the send is never recreated. |
 | `MATRIX_PROBE_BODY` | — | no | Defaults to `lavoisier lattice probe <nanos>`. |
 
 Auth order: access token, then a persisted session, then registration when enabled, then password
@@ -88,7 +88,20 @@ or a fresh container filesystem) is a valid G4 state:
 
 G4 is this command. It prints the event id on stdout and exits. It does not start a model provider.
 
-An account that already exists logs in with the password (registration stays off):
+`POST /_matrix/client/v3/createRoom` uses an empty JSON body. The creator is in the room because creation joined them; the probe does not call join or invite. A created room id is printed on stderr:
+
+```text
+lavoisier: created probe room !new:davidlee18.dev (MATRIX_PROBE_ROOM unset)
+lavoisier: created probe room !new:davidlee18.dev (send to !old:davidlee18.dev was M_FORBIDDEN not in room)
+```
+
+The same ids are logged at info (`room_id`, and `configured_room` on the refusal path). The log line does not include the access token, password, or registration token. Stdout stays the event id alone, after `/sync` has shown that id in a joined timeline (two sync rounds at most).
+
+`createRoom` is one shot. It is not retried, and it is not called when the configured room accepts the send. A lost response may already have created a room; running the probe again creates another.
+
+This behaviour is in the `lav` binary. A lattice job keeps running whatever image digest the latch pinned. Rolling that digest is outside this repository (no Terraform apply, no image push).
+
+An account that already exists logs in with the password (registration stays off). `MATRIX_PROBE_ROOM` may be omitted; the example below sets one:
 
 ```sh
 MATRIX_HOMESERVER=http://matrix-cs.wasmcloud.svc.cluster.local:80 \

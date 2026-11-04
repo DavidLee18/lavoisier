@@ -162,7 +162,9 @@ the ECS one. Set `MATRIX_HOMESERVER=http://matrix-cs.wasmcloud.svc.cluster.local
 `MATRIX_HTTP_HOST=matrix-cs.wasmcloud.svc` (the `Host` header), and
 `MATRIX_SERVER_NAME=davidlee18.dev`, with a `@localpart:davidlee18.dev` user and a pinned
 `MATRIX_DEVICE_ID`. Gate G4 is `lav --matrix-probe` (send, then `/sync` read-back) and does not
-start the agent. Lattice `MATRIX_REGISTER` requires `MATRIX_REGISTRATION_TOKEN`
+start the agent. `MATRIX_PROBE_ROOM` is optional: unset, or a send refused with `M_FORBIDDEN` /
+`not in room`, creates a room and sends there (matrix-cs has no join). Lattice `MATRIX_REGISTER`
+requires `MATRIX_REGISTRATION_TOKEN`
 (`m.login.registration_token`). The state directory must not be the ECS volume `fs-0966896c7d24d7b20`. Contract,
 image pin, and hold-apply notes: [`docs/PHASE4-PORT.md`](docs/PHASE4-PORT.md). The spider42 path is
 unchanged when those variables are unset.

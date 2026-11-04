@@ -108,7 +108,11 @@ identity — no re-verification after restart). Password login reuses a configur
 (`MATRIX_SERVER_NAME`). Any one of those markers requires the full pin, including
 `MATRIX_DEVICE_ID`, and rejects state dirs that name ECS volume `fs-0966896c7d24d7b20`. Unset, the
 ECS `@lav:matrix.spider42.com` path is unchanged. `lav --matrix-probe` is the G4 send + `/sync`
-read-back and does not start a model provider. A **per-sender allowlist** (`MATRIX_ALLOWED_USERS` / `[gateway]
+read-back and does not start a model provider. `MATRIX_PROBE_ROOM` may be unset: the probe
+`createRoom`s first (matrix-cs has no join). A set room is tried first, and only an
+`M_FORBIDDEN` / `not in room` send creates a new room and continues there. `createRoom` is not
+idempotent, so a successful send does not create one. The new room id is logged and printed on
+stderr; stdout stays the event id. A **per-sender allowlist** (`MATRIX_ALLOWED_USERS` / `[gateway]
 matrix_allowed_users`) gates both plaintext and encrypted paths (enforced pre-decrypt on the
 cleartext `sender`); empty ⇒ answer everyone.
 

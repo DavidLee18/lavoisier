@@ -26,7 +26,7 @@ use lvz_gw_a2a::A2aGateway;
 use lvz_gw_acp::AcpGateway;
 use lvz_gw_cron::{CronGateway, CronJob};
 use lvz_gw_http::{GatewayConfig, HttpGateway};
-use lvz_gw_matrix::MatrixGateway;
+use lvz_gw_matrix::{MatrixGateway, ProbeRoom};
 use lvz_gw_slack::SlackGateway;
 use lvz_gw_tui::{ChannelGate, TuiGateway};
 use lvz_legion::{Debater, Language, Panel};
@@ -289,9 +289,11 @@ struct Cli {
     #[arg(long)]
     serve_matrix: bool,
 
-    /// Lattice gate G4: log in, send one message to `MATRIX_PROBE_ROOM`, `/sync` until that
-    /// event is read back, print the event id, and exit. Does not start the agent. Optional
-    /// body: `MATRIX_PROBE_BODY`.
+    /// Lattice gate G4: log in, send one message, `/sync` until that event is read back, print
+    /// the event id, and exit. Does not start the agent. Optional body: `MATRIX_PROBE_BODY`.
+    /// `MATRIX_PROBE_ROOM` is optional. When it is unset, or the send is refused with
+    /// `M_FORBIDDEN` / `not in room`, the probe creates a room and sends there. The created
+    /// room id is printed on stderr. `createRoom` is not idempotent.
     #[arg(long)]
     matrix_probe: bool,
 
@@ -1237,10 +1239,18 @@ fn matrix_gateway_from_config(
     Ok(gw)
 }
 
-/// Gate G4. Prints the event id that `/sync` read back. No model provider is contacted.
+/// Gate G4. Prints the event id that `/sync` read back on stdout. No model provider is
+/// contacted.
+///
+/// `MATRIX_PROBE_ROOM` unset or blank: create a room, then send. Set: send there first, and
+/// only when that send is `M_FORBIDDEN` / `not in room` create a new room and send into it.
+/// A created room id is printed on stderr. Stdout stays the event id alone.
 async fn run_matrix_probe(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let gw = matrix_gateway_from_config(config)?;
-    let room = std::env::var("MATRIX_PROBE_ROOM").map_err(|_| "MATRIX_PROBE_ROOM is not set")?;
+    let room = std::env::var("MATRIX_PROBE_ROOM")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let body = std::env::var("MATRIX_PROBE_BODY")
         .ok()
         .filter(|s| !s.is_empty())
@@ -1251,8 +1261,22 @@ async fn run_matrix_probe(config: &Config) -> Result<(), Box<dyn std::error::Err
                 .unwrap_or(0);
             format!("lavoisier lattice probe {nanos}")
         });
-    let event_id = gw.probe_send_sync(&room, &body).await?;
-    println!("{event_id}");
+    let receipt = gw.probe_send_sync(room.as_deref(), &body).await?;
+    match &receipt.room {
+        ProbeRoom::Configured { .. } => {}
+        ProbeRoom::Created { room_id } => {
+            eprintln!("lavoisier: created probe room {room_id} (MATRIX_PROBE_ROOM unset)");
+        }
+        ProbeRoom::Replaced {
+            configured,
+            room_id,
+        } => {
+            eprintln!(
+                "lavoisier: created probe room {room_id} (send to {configured} was M_FORBIDDEN not in room)"
+            );
+        }
+    }
+    println!("{}", receipt.event_id);
     Ok(())
 }
 
