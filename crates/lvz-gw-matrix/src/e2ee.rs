@@ -120,6 +120,9 @@ pub(crate) fn encrypt_attachment(plaintext: &[u8]) -> Result<EncryptedAttachment
 pub struct Crypto {
     machine: OlmMachine,
     http: reqwest::Client,
+    /// When set, forced onto every request after ruma's own headers so a lattice `Host`
+    /// is not replaced by the dial URL's authority.
+    http_host: Option<String>,
     homeserver: String,
     token: String,
     /// Matrix versions we advertise when serialising ruma requests (selects the `v3` endpoints).
@@ -131,6 +134,7 @@ impl Crypto {
     /// `store_path` is given the machine is backed by a durable SQLite crypto store opened there
     /// (created if absent, reused if present), optionally encrypted at rest with `passphrase`;
     /// otherwise it is in-memory.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         homeserver: String,
         token: String,
@@ -138,6 +142,8 @@ impl Crypto {
         device_id: &str,
         store_path: Option<&Path>,
         passphrase: Option<&str>,
+        http: reqwest::Client,
+        http_host: Option<String>,
     ) -> Result<Self, E2eeError> {
         let user = UserId::parse(user_id).map_err(estr)?;
         let device: OwnedDeviceId = device_id.into();
@@ -159,7 +165,8 @@ impl Crypto {
         };
         let crypto = Self {
             machine,
-            http: reqwest::Client::new(),
+            http,
+            http_host,
             homeserver,
             token,
             versions,
@@ -498,6 +505,13 @@ impl Crypto {
         self.send_ruma(req).await
     }
 
+    fn stamp(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.http_host {
+            Some(host) => req.header(reqwest::header::HOST, host.as_str()),
+            None => req,
+        }
+    }
+
     /// Serialise a ruma request to HTTP, send it over the gateway's `reqwest` client, and parse
     /// the typed response back — bridging `matrix-sdk-crypto`'s ruma types to our transport.
     async fn send_ruma<R>(&self, req: R) -> Result<R::IncomingResponse, E2eeError>
@@ -513,10 +527,12 @@ impl Crypto {
             .map_err(estr)?;
         let (parts, body) = http_req.into_parts();
         let resp = self
-            .http
-            .request(parts.method, parts.uri.to_string())
-            .headers(parts.headers)
-            .body(body)
+            .stamp(
+                self.http
+                    .request(parts.method, parts.uri.to_string())
+                    .headers(parts.headers)
+                    .body(body),
+            )
             .send()
             .await
             .map_err(estr)?;
@@ -544,10 +560,7 @@ impl Crypto {
             txn
         );
         let resp = self
-            .http
-            .put(url)
-            .bearer_auth(&self.token)
-            .json(content)
+            .stamp(self.http.put(url).bearer_auth(&self.token).json(content))
             .send()
             .await
             .map_err(estr)?;
@@ -571,9 +584,7 @@ impl Crypto {
             crate::urlencode(room_id)
         );
         let resp = self
-            .http
-            .get(url)
-            .bearer_auth(&self.token)
+            .stamp(self.http.get(url).bearer_auth(&self.token))
             .send()
             .await
             .map_err(estr)?;

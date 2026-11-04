@@ -96,11 +96,19 @@ live-verified end-to-end (cross-implementation, against both Synapse and Continu
 
 **Matrix auth/identity** (`crates/lvz-gw-matrix/src/lib.rs`): authenticates by **access token**
 (`MATRIX_ACCESS_TOKEN`, identity via `/account/whoami`, no login) **or** password (`MATRIX_USER` +
-`MATRIX_PASSWORD`), precedence: explicit token > persisted session > password. `MATRIX_STATE_DIR`
+`MATRIX_PASSWORD`), precedence: explicit token > persisted session > optional `MATRIX_REGISTER`
+(`POST /register`, `M_USER_IN_USE` falls through to login; lattice registration requires
+`MATRIX_REGISTRATION_TOKEN` / `m.login.registration_token`) > password. `MATRIX_STATE_DIR`
 (or `[gateway] matrix_state_dir`) persists `session.json` (token + device id) so the **device id is
 stable across restarts** (and under `e2ee` the `<dir>/crypto` SQLite store persists the whole crypto
 identity — no re-verification after restart). Password login reuses a configured/persisted
-`MATRIX_DEVICE_ID`. A **per-sender allowlist** (`MATRIX_ALLOWED_USERS` / `[gateway]
+`MATRIX_DEVICE_ID`. **Lattice Phase 4 Port** (same process, not a new gateway — see
+`docs/PHASE4-PORT.md`): dial `http://matrix-cs.wasmcloud.svc.cluster.local:80` with HTTP `Host`
+`matrix-cs.wasmcloud.svc` (`MATRIX_HTTP_HOST`) and server name `davidlee18.dev`
+(`MATRIX_SERVER_NAME`). Any one of those markers requires the full pin, including
+`MATRIX_DEVICE_ID`, and rejects state dirs that name ECS volume `fs-0966896c7d24d7b20`. Unset, the
+ECS `@lav:matrix.spider42.com` path is unchanged. `lav --matrix-probe` is the G4 send + `/sync`
+read-back and does not start a model provider. A **per-sender allowlist** (`MATRIX_ALLOWED_USERS` / `[gateway]
 matrix_allowed_users`) gates both plaintext and encrypted paths (enforced pre-decrypt on the
 cleartext `sender`); empty ⇒ answer everyone.
 

@@ -120,6 +120,17 @@
 #                                # A tool's own estimate wins. env LVZ_SCHEDULE_PENDING_TIMEOUT wins.
 # Matrix gateway:
 # matrix_auto_join    = true     # auto-accept Matrix room invites (default true)
+# Lattice Phase 4 Port (in-cluster wasmCloud homeserver). Leave unset on the ECS
+# spider42 task. Full contract: docs/PHASE4-PORT.md. Secrets stay in the environment.
+# matrix_homeserver   = "http://matrix-cs.wasmcloud.svc.cluster.local:80"
+# matrix_http_host    = "matrix-cs.wasmcloud.svc"   # Host header (wadm hostInterfaces)
+# matrix_server_name  = "davidlee18.dev"            # MXID domain, not the dial host
+# matrix_user         = "@lav:davidlee18.dev"       # env MATRIX_USER wins
+# matrix_device_id    = "LAVOISIER_LATTICE"         # stable device without the ECS volume
+# matrix_register     = false                       # lattice: true also needs
+#                                                   # MATRIX_REGISTRATION_TOKEN
+#                                                   # (m.login.registration_token). G4 is
+#                                                   # `lav --matrix-probe`.
 # matrix_state_dir    = "./.lavoisier/matrix"  # persist session (token + device id) + E2EE crypto
 #                                              # store here so identity is stable across restarts
 #                                              # (env MATRIX_STATE_DIR wins). Auth via env:

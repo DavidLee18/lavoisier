@@ -157,6 +157,16 @@ the operating system-prompt and rides in the cached prefix, so it costs almost n
 id) and keep a **stable device identity across restarts** — a prerequisite for durable E2EE. Restrict
 who can drive the bot with `MATRIX_ALLOWED_USERS` (or `[gateway] matrix_allowed_users`).
 
+**Lattice Phase 4 Port.** The same gateway can dial the in-cluster wasmCloud homeserver instead of
+the ECS one. Set `MATRIX_HOMESERVER=http://matrix-cs.wasmcloud.svc.cluster.local:80`,
+`MATRIX_HTTP_HOST=matrix-cs.wasmcloud.svc` (the `Host` header), and
+`MATRIX_SERVER_NAME=davidlee18.dev`, with a `@localpart:davidlee18.dev` user and a pinned
+`MATRIX_DEVICE_ID`. Gate G4 is `lav --matrix-probe` (send, then `/sync` read-back) and does not
+start the agent. Lattice `MATRIX_REGISTER` requires `MATRIX_REGISTRATION_TOKEN`
+(`m.login.registration_token`). The state directory must not be the ECS volume `fs-0966896c7d24d7b20`. Contract,
+image pin, and hold-apply notes: [`docs/PHASE4-PORT.md`](docs/PHASE4-PORT.md). The spider42 path is
+unchanged when those variables are unset.
+
 **Matrix access control & tool permissions.** Three layers, all opt-in and applied uniformly to
 plaintext and encrypted rooms:
 - **Allowed rooms** — `MATRIX_ALLOWED_ROOMS` (or `[gateway] matrix_allowed_rooms`) limits the rooms
@@ -389,7 +399,8 @@ Env: `XAI_API_KEY` / `XAI_TRANSPORT=grpc|http` (default `grpc`) / `XAI_GRPC_ENDP
 / `GOOGLE_THINKING` · Matrix: `MATRIX_HOMESERVER` / `MATRIX_ACCESS_TOKEN` /
 `MATRIX_USER` / `MATRIX_PASSWORD` / `MATRIX_DEVICE_ID` / `MATRIX_STATE_DIR` /
 `MATRIX_CRYPTO_STORE_KEY` / `MATRIX_ALLOWED_USERS` / `MATRIX_ALLOWED_ROOMS` / `MATRIX_HOME_ROOM` /
-`MATRIX_MEDIA_DIR` ·
+`MATRIX_MEDIA_DIR` · Lattice Port: `MATRIX_HTTP_HOST` / `MATRIX_SERVER_NAME` /
+`MATRIX_REGISTER` / `MATRIX_REGISTRATION_TOKEN` / `MATRIX_PROBE_ROOM` / `MATRIX_PROBE_BODY` ·
 Slack: `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN` /
 `SLACK_ALLOWED_USERS` · `LVZ_PROVIDER` / `LVZ_MODEL` / `LVZ_API_KEYS` / `LVZ_RATE_LIMIT` /
 `LVZ_SERVE_ADDR` / `LVZ_LOG_LEVEL`.
