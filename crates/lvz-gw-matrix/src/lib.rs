@@ -253,13 +253,17 @@ impl MatrixGateway {
     ///
     /// `M_USER_IN_USE` falls through to login, so a scripted boot is idempotent. Off unless
     /// `MATRIX_REGISTER` / `[gateway] matrix_register` says so. An access token still wins and
-    /// skips registration.
+    /// skips registration. On a lattice dial this also requires
+    /// [`Self::with_registration_token`] (`m.login.registration_token`).
     pub fn with_register(mut self, register: bool) -> Self {
         self.register = register;
         self
     }
 
     /// Registration-token auth (`m.login.registration_token`) for [`Self::with_register`].
+    ///
+    /// Required when registration is enabled on a lattice dial. Without it the dial is refused.
+    /// A non-lattice `MATRIX_REGISTER` with no token uses `m.login.dummy` (lab only, not G4).
     pub fn with_registration_token(mut self, token: impl Into<String>) -> Self {
         self.registration_token = Some(token.into());
         self
@@ -509,6 +513,8 @@ impl MatrixGateway {
             state_dir: self.state_dir.as_ref().map(|p| p.display().to_string()),
             has_access_token: self.access_token.is_some(),
             has_password: self.password.is_some(),
+            register: self.register,
+            has_registration_token: self.registration_token.is_some(),
         }
     }
 
@@ -849,7 +855,14 @@ impl MatrixGateway {
         }
         let mut auth = if let Some(token) = &self.registration_token {
             serde_json::json!({ "type": "m.login.registration_token", "token": token })
+        } else if self.dial_contract().is_lattice() {
+            return Err(GatewayError::Bind(
+                "lattice MATRIX_REGISTER requires MATRIX_REGISTRATION_TOKEN \
+                 (m.login.registration_token)"
+                    .into(),
+            ));
         } else {
+            // Non-lattice lab only. G4 does not use m.login.dummy.
             serde_json::json!({ "type": "m.login.dummy" })
         };
         if let Some(session) = uia_session {
@@ -2907,6 +2920,7 @@ mod tests {
         });
         let gw = lattice_gw("@lav:davidlee18.dev")
             .with_register(true)
+            .with_registration_token("g4-reg-token")
             .with_connect_port(addr.port());
         gw.install_client(lattice_client(addr));
         let event = tokio::time::timeout(
@@ -2928,6 +2942,13 @@ mod tests {
             register.1
         );
         assert!(register.1.contains("LAVOISIER_LATTICE"), "{}", register.1);
+        assert!(
+            register.1.contains("m.login.registration_token"),
+            "{}",
+            register.1
+        );
+        assert!(register.1.contains("g4-reg-token"), "{}", register.1);
+        assert!(!register.1.contains("m.login.dummy"), "{}", register.1);
         assert!(hits.iter().any(|(path, _)| path.contains("/login")));
     }
 
@@ -2958,6 +2979,17 @@ mod tests {
         assert!(err.contains(LATTICE_SERVER_NAME), "{err}");
         let hosts = hosts.lock().unwrap();
         assert_eq!(hosts.as_slice(), [LATTICE_HTTP_HOST]);
+    }
+
+    #[test]
+    fn lattice_register_without_token_is_refused() {
+        let gw = lattice_gw("@lav:davidlee18.dev").with_register(true);
+        let err = gw.revalidate_lattice().unwrap_err().to_string();
+        assert!(err.contains("MATRIX_REGISTRATION_TOKEN"), "{err}");
+        assert!(gw
+            .with_registration_token("g4-reg-token")
+            .revalidate_lattice()
+            .is_ok());
     }
 
     #[test]

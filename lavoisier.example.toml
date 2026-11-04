@@ -127,7 +127,10 @@
 # matrix_server_name  = "davidlee18.dev"            # MXID domain, not the dial host
 # matrix_user         = "@lav:davidlee18.dev"       # env MATRIX_USER wins
 # matrix_device_id    = "LAVOISIER_LATTICE"         # stable device without the ECS volume
-# matrix_register     = false                       # true ⇒ POST /register, then login
+# matrix_register     = false                       # lattice: true also needs
+#                                                   # MATRIX_REGISTRATION_TOKEN
+#                                                   # (m.login.registration_token). G4 is
+#                                                   # `lav --matrix-probe`.
 # matrix_state_dir    = "./.lavoisier/matrix"  # persist session (token + device id) + E2EE crypto
 #                                              # store here so identity is stable across restarts
 #                                              # (env MATRIX_STATE_DIR wins). Auth via env:

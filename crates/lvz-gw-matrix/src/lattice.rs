@@ -47,6 +47,10 @@ pub struct DialContract {
     pub has_access_token: bool,
     /// A password was supplied.
     pub has_password: bool,
+    /// `MATRIX_REGISTER` is on.
+    pub register: bool,
+    /// `MATRIX_REGISTRATION_TOKEN` was supplied. Lattice registration requires it.
+    pub has_registration_token: bool,
 }
 
 impl DialContract {
@@ -64,6 +68,8 @@ impl DialContract {
             state_dir: None,
             has_access_token: false,
             has_password: false,
+            register: false,
+            has_registration_token: false,
         }
     }
 
@@ -143,6 +149,15 @@ impl DialContract {
         if !self.has_access_token && !self.has_password {
             return Err(GatewayError::Bind(
                 "lattice dial needs MATRIX_ACCESS_TOKEN or MATRIX_PASSWORD".into(),
+            ));
+        }
+        // G4 registration is m.login.registration_token. Dummy auth is not accepted
+        // on this plane.
+        if self.register && !self.has_registration_token {
+            return Err(GatewayError::Bind(
+                "lattice MATRIX_REGISTER requires MATRIX_REGISTRATION_TOKEN \
+                 (m.login.registration_token)"
+                    .into(),
             ));
         }
         Ok(())
@@ -401,6 +416,8 @@ mod tests {
             state_dir: Some(format!("/mnt/{ECS_EFS_VOLUME_ID}/matrix")),
             has_access_token: true,
             has_password: false,
+            register: true,
+            has_registration_token: false,
         };
         assert!(!ecs.is_lattice());
         assert!(ecs.validate().is_ok());
@@ -420,6 +437,8 @@ mod tests {
             state_dir: None,
             has_access_token: true,
             has_password: false,
+            register: false,
+            has_registration_token: false,
         };
         assert!(only_host.is_lattice());
         assert!(only_host.validate().is_err());
@@ -428,6 +447,19 @@ mod tests {
         only_host.server_name = Some(LATTICE_SERVER_NAME.into());
         let err = only_host.validate().unwrap_err().to_string();
         assert!(err.contains(LATTICE_HOMESERVER), "{err}");
+    }
+
+    #[test]
+    fn lattice_register_requires_registration_token() {
+        let mut dial = lattice_ready();
+        dial.register = true;
+        dial.has_registration_token = false;
+        let err = dial.validate().unwrap_err().to_string();
+        assert!(err.contains("MATRIX_REGISTRATION_TOKEN"), "{err}");
+        assert!(err.contains("m.login.registration_token"), "{err}");
+
+        dial.has_registration_token = true;
+        assert!(dial.validate().is_ok());
     }
 
     #[test]

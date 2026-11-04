@@ -97,7 +97,8 @@ live-verified end-to-end (cross-implementation, against both Synapse and Continu
 **Matrix auth/identity** (`crates/lvz-gw-matrix/src/lib.rs`): authenticates by **access token**
 (`MATRIX_ACCESS_TOKEN`, identity via `/account/whoami`, no login) **or** password (`MATRIX_USER` +
 `MATRIX_PASSWORD`), precedence: explicit token > persisted session > optional `MATRIX_REGISTER`
-(`POST /register`, `M_USER_IN_USE` falls through to login) > password. `MATRIX_STATE_DIR`
+(`POST /register`, `M_USER_IN_USE` falls through to login; lattice registration requires
+`MATRIX_REGISTRATION_TOKEN` / `m.login.registration_token`) > password. `MATRIX_STATE_DIR`
 (or `[gateway] matrix_state_dir`) persists `session.json` (token + device id) so the **device id is
 stable across restarts** (and under `e2ee` the `<dir>/crypto` SQLite store persists the whole crypto
 identity — no re-verification after restart). Password login reuses a configured/persisted

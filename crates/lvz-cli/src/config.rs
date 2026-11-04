@@ -270,6 +270,7 @@ pub struct GatewaySection {
     /// Pinned Matrix device id when `MATRIX_DEVICE_ID` is unset. Required on the lattice dial.
     pub matrix_device_id: Option<String>,
     /// Try `POST /register` before password login. `MATRIX_REGISTER` wins. Off by default.
+    /// On a lattice dial this requires `MATRIX_REGISTRATION_TOKEN` (`m.login.registration_token`).
     pub matrix_register: Option<bool>,
     /// Refuse to start when Matrix E2EE cannot be initialised, instead of degrading to plaintext.
     ///

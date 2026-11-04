@@ -4,6 +4,11 @@ Lavoisier runs as a **lattice workload** that speaks the Matrix client-server AP
 in-cluster wasmCloud homeserver `matrix-cs`. This is the existing `lav` process (`--serve-matrix`),
 not a new gateway and not a wasm guest.
 
+## Locked
+
+- **G4 is `lav --matrix-probe`.** It sends one `m.text` and `/sync`s until that event is read back. `--serve-matrix` is the resident client. It is not G4.
+- **G4 registration is `m.login.registration_token`.** The secret is `MATRIX_REGISTRATION_TOKEN`. On a lattice dial, `MATRIX_REGISTER` without that secret is refused. `m.login.dummy` is not the G4 path. It remains only for a non-lattice lab that sets `MATRIX_REGISTER` without the lattice markers.
+
 **HOLD APPLY.** Do not apply Terraform. Do not push an image. Do not change Continuwuity, Phase D,
 ECS desired counts, or EFS. Path A stays off (no Continuwuity-on-GKE). Publishing stays with Sir.
 
@@ -47,8 +52,8 @@ default. Secrets are environment-only. They are not toml keys.
 | `MATRIX_DEVICE_ID` | `matrix_device_id` | yes | Pinned device. Password login and registration send it. If `whoami` reports another id, that id wins and a warning is logged. |
 | `MATRIX_ACCESS_TOKEN` | — | one of token or password | Skips `/login` and registration. Identity from `/account/whoami`. |
 | `MATRIX_PASSWORD` | — | one of token or password | `m.login.password` |
-| `MATRIX_REGISTER` | `matrix_register` | no (default off) | `true`/`1`/`yes`/`on` tries `POST /_matrix/client/v3/register` before login. `M_USER_IN_USE` falls through to login. |
-| `MATRIX_REGISTRATION_TOKEN` | — | no | Auth type `m.login.registration_token`. Absent ⇒ `m.login.dummy`. A 401 that carries a UIA `session` is retried once with that session. |
+| `MATRIX_REGISTER` | `matrix_register` | no (default off) | `true`/`1`/`yes`/`on` tries `POST /_matrix/client/v3/register` before login. `M_USER_IN_USE` falls through to login. On a lattice dial this requires `MATRIX_REGISTRATION_TOKEN`. |
+| `MATRIX_REGISTRATION_TOKEN` | — | when `MATRIX_REGISTER` is on | G4 auth type `m.login.registration_token`. A lattice register without it is refused. A 401 that carries a UIA `session` is retried once with that session. |
 | `MATRIX_STATE_DIR` | `matrix_state_dir` | no | See state below. |
 | `MATRIX_CRYPTO_STORE_KEY` | — | no | E2EE at-rest passphrase. Not required for G4. |
 | `MATRIX_PROBE_ROOM` | — | for `--matrix-probe` | Room id to send into. |
@@ -57,8 +62,10 @@ default. Secrets are environment-only. They are not toml keys.
 Auth order: access token, then a persisted session, then registration when enabled, then password
 login. Resolved user ids must match `MATRIX_SERVER_NAME` when it is set.
 
-`MATRIX_REGISTER` needs `MATRIX_USER` and `MATRIX_PASSWORD`. The username sent to `/register` is
-the localpart (`@lav:davidlee18.dev` → `lav`). The device display name is `Lavoisier lattice`.
+`MATRIX_REGISTER` needs `MATRIX_USER`, `MATRIX_PASSWORD`, and, on a lattice dial,
+`MATRIX_REGISTRATION_TOKEN`. The username sent to `/register` is the localpart
+(`@lav:davidlee18.dev` → `lav`). The device display name is `Lavoisier lattice`. The auth object
+is `{"type":"m.login.registration_token","token":…}`.
 
 ## State without the ECS volume
 
@@ -79,6 +86,10 @@ or a fresh container filesystem) is a valid G4 state:
 
 ## Gate G4
 
+G4 is this command. It prints the event id on stdout and exits. It does not start a model provider.
+
+An account that already exists logs in with the password (registration stays off):
+
 ```sh
 MATRIX_HOMESERVER=http://matrix-cs.wasmcloud.svc.cluster.local:80 \
 MATRIX_HTTP_HOST=matrix-cs.wasmcloud.svc \
@@ -90,10 +101,24 @@ MATRIX_PROBE_ROOM='!room:davidlee18.dev' \
 lav --matrix-probe
 ```
 
-The command logs in (or registers, if `MATRIX_REGISTER` is on), puts one `m.text` in
-`MATRIX_PROBE_ROOM`, and `/sync`s until that event id is in a joined timeline. It prints the event
-id on stdout and exits. It does not start a model provider. A resident workload uses
-`lav --serve-matrix` with the same identity variables.
+First boot registers with `m.login.registration_token`, then sends and reads back. `M_USER_IN_USE`
+on a later boot falls through to password login. Omitting the registration token with
+`MATRIX_REGISTER` set is a startup failure.
+
+```sh
+MATRIX_HOMESERVER=http://matrix-cs.wasmcloud.svc.cluster.local:80 \
+MATRIX_HTTP_HOST=matrix-cs.wasmcloud.svc \
+MATRIX_SERVER_NAME=davidlee18.dev \
+MATRIX_USER='@lav:davidlee18.dev' \
+MATRIX_PASSWORD='…' \
+MATRIX_DEVICE_ID=LAVOISIER_LATTICE \
+MATRIX_REGISTER=true \
+MATRIX_REGISTRATION_TOKEN='…' \
+MATRIX_PROBE_ROOM='!room:davidlee18.dev' \
+lav --matrix-probe
+```
+
+A resident workload uses `lav --serve-matrix` with the same identity variables. That is not G4.
 
 ## What `lvz-extra-tools` / `deploy_lavoisier_lattice` must pin
 
