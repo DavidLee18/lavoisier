@@ -960,6 +960,14 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
     // `session` continues across turns (§7.3) — then run every active gateway (HTTP, Matrix, cron)
     // concurrently until shutdown. No prompt is consumed.
     if serving {
+        // The fence, when configured, is acquired before the memory store, Slack, or the
+        // schedule can run. An unset secret leaves this as `None` and SQLite stays the store.
+        #[cfg(feature = "e2ee")]
+        let mut leadership = lvz_gw_matrix::acquire_leadership_from_env().await?;
+        #[cfg(feature = "e2ee")]
+        let handoff = leadership
+            .as_ref()
+            .map(|lead| std::sync::Arc::clone(&lead.handoff));
         let store = config.build_session_store()?;
         // Schedules run inside the Matrix gateway, but the registry is built here: the agent needs
         // the `schedule_*` tools, and the gateway needs the same registry to fire jobs against.
@@ -1063,6 +1071,10 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
                 Language::English => lvz_gw_matrix::Language::English,
             };
             matrix = matrix.with_language(matrix_lang);
+            #[cfg(feature = "e2ee")]
+            if let Some(lead) = leadership.take() {
+                matrix = matrix.with_leadership(lead);
+            }
             // Per-room/per-member tool permissions are config-file-only (too structured for env).
             if let Some(room_tools) = &config.gateway.matrix_room_tools {
                 matrix = matrix.with_room_tools(room_tools.clone());
@@ -1140,6 +1152,12 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
         // returning `Ok` after catching SIGTERM / Ctrl-C and posting its home-room notice — ends the
         // whole process promptly, and any gateway error surfaces immediately instead of being
         // swallowed behind the other (endless) loops.
+        #[cfg(feature = "e2ee")]
+        let _ = leadership;
+        #[cfg(feature = "e2ee")]
+        if let Some(handoff) = handoff {
+            return supervise_gateways(gateways, agent, handoff).await;
+        }
         let runs = gateways
             .into_iter()
             .map(|gw| Box::pin(gw.serve(agent.clone())));
@@ -1191,6 +1209,64 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
     }
 
     Ok(())
+}
+
+/// Run gateways until one finishes. A Slack `Ok` after a requested handoff does not end the
+/// process before the fence release `UPDATE`. Any other Slack completion does.
+#[cfg(feature = "e2ee")]
+async fn supervise_gateways(
+    gateways: Vec<Arc<dyn lvz_protocol::Gateway>>,
+    agent: Arc<dyn AgentHandle>,
+    handoff: Arc<lvz_gw_matrix::Handoff>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    type GatewayRun = Pin<Box<dyn Future<Output = Result<(), lvz_protocol::GatewayError>> + Send>>;
+
+    let mut names = Vec::new();
+    let mut runs: Vec<GatewayRun> = Vec::new();
+    for gw in gateways {
+        let name = gw.name().to_string();
+        let agent = Arc::clone(&agent);
+        if name == "slack" {
+            let handoff = Arc::clone(&handoff);
+            names.push(name);
+            runs.push(Box::pin(async move {
+                tokio::select! {
+                    result = gw.serve(agent) => result,
+                    _ = handoff.stopped() => Ok(()),
+                }
+            }));
+        } else {
+            names.push(name);
+            runs.push(Box::pin(gw.serve(agent)));
+        }
+    }
+    loop {
+        if runs.is_empty() {
+            return Ok(());
+        }
+        let (res, idx, rest) = futures::future::select_all(runs).await;
+        let name = names.remove(idx);
+        runs = rest;
+        let slack = name == "slack";
+        match lvz_gw_matrix::supervisor_step(
+            slack,
+            res.is_ok(),
+            handoff.requested(),
+            handoff.released(),
+        ) {
+            lvz_gw_matrix::SupervisorStep::Exit => {
+                res?;
+                return Ok(());
+            }
+            // Keep polling. Matrix performs the release `UPDATE` on its own future.
+            // Returning here would end the process before that update.
+            lvz_gw_matrix::SupervisorStep::WaitForRelease
+            | lvz_gw_matrix::SupervisorStep::Ignore => {}
+        }
+    }
 }
 
 /// Matrix gateway from `MATRIX_*` env, with `[gateway]` filling any lattice/identity field the

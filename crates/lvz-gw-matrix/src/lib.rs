@@ -45,8 +45,15 @@ use tracing::{error, info, warn};
 
 #[cfg(feature = "e2ee")]
 mod e2ee;
+mod fence_supervisor;
 mod lattice;
 mod media;
+#[cfg(feature = "e2ee")]
+mod pg_crypto;
+
+pub use fence_supervisor::{supervisor_step, FenceSnapshot, Handoff, ParkAction, SupervisorStep};
+#[cfg(feature = "e2ee")]
+pub use pg_crypto::{acquire_leadership_from_env, Leadership, PostgresCryptoStore};
 
 pub use lattice::{
     DialContract, ECS_EFS_VOLUME_ID, LATTICE_HOMESERVER, LATTICE_HTTP_HOST, LATTICE_SERVER_NAME,
@@ -197,6 +204,15 @@ pub struct MatrixGateway {
     media_dir: Option<PathBuf>,
     /// Language for gateway-authored notices (the shutdown message). Defaults to English.
     lang: Language,
+    /// Aurora store the CLI acquired once. Absent means SQLite or memory.
+    #[cfg(feature = "e2ee")]
+    leadership: Option<Arc<crate::pg_crypto::PostgresCryptoStore>>,
+    /// Handoff flag shared with the process supervisor. Set with [`Self::with_leadership`].
+    #[cfg(feature = "e2ee")]
+    handoff: Option<Arc<Handoff>>,
+    /// `MATRIX_CRYPTO_STORE_SECRET` is set. The JSON itself is not stored here.
+    #[cfg(feature = "e2ee")]
+    postgres_selected: bool,
 }
 
 impl MatrixGateway {
@@ -236,7 +252,21 @@ impl MatrixGateway {
             schedule_room: None,
             media_dir: None,
             lang: Language::English,
+            #[cfg(feature = "e2ee")]
+            leadership: None,
+            #[cfg(feature = "e2ee")]
+            handoff: None,
+            #[cfg(feature = "e2ee")]
+            postgres_selected: false,
         }
+    }
+
+    /// Use a fence the process already acquired. Does not acquire again.
+    #[cfg(feature = "e2ee")]
+    pub fn with_leadership(mut self, lead: crate::pg_crypto::Leadership) -> Self {
+        self.leadership = Some(lead.store);
+        self.handoff = Some(lead.handoff);
+        self
     }
 
     /// Construct against a homeserver base URL (e.g. `https://matrix.example.org`) and the
@@ -519,6 +549,11 @@ impl MatrixGateway {
         }
         gw.registration_token = opt("MATRIX_REGISTRATION_TOKEN");
         gw.crypto_passphrase = opt("MATRIX_CRYPTO_STORE_KEY");
+        #[cfg(feature = "e2ee")]
+        {
+            gw.postgres_selected =
+                std::env::var_os("MATRIX_CRYPTO_STORE_SECRET").is_some_and(|v| !v.is_empty());
+        }
         gw.media_dir = opt("MATRIX_MEDIA_DIR").map(PathBuf::from);
         if let Some(users) = opt("MATRIX_ALLOWED_USERS") {
             gw = gw.with_allowed_users(users.split(',').map(|s| s.trim().to_string()));
@@ -2139,36 +2174,56 @@ impl MatrixGateway {
         // dir backs the OlmMachine with a durable SQLite crypto store (`<state_dir>/crypto`) so the
         // crypto identity survives restarts; without one the machine is in-memory (single-session).
         #[cfg(feature = "e2ee")]
-        let crypto = match e2ee::Crypto::new(
-            self.request_base()?,
-            token.clone(),
-            &session.user_id,
-            &session.device_id,
-            self.state_dir.as_ref().map(|d| d.join("crypto")).as_deref(),
-            self.crypto_passphrase.as_deref(),
-            self.http()?.clone(),
-            self.http_host.clone(),
-        )
-        .await
-        {
-            Ok(c) => {
-                info!("e2ee: matrix E2EE enabled");
-                Some(c)
+        let mut crypto = {
+            if self.postgres_selected && self.leadership.is_none() {
+                return Err(GatewayError::Bind(
+                    "MATRIX_CRYPTO_STORE_SECRET is set but the fence was not acquired".into(),
+                ));
             }
-            Err(e) if self.require_e2ee => {
-                // Asked for mandatory E2EE and we cannot provide it: fail loudly at startup rather
-                // than run deaf in encrypted rooms.
-                error!(error = %e, "e2ee: init failed and require_e2ee is set — refusing to start");
-                return Err(GatewayError::Bind(format!(
-                    "matrix E2EE is required but could not be initialised: {e}"
-                )));
-            }
-            Err(e) => {
-                // Degrading is only safe where some rooms are plaintext. `error!`, not `warn!`:
-                // in an encrypted deployment this single line is the whole signal that the bot is
-                // about to be silently unable to read or write anything.
-                error!(error = %e, "e2ee: init failed, continuing WITHOUT encryption (set require_e2ee to make this fatal)");
-                None
+            let init = if let Some(store) = self.leadership.clone() {
+                e2ee::Crypto::with_leadership(
+                    self.request_base()?,
+                    token.clone(),
+                    &session.user_id,
+                    &session.device_id,
+                    store,
+                    self.state_dir.as_ref().map(|d| d.join("crypto")).as_deref(),
+                    self.crypto_passphrase.as_deref(),
+                    self.http()?.clone(),
+                    self.http_host.clone(),
+                )
+                .await
+            } else {
+                e2ee::Crypto::new(
+                    self.request_base()?,
+                    token.clone(),
+                    &session.user_id,
+                    &session.device_id,
+                    self.state_dir.as_ref().map(|d| d.join("crypto")).as_deref(),
+                    self.crypto_passphrase.as_deref(),
+                    self.http()?.clone(),
+                    self.http_host.clone(),
+                )
+                .await
+            };
+            match init {
+                Ok(c) => {
+                    if c.uses_postgres() {
+                        let _ = std::fs::write("/tmp/e2ee-ready", b"1");
+                    }
+                    info!("e2ee: matrix E2EE enabled");
+                    Some(c)
+                }
+                Err(e) if self.require_e2ee || self.postgres_selected => {
+                    error!(error = %e, "e2ee: init failed and encryption is required — refusing to start");
+                    return Err(GatewayError::Bind(format!(
+                        "matrix E2EE is required but could not be initialised: {e}"
+                    )));
+                }
+                Err(e) => {
+                    error!(error = %e, "e2ee: init failed, continuing WITHOUT encryption (set require_e2ee to make this fatal)");
+                    None
+                }
             }
         };
 
@@ -2193,6 +2248,37 @@ impl MatrixGateway {
         // the home-room notice) on SIGTERM / Ctrl-C rather than being hard-killed.
         let shutdown = shutdown_signal();
         tokio::pin!(shutdown);
+
+        let (beat_tx, mut beat_rx) = tokio::sync::mpsc::channel::<FenceBeat>(1);
+        #[cfg(feature = "e2ee")]
+        let _beat_hold = if let Some(store) = self.leadership.clone() {
+            let tx = beat_tx.clone();
+            let me = store.holder().to_string();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    match store.heartbeat_if_idle().await {
+                        None => {}
+                        Some(Ok(waiter)) => {
+                            if waiter.as_deref().is_some_and(|w| !w.is_empty() && w != me) {
+                                let _ = tx.send(FenceBeat::Handoff).await;
+                                break;
+                            }
+                        }
+                        Some(Err(_)) => {
+                            let _ = tx.send(FenceBeat::Poison).await;
+                            break;
+                        }
+                    }
+                }
+            });
+            None
+        } else {
+            Some(beat_tx.clone())
+        };
+        #[cfg(not(feature = "e2ee"))]
+        let _beat_hold = Some(beat_tx.clone());
+        drop(beat_tx);
 
         loop {
             // Three-way race: shutdown, a due scheduled job, or the next `/sync`. Running the
@@ -2231,6 +2317,28 @@ impl MatrixGateway {
                         continue;
                     }
                 },
+                beat = beat_rx.recv() => {
+                    #[cfg(feature = "e2ee")]
+                    {
+                        match beat {
+                            Some(FenceBeat::Handoff) => {
+                                self.finish_handoff(&token, crypto.as_ref(), &mut shutdown)
+                                    .await;
+                                return Ok(());
+                            }
+                            Some(FenceBeat::Poison) => {
+                                let _ = std::fs::remove_file("/tmp/e2ee-ready");
+                                return Err(GatewayError::Io("e2ee: stale fence".into()));
+                            }
+                            None => continue,
+                        }
+                    }
+                    #[cfg(not(feature = "e2ee"))]
+                    {
+                        let _ = beat;
+                        continue;
+                    }
+                }
             };
 
             // Accept any new room invites before processing messages.
@@ -2238,10 +2346,29 @@ impl MatrixGateway {
                 .await;
 
             // Feed encryption changes (to-device, device lists, key counts) before acting.
+            // `since` advances only when a fenced pair is known committed. SQLite keeps the
+            // previous behaviour: a failed feed still advances.
             #[cfg(feature = "e2ee")]
-            if let Some(c) = &crypto {
-                if let Err(e) = c.receive_sync(&value).await {
-                    error!(error = %e, "e2ee: receive_sync failed");
+            let mut advance_since = true;
+            #[cfg(not(feature = "e2ee"))]
+            let advance_since = true;
+            #[cfg(feature = "e2ee")]
+            if let Some(c) = crypto.as_ref() {
+                let drop_crypto = match c.receive_sync(&value).await {
+                    Ok(advance) => {
+                        advance_since = advance || !c.uses_postgres();
+                        c.is_poisoned()
+                    }
+                    Err(e) => {
+                        error!(error = %e, "e2ee: receive_sync failed");
+                        if c.uses_postgres() {
+                            advance_since = false;
+                        }
+                        c.is_poisoned()
+                    }
+                };
+                if drop_crypto {
+                    crypto = None;
                 }
             }
 
@@ -2250,7 +2377,9 @@ impl MatrixGateway {
                 Ok(resp) => resp,
                 Err(e) => {
                     error!(error = %e, "malformed sync");
-                    since = next;
+                    if advance_since {
+                        since = next;
+                    }
                     continue;
                 }
             };
@@ -2301,9 +2430,69 @@ impl MatrixGateway {
                 }
             }
 
-            since = next;
+            if advance_since {
+                since = next;
+            }
         }
     }
+
+    /// Stop Slack, send the home-room notice while the epoch is held, release, then park.
+    /// A parked holder does not acquire again.
+    #[cfg(feature = "e2ee")]
+    async fn finish_handoff(
+        &self,
+        token: &str,
+        crypto: Option<&e2ee::Crypto>,
+        shutdown: &mut std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+    ) {
+        if let Some(handoff) = &self.handoff {
+            handoff.request_stop();
+        }
+        self.send_shutdown_notice(token, crypto).await;
+        let Some(store) = &self.leadership else {
+            return;
+        };
+        if let Ok(crate::pg_crypto::Reconcile::StillUnknown) = store.reconcile_inflight().await {
+            error!("e2ee: commit outcome unknown, not releasing the fence");
+            return;
+        }
+        if let Err(e) = store.release().await {
+            error!(error = %e, "e2ee: fence release failed");
+            return;
+        }
+        if let Some(handoff) = &self.handoff {
+            handoff.mark_released();
+        }
+        let mut state = fence_supervisor::ParkState::new();
+        let me = store.holder().to_string();
+        loop {
+            tokio::select! {
+                _ = shutdown.as_mut() => return,
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                    let Ok(snap) = store.fence_snapshot().await else {
+                        continue;
+                    };
+                    if fence_supervisor::park_action(
+                        &me,
+                        &snap,
+                        &mut state,
+                        std::time::Instant::now(),
+                        Duration::from_secs(120),
+                    ) == fence_supervisor::ParkAction::Exit
+                    {
+                        let _ = std::fs::remove_file("/tmp/e2ee-ready");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "e2ee"), allow(dead_code))]
+enum FenceBeat {
+    Handoff,
+    Poison,
 }
 
 /// Wait for the next due scheduled job. With no schedule configured this never resolves, so the

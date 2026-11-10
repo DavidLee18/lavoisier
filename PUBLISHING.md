@@ -51,6 +51,12 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
+(`v0.18.12`): **fenced Postgres CryptoStore**. `lvz-gw-matrix` (0.7.5→**0.7.6** — Postgres
+`CryptoStore` behind `MATRIX_CRYPTO_STORE_SECRET`, pair-bracketed `receive_sync`, poison on a
+stale fence or unknown commit, one-shot SQLite copy under the fence) and `lavoisier`
+(0.18.11→**0.18.12** — one incrementing acquire before the gateways, Slack handoff supervisor).
+Publish order `lvz-gw-matrix` → `lavoisier`. The other crates stay put.
+Earlier changed set
 (`v0.18.11`): **Matrix member-tool fail-closed**. `lvz-gw-matrix` (0.7.4→**0.7.5** — when
 `matrix_user_tools` is non-empty, `tools_for` returns `Some([])` for a sender absent from the map,
 so no tools are advertised or callable; an empty or absent map is unchanged, listed members still

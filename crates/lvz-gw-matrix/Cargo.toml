@@ -1,6 +1,6 @@
 [package]
 name = "lvz-gw-matrix"
-version = "0.7.5"
+version = "0.7.6"
 description = "Matrix gateway for Lavoisier: a thin reqwest client-server API client (login + /sync long-poll + m.room.message send) that drives the shared agent, one room per session. End-to-end encryption (Olm/Megolm) is opt-in behind the `e2ee` feature."
 edition.workspace = true
 rust-version.workspace = true
@@ -17,7 +17,7 @@ futures.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
 base64.workspace = true
 
@@ -27,9 +27,21 @@ base64.workspace = true
 # the rest of the workspace still builds on the pinned 1.88 when the feature is off).
 # AES-256-CTR attachment encryption (outbound `m.image` in encrypted rooms) rides the same feature.
 aes = { version = "0.8", optional = true }
+aes-gcm = { version = "0.10", optional = true }
 ctr = { version = "0.9", optional = true }
+hkdf = { version = "0.12", optional = true }
+hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 getrandom = { version = "0.2", optional = true }
+rmp-serde = { version = "1", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+rustls-pemfile = { version = "2", optional = true }
+matrix-sdk-common = { version = "0.18", optional = true }
+tokio-postgres = { version = "0.7", optional = true, default-features = false, features = ["runtime", "with-uuid-1"] }
+tokio-postgres-rustls = { version = "0.13", optional = true }
+uuid = { version = "1", optional = true, features = ["v4"] }
+webpki-roots = { version = "1", optional = true }
+zeroize = { version = "1", optional = true }
 matrix-sdk-crypto = { version = "0.18", optional = true }
 # Durable crypto store so the bot's E2EE identity (device keys, Olm/Megolm sessions, tracked
 # devices) survives restarts. `bundled` compiles SQLite from source (no runtime libsqlite3),
@@ -39,10 +51,32 @@ ruma = { version = "0.16", optional = true, features = ["client-api", "events"] 
 http = { version = "1", optional = true }
 
 [features]
-e2ee = ["dep:matrix-sdk-crypto", "dep:matrix-sdk-sqlite", "dep:ruma", "dep:http", "dep:aes", "dep:ctr", "dep:sha2", "dep:getrandom"]
+e2ee = [
+    "dep:matrix-sdk-common",
+    "dep:matrix-sdk-crypto",
+    "dep:matrix-sdk-sqlite",
+    "dep:ruma",
+    "dep:http",
+    "dep:aes",
+    "dep:aes-gcm",
+    "dep:ctr",
+    "dep:hkdf",
+    "dep:hmac",
+    "dep:sha2",
+    "dep:getrandom",
+    "dep:rmp-serde",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:tokio-postgres",
+    "dep:tokio-postgres-rustls",
+    "dep:uuid",
+    "dep:webpki-roots",
+    "dep:zeroize",
+]
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile = "3"
 
 # Build docs.rs with `e2ee` on so the crypto module (off by default) is documented too. The
 # feature needs Rust >= 1.93; docs.rs builds on recent nightly, so this resolves there.

@@ -22,6 +22,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::{self, Display};
 use std::ops::Deref;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use aes::cipher::{KeyIvInit, StreamCipher};
 use aes::Aes256;
@@ -51,7 +53,10 @@ use ruma::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard};
 use tracing::{error, info, warn};
+
+use crate::pg_crypto::{migrate_sqlite, Reconcile, StoreError};
 
 /// An end-to-end-encryption error. We collapse the many `matrix-sdk-crypto`/`ruma` error types to
 /// a string at the boundary — the gateway only logs them, and this avoids leaking those types
@@ -118,7 +123,13 @@ pub(crate) fn encrypt_attachment(plaintext: &[u8]) -> Result<EncryptedAttachment
 
 /// The crypto layer bound to a logged-in bot session.
 pub struct Crypto {
-    machine: OlmMachine,
+    machine: Mutex<Option<OlmMachine>>,
+    /// Set when a stale fence or an unknown commit has dropped the machine.
+    poisoned: AtomicBool,
+    /// Set when this process holds the Aurora fence. SQLite leaves this empty.
+    pg: Option<Arc<crate::pg_crypto::PostgresCryptoStore>>,
+    user: OwnedUserId,
+    device: OwnedDeviceId,
     http: reqwest::Client,
     /// When set, forced onto every request after ruma's own headers so a lattice `Host`
     /// is not replaced by the dial URL's authority.
@@ -159,23 +170,102 @@ impl Crypto {
             }
             None => OlmMachine::new(&user, &device).await,
         };
+        Self::finish(
+            machine, None, user, device, homeserver, token, http, http_host,
+        )
+        .await
+    }
+
+    /// Open the machine on a fence the CLI already acquired. Does not run the
+    /// incrementing acquire. A null marker copies the SQLite directory once, or
+    /// refuses to call `with_store` when there is nothing to copy.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn with_leadership(
+        homeserver: String,
+        token: String,
+        user_id: &str,
+        device_id: &str,
+        store: Arc<crate::pg_crypto::PostgresCryptoStore>,
+        sqlite_source: Option<&Path>,
+        passphrase: Option<&str>,
+        http: reqwest::Client,
+        http_host: Option<String>,
+    ) -> Result<Self, E2eeError> {
+        let user = UserId::parse(user_id).map_err(estr)?;
+        let device: OwnedDeviceId = device_id.into();
+        if store.migration_marker().await.map_err(estr)?.is_none() {
+            if let Some(path) = sqlite_source {
+                if path.join("matrix-sdk-crypto.sqlite3").is_file() {
+                    migrate_sqlite(&store, path, passphrase)
+                        .await
+                        .map_err(estr)?;
+                }
+            }
+            if store.migration_marker().await.map_err(estr)?.is_none() {
+                return Err(estr("e2ee: aurora crypto store has no migration marker"));
+            }
+        }
+        store.ready_for_machine().await.map_err(estr)?;
+        store.set_boot_load(true);
+        let machine = OlmMachine::with_store(&user, &device, Arc::clone(&store), None)
+            .await
+            .map_err(estr)?;
+        store.set_boot_load(false);
+        let _ = store.renew_lease().await;
+        info!(epoch = store.epoch(), "e2ee: using postgres crypto store");
+        Self::finish(
+            machine,
+            Some(store),
+            user,
+            device,
+            homeserver,
+            token,
+            http,
+            http_host,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish(
+        machine: OlmMachine,
+        pg: Option<Arc<crate::pg_crypto::PostgresCryptoStore>>,
+        user: OwnedUserId,
+        device: OwnedDeviceId,
+        homeserver: String,
+        token: String,
+        http: reqwest::Client,
+        http_host: Option<String>,
+    ) -> Result<Self, E2eeError> {
         let versions = SupportedVersions {
             versions: BTreeSet::from([MatrixVersion::V1_1]),
             features: BTreeSet::new(),
         };
         let crypto = Self {
-            machine,
+            machine: Mutex::new(Some(machine)),
+            poisoned: AtomicBool::new(false),
+            pg,
+            user,
+            device,
             http,
             http_host,
             homeserver,
             token,
             versions,
         };
-        // Initial device-key + one-time-key upload.
         crypto.process_outgoing().await?;
-        // Publish the bot's cross-signing identity once (best-effort; logged, never fatal).
         crypto.bootstrap_cross_signing().await;
         Ok(crypto)
+    }
+
+    /// This process is using the fenced store.
+    pub fn uses_postgres(&self) -> bool {
+        self.pg.is_some()
+    }
+
+    /// The machine was dropped after a stale fence or an unknown commit.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
     }
 
     /// Publish the bot's **cross-signing identity** the first time it's set up, so other users'
@@ -192,24 +282,28 @@ impl Crypto {
     }
 
     async fn try_bootstrap_cross_signing(&self) -> Result<(), E2eeError> {
-        if self.machine.cross_signing_status().await.is_complete() {
+        let complete = {
+            let machine = self.lock_machine().await?;
+            machine.cross_signing_status().await.is_complete()
+        };
+        if complete {
             return Ok(()); // already have an identity (persistent store / earlier run)
         }
-        let reqs = self
-            .machine
-            .bootstrap_cross_signing(false)
-            .await
-            .map_err(estr)?;
+        let reqs = {
+            let machine = self.lock_machine().await?;
+            machine.bootstrap_cross_signing(false).await.map_err(estr)?
+        };
         // 1. Device-key upload, if the machine asks for one (its response is fed back). Usually
         //    `None` here since `process_outgoing` already uploaded the device keys.
         if let Some(req) = reqs.upload_keys_req {
             let id = req.request_id().to_owned();
             if let AnyOutgoingRequest::KeysUpload(r) = req.request() {
                 let resp = self.send_ruma(r.clone()).await?;
-                self.machine
-                    .mark_request_as_sent(&id, &resp)
-                    .await
-                    .map_err(estr)?;
+                let marked = {
+                    let machine = self.lock_machine().await?;
+                    machine.mark_request_as_sent(&id, &resp).await
+                };
+                self.map_store(marked).await?;
             }
         }
         // 2. Upload the public cross-signing key triplet (no UIA on this first upload).
@@ -235,7 +329,10 @@ impl Crypto {
 
     /// Feed a `/sync` response's encryption-relevant parts into the machine, then flush the
     /// requests it produces. `sync` is the raw sync JSON.
-    pub async fn receive_sync(&self, sync: &Value) -> Result<(), E2eeError> {
+    ///
+    /// `Ok(true)` means the paired sync transaction is known committed and `since` may advance.
+    /// `Ok(false)` means the pair aborted or a lost reply must not be re-fed, so `since` stays.
+    pub async fn receive_sync(&self, sync: &Value) -> Result<bool, E2eeError> {
         let from = |key: &str| -> Option<&Value> { sync.get(key) };
 
         let to_device_events: Vec<Raw<AnyToDeviceEvent>> = from("to_device")
@@ -266,11 +363,20 @@ impl Crypto {
         let settings = DecryptionSettings {
             sender_device_trust_requirement: TrustRequirement::Untrusted,
         };
-        self.machine
-            .receive_sync_changes(changes, &settings)
-            .await
-            .map_err(estr)?;
-        self.process_outgoing().await
+        if self.pg.is_some() {
+            return self.receive_sync_fenced(sync).await;
+        }
+        {
+            let machine = self.lock_machine().await?;
+            machine
+                .receive_sync_changes(changes, &settings)
+                .await
+                .map_err(estr)?;
+        }
+        self.process_outgoing().await?;
+        // SQLite has no fence. The gateway still advances `since` on this `Ok`,
+        // including when a later caller treats an `Err` as "advance anyway".
+        Ok(true)
     }
 
     /// Decrypt every inbound `m.room.encrypted` text message in a sync response, skipping our own,
@@ -335,11 +441,16 @@ impl Crypto {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
-                match self
-                    .machine
-                    .decrypt_room_event(&raw, &parsed_room, &settings)
-                    .await
-                {
+                let decrypted = {
+                    let machine = match self.lock_machine().await {
+                        Ok(machine) => machine,
+                        Err(_) => return out,
+                    };
+                    machine
+                        .decrypt_room_event(&raw, &parsed_room, &settings)
+                        .await
+                };
+                match decrypted {
                     Ok(decrypted) => {
                         if let Some(msg) = to_incoming(
                             &decrypted.event,
@@ -393,93 +504,113 @@ impl Crypto {
         // their device lists before establishing sessions and sharing the key. `update_tracked_users`
         // only marks them dirty; without running the outgoing requests it triggers, the first reply
         // to a room is encrypted to zero devices and the recipient can't decrypt it.
-        self.machine
-            .update_tracked_users(users.iter().map(Deref::deref))
-            .await
-            .map_err(estr)?;
-        self.process_outgoing().await?;
-        if let Some((id, req)) = self
-            .machine
-            .get_missing_sessions(users.iter().map(Deref::deref))
-            .await
-            .map_err(estr)?
-        {
-            let resp = self.send_ruma(req).await?;
-            self.machine
-                .mark_request_as_sent(&id, &resp)
+        let tracked = {
+            let machine = self.lock_machine().await?;
+            machine
+                .update_tracked_users(users.iter().map(Deref::deref))
                 .await
-                .map_err(estr)?;
+        };
+        self.map_store(tracked).await?;
+        self.process_outgoing().await?;
+        let missing = {
+            let machine = self.lock_machine().await?;
+            machine
+                .get_missing_sessions(users.iter().map(Deref::deref))
+                .await
+        };
+        if let Some((id, req)) = self.map_store(missing).await? {
+            let resp = self.send_ruma(req).await?;
+            let marked = {
+                let machine = self.lock_machine().await?;
+                machine.mark_request_as_sent(&id, &resp).await
+            };
+            self.map_store(marked).await?;
         }
-        let key_requests = self
-            .machine
-            .share_room_key(
-                &room,
-                users.iter().map(Deref::deref),
-                EncryptionSettings::default(),
-            )
-            .await
-            .map_err(estr)?;
+        let shared = {
+            let machine = self.lock_machine().await?;
+            machine
+                .share_room_key(
+                    &room,
+                    users.iter().map(Deref::deref),
+                    EncryptionSettings::default(),
+                )
+                .await
+        };
+        let key_requests = self.map_store(shared).await?;
         for req in key_requests {
             let resp = self.send_to_device(&req).await?;
-            self.machine
-                .mark_request_as_sent(&req.txn_id, &resp)
-                .await
-                .map_err(estr)?;
+            let marked = {
+                let machine = self.lock_machine().await?;
+                machine.mark_request_as_sent(&req.txn_id, &resp).await
+            };
+            self.map_store(marked).await?;
         }
 
         let content: Raw<AnyMessageLikeEventContent> =
             Raw::new(&content).map_err(estr)?.cast_unchecked();
-        let encrypted = self
-            .machine
-            .encrypt_room_event_raw(&room, "m.room.message", &content)
-            .await
-            .map_err(estr)?;
+        let encrypted_result = {
+            let machine = self.lock_machine().await?;
+            machine
+                .encrypt_room_event_raw(&room, "m.room.message", &content)
+                .await
+        };
+        let encrypted = self.map_store(encrypted_result).await?;
         self.send_encrypted_event(&room_id, &encrypted.content)
             .await
     }
 
     /// Drain and dispatch the machine's outgoing requests until none remain.
     async fn process_outgoing(&self) -> Result<(), E2eeError> {
-        for request in self.machine.outgoing_requests().await.map_err(estr)? {
+        let outgoing = {
+            let machine = self.lock_machine().await?;
+            machine.outgoing_requests().await
+        };
+        let requests = self.map_store(outgoing).await?;
+        for request in requests {
             let id = request.request_id().to_owned();
             match request.request() {
                 AnyOutgoingRequest::KeysUpload(r) => {
                     let resp = self.send_ruma(r.clone()).await?;
-                    self.machine
-                        .mark_request_as_sent(&id, &resp)
-                        .await
-                        .map_err(estr)?;
+                    let marked = {
+                        let machine = self.lock_machine().await?;
+                        machine.mark_request_as_sent(&id, &resp).await
+                    };
+                    self.map_store(marked).await?;
                 }
                 AnyOutgoingRequest::KeysQuery(r) => {
                     let mut req = get_keys::v3::Request::new();
                     req.device_keys = r.device_keys.clone();
                     req.timeout = r.timeout;
                     let resp = self.send_ruma(req).await?;
-                    self.machine
-                        .mark_request_as_sent(&id, &resp)
-                        .await
-                        .map_err(estr)?;
+                    let marked = {
+                        let machine = self.lock_machine().await?;
+                        machine.mark_request_as_sent(&id, &resp).await
+                    };
+                    self.map_store(marked).await?;
                 }
                 AnyOutgoingRequest::KeysClaim(r) => {
                     let resp = self.send_ruma(r.clone()).await?;
-                    self.machine
-                        .mark_request_as_sent(&id, &resp)
-                        .await
-                        .map_err(estr)?;
+                    let marked = {
+                        let machine = self.lock_machine().await?;
+                        machine.mark_request_as_sent(&id, &resp).await
+                    };
+                    self.map_store(marked).await?;
                 }
                 AnyOutgoingRequest::ToDeviceRequest(r) => {
                     let resp = self.send_to_device(r).await?;
-                    self.machine
-                        .mark_request_as_sent(&id, &resp)
-                        .await
-                        .map_err(estr)?;
+                    let marked = {
+                        let machine = self.lock_machine().await?;
+                        machine.mark_request_as_sent(&id, &resp).await
+                    };
+                    self.map_store(marked).await?;
                 }
                 AnyOutgoingRequest::SignatureUpload(r) => {
                     let resp = self.send_ruma(r.clone()).await?;
-                    self.machine
-                        .mark_request_as_sent(&id, &resp)
-                        .await
-                        .map_err(estr)?;
+                    let marked = {
+                        let machine = self.lock_machine().await?;
+                        machine.mark_request_as_sent(&id, &resp).await
+                    };
+                    self.map_store(marked).await?;
                 }
                 AnyOutgoingRequest::RoomMessage(_) => {
                     // Only emitted for in-room interactive verification, which this bot neither
@@ -503,6 +634,146 @@ impl Crypto {
             r.messages.clone(),
         );
         self.send_ruma(req).await
+    }
+
+    async fn lock_machine(&self) -> Result<MappedMutexGuard<'_, OlmMachine>, E2eeError> {
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(E2eeError("olm machine poisoned".into()));
+        }
+        let guard = self.machine.lock().await;
+        MutexGuard::try_map(guard, |slot| slot.as_mut())
+            .map_err(|_| E2eeError("olm machine poisoned".into()))
+    }
+
+    async fn map_store<T, E: Display>(&self, result: Result<T, E>) -> Result<T, E2eeError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("commit outcome unknown") {
+                    if let Some(store) = &self.pg {
+                        let _ = store.reconcile_inflight().await;
+                    }
+                    self.poison_machine().await;
+                } else if msg.contains("stale fence") {
+                    self.poison_machine().await;
+                }
+                Err(estr(msg))
+            }
+        }
+    }
+
+    async fn poison_machine(&self) {
+        self.poisoned.store(true, Ordering::SeqCst);
+        *self.machine.lock().await = None;
+        if self.pg.is_some() {
+            let _ = std::fs::remove_file("/tmp/e2ee-ready");
+        }
+    }
+
+    async fn reload_machine(&self) -> Result<(), E2eeError> {
+        let store = self
+            .pg
+            .clone()
+            .ok_or_else(|| E2eeError("no postgres crypto store".into()))?;
+        *self.machine.lock().await = None;
+        self.poisoned.store(false, Ordering::SeqCst);
+        store.set_boot_load(true);
+        let machine = OlmMachine::with_store(&self.user, &self.device, Arc::clone(&store), None)
+            .await
+            .map_err(estr)?;
+        store.set_boot_load(false);
+        let _ = store.renew_lease().await;
+        *self.machine.lock().await = Some(machine);
+        Ok(())
+    }
+
+    async fn receive_sync_fenced(&self, sync: &Value) -> Result<bool, E2eeError> {
+        let first = self.drive_pair(sync).await?;
+        match first {
+            Reconcile::Committed => {
+                if self.is_poisoned() {
+                    self.reload_machine().await?;
+                }
+                if let Err(e) = self.process_outgoing().await {
+                    warn!(error = %e, "e2ee: process_outgoing failed after committed pair");
+                }
+                Ok(true)
+            }
+            Reconcile::Aborted => {
+                self.reload_machine().await?;
+                let second = self.drive_pair(sync).await?;
+                if second == Reconcile::Committed {
+                    if self.is_poisoned() {
+                        self.reload_machine().await?;
+                    }
+                    let _ = self.process_outgoing().await;
+                    Ok(true)
+                } else {
+                    self.poison_machine().await;
+                    Ok(false)
+                }
+            }
+            Reconcile::ForeignCommit | Reconcile::DoNotRefeed | Reconcile::StillUnknown => {
+                self.poison_machine().await;
+                Ok(false)
+            }
+        }
+    }
+
+    async fn drive_pair(&self, sync: &Value) -> Result<Reconcile, E2eeError> {
+        let store = self
+            .pg
+            .as_ref()
+            .ok_or_else(|| E2eeError("no postgres crypto store".into()))?;
+        let settings = DecryptionSettings {
+            sender_device_trust_requirement: TrustRequirement::Untrusted,
+        };
+        store.begin_pair();
+        let sdk = {
+            let parts = sync_parts(sync);
+            let changes = EncryptionSyncChanges {
+                to_device_events: parts.to_device_events,
+                changed_devices: &parts.changed_devices,
+                one_time_keys_counts: &parts.one_time_keys_counts,
+                unused_fallback_keys: parts.unused_fallback_keys.as_deref(),
+                next_batch_token: parts.next_batch_token,
+            };
+            let machine = self.lock_machine().await?;
+            machine.receive_sync_changes(changes, &settings).await
+        };
+        let flush = store.end_pair().await;
+        let sdk_msg = sdk
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        let unknown = sdk_msg.contains("commit outcome unknown")
+            || matches!(flush, Err(StoreError::CommitUnknown));
+        let stale = sdk_msg.contains("stale fence") || matches!(flush, Err(StoreError::StaleFence));
+        if unknown {
+            let outcome = store
+                .reconcile_inflight()
+                .await
+                .unwrap_or(Reconcile::StillUnknown);
+            self.poison_machine().await;
+            return Ok(outcome);
+        }
+        if stale || sdk_msg.contains("account write failed") {
+            self.poison_machine().await;
+            return Ok(Reconcile::Aborted);
+        }
+        match (sdk, flush) {
+            (Ok(_), Ok(())) => Ok(Reconcile::Committed),
+            (Err(e), _) => {
+                self.poison_machine().await;
+                Err(estr(e))
+            }
+            (Ok(_), Err(e)) => {
+                self.poison_machine().await;
+                Err(estr(e))
+            }
+        }
     }
 
     fn stamp(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -598,6 +869,35 @@ impl Crypto {
             }
         }
         Ok(users)
+    }
+}
+
+struct SyncParts {
+    to_device_events: Vec<Raw<AnyToDeviceEvent>>,
+    changed_devices: DeviceLists,
+    one_time_keys_counts: BTreeMap<OneTimeKeyAlgorithm, UInt>,
+    unused_fallback_keys: Option<Vec<OneTimeKeyAlgorithm>>,
+    next_batch_token: Option<String>,
+}
+
+fn sync_parts(sync: &Value) -> SyncParts {
+    let from = |key: &str| -> Option<&Value> { sync.get(key) };
+    SyncParts {
+        to_device_events: from("to_device")
+            .and_then(|t| t.get("events"))
+            .and_then(|e| serde_json::from_value(e.clone()).ok())
+            .unwrap_or_default(),
+        changed_devices: from("device_lists")
+            .and_then(|d| serde_json::from_value(d.clone()).ok())
+            .unwrap_or_default(),
+        one_time_keys_counts: from("device_one_time_keys_count")
+            .and_then(|c| serde_json::from_value(c.clone()).ok())
+            .unwrap_or_default(),
+        unused_fallback_keys: from("device_unused_fallback_key_types")
+            .and_then(|f| serde_json::from_value(f.clone()).ok()),
+        next_batch_token: from("next_batch")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     }
 }
 
