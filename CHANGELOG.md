@@ -5,6 +5,8 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 
 ## [Unreleased]
 
+## [0.18.13] — 2026-11-12
+
 ### Jobs route for an external clock
 
 - `lav --serve --serve-jobs --schedule-file …` (env `LVZ_SERVE_JOBS`, `[gateway] serve_jobs`)
@@ -20,6 +22,8 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
   `--serve-jobs` is refused with `--serve-matrix`, and needs `--serve` and `--schedule-file`.
 - New API: `lvz_gw_http::jobs::{JobRunner, JobRequest, JobReport, JobRejection}`,
   `GatewayConfig::with_jobs`, `ScheduleRegistry::run_attempt`, `CronSchedule::matches_at`.
+
+`lavoisier` 0.18.12 → 0.18.13. `lvz-gw-http` 0.1.1 → 0.1.2. `lvz-schedule` 0.4.2 → 0.4.3.
 
 ## [0.18.12] — 2026-11-10
 

@@ -51,6 +51,12 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
+(`v0.18.13`): **jobs route for an external clock**. `lvz-schedule` (0.4.2→**0.4.3** —
+`ScheduleRegistry::run_attempt` and `CronSchedule::matches_at`), `lvz-gw-http` (0.1.1→**0.1.2** —
+`POST /v1/jobs/{id}` behind the API-key guard) and `lavoisier` (0.18.12→**0.18.13** — `lav --serve
+--serve-jobs --schedule-file`). Publish order `lvz-schedule` → `lvz-gw-http` → `lavoisier`. The
+other crates stay put.
+Earlier changed set
 (`v0.18.12`): **fenced Postgres CryptoStore**. `lvz-gw-matrix` (0.7.5→**0.7.6** — Postgres
 `CryptoStore` behind `MATRIX_CRYPTO_STORE_SECRET`, pair-bracketed `receive_sync`, poison on a
 stale fence or unknown commit, one-shot SQLite copy under the fence) and `lavoisier`
