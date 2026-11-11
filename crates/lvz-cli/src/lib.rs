@@ -45,6 +45,7 @@ use lvz_tune::{BayesTuner, LearningTuner, PersistableTuner, TuneConfig};
 use lvz_xai::{ResponsesTransport, XaiProvider};
 
 mod config;
+mod jobs;
 use config::Config;
 use std::path::PathBuf;
 
@@ -414,6 +415,20 @@ struct Cli {
         env = "LVZ_SCHEDULE_PENDING_TIMEOUT"
     )]
     schedule_pending_timeout: Option<u64>,
+
+    /// Serve `POST /v1/jobs/{id}` on the `--serve` HTTP gateway: run **one attempt** of a
+    /// `--schedule-file` job per call, for an external clock that owns the timer, the lease and
+    /// the retry chain (phase5-endpoint, S1). lav runs no schedule timer in this mode and
+    /// `schedule_run` is not registered. Requires `--serve` and `--schedule-file`; refused with
+    /// `--serve-matrix` (two clocks would double-fire). Also `[gateway] serve_jobs`.
+    #[arg(long = "serve-jobs", env = "LVZ_SERVE_JOBS")]
+    serve_jobs: bool,
+
+    /// Hard cap, in seconds, on one `POST /v1/jobs/{id}` attempt (pending polls and the
+    /// `summarize` turn included); hitting it is a failed attempt. Default 1800. Also
+    /// `[gateway] jobs_timeout`.
+    #[arg(long = "jobs-timeout", value_name = "SECS", env = "LVZ_JOBS_TIMEOUT")]
+    jobs_timeout: Option<u64>,
 
     /// Enable adaptive token optimisation (ATO, experimental): an online tuner that learns
     /// per-archetype knob settings from realised outcomes (most useful in a long-running
@@ -1010,6 +1025,19 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             if let Some(n) = cli.rate_limit {
                 gw_config = gw_config.with_rate_limit(n, std::time::Duration::from_secs(60));
             }
+            if cli.serve_jobs {
+                if let Some(schedule) = &schedule {
+                    let timeout = std::time::Duration::from_secs(cli.jobs_timeout.unwrap_or(1800));
+                    tracing::info!(jobs = schedule.len(), timeout_s = timeout.as_secs(),
+                        "schedule served for an external clock (POST /v1/jobs/{{id}}); no local timer");
+                    gw_config = gw_config.with_jobs(Arc::new(jobs::ScheduleJobRunner::new(
+                        schedule.clone(),
+                        tools.clone(),
+                        agent.clone(),
+                        timeout,
+                    )));
+                }
+            }
             let auth = if cli.api_key.is_empty() {
                 "open"
             } else {
@@ -1377,16 +1405,34 @@ fn build_cron_jobs(cli: &Cli) -> Result<Vec<CronJob>, Box<dyn std::error::Error>
 /// Load the Matrix schedule from `--schedule-file`, applying the global retry defaults. `None`
 /// when no file is configured (⇒ no schedule, and the `schedule_*` tools stay unregistered).
 ///
-/// A schedule without `--serve-matrix` is a configuration mistake — the jobs would have nowhere to
+/// With `--serve-jobs` the jobs are run one attempt at a time through `POST /v1/jobs/{id}`
+/// instead (no timer here). A schedule with neither is a configuration mistake — the jobs would have nowhere to
 /// report — so it fails loudly rather than running them silently into stderr.
 fn build_schedule(cli: &Cli) -> Result<Option<Vec<ScheduleJob>>, Box<dyn std::error::Error>> {
     let Some(path) = &cli.schedule_file else {
+        if cli.serve_jobs {
+            return Err("--serve-jobs requires --schedule-file".into());
+        }
         return Ok(None);
     };
-    if !cli.serve_matrix {
+    if cli.serve_jobs {
+        if cli.serve_matrix {
+            return Err(
+                "--serve-jobs cannot be combined with --serve-matrix (the external \
+                        clock and the Matrix scheduler would both fire the jobs)"
+                    .into(),
+            );
+        }
+        if cli.serve.is_none() {
+            return Err(
+                "--serve-jobs requires --serve (the route lives on the HTTP gateway)".into(),
+            );
+        }
+    } else if !cli.serve_matrix {
         return Err(
-            "--schedule-file requires --serve-matrix (schedules run inside the Matrix \
-                    gateway; use --cron/--cron-file for a standalone scheduler)"
+            "--schedule-file requires --serve-matrix or --serve-jobs (schedules run inside the \
+                    Matrix gateway or for an external clock; use --cron/--cron-file for a \
+                    standalone scheduler)"
                 .into(),
         );
     }
@@ -1658,7 +1704,11 @@ fn build_tool_registry(
     if let Some(schedule) = schedule {
         registry.register(Arc::new(ScheduleListTool::new(schedule.clone())));
         registry.register(Arc::new(ScheduleStatusTool::new(schedule.clone())));
-        registry.register(Arc::new(ScheduleRunTool::new(schedule.clone())));
+        // In `--serve-jobs` mode nothing would drain a `schedule_run` request: the external clock
+        // owns re-runs, so the tool is left out rather than silently accepting a no-op.
+        if !cli.serve_jobs {
+            registry.register(Arc::new(ScheduleRunTool::new(schedule.clone())));
+        }
     }
     // Caller-provided tools (e.g. a private downstream binary via `run_with`/`main_with`). Last, so
     // a downstream tool can deliberately shadow a built-in (last registration wins).

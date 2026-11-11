@@ -11,8 +11,12 @@
 //!   events back as **Server-Sent Events** (one JSON-encoded [`Event`] per `data:` frame).
 //! - `GET  /v1/ws`    — a **WebSocket**: send a turn JSON per message, receive the event
 //!   stream as JSON text frames; the socket stays open for further turns.
+//! - `POST /v1/jobs/{id}` — only with [`GatewayConfig::with_jobs`]: run one attempt of a
+//!   scheduled job for an external clock (see [`jobs`]).
 
 #![warn(missing_docs)]
+
+pub mod jobs;
 
 use std::collections::HashSet;
 use std::convert::Infallible;
@@ -54,6 +58,8 @@ pub struct GatewayConfig {
     api_keys: HashSet<String>,
     /// Optional fixed-window per-principal request quota.
     rate_limit: Option<(u32, Duration)>,
+    /// Serve `POST /v1/jobs/{id}` through this runner (behind the same guard).
+    jobs: Option<Arc<dyn jobs::JobRunner>>,
 }
 
 impl GatewayConfig {
@@ -68,6 +74,12 @@ impl GatewayConfig {
     /// protected requests per `window`.
     pub fn with_rate_limit(mut self, max_requests: u32, window: Duration) -> Self {
         self.rate_limit = Some((max_requests, window));
+        self
+    }
+
+    /// Serve `POST /v1/jobs/{id}` (one attempt of a scheduled job per call) through `runner`.
+    pub fn with_jobs(mut self, runner: Arc<dyn jobs::JobRunner>) -> Self {
+        self.jobs = Some(runner);
         self
     }
 }
@@ -110,18 +122,23 @@ impl HttpGateway {
     }
 
     /// Build the router with an explicit auth/quota policy. `/health` and `/metrics` are
-    /// always open; `/v1/turns` and `/v1/ws` sit behind the [`GatewayConfig`] guard.
+    /// always open; `/v1/turns`, `/v1/ws` (and `/v1/jobs/{id}` when configured) sit behind the
+    /// [`GatewayConfig`] guard.
     pub fn router_with(agent: SharedAgent, config: GatewayConfig) -> Router {
         let state = Arc::new(AppState {
             agent,
             metrics: Arc::new(Metrics::default()),
         });
+        let jobs = config.jobs.clone();
         let guard = Arc::new(Guard::new(config));
-        let protected = Router::new()
+        let mut protected = Router::new()
             .route("/v1/turns", post(post_turn))
             .route("/v1/ws", get(ws_upgrade))
-            .route_layer(middleware::from_fn_with_state(guard, guard_request))
             .with_state(state.clone());
+        if let Some(runner) = jobs {
+            protected = protected.merge(jobs::router(runner));
+        }
+        let protected = protected.route_layer(middleware::from_fn_with_state(guard, guard_request));
         Router::new()
             .route("/health", get(health))
             .route("/metrics", get(metrics))

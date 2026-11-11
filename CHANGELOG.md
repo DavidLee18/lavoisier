@@ -5,6 +5,22 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 
 ## [Unreleased]
 
+### Jobs route for an external clock
+
+- `lav --serve --serve-jobs --schedule-file …` (env `LVZ_SERVE_JOBS`, `[gateway] serve_jobs`)
+  serves `POST /v1/jobs/{id}` behind the same API-key guard: one attempt of a schedule job
+  per call, for a caller that owns the clock, the lease and the retry chain (lvz-matrix-infra
+  phase5-endpoint, S1). Body `{"scheduled_minute","idempotency_key","attempt"}`; SSE answer
+  with at most one `waiting` event and one terminal `report` (or `error`). Refusals: 404
+  `unknown_job`, 409 `in_progress`, 422 `bad_body`/`bad_key`/`not_a_slot`/`stale`/`bad_attempt`.
+- The attempt is the Matrix scheduler's fire: direct tool call or prompt turn, pending work
+  polled inline, `summarize`, the same `report_body` and retry decision (`retry_in_s`,
+  `gave_up`). Hard cap `--jobs-timeout` (default 1800 s). Finished keys replay for 24 h
+  (in memory). No timer runs and `schedule_run` is not registered in this mode;
+  `--serve-jobs` is refused with `--serve-matrix`, and needs `--serve` and `--schedule-file`.
+- New API: `lvz_gw_http::jobs::{JobRunner, JobRequest, JobReport, JobRejection}`,
+  `GatewayConfig::with_jobs`, `ScheduleRegistry::run_attempt`, `CronSchedule::matches_at`.
+
 ## [0.18.12] — 2026-11-10
 
 ### Matrix crypto store

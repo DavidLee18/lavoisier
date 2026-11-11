@@ -1604,6 +1604,7 @@ dependencies = [
 name = "lavoisier"
 version = "0.18.12"
 dependencies = [
+ "async-trait",
  "clap",
  "futures",
  "lvz-agent",

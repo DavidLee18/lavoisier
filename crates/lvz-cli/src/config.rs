@@ -235,6 +235,10 @@ pub struct GatewaySection {
     pub serve: Option<String>,
     pub serve_matrix: Option<bool>,
     pub serve_slack: Option<bool>,
+    /// Serve `POST /v1/jobs/{id}` for an external clock (see `--serve-jobs`).
+    pub serve_jobs: Option<bool>,
+    /// Hard cap, in seconds, on one `POST /v1/jobs/{id}` attempt (see `--jobs-timeout`).
+    pub jobs_timeout: Option<u64>,
     /// A2A server bind address (`host:port`). `--serve-a2a` / `LVZ_SERVE_A2A` take precedence.
     pub serve_a2a: Option<String>,
     /// Run as a Zed Agent Client Protocol agent over stdio (see `--acp`). `--acp` takes precedence.
@@ -400,6 +404,8 @@ impl Config {
         merge(&mut cli.serve, &self.gateway.serve);
         cli.serve_matrix |= self.gateway.serve_matrix.unwrap_or(false);
         cli.serve_slack |= self.gateway.serve_slack.unwrap_or(false);
+        cli.serve_jobs |= self.gateway.serve_jobs.unwrap_or(false);
+        merge_copy(&mut cli.jobs_timeout, self.gateway.jobs_timeout);
         merge(&mut cli.serve_a2a, &self.gateway.serve_a2a);
         cli.acp |= self.gateway.acp.unwrap_or(false);
         cli.tui |= self.gateway.tui.unwrap_or(false);
@@ -595,6 +601,20 @@ mod tests {
         let mut cli = Cli::parse_from(["lav", "--log-level", "trace"]);
         cfg.apply_to(&mut cli);
         assert_eq!(cli.log_level.as_deref(), Some("trace"));
+    }
+
+    #[test]
+    fn serve_jobs_and_timeout_merge_from_the_file() {
+        use clap::Parser;
+        let cfg: Config =
+            toml::from_str("[gateway]\nserve_jobs = true\njobs_timeout = 900\n").unwrap();
+        let mut cli = Cli::parse_from(["lav"]);
+        cfg.apply_to(&mut cli);
+        assert!(cli.serve_jobs);
+        assert_eq!(cli.jobs_timeout, Some(900));
+        let mut cli = Cli::parse_from(["lav", "--jobs-timeout", "60"]);
+        cfg.apply_to(&mut cli);
+        assert_eq!(cli.jobs_timeout, Some(60), "the flag wins");
     }
 
     #[test]
