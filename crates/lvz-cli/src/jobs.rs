@@ -104,8 +104,13 @@ mod tests {
     const SCHEDULE: &str = r#"[{"id":"wake","schedule":"25 10 * * 2","room":"!ops:hs","tool":"no_such_tool","args":{}}]"#;
 
     fn schedule_file() -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("lvz-jobs-{}.json", std::process::id()));
-        std::fs::write(&p, SCHEDULE).unwrap();
+        // Unique per call: a pid-only path is shared by every test in the process, so a
+        // parallel `std::fs::write` can truncate the file while another test is mid-parse
+        // and yield `Json("EOF while parsing a value at line 1 column 0")`.
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("lvz-jobs-{}-{n}.json", std::process::id()));
+        std::fs::write(&p, SCHEDULE).expect("write schedule fixture");
         p
     }
 
@@ -119,7 +124,14 @@ mod tests {
     #[test]
     fn serve_jobs_flag_rules() {
         let ok = crate::build_schedule(&cli(&["--serve", "127.0.0.1:8090", "--serve-jobs"]));
-        assert_eq!(ok.unwrap().unwrap().len(), 1);
+        let jobs = ok.unwrap_or_else(|e| {
+            panic!("--serve --serve-jobs should load the one-job fixture, got {e}")
+        });
+        assert_eq!(
+            jobs.expect("--serve-jobs with a non-empty schedule returns Some")
+                .len(),
+            1
+        );
         let both = crate::build_schedule(&cli(&[
             "--serve",
             "127.0.0.1:8090",
