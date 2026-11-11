@@ -33,9 +33,11 @@ use lvz_tools::ToolRegistry;
 use serde::Deserialize;
 use tokio::sync::Notify;
 
+mod attempt;
 mod cron;
 pub mod tools;
 
+pub use attempt::AttemptReport;
 pub use cron::{CronError, CronSchedule};
 pub use tools::{ScheduleListTool, ScheduleRunTool, ScheduleStatusTool};
 
@@ -348,6 +350,9 @@ pub struct ScheduleRegistry {
     /// Fallback polling budget for a tool that returned `pending` with no `estimated_seconds`.
     /// Set from `[gateway] schedule_pending_timeout`.
     pending_timeout: u64,
+    /// Seconds between polls of accepted work in [`run_attempt`](Self::run_attempt) (the timer
+    /// path uses `POLL_INTERVAL` directly). Tests shorten it.
+    poll_interval: u64,
     jobs: Vec<ScheduleJob>,
     state: RwLock<HashMap<String, JobState>>,
     /// Manual `schedule_run` requests, as job indices.
@@ -372,6 +377,7 @@ impl ScheduleRegistry {
         Self {
             jobs,
             pending_timeout: DEFAULT_PENDING_TIMEOUT,
+            poll_interval: POLL_INTERVAL,
             state: RwLock::new(state),
             requested: Mutex::new(VecDeque::new()),
             notify: Notify::new(),

@@ -107,6 +107,12 @@ impl CronSchedule {
         self.next_after(now)
     }
 
+    /// Whether the UTC minute containing `unix_secs` is one of this schedule's slots. Used by
+    /// an external clock (`POST /v1/jobs/{id}`) to validate the `scheduled_minute` it sends.
+    pub fn matches_at(&self, unix_secs: u64) -> bool {
+        self.matches(&civil_from_unix(unix_secs - unix_secs % 60))
+    }
+
     fn matches(&self, c: &Civil) -> bool {
         let day_ok = match (self.dom.star, self.dow.star) {
             (true, true) => true,
@@ -309,6 +315,15 @@ mod tests {
         // Feb 30 never occurs.
         let s = sched("0 0 30 2 *");
         assert_eq!(s.next_after(0), None);
+    }
+
+    #[test]
+    fn matches_at_agrees_with_next_after() {
+        let s = sched("30 22 * * 6");
+        let slot = s.next_after(1_794_306_300).unwrap(); // Sat 2026-11-14 22:30 UTC
+        assert_eq!(slot, 1_794_695_400);
+        assert!(s.matches_at(slot) && s.matches_at(slot + 59));
+        assert!(!s.matches_at(slot + 60) && !s.matches_at(slot - 1));
     }
 
     #[test]
