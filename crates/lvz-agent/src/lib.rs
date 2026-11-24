@@ -23,11 +23,12 @@
 //! Token usage is summed across every round-trip — including the compaction call — which is
 //! the metric that matters (§6.4) and is enforced against an optional budget.
 //!
-//! A live OBS/PiKVM/schedule status ask that finishes with no structured tool call is retried
-//! once with [`ToolChoice::Required`]. If that retry is still message-only, the loop advances to
-//! the next fallback model (still required). An incomplete / max-token message with no tool call
-//! is an error, not the room answer. Text and thinking from a discarded round-trip are not
-//! forwarded.
+//! A live OBS/PiKVM/schedule status ask forces [`ToolChoice::Required`] on the first round only.
+//! Later rounds send [`ToolChoice::Auto`], so the model can answer instead of being forced into
+//! another tool call. The turn does not retry on the fallback model when that first round has no
+//! tool call, and it stops after [`MAX_LIVE_OPS_ROUNDS`] provider calls. An incomplete / max-token
+//! message with no tool call is an error, not the room answer. Text and thinking from a discarded
+//! round-trip are not forwarded.
 
 #![warn(missing_docs)]
 
@@ -103,10 +104,11 @@ const MAX_EDIT_NUDGES: usize = 2;
 /// without a structured call. Same bound as the no-edit guard so it cannot loop forever.
 const MAX_TOOL_CLAIM_NUDGES: usize = MAX_EDIT_NUDGES;
 
-/// A live OBS/PiKVM/schedule status ask that finishes with no structured call is retried once
-/// with [`ToolChoice::Required`]. One retry: the follow-up answer after the tool must be free
-/// to emit text.
-const MAX_LIVE_OPS_NUDGES: usize = 1;
+/// Provider calls allowed for one live OBS/PiKVM/schedule status ask. The first is
+/// [`ToolChoice::Required`]; the rest are [`ToolChoice::Auto`]. Three covers a tool call, a
+/// follow-up, and the answer. A fourth call is what the live turn was spending on extra
+/// required rounds.
+const MAX_LIVE_OPS_ROUNDS: u32 = 3;
 
 /// Most times the verify-and-fix gate ([`AgentConfig::verify_and_fix`]) feeds a failing verify back
 /// before giving up — bounds the extra cost so a never-passing verify can't loop forever.
@@ -843,8 +845,6 @@ async fn run_loop(
     let mut task_edited = false;
     let mut edit_nudges: usize = 0;
     let mut tool_claim_nudges: usize = 0;
-    let mut live_ops_nudges: usize = 0;
-    let mut require_tool_choice = false;
     let mut fix_attempts: usize = 0;
     let live_ops_ask = live_ops_status_ask(&task_text, tool_defs.iter().map(|d| d.name.as_str()));
     // Largest untruncated tool-result seen, for the learner's safe counterfactual crediting
@@ -904,6 +904,15 @@ async fn run_loop(
     let mut model_cursor = breaker.first_available(fallbacks.len());
 
     for _step in 0..config.max_steps {
+        if live_ops_ask && round_trips >= MAX_LIVE_OPS_ROUNDS {
+            tracing::warn!(
+                rounds = round_trips,
+                "live-ops round cap reached; not calling the model again"
+            );
+            obs.record(&total, round_trips, true, max_result_bytes, &radius_traces);
+            let _ = tx.unbounded_send(Ok(Event::Done(StopReason::EndTurn)));
+            return;
+        }
         // Staleness eviction (§6.3): once a file has been edited, replace earlier reads/outlines
         // of it with a short pointer — their bytes are now wrong and re-billing them wastes tokens.
         // Runs first so dedup/compaction see the shrunken results.
@@ -941,12 +950,15 @@ async fn run_loop(
         // skipped from turn start until re-probed.
         let mut turn = TurnAccumulator::default();
         let mut held: Vec<Event> = Vec::new();
-        let this_tool_choice = if require_tool_choice {
+        // Send `auto` whenever tools are advertised. A live-ops ask uses `required` on the
+        // first round only, so a later round can answer in prose instead of another tool call.
+        let this_tool_choice = if tool_defs.is_empty() {
+            None
+        } else if live_ops_ask && round_trips == 0 {
             Some(ToolChoice::Required)
         } else {
-            None
+            Some(ToolChoice::Auto)
         };
-        require_tool_choice = false;
         'attempt: loop {
             // Resolve the candidate `(provider, model)` at the cursor. Cheap-model-first (§8) only
             // applies to the primary: fallbacks name their model explicitly.
@@ -1123,39 +1135,6 @@ async fn run_loop(
 
         if turn.tool_calls.is_empty() {
             let truncated = is_truncated_stop(&turn.stop);
-            // Live-ops status ask with no structured call: grok on Responses often answers
-            // from the last Korean line in history (LED off / not streaming) instead of emitting
-            // a function_call. Bounce once with tool_choice=required. The false-claim guard
-            // below never sees this path — the prose names no tool.
-            if live_ops_ask && live_ops_nudges < MAX_LIVE_OPS_NUDGES {
-                live_ops_nudges += 1;
-                tracing::warn!(
-                    nudge = live_ops_nudges,
-                    truncated,
-                    "live-ops status ask finished without a structured tool call; retrying with tool_choice=required"
-                );
-                if !truncated {
-                    history.push(turn.to_assistant_message());
-                }
-                history.push(Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::text(LIVE_OPS_NUDGE)],
-                });
-                require_tool_choice = true;
-                continue;
-            }
-            // Required retry still produced no call: hand the rest of this turn to the next
-            // fallback (typically Anthropic). Do not trip the circuit breaker — the primary did
-            // respond; the next Matrix turn still starts on it.
-            if live_ops_ask && model_cursor < fallbacks.len() {
-                tracing::warn!(
-                    truncated,
-                    "live-ops required retry still had no structured tool call; falling back to the next model"
-                );
-                model_cursor += 1;
-                require_tool_choice = true;
-                continue;
-            }
             // Incomplete / max-token prose is not an answer. Drop the held text so the room
             // never sees the ramble.
             if truncated {
@@ -1644,13 +1623,6 @@ fn is_edit_tool(name: &str) -> bool {
 const FALSE_TOOL_CLAIM_NUDGE: &str =
     "No tool ran this turn. You claimed a tool check or result in text. \
 Call the tool now; do not report a result you were not given.";
-
-/// User-message body injected when a live OBS/PiKVM/schedule status ask finished with no
-/// structured call. The matching retry sets [`ToolChoice::Required`].
-const LIVE_OPS_NUDGE: &str =
-    "No tool ran this turn. Live OBS/PiKVM/schedule state from earlier messages is stale. \
-Call the matching tool now (server_state, obs_streaming, or schedule_list); \
-do not answer from memory.";
 
 /// Client tools whose advertised presence means this turn can read live broadcast/machine state.
 const LIVE_OPS_TOOLS: &[&str] = &[
@@ -3876,12 +3848,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn live_ops_status_ask_retries_with_tool_choice_required() {
+    async fn live_ops_requires_only_the_first_round() {
         let provider = ScriptedProvider::new(vec![
-            vec![
-                Event::TextDelta("신길동 PC는 꺼져 있습니다.".into()),
-                Event::Done(StopReason::EndTurn),
-            ],
             vec![
                 Event::ToolUseStart {
                     id: "t1".into(),
@@ -3904,22 +3872,58 @@ mod tests {
             registry_with_server_state(),
             AgentConfig::default(),
         );
-        let _ = collect(agent.run("신길동 PC 상태 알려줘")).await;
+        let events = collect(agent.run("신길동 PC 상태 알려줘")).await;
         assert_eq!(
             provider.calls.load(Ordering::SeqCst),
-            3,
-            "prose finish, required retry that calls the tool, then the answer"
+            2,
+            "required tool round, then an auto answer — no prose retry"
         );
         let choices = provider.tool_choices.lock().unwrap().clone();
         assert_eq!(
             choices.as_slice(),
-            &[None, Some(ToolChoice::Required), None],
-            "only the retry is required: {choices:?}"
+            &[Some(ToolChoice::Required), Some(ToolChoice::Auto)],
+            "required only on the first round: {choices:?}"
         );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::TextDelta(t) if t.contains("전원 LED"))));
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn live_ops_retry_cap_is_one() {
+    async fn live_ops_round_cap_stops_a_fourth_provider_call() {
+        let tool = || {
+            vec![
+                Event::ToolUseStart {
+                    id: "t1".into(),
+                    name: "server_state".into(),
+                },
+                Event::ToolUseDelta {
+                    id: "t1".into(),
+                    json: "{\"location\":\"singil\"}".into(),
+                },
+                Event::ToolUseEnd { id: "t1".into() },
+                Event::Done(StopReason::ToolUse),
+            ]
+        };
+        let provider = ScriptedProvider::new(vec![tool(), tool(), tool(), tool(), tool()]);
+        let agent = Agent::new(
+            provider.clone(),
+            registry_with_server_state(),
+            AgentConfig::default(),
+        );
+        let _ = collect(agent.run("check atx_state of singil")).await;
+        assert_eq!(
+            u32::try_from(provider.calls.load(Ordering::SeqCst)).unwrap_or(u32::MAX),
+            MAX_LIVE_OPS_ROUNDS,
+            "three provider calls, then the cap"
+        );
+        let choices = provider.tool_choices.lock().unwrap().clone();
+        assert_eq!(choices.first(), Some(&Some(ToolChoice::Required)));
+        assert!(choices.iter().skip(1).all(|c| *c == Some(ToolChoice::Auto)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_ops_prose_is_accepted_without_a_retry() {
         let finish = || {
             vec![
                 Event::TextDelta("꺼져 있습니다.".into()),
@@ -3935,14 +3939,14 @@ mod tests {
         let events = collect(agent.run("check atx_state of singil")).await;
         assert_eq!(
             provider.calls.load(Ordering::SeqCst),
-            MAX_LIVE_OPS_NUDGES + 1,
-            "one required retry, then the second prose finish is accepted"
+            1,
+            "a prose finish is the answer; there is no required retry"
         );
         let choices = provider.tool_choices.lock().unwrap().clone();
         assert_eq!(
             choices.as_slice(),
-            &[None, Some(ToolChoice::Required)],
-            "the accepted finish must not send required again: {choices:?}"
+            &[Some(ToolChoice::Required)],
+            "the first round is required and is not repeated: {choices:?}"
         );
         assert!(
             events
@@ -3953,35 +3957,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn live_ops_required_miss_falls_back_to_next_model() {
-        let primary = ScriptedProvider::new(vec![
-            vec![
-                Event::TextDelta("꺼져 있습니다.".into()),
-                Event::Done(StopReason::EndTurn),
-            ],
-            vec![
-                Event::TextDelta("RAMBLE FROM REQUIRED RETRY".into()),
-                Event::Done(StopReason::Other("incomplete".into())),
-            ],
-        ]);
-        let fallback = ScriptedProvider::new(vec![
-            vec![
-                Event::ToolUseStart {
-                    id: "t1".into(),
-                    name: "server_state".into(),
-                },
-                Event::ToolUseDelta {
-                    id: "t1".into(),
-                    json: "{\"location\":\"singil\"}".into(),
-                },
-                Event::ToolUseEnd { id: "t1".into() },
-                Event::Done(StopReason::ToolUse),
-            ],
-            vec![
-                Event::TextDelta("전원 LED가 켜져 있습니다.".into()),
-                Event::Done(StopReason::EndTurn),
-            ],
-        ]);
+    async fn live_ops_required_miss_does_not_call_the_fallback() {
+        let primary = ScriptedProvider::new(vec![vec![
+            Event::TextDelta("꺼져 있습니다.".into()),
+            Event::Done(StopReason::EndTurn),
+        ]]);
+        let fallback = ScriptedProvider::new(vec![vec![
+            Event::TextDelta("fallback answer".into()),
+            Event::Done(StopReason::EndTurn),
+        ]]);
         let agent = Agent::new(
             primary.clone(),
             registry_with_server_state(),
@@ -3992,37 +3976,26 @@ mod tests {
             Duration::from_secs(60),
         );
         let events = collect(agent.run("신길동 PC 상태 알려줘")).await;
-        assert_eq!(primary.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(fallback.calls.load(Ordering::SeqCst), 2);
-        let fb_choices = fallback.tool_choices.lock().unwrap().clone();
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            fb_choices.as_slice(),
-            &[Some(ToolChoice::Required), None],
-            "fallback keeps required on the first call: {fb_choices:?}"
-        );
-        assert!(
-            !events.iter().any(|e| {
-                matches!(e, Event::TextDelta(t) if t.contains("RAMBLE") || t.contains("꺼져"))
-            }),
-            "discarded grok prose must not reach the caller: {events:?}"
+            fallback.calls.load(Ordering::SeqCst),
+            0,
+            "a live-ops miss must not start the fallback model"
         );
         assert!(events
             .iter()
-            .any(|e| matches!(e, Event::TextDelta(t) if t.contains("전원 LED"))));
+            .any(|e| matches!(e, Event::TextDelta(t) if t.contains("꺼져"))));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::TextDelta(t) if t.contains("fallback"))));
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn incomplete_message_without_tools_is_an_error() {
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                Event::TextDelta("꺼져 있습니다.".into()),
-                Event::Done(StopReason::EndTurn),
-            ],
-            vec![
-                Event::TextDelta("RAMBLE".into()),
-                Event::Done(StopReason::Other("incomplete".into())),
-            ],
-        ]);
+        let provider = ScriptedProvider::new(vec![vec![
+            Event::TextDelta("RAMBLE".into()),
+            Event::Done(StopReason::Other("incomplete".into())),
+        ]]);
         let agent = Agent::new(
             provider.clone(),
             registry_with_server_state(),
@@ -4044,7 +4017,7 @@ mod tests {
                 .any(|e| matches!(e, Event::TextDelta(t) if t.contains("RAMBLE"))),
             "the truncated ramble must not be the answer: {events:?}"
         );
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -4065,7 +4038,7 @@ mod tests {
             "no live-ops tools advertised, so a status question is not retried"
         );
         let choices = provider.tool_choices.lock().unwrap().clone();
-        assert_eq!(choices.as_slice(), &[None]);
+        assert_eq!(choices.as_slice(), &[Some(ToolChoice::Auto)]);
     }
 
     #[tokio::test]
