@@ -51,6 +51,12 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
+(`v0.18.14`): **live-ops tool choice**. `lvz-agent` (0.1.12→**0.1.13** — live-ops sends
+`tool_choice=required` on the first provider round only, accepts a prose first answer without a
+fallback, and caps the loop at `MAX_LIVE_OPS_ROUNDS` (3); patch, so `lvz-memory`'s `^0.1.12` still
+resolves and it needs **no** republish) and `lavoisier` (0.18.13→**0.18.14**). Publish order
+`lvz-agent` → `lavoisier`. The other crates stay put.
+Earlier changed set
 (`v0.18.13`): **jobs route for an external clock**. `lvz-schedule` (0.4.2→**0.4.3** —
 `ScheduleRegistry::run_attempt` and `CronSchedule::matches_at`), `lvz-gw-http` (0.1.1→**0.1.2** —
 `POST /v1/jobs/{id}` behind the API-key guard) and `lavoisier` (0.18.12→**0.18.13** — `lav --serve
