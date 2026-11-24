@@ -5,6 +5,8 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 
 ## [Unreleased]
 
+## [0.18.14] — 2026-11-24
+
 ### Live-ops tool choice
 
 - A live OBS/PiKVM/schedule ask sends `tool_choice=required` on the first provider round only. Later rounds with tools send `tool_choice=auto`. An empty tool list still omits the field.
@@ -12,7 +14,7 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 - The live-ops loop stops after `MAX_LIVE_OPS_ROUNDS` (3) provider calls. An incomplete or max-token message with no tool call is still an error.
 - Expected, from the loop counts rather than a live clock: a miss that used to be two primary calls plus two fallback calls is now one primary call and zero fallback calls. A tool loop that ran about four rounds plus a fallback (~13 s on grok-4.3) stops at three provider calls. Connect and pre-token stream fallback is unchanged.
 
-
+`lavoisier` 0.18.13 → 0.18.14. `lvz-agent` 0.1.12 → 0.1.13.
 
 ## [0.18.13] — 2026-11-12
 
