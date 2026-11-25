@@ -734,9 +734,13 @@ impl ProviderKind {
     }
 }
 
+pub use lvz_agent::jobs::{fail_job, finish_job, in_job_scope, job_running, reserve_job};
 /// Tool-authoring types, re-exported so a private downstream crate can implement [`Tool`] by
 /// depending only on `lavoisier` (no direct `lvz-protocol` dependency needed).
-pub use lvz_protocol::{Pending, Tool, ToolError, ToolImage, ToolOutput};
+pub use lvz_protocol::{
+    AcceptedJob, JobError, JobId, LongTool, Pending, Tool, ToolError, ToolImage, ToolOutput,
+    MAX_JOBS_PER_SESSION,
+};
 
 /// The [`tracing`] facade, re-exported so a private downstream crate can instrument its own tools
 /// (`lavoisier::tracing::info!(…)`) without taking a direct `tracing` dependency or having to match
@@ -958,6 +962,7 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
     // serving and one-shot paths share it, and a bad spec / missing key fails fast rather than
     // mid-turn.
     let fallbacks = build_fallbacks(&cli, cli.thinking.as_deref(), serving)?;
+    arm_jobs(&config, &cli);
 
     // External MCP servers (`--mcp-server` / `[mcp] servers`): connect and adapt their tools. Only
     // when the tools can actually be used (a gateway, or the `--agent` loop) — a plain one-shot ask
@@ -1716,6 +1721,24 @@ fn build_tool_registry(
         registry.register(tool.clone());
     }
     registry
+}
+
+/// Persist in-flight jobs beside the file session store, and settle a previous process.
+///
+/// A memory store has no session file, so jobs stay in this process only. The artifact
+/// directory is where `run_build` writes `$BUILD_ID.code`.
+fn arm_jobs(config: &Config, cli: &Cli) {
+    let store = match config.memory.store {
+        Some(config::StoreKind::File) => config.memory.path.clone(),
+        _ => None,
+    };
+    let artifact = std::env::var_os("BUILDER_RESULT_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".builds")));
+    let timeout = cli
+        .schedule_pending_timeout
+        .unwrap_or(lvz_schedule::DEFAULT_PENDING_TIMEOUT);
+    lvz_agent::jobs::configure(store, artifact, timeout);
 }
 
 /// Build the tool-using [`Agent`] from the CLI config. Shared by `--agent` (one-shot) and
