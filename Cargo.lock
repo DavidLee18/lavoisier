@@ -1968,7 +1968,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-memory"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "futures",
@@ -2010,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "lvz-tools"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "lvz-context",
