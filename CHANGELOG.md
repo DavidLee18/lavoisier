@@ -5,6 +5,16 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 
 ## [Unreleased]
 
+## [0.18.15] — 2026-11-25
+
+### Live-ops summary after the round cap
+
+- After `MAX_LIVE_OPS_ROUNDS` (3) tool-capable provider calls, a live OBS/PiKVM/schedule ask makes one more call. That call sends `tool_choice=none`, an empty tool list, and no server tools, and asks the model to summarise. The prose is the answer.
+- A tool call on that summary round is not run and is not forwarded. The turn ends. A fifth provider call does not happen.
+- An incomplete or max-token summary is still an error. A prose answer before the cap is unchanged: it is accepted, and the summary round is not added.
+
+`lavoisier` 0.18.14 → 0.18.15. `lvz-agent` 0.1.13 → 0.1.14. Not tagged in this change.
+
 ## [0.18.14] — 2026-11-24
 
 ### Live-ops tool choice
