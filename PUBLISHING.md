@@ -51,6 +51,12 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
+(`v0.18.15`): **live-ops summary after the cap**. `lvz-agent` (0.1.13→**0.1.14** — after
+`MAX_LIVE_OPS_ROUNDS` the loop makes one `tool_choice=none` call with no tools and accepts
+that prose; patch, so `lvz-memory`'s `^0.1.12` still resolves and it needs **no** republish)
+and `lavoisier` (0.18.14→**0.18.15**). Publish order `lvz-agent` → `lavoisier`. The other
+crates stay put. Do not tag from this note until the draft is merged.
+Earlier changed set
 (`v0.18.14`): **live-ops tool choice**. `lvz-agent` (0.1.12→**0.1.13** — live-ops sends
 `tool_choice=required` on the first provider round only, accepts a prose first answer without a
 fallback, and caps the loop at `MAX_LIVE_OPS_ROUNDS` (3); patch, so `lvz-memory`'s `^0.1.12` still

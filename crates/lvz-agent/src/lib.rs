@@ -26,9 +26,10 @@
 //! A live OBS/PiKVM/schedule status ask forces [`ToolChoice::Required`] on the first round only.
 //! Later rounds send [`ToolChoice::Auto`], so the model can answer instead of being forced into
 //! another tool call. The turn does not retry on the fallback model when that first round has no
-//! tool call, and it stops after [`MAX_LIVE_OPS_ROUNDS`] provider calls. An incomplete / max-token
-//! message with no tool call is an error, not the room answer. Text and thinking from a discarded
-//! round-trip are not forwarded.
+//! tool call, and it stops after [`MAX_LIVE_OPS_ROUNDS`] tool-capable provider calls. One more
+//! call then runs with [`ToolChoice::None`] and no tools advertised, so the model can summarise.
+//! An incomplete / max-token message with no tool call is an error, not the room answer. Text
+//! and thinking from a discarded round-trip are not forwarded.
 
 #![warn(missing_docs)]
 
@@ -104,11 +105,15 @@ const MAX_EDIT_NUDGES: usize = 2;
 /// without a structured call. Same bound as the no-edit guard so it cannot loop forever.
 const MAX_TOOL_CLAIM_NUDGES: usize = MAX_EDIT_NUDGES;
 
-/// Provider calls allowed for one live OBS/PiKVM/schedule status ask. The first is
-/// [`ToolChoice::Required`]; the rest are [`ToolChoice::Auto`]. Three covers a tool call, a
-/// follow-up, and the answer. A fourth call is what the live turn was spending on extra
-/// required rounds.
+/// Tool-capable provider calls allowed for one live OBS/PiKVM/schedule status ask. The
+/// first is [`ToolChoice::Required`]; the rest are [`ToolChoice::Auto`]. When the cap is
+/// reached the loop makes one more call with no tools, to summarise.
 const MAX_LIVE_OPS_ROUNDS: u32 = 3;
+
+/// User turn appended once the live-ops cap is reached. The following request advertises
+/// no tools.
+const LIVE_OPS_SUMMARY_NUDGE: &str =
+    "The tool-call limit is reached. Summarise the result for the room in prose. Do not call a tool.";
 
 /// Most times the verify-and-fix gate ([`AgentConfig::verify_and_fix`]) feeds a failing verify back
 /// before giving up — bounds the extra cost so a never-passing verify can't loop forever.
@@ -903,15 +908,27 @@ async fn run_loop(
     // timeout isn't re-paid) until its cooldown elapses and it is re-probed.
     let mut model_cursor = breaker.first_available(fallbacks.len());
 
+    let mut live_ops_summary = false;
     for _step in 0..config.max_steps {
         if live_ops_ask && round_trips >= MAX_LIVE_OPS_ROUNDS {
-            tracing::warn!(
+            if live_ops_summary {
+                tracing::warn!(
+                    rounds = round_trips,
+                    "live-ops summary already requested; stopping"
+                );
+                obs.record(&total, round_trips, true, max_result_bytes, &radius_traces);
+                let _ = tx.unbounded_send(Ok(Event::Done(StopReason::EndTurn)));
+                return;
+            }
+            live_ops_summary = true;
+            tracing::info!(
                 rounds = round_trips,
-                "live-ops round cap reached; not calling the model again"
+                "live-ops round cap reached; requesting one prose summary"
             );
-            obs.record(&total, round_trips, true, max_result_bytes, &radius_traces);
-            let _ = tx.unbounded_send(Ok(Event::Done(StopReason::EndTurn)));
-            return;
+            history.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::text(LIVE_OPS_SUMMARY_NUDGE)],
+            });
         }
         // Staleness eviction (§6.3): once a file has been edited, replace earlier reads/outlines
         // of it with a short pointer — their bytes are now wrong and re-billing them wastes tokens.
@@ -952,7 +969,11 @@ async fn run_loop(
         let mut held: Vec<Event> = Vec::new();
         // Send `auto` whenever tools are advertised. A live-ops ask uses `required` on the
         // first round only, so a later round can answer in prose instead of another tool call.
-        let this_tool_choice = if tool_defs.is_empty() {
+        // After the live-ops cap, one round forbids tools so the model can only summarise.
+        let advertised: &[ToolDef] = if live_ops_summary { &[] } else { &tool_defs };
+        let this_tool_choice = if live_ops_summary {
+            Some(ToolChoice::None)
+        } else if advertised.is_empty() {
             None
         } else if live_ops_ask && round_trips == 0 {
             Some(ToolChoice::Required)
@@ -978,10 +999,10 @@ async fn run_loop(
             // Anthropic `cache_control` to an xAI request); the turn-level `caps` stays the primary's.
             let cand_caps = active_provider.capabilities();
 
-            let req = build_request(
+            let mut req = build_request(
                 &config,
                 active_model,
-                &tool_defs,
+                advertised,
                 &cand_caps,
                 &knobs,
                 &history,
@@ -989,6 +1010,11 @@ async fn run_loop(
                 task_thinking,
                 this_tool_choice.clone(),
             );
+            if live_ops_summary {
+                req.tools.clear();
+                req.server_tools.clear();
+                req.tool_choice = Some(ToolChoice::None);
+            }
             // Bound the initial send too (connect + response headers): a connection that hangs before
             // the first byte must also fail fast, not block forever (no provider sets an HTTP timeout).
             let opened = match tokio::time::timeout(
@@ -1073,12 +1099,16 @@ async fn run_loop(
                     Ok(event) => {
                         if let Some(forward) = turn.observe(event) {
                             forwarded_any = true;
-                            match &forward {
-                                // Hold prose until this round-trip is accepted. A live-ops retry
-                                // or fallback must not leak the discarded answer into the room.
-                                Event::TextDelta(_) | Event::Thinking(_) => held.push(forward),
-                                _ => {
-                                    let _ = tx.unbounded_send(Ok(forward));
+                            // The summary request advertised no tools. Keep the prose; do not
+                            // tell the room a tool ran.
+                            if !(live_ops_summary && is_tool_wire_event(&forward)) {
+                                match &forward {
+                                    // Hold prose until this round-trip is accepted. A live-ops retry
+                                    // or fallback must not leak the discarded answer into the room.
+                                    Event::TextDelta(_) | Event::Thinking(_) => held.push(forward),
+                                    _ => {
+                                        let _ = tx.unbounded_send(Ok(forward));
+                                    }
                                 }
                             }
                         }
@@ -1119,6 +1149,37 @@ async fn run_loop(
                 let _ = tx.unbounded_send(Err(AgentError::BudgetExceeded));
                 return;
             }
+        }
+
+        if live_ops_summary {
+            if is_truncated_stop(&turn.stop) {
+                tracing::warn!(
+                    "live-ops summary ended incomplete or at max_tokens; not accepting it"
+                );
+                obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
+                let _ = tx.unbounded_send(Err(AgentError::Provider(
+                    "response incomplete (hit max_output_tokens) with no tool call".into(),
+                )));
+                return;
+            }
+            if !turn.tool_calls.is_empty() {
+                tracing::warn!(
+                    n = turn.tool_calls.len(),
+                    "live-ops summary round returned a tool call; not running it"
+                );
+            }
+            flush_held(tx, &mut held);
+            obs.record(
+                &total,
+                round_trips,
+                !turn.text.trim().is_empty(),
+                max_result_bytes,
+                &radius_traces,
+            );
+            let _ = tx.unbounded_send(Ok(Event::Usage(total)));
+            // A tool stop on this round is not a request to continue: tools were not offered.
+            let _ = tx.unbounded_send(Ok(Event::Done(StopReason::EndTurn)));
+            return;
         }
 
         // Server-side tool loop paused (`pause_turn`): the provider ran a built-in tool and wants
@@ -1691,6 +1752,18 @@ where
         .into_iter()
         .any(|n| LIVE_OPS_TOOLS.contains(&n.as_ref()));
     has_ops && looks_like_live_ops_ask(text)
+}
+
+fn is_tool_wire_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::ToolUseStart { .. }
+            | Event::ToolUseDelta { .. }
+            | Event::ToolUseEnd { .. }
+            | Event::ServerToolUse { .. }
+            | Event::ServerToolResult { .. }
+            | Event::ToolResultImages { .. }
+    )
 }
 
 fn is_truncated_stop(stop: &Option<StopReason>) -> bool {
@@ -3890,7 +3963,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn live_ops_round_cap_stops_a_fourth_provider_call() {
+    async fn live_ops_round_cap_stops_after_the_summary_call() {
         let tool = || {
             vec![
                 Event::ToolUseStart {
@@ -3913,13 +3986,155 @@ mod tests {
         );
         let _ = collect(agent.run("check atx_state of singil")).await;
         assert_eq!(
-            u32::try_from(provider.calls.load(Ordering::SeqCst)).unwrap_or(u32::MAX),
-            MAX_LIVE_OPS_ROUNDS,
-            "three provider calls, then the cap"
+            provider.calls.load(Ordering::SeqCst),
+            usize::try_from(MAX_LIVE_OPS_ROUNDS)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1),
+            "three tool rounds, then one tool-less summary, and the fifth script stays unused"
         );
         let choices = provider.tool_choices.lock().unwrap().clone();
         assert_eq!(choices.first(), Some(&Some(ToolChoice::Required)));
-        assert!(choices.iter().skip(1).all(|c| *c == Some(ToolChoice::Auto)));
+        assert_eq!(choices.get(1), Some(&Some(ToolChoice::Auto)));
+        assert_eq!(choices.get(2), Some(&Some(ToolChoice::Auto)));
+        assert_eq!(choices.get(3), Some(&Some(ToolChoice::None)));
+        assert_eq!(choices.len(), 4, "{choices:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_ops_round_cap_ends_with_one_prose_round() {
+        let tool = || {
+            vec![
+                Event::ToolUseStart {
+                    id: "t1".into(),
+                    name: "server_state".into(),
+                },
+                Event::ToolUseDelta {
+                    id: "t1".into(),
+                    json: "{\"location\":\"singil\"}".into(),
+                },
+                Event::ToolUseEnd { id: "t1".into() },
+                Event::Done(StopReason::ToolUse),
+            ]
+        };
+        let provider = ScriptedProvider::new(vec![
+            tool(),
+            tool(),
+            tool(),
+            vec![
+                Event::TextDelta("broadcast stopped.".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+            vec![
+                Event::TextDelta("must not run".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+        ]);
+        let agent = Agent::new(
+            provider.clone(),
+            registry_with_server_state(),
+            AgentConfig::default(),
+        );
+        let events = collect(agent.run("check atx_state of singil")).await;
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            usize::try_from(MAX_LIVE_OPS_ROUNDS)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1),
+            "three tool rounds, then one prose summary, and nothing after"
+        );
+        let choices = provider.tool_choices.lock().unwrap().clone();
+        assert_eq!(choices.len(), 4, "{choices:?}");
+        assert_eq!(choices[0], Some(ToolChoice::Required));
+        assert_eq!(choices[1], Some(ToolChoice::Auto));
+        assert_eq!(choices[2], Some(ToolChoice::Auto));
+        assert_eq!(
+            choices[3],
+            Some(ToolChoice::None),
+            "the summary round forbids tools: {choices:?}"
+        );
+        let reqs = provider.requests.lock().unwrap();
+        assert!(
+            reqs[3].tools.is_empty(),
+            "summary request has no client tools"
+        );
+        assert!(
+            reqs[3].server_tools.is_empty(),
+            "summary request has no server tools"
+        );
+        assert!(
+            reqs[3]
+                .messages
+                .iter()
+                .any(|m| m.content.iter().any(|b| matches!(
+                    b,
+                    ContentBlock::Text { text, .. } if text.contains("Summarise")
+                ))),
+            "the summary round is told to summarise"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::TextDelta(t) if t.contains("broadcast stopped"))));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::TextDelta(t) if t.contains("must not run"))));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::Done(StopReason::EndTurn))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_ops_summary_round_does_not_run_a_tool() {
+        let tool = || {
+            vec![
+                Event::ToolUseStart {
+                    id: "t1".into(),
+                    name: "server_state".into(),
+                },
+                Event::ToolUseDelta {
+                    id: "t1".into(),
+                    json: "{\"location\":\"singil\"}".into(),
+                },
+                Event::ToolUseEnd { id: "t1".into() },
+                Event::Done(StopReason::ToolUse),
+            ]
+        };
+        let provider = ScriptedProvider::new(vec![
+            tool(),
+            tool(),
+            tool(),
+            tool(),
+            vec![
+                Event::TextDelta("must not run".into()),
+                Event::Done(StopReason::EndTurn),
+            ],
+        ]);
+        let agent = Agent::new(
+            provider.clone(),
+            registry_with_server_state(),
+            AgentConfig::default(),
+        );
+        let events = collect(agent.run("check atx_state of singil")).await;
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            usize::try_from(MAX_LIVE_OPS_ROUNDS)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1),
+            "a tool call on the summary round does not start another provider call"
+        );
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, Event::ToolUseStart { .. }))
+            .count();
+        assert_eq!(
+            starts, 3,
+            "the summary round's tool call is not forwarded: {events:?}"
+        );
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::TextDelta(t) if t.contains("must not run"))));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::Done(StopReason::EndTurn))));
     }
 
     #[tokio::test(flavor = "current_thread")]
