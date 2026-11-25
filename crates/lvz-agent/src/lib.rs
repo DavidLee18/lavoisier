@@ -33,6 +33,8 @@
 
 #![warn(missing_docs)]
 
+pub mod jobs;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -43,6 +45,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::channel::mpsc;
 use futures::stream::{BoxStream, StreamExt};
+use futures::Stream;
 use lvz_context::symbols::skeleton_with_radius;
 use lvz_context::tokens::estimate_tokens;
 use lvz_context::Lang;
@@ -55,6 +58,8 @@ use lvz_protocol::{
 };
 use lvz_tools::ToolRegistry;
 use serde_json::{json, Value};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 const DEFAULT_SYSTEM: &str = "You are Lavoisier, a terse, token-efficient coding agent. \
 Use the provided tools to inspect and modify the repository. To save tokens, prefer \
@@ -632,17 +637,33 @@ impl Agent {
         history: Vec<Message>,
         allowed_tools: Option<Vec<String>>,
     ) -> BoxStream<'static, Result<Event, AgentError>> {
-        self.run_inner(history, allowed_tools, None)
+        self.run_inner(history, allowed_tools, None, "default")
+    }
+
+    /// Like [`run_seeded_with_tools`](Self::run_seeded_with_tools), and the job table is keyed
+    /// by `session` (the same id the session store uses).
+    pub fn run_in_session(
+        &self,
+        history: Vec<Message>,
+        allowed_tools: Option<Vec<String>>,
+        model_override: Option<String>,
+        session: &str,
+    ) -> BoxStream<'static, Result<Event, AgentError>> {
+        self.run_inner(history, allowed_tools, model_override, session)
     }
 
     /// The shared implementation, additionally taking a per-turn model override
     /// ([`TurnRequest::model`]): when set it replaces the executor model and suppresses
     /// cheap-model-first for this turn, so the chosen model is used throughout.
+    ///
+    /// `session` is the cap and persistence key for background jobs. Callers that have no
+    /// session use `"default"`.
     fn run_inner(
         &self,
         history: Vec<Message>,
         allowed_tools: Option<Vec<String>>,
         model_override: Option<String>,
+        session: &str,
     ) -> BoxStream<'static, Result<Event, AgentError>> {
         let (tx, rx) = mpsc::unbounded();
         let provider = self.provider.clone();
@@ -660,6 +681,11 @@ impl Agent {
         let skeleton_cell = self.repo_skeleton.clone();
         let tool_gate = self.tool_gate.clone();
         let allowed_tools = allowed_tools.map(|v| v.into_iter().collect::<HashSet<String>>());
+        let session = session.to_string();
+        // Dropping the stream (the caller finished, or ACP `session/cancel` dropped it)
+        // cancels this token. Job workers hold children of it.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_task = cancel.clone();
 
         tokio::spawn(async move {
             run_loop(
@@ -676,12 +702,34 @@ impl Agent {
                 allowed_tools,
                 history,
                 &tx,
+                session,
+                cancel_task,
             )
             .await;
             // tx drops here, closing the stream.
         });
 
-        rx.boxed()
+        CancelOnDrop { inner: rx, cancel }.boxed()
+    }
+}
+
+/// Cancels the turn token when the caller drops the event stream.
+struct CancelOnDrop<S> {
+    inner: S,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl<S> Drop for CancelOnDrop<S> {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+impl<S: Stream + Unpin> Stream for CancelOnDrop<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().inner).poll_next(cx)
     }
 }
 
@@ -695,6 +743,7 @@ impl AgentHandle for Agent {
             vec![Message::user(turn.input)],
             turn.allowed_tools,
             turn.model,
+            &turn.session,
         ))
     }
 }
@@ -742,19 +791,6 @@ async fn invoke_forwarding(
     })
 }
 
-/// Room line for a tool that accepted work and has not finished. The chat path posts this;
-/// a schedule job posts its own from `fire`, because that call never enters the agent loop.
-fn pending_notice(name: &str, pending: &lvz_protocol::Pending) -> String {
-    let eta = pending
-        .estimated_seconds
-        .map(|s| format!(", ~{s}s"))
-        .unwrap_or_default();
-    format!(
-        "⏳ `{name}` started, waiting on `{}` (handle {}{eta})",
-        pending.poll_with, pending.handle
-    )
-}
-
 // The agent's owned, already-cloned dependencies threaded in once per task; grouping them into a
 // struct would just move the same fields behind an extra indirection without aiding clarity.
 #[allow(clippy::too_many_arguments)]
@@ -772,6 +808,8 @@ async fn run_loop(
     allowed_tools: Option<HashSet<String>>,
     mut history: Vec<Message>,
     tx: &Sink,
+    session: String,
+    cancel: tokio_util::sync::CancellationToken,
 ) {
     let started = std::time::Instant::now();
     // Per-turn tool allowlist (e.g. a gateway's room/member permissions): advertise only the
@@ -910,25 +948,40 @@ async fn run_loop(
 
     let mut live_ops_summary = false;
     for _step in 0..config.max_steps {
+        if cancel.is_cancelled() {
+            jobs::global().fail_running(
+                &session,
+                lvz_protocol::JobError::Cancelled {
+                    name: "turn".into(),
+                },
+            );
+            return;
+        }
+        if let Some(done) = jobs::global().drain_ready(&session) {
+            history.push(done);
+        }
         if live_ops_ask && round_trips >= MAX_LIVE_OPS_ROUNDS {
             if live_ops_summary {
-                tracing::warn!(
+                if !jobs::global().session_busy(&session) {
+                    tracing::warn!(
+                        rounds = round_trips,
+                        "live-ops summary already requested; stopping"
+                    );
+                    obs.record(&total, round_trips, true, max_result_bytes, &radius_traces);
+                    let _ = tx.unbounded_send(Ok(Event::Done(StopReason::EndTurn)));
+                    return;
+                }
+            } else {
+                live_ops_summary = true;
+                tracing::info!(
                     rounds = round_trips,
-                    "live-ops summary already requested; stopping"
+                    "live-ops round cap reached; requesting one prose summary"
                 );
-                obs.record(&total, round_trips, true, max_result_bytes, &radius_traces);
-                let _ = tx.unbounded_send(Ok(Event::Done(StopReason::EndTurn)));
-                return;
+                history.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::text(LIVE_OPS_SUMMARY_NUDGE)],
+                });
             }
-            live_ops_summary = true;
-            tracing::info!(
-                rounds = round_trips,
-                "live-ops round cap reached; requesting one prose summary"
-            );
-            history.push(Message {
-                role: Role::User,
-                content: vec![ContentBlock::text(LIVE_OPS_SUMMARY_NUDGE)],
-            });
         }
         // Staleness eviction (§6.3): once a file has been edited, replace earlier reads/outlines
         // of it with a short pointer — their bytes are now wrong and re-billing them wastes tokens.
@@ -1268,6 +1321,40 @@ async fn run_loop(
                     continue;
                 }
             }
+            if cancel.is_cancelled() {
+                jobs::global().fail_running(
+                    &session,
+                    lvz_protocol::JobError::Cancelled {
+                        name: "turn".into(),
+                    },
+                );
+                return;
+            }
+            // EndTurn with a job still open waits, bounded by that job's timeout.
+            // The completion is a later user message, then another model call.
+            // It is not a second tool_result, and it is not injected mid-stream.
+            if jobs::global().session_busy(&session) {
+                match jobs::global().wait_ready(&session, &cancel).await {
+                    jobs::JobWait::Cancelled => {
+                        jobs::global().fail_running(
+                            &session,
+                            lvz_protocol::JobError::Cancelled {
+                                name: "turn".into(),
+                            },
+                        );
+                        return;
+                    }
+                    jobs::JobWait::Ready(items) => {
+                        history.push(turn.to_assistant_message());
+                        if !items.is_empty() {
+                            history.push(jobs::completion_message(&items));
+                        }
+                        if !items.is_empty() || jobs::global().session_busy(&session) {
+                            continue;
+                        }
+                    }
+                }
+            }
             let stop = turn.stop.unwrap_or(StopReason::EndTurn);
             flush_held(tx, &mut held);
             // Real ATO success signal (§6.6): a clean completion is only counted successful if
@@ -1344,41 +1431,103 @@ async fn run_loop(
                 // Log the real run (name only — never args, file contents, or secrets) so a
                 // structured call and a prose-only claim are distinguishable in CloudWatch.
                 tracing::info!(tool = %call.name, "running structured tool call");
-                match invoke_forwarding(&tools, &call.name, args, tx).await {
+                match jobs::scoped_invoke(
+                    &session,
+                    &cancel,
+                    invoke_forwarding(&tools, &call.name, args, tx),
+                )
+                .await
+                {
                     Ok(out) => {
-                        if let Some(pending) = &out.pending {
-                            // The tool accepted the work and returned. Say so before the model
-                            // writes. This is the chat path; a schedule job reports the same fact
-                            // from `fire` because it never enters this loop.
-                            let _ = tx.unbounded_send(Ok(Event::Notice(pending_notice(
-                                &call.name, pending,
-                            ))));
-                        }
-                        // Record the pre-truncation size for counterfactual truncate-knob crediting.
-                        let len = out.content.len();
-                        max_result_bytes = Some(max_result_bytes.map_or(len, |m| m.max(len)));
-                        made_real_edit |= out.changed && is_edit_tool(&call.name);
-                        let mut content = truncate(&out.content, knobs.truncate_bytes);
-                        let images = lvz_protocol::admit_tool_images(&mut content, out.images);
-                        if !images.is_empty() {
-                            tracing::info!(
-                                tool = %call.name,
-                                n = images.len(),
-                                media_type = images[0].media_type.as_str(),
-                                base64_len = images[0].data.len(),
-                                "tool result image admitted"
-                            );
-                            let _ = tx.unbounded_send(Ok(Event::ToolResultImages {
-                                id: call.id.clone(),
-                                name: call.name.clone(),
-                                images: images.clone(),
-                            }));
-                        }
-                        ContentBlock::ToolResult {
-                            tool_use_id: call.id.clone(),
-                            content,
-                            is_error: out.is_error,
-                            images,
+                        if let Some(job) = out.accepted.clone() {
+                            let tracked = if jobs::global().contains(&job.id) {
+                                Ok(())
+                            } else {
+                                jobs::global()
+                                    .reserve(
+                                        &session,
+                                        &call.name,
+                                        job.id.clone(),
+                                        job.estimated_seconds,
+                                        &cancel,
+                                    )
+                                    .map(|_| ())
+                            };
+                            match tracked {
+                                Ok(()) => {
+                                    let _ = tx.unbounded_send(Ok(Event::Notice(
+                                        jobs::accept_notice(&call.name, &job.id),
+                                    )));
+                                    ContentBlock::ToolResult {
+                                        tool_use_id: call.id.clone(),
+                                        content: jobs::placeholder(&job.id),
+                                        is_error: false,
+                                        images: Vec::new(),
+                                    }
+                                }
+                                Err(err) => ContentBlock::ToolResult {
+                                    tool_use_id: call.id.clone(),
+                                    content: format!("tool error: {err}"),
+                                    is_error: true,
+                                    images: Vec::new(),
+                                },
+                            }
+                        } else if let Some(pending) = out.pending.clone() {
+                            // Legacy poll protocol on the chat path: the host polls. The model
+                            // gets the placeholder, not a request to call `poll_*`. The schedule
+                            // path never enters this loop, so it still polls inline.
+                            match jobs::promote_pending(
+                                &session,
+                                &call.name,
+                                &pending,
+                                &cancel,
+                                tools.clone(),
+                            ) {
+                                Ok(id) => {
+                                    let _ = tx.unbounded_send(Ok(Event::Notice(
+                                        jobs::accept_notice(&call.name, &id),
+                                    )));
+                                    ContentBlock::ToolResult {
+                                        tool_use_id: call.id.clone(),
+                                        content: jobs::placeholder(&id),
+                                        is_error: false,
+                                        images: Vec::new(),
+                                    }
+                                }
+                                Err(err) => ContentBlock::ToolResult {
+                                    tool_use_id: call.id.clone(),
+                                    content: format!("tool error: {err}"),
+                                    is_error: true,
+                                    images: Vec::new(),
+                                },
+                            }
+                        } else {
+                            // Record the pre-truncation size for counterfactual truncate-knob crediting.
+                            let len = out.content.len();
+                            max_result_bytes = Some(max_result_bytes.map_or(len, |m| m.max(len)));
+                            made_real_edit |= out.changed && is_edit_tool(&call.name);
+                            let mut content = truncate(&out.content, knobs.truncate_bytes);
+                            let images = lvz_protocol::admit_tool_images(&mut content, out.images);
+                            if !images.is_empty() {
+                                tracing::info!(
+                                    tool = %call.name,
+                                    n = images.len(),
+                                    media_type = images[0].media_type.as_str(),
+                                    base64_len = images[0].data.len(),
+                                    "tool result image admitted"
+                                );
+                                let _ = tx.unbounded_send(Ok(Event::ToolResultImages {
+                                    id: call.id.clone(),
+                                    name: call.name.clone(),
+                                    images: images.clone(),
+                                }));
+                            }
+                            ContentBlock::ToolResult {
+                                tool_use_id: call.id.clone(),
+                                content,
+                                is_error: out.is_error,
+                                images,
+                            }
                         }
                     }
                     Err(e) => ContentBlock::ToolResult {
@@ -1410,6 +1559,7 @@ async fn run_loop(
         if config.in_loop_verify
             && made_edit
             && config.verify_command.is_some()
+            && !jobs::global().session_busy(&session)
             && run_verify(&config).await
         {
             history.push(Message {
@@ -1424,7 +1574,10 @@ async fn run_loop(
 
         // No-progress circuit-breaker: hard-stop after 2n edit-free turns; nudge once at n.
         if let Some(limit) = config.no_progress_limit {
-            if limit > 0 && edit_free_streak >= limit.saturating_mul(2) {
+            if limit > 0
+                && edit_free_streak >= limit.saturating_mul(2)
+                && !jobs::global().session_busy(&session)
+            {
                 history.push(Message {
                     role: Role::User,
                     content: results,
@@ -1463,7 +1616,15 @@ async fn run_loop(
         });
     }
 
-    // Ran out of steps without a final answer.
+    // Ran out of steps without a final answer. Drop running jobs so a late finish
+    // cannot arrive as a second result after the turn has ended.
+    jobs::global().fail_running(
+        &session,
+        lvz_protocol::JobError::Failed {
+            name: "turn".into(),
+            message: "turn stopped at max steps".into(),
+        },
+    );
     obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
     let _ = tx.unbounded_send(Ok(Event::Usage(total)));
     let _ = tx.unbounded_send(Ok(Event::Done(StopReason::Other("max_steps".into()))));
@@ -3310,6 +3471,245 @@ mod tests {
             }),
             Event::Done(StopReason::ToolUse),
         ]
+    }
+
+    fn tool_turn(id: &str, name: &str, json: &str) -> Vec<Event> {
+        vec![
+            Event::ToolUseStart {
+                id: id.into(),
+                name: name.into(),
+            },
+            Event::ToolUseDelta {
+                id: id.into(),
+                json: json.into(),
+            },
+            Event::ToolUseEnd { id: id.into() },
+            Event::Done(StopReason::ToolUse),
+        ]
+    }
+
+    fn end_turn(text: &str) -> Vec<Event> {
+        vec![
+            Event::TextDelta(text.into()),
+            Event::Done(StopReason::EndTurn),
+        ]
+    }
+
+    fn history_text(req: &ChatRequest) -> String {
+        let mut out = String::new();
+        for message in &req.messages {
+            for block in &message.content {
+                match block {
+                    ContentBlock::Text { text, .. } => {
+                        out.push_str(text);
+                        out.push('\n');
+                    }
+                    ContentBlock::ToolResult { content, .. } => {
+                        out.push_str("RESULT:");
+                        out.push_str(content);
+                        out.push('\n');
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    struct SlowJob;
+
+    #[async_trait]
+    impl Tool for SlowJob {
+        fn name(&self) -> &str {
+            "slow_job"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "ms": { "type": "integer" }
+                }
+            })
+        }
+        async fn invoke(&self, args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+            let token = args.get("id").and_then(|v| v.as_str()).unwrap_or("job");
+            let id = lvz_protocol::JobId::new(token)
+                .map_err(|err| ToolError::Execution(err.to_string()))?;
+            let ms = args.get("ms").and_then(|v| v.as_u64()).unwrap_or(10);
+            let child = jobs::reserve_job("slow_job", id.clone(), Some(30))?;
+            let label = token.to_string();
+            let done_label = label.clone();
+            let done = id.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = child.cancelled() => {
+                        jobs::fail_job(
+                            done,
+                            lvz_protocol::JobError::Cancelled { name: "slow_job".into() },
+                        );
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {
+                        jobs::finish_job(done, ToolOutput::ok(format!("done {done_label}")));
+                    }
+                }
+            });
+            Ok(ToolOutput::accepted(
+                format!("started {label}"),
+                id,
+                Some(30),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_injects_job_completions_in_finish_order() {
+        let session = "room-order-jobs";
+        let provider = ScriptedProvider::new(vec![
+            {
+                let mut turn = tool_turn("c-a", "slow_job", "{\"id\":\"order-a\",\"ms\":80}");
+                turn.pop();
+                turn.extend(tool_turn(
+                    "c-b",
+                    "slow_job",
+                    "{\"id\":\"order-b\",\"ms\":15}",
+                ));
+                turn
+            },
+            end_turn("saw them"),
+            end_turn("saw them"),
+            end_turn("saw them"),
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(SlowJob));
+        let agent = Agent::new(provider.clone(), tools, AgentConfig::default());
+        let events =
+            collect(agent.run_in_session(vec![Message::user("go")], None, None, session)).await;
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Notice(text) if text.contains("order-b")
+            )),
+            "the room is told the job was accepted"
+        );
+        let reqs = provider.requests.lock().unwrap();
+        let combined = reqs.iter().map(history_text).collect::<Vec<_>>().join("\n");
+        let result_b = combined
+            .find("RESULT:accepted, id=order-b")
+            .expect("placeholder");
+        let done_b = combined.find("done order-b").expect("b completion");
+        let done_a = combined.find("done order-a").expect("a completion");
+        assert!(result_b < done_b, "placeholder precedes the real payload");
+        assert!(done_b < done_a, "finish order, not start order");
+        assert!(
+            !combined.contains("RESULT:done order-b"),
+            "the terminal payload is user text, not a second tool_result"
+        );
+        drop(reqs);
+        jobs::global().clear_session(session);
+    }
+
+    struct HangJob {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for HangJob {
+        fn name(&self) -> &str {
+            "hang_job"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn invoke(&self, _args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let id = lvz_protocol::JobId::new("hang-timeout-1")
+                .map_err(|err| ToolError::Execution(err.to_string()))?;
+            Ok(ToolOutput::accepted("started", id, Some(1)))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_timeout_does_not_invoke_the_tool_again() {
+        let session = "room-timeout-job";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ScriptedProvider::new(vec![
+            tool_turn("c1", "hang_job", "{}"),
+            end_turn("waiting"),
+            end_turn("stopped"),
+            end_turn("stopped"),
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(HangJob {
+            calls: calls.clone(),
+        }));
+        let agent = Agent::new(provider.clone(), tools, AgentConfig::default());
+        let _events =
+            collect(agent.run_in_session(vec![Message::user("go")], None, None, session)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a timeout does not re-fire the tool"
+        );
+        let reqs = provider.requests.lock().unwrap();
+        let combined = reqs.iter().map(history_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            combined.contains("timed out after 1s"),
+            "the timeout is injected as user text: {combined}"
+        );
+        drop(reqs);
+        jobs::global().clear_session(session);
+    }
+
+    struct ParkJob;
+
+    #[async_trait]
+    impl Tool for ParkJob {
+        fn name(&self) -> &str {
+            "park_job"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn invoke(&self, _args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+            let id = lvz_protocol::JobId::new("park-cancel-1")
+                .map_err(|err| ToolError::Execution(err.to_string()))?;
+            let _child = jobs::reserve_job("park_job", id.clone(), Some(60))?;
+            Ok(ToolOutput::accepted("parked", id, Some(60)))
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_turn_cancels_the_job() {
+        let session = "room-cancel-job";
+        let id = lvz_protocol::JobId::new("park-cancel-1").expect("id");
+        let provider =
+            ScriptedProvider::new(vec![tool_turn("c1", "park_job", "{}"), end_turn("waiting")]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ParkJob));
+        let agent = Agent::new(provider, tools, AgentConfig::default());
+        let mut stream = agent.run_in_session(vec![Message::user("go")], None, None, session);
+        while let Some(event) = stream.next().await {
+            if matches!(event, Ok(Event::Notice(ref text)) if text.contains("park-cancel-1")) {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(stream);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match jobs::global().outcome_kind(&id) {
+                Some(jobs::OutcomeKind::Failed(message)) if message.contains("cancelled") => break,
+                other => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "job was not cancelled: {other:?}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
+        jobs::global().clear_session(session);
     }
 
     #[test]

@@ -20,6 +20,7 @@ mod deliberate;
 mod event;
 mod gate;
 mod gateway;
+mod job;
 mod message;
 mod provider;
 mod retry;
@@ -33,6 +34,10 @@ pub use deliberate::{DeliberateError, Deliberation, DeliberationContext, Deliber
 pub use event::{CostWeights, Event, StopReason, Usage};
 pub use gate::{ToolDecision, ToolGate};
 pub use gateway::{Gateway, GatewayError};
+pub use job::{
+    fails_closed_on_restart, reattach_from_artifact, AcceptedJob, JobError, JobId, LongTool,
+    MAX_JOBS_PER_SESSION,
+};
 pub use message::{
     BuiltinTool, ChatRequest, ContentBlock, McpServer, MediaSource, Message, OutputFormat, Role,
     ServerTool, SystemPrompt, ThinkingLevel, ToolChoice, ToolDef,

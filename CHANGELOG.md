@@ -5,6 +5,31 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 
 ## [Unreleased]
 
+## [0.18.16] — 2026-11-25
+
+### Background jobs on the chat path
+
+- A long tool returns a [`JobId`] immediately. The chat loop posts one placeholder
+  `tool_result` (`accepted, id=…`) and keeps the turn open. The terminal payload is a
+  later user message, in finish order, not a second result for the same id. `EndTurn`
+  with a job still open waits until that job finishes, times out, or the turn is
+  cancelled. Dropping the event stream, including ACP `session/cancel`, cancels the job.
+- At most 4 running jobs per session. The next accept is `ToolError::Execution` and the
+  placeholder is `is_error`. A chat timeout does not call the tool again. The schedule
+  path and `POST /v1/jobs/{id}` still poll inline, and a schedule timeout still retries.
+- A legacy `ToolOutput::pending` on the chat path is polled by the host. The model is
+  not required to call `poll_build`, `server_poll_wake`, or `server_poll_shutdown`.
+- Running rows are stored beside the file session transcript as `{hex}.jobs.json`
+  (`id`, `tool`, `session`, `started`). After a restart, power and OBS jobs fail with
+  `process restarted` and are not sent again. `run_build` reattaches when
+  `$BUILD_ID.code` is already in the artifact directory.
+- The table is one `Mutex`. It is not held across `.await`. The cap check and the insert
+  share that critical section. A row is removed once its terminal value has been copied
+  into the user message, so a finished id does not stay in the map.
+
+`lavoisier` 0.18.15 → 0.18.16. `lvz-protocol` 0.1.9 → 0.1.10. `lvz-agent` 0.1.14 → 0.1.15.
+Not tagged in this change. HOLD APPLY.
+
 ## [0.18.15] — 2026-11-25
 
 ### Live-ops summary after the round cap

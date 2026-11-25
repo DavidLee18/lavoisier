@@ -5,6 +5,9 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::AcceptedJob;
+use crate::JobId;
+
 /// A capability the model can invoke. Implementors expose a name, a JSON Schema for their
 /// arguments, and an async `invoke`.
 #[async_trait]
@@ -66,6 +69,12 @@ pub struct ToolOutput {
     /// A **typed field, not a JSON convention** in `content`: a tool that mis-spelled a magic key
     /// would silently be treated as terminal, which is the failure this exists to remove.
     pub pending: Option<Pending>,
+    /// Set when this output is the acceptance of a background job.
+    ///
+    /// The chat path turns this into one placeholder `tool_result` (`accepted, id=…`) and
+    /// delivers the real payload later as user text. `None` for every ordinary result.
+    /// A schedule caller that is not inside a chat turn still uses [`pending`](ToolOutput::pending).
+    pub accepted: Option<AcceptedJob>,
     /// Images the model should see along with [`content`](ToolOutput::content). Empty for every
     /// tool that returns text only. The bytes are base64, not a file path: a path would depend on
     /// a later `read_file`, and that read is text-only.
@@ -102,6 +111,22 @@ impl ToolOutput {
             is_error: false,
             changed: false,
             pending: None,
+            accepted: None,
+            images: Vec::new(),
+        }
+    }
+
+    /// The work was accepted as background job `id` and this call is not the terminal result.
+    pub fn accepted(content: impl Into<String>, id: JobId, estimated_seconds: Option<u64>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            changed: false,
+            pending: None,
+            accepted: Some(AcceptedJob {
+                id,
+                estimated_seconds,
+            }),
             images: Vec::new(),
         }
     }
@@ -132,6 +157,7 @@ impl ToolOutput {
                 poll_with: poll_with.into(),
                 estimated_seconds,
             }),
+            accepted: None,
             images: Vec::new(),
         }
     }
@@ -144,6 +170,7 @@ impl ToolOutput {
             changed: false,
             // An error is terminal by construction: there is nothing to poll for.
             pending: None,
+            accepted: None,
             images: Vec::new(),
         }
     }
