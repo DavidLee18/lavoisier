@@ -68,12 +68,16 @@
 # verify_cmd     = "cargo test --quiet"
 
 [memory]
+# fs = "local"   # or "object" on a GCS FUSE mount
 # Bounds for the in-memory session store (unbounded by default):
 # max_messages = 200            # keep each session's most recent N messages
 # max_sessions = 100            # keep at most N sessions (LRU eviction)
 # Durable, file-backed store (survives restarts) instead of process-only memory:
 # store = "file"                # "memory" (default) | "file"
 # path  = "./.lavoisier/sessions"   # required when store = "file"
+
+[jobs]
+# recover_on_signal = false
 
 [gateway]
 # serve            = "127.0.0.1:8080"

@@ -64,6 +64,8 @@ pub struct GatewayConfig {
     jobs: Option<Arc<dyn jobs::JobRunner>>,
     /// Room and member tool maps. Empty maps leave turns unconstrained.
     tool_policy: ToolPolicy,
+    /// `POST /v1/admin/recover`. Absent ⇒ the route is not mounted.
+    recover: Option<Arc<dyn LeaseRecover>>,
 }
 
 impl GatewayConfig {
@@ -100,6 +102,37 @@ impl GatewayConfig {
         self.tool_policy = ToolPolicy::from_lists(rooms, users);
         self
     }
+
+    /// Mount `POST /v1/admin/recover` and pass each body to `hook`.
+    pub fn with_recover(mut self, hook: Arc<dyn LeaseRecover>) -> Self {
+        self.recover = Some(hook);
+        self
+    }
+}
+
+/// Outcome of one `POST /v1/admin/recover`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoverReport {
+    /// Rows were settled.
+    Recovered {
+        /// Rows touched.
+        jobs: usize,
+    },
+    /// This generation was already adopted, or boot recovery already ran.
+    AlreadyRecovered,
+}
+
+/// Why `POST /v1/admin/recover` refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoverRefuse {
+    /// `lease_generation` is not the generation already accepted.
+    StaleLease,
+}
+
+/// Sync hook for lease-gated job recovery. The HTTP crate does not own the job table.
+pub trait LeaseRecover: Send + Sync {
+    /// Adopt persisted jobs for `lease_generation`.
+    fn recover(&self, lease_generation: u64) -> Result<RecoverReport, RecoverRefuse>;
 }
 
 /// The HTTP copy of the Matrix room/member tool maps.
@@ -192,13 +225,18 @@ impl HttpGateway {
             agent,
             metrics: Arc::new(Metrics::default()),
             tool_policy: config.tool_policy.clone(),
+            recover: config.recover.clone(),
         });
+        let mount_recover = config.recover.is_some();
         let jobs = config.jobs.clone();
         let guard = Arc::new(Guard::new(config));
-        let mut protected = Router::new()
+        let mut routes = Router::new()
             .route("/v1/turns", post(post_turn))
-            .route("/v1/ws", get(ws_upgrade))
-            .with_state(state.clone());
+            .route("/v1/ws", get(ws_upgrade));
+        if mount_recover {
+            routes = routes.route("/v1/admin/recover", post(post_recover));
+        }
+        let mut protected = routes.with_state(state.clone());
         if let Some(runner) = jobs {
             protected = protected.merge(jobs::router(runner));
         }
@@ -217,6 +255,7 @@ struct AppState {
     agent: SharedAgent,
     metrics: Arc<Metrics>,
     tool_policy: ToolPolicy,
+    recover: Option<Arc<dyn LeaseRecover>>,
 }
 
 #[async_trait]
@@ -523,6 +562,38 @@ async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
         state.metrics.render_prometheus(),
     )
+}
+
+#[derive(Deserialize)]
+struct RecoverDto {
+    lease_generation: u64,
+}
+
+/// `POST /v1/admin/recover` — adopt persisted jobs for one lease generation.
+async fn post_recover(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RecoverDto>,
+) -> Response {
+    let Some(hook) = state.recover.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match hook.recover(body.lease_generation) {
+        Ok(RecoverReport::Recovered { jobs }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "recovered", "jobs": jobs})),
+        )
+            .into_response(),
+        Ok(RecoverReport::AlreadyRecovered) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "already_recovered"})),
+        )
+            .into_response(),
+        Err(RecoverRefuse::StaleLease) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "stale_lease"})),
+        )
+            .into_response(),
+    }
 }
 
 /// `POST /v1/turns` — run one turn and stream its events as SSE.

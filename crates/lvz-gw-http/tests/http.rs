@@ -242,3 +242,41 @@ async fn rate_limit_returns_429_past_the_quota() {
         .status()
         .is_success());
 }
+
+struct ScriptedRecover;
+
+impl lvz_gw_http::LeaseRecover for ScriptedRecover {
+    fn recover(
+        &self,
+        generation: u64,
+    ) -> Result<lvz_gw_http::RecoverReport, lvz_gw_http::RecoverRefuse> {
+        match generation {
+            1 => Ok(lvz_gw_http::RecoverReport::Recovered { jobs: 2 }),
+            2 => Ok(lvz_gw_http::RecoverReport::AlreadyRecovered),
+            _ => Err(lvz_gw_http::RecoverRefuse::StaleLease),
+        }
+    }
+}
+
+#[tokio::test]
+async fn admin_recover_maps_the_hook() {
+    let config = GatewayConfig::default().with_recover(Arc::new(ScriptedRecover));
+    let base = spawn_with(Arc::new(EchoAgent), config).await;
+    let client = reqwest::Client::new();
+    let post = |gen: u64| {
+        client
+            .post(format!("{base}/v1/admin/recover"))
+            .json(&serde_json::json!({"lease_generation": gen}))
+            .send()
+    };
+    let recovered = post(1).await.unwrap();
+    assert_eq!(recovered.status(), reqwest::StatusCode::OK);
+    let body = recovered.text().await.unwrap();
+    assert!(body.contains("recovered"), "{body}");
+    assert!(body.contains("2"), "{body}");
+    let again = post(2).await.unwrap();
+    assert!(again.text().await.unwrap().contains("already_recovered"));
+    let stale = post(0).await.unwrap();
+    assert_eq!(stale.status(), reqwest::StatusCode::CONFLICT);
+    assert!(stale.text().await.unwrap().contains("stale_lease"));
+}

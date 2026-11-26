@@ -1037,6 +1037,7 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             if !rooms.is_empty() || !users.is_empty() {
                 gw_config = gw_config.with_tool_maps(rooms, users);
             }
+            gw_config = gw_config.with_recover(Arc::new(jobs::LeaseHook));
             if cli.serve_jobs {
                 if let Some(schedule) = &schedule {
                     let timeout = std::time::Duration::from_secs(cli.jobs_timeout.unwrap_or(1800));
@@ -1745,7 +1746,11 @@ fn arm_jobs(config: &Config, cli: &Cli) {
     let timeout = cli
         .schedule_pending_timeout
         .unwrap_or(lvz_schedule::DEFAULT_PENDING_TIMEOUT);
-    lvz_agent::jobs::configure(store, artifact, timeout);
+    let fs: std::sync::Arc<dyn lvz_agent::durable::DurableFs> = match config.memory.fs {
+        config::FsKind::Object => std::sync::Arc::new(lvz_agent::durable::ObjectFs),
+        config::FsKind::Local => std::sync::Arc::new(lvz_agent::durable::LocalFs),
+    };
+    lvz_agent::jobs::configure_ext(store, artifact, timeout, config.jobs.recover_on_signal, fs);
 }
 
 /// Build the tool-using [`Agent`] from the CLI config. Shared by `--agent` (one-shot) and
