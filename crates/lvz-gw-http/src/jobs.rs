@@ -90,6 +90,9 @@ pub trait JobRunner: Send + Sync + 'static {
         req: &JobRequest,
         waiting: Box<dyn FnMut(String) + Send>,
     ) -> Result<JobReport, String>;
+
+    /// Cancel the real work of a running attempt. The default does nothing.
+    async fn cancel(&self, _job: &str, _key: &str) {}
 }
 
 #[derive(Clone)]
@@ -101,22 +104,39 @@ enum Terminal {
 struct Entry {
     job: String,
     done: Option<Terminal>,
+    /// Set when a persisted `running` row is read back after a restart.
+    lost: bool,
+    waiting: Option<String>,
     at: Instant,
 }
 
 pub(crate) struct JobsState {
     runner: Arc<dyn JobRunner>,
     entries: Mutex<HashMap<String, Entry>>,
+    dir: Option<std::path::PathBuf>,
 }
 
 /// The route, unguarded; `router_with` puts it behind the API-key guard.
-pub(crate) fn router(runner: Arc<dyn JobRunner>) -> Router {
+///
+/// `dir` persists attempts. A `running` row read back at startup is `lost`.
+pub(crate) fn router(runner: Arc<dyn JobRunner>, dir: Option<std::path::PathBuf>) -> Router {
+    let mut entries = HashMap::new();
+    if let Some(dir) = &dir {
+        for (key, entry) in load_attempts(dir) {
+            entries.insert(key, entry);
+        }
+    }
     let state = Arc::new(JobsState {
         runner,
-        entries: Mutex::new(HashMap::new()),
+        entries: Mutex::new(entries),
+        dir,
     });
     Router::new()
         .route("/v1/jobs/{id}", post(post_job))
+        .route(
+            "/v1/jobs/{id}/attempts/{key}",
+            axum::routing::get(get_attempt).delete(delete_attempt),
+        )
         .with_state(state)
 }
 
@@ -157,9 +177,17 @@ fn sse(rx: tokio::sync::mpsc::UnboundedReceiver<SseEvent>) -> Response {
         .into_response()
 }
 
+fn respond_async(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("prefer")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("respond-async"))
+}
+
 async fn post_job(
     Path(id): Path<String>,
     State(st): State<Arc<JobsState>>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
     let req: JobRequest = match serde_json::from_slice(&body) {
@@ -197,6 +225,7 @@ async fn post_job(
         }
     }
 
+    let async_ack = respond_async(&headers);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     {
         let mut map = st.entries.lock().expect("jobs map poisoned");
@@ -235,17 +264,31 @@ async fn post_job(
             Entry {
                 job: id.clone(),
                 done: None,
+                lost: false,
+                waiting: None,
                 at: Instant::now(),
             },
         );
+        save_attempt(&st, &req.idempotency_key);
     }
 
     // Detached: a dropped stream does not cancel the attempt; its verdict stays replayable.
+    let status_key = req.idempotency_key.clone();
+    let status_job = id.clone();
     tokio::spawn(async move {
         let wtx = tx.clone();
         let wjob = id.clone();
+        let wst = Arc::clone(&st);
+        let wkey = req.idempotency_key.clone();
         let mut sent = false;
         let waiting = Box::new(move |body: String| {
+            if let Ok(mut map) = wst.entries.lock() {
+                if let Some(entry) = map.get_mut(&wkey) {
+                    if entry.waiting.is_none() {
+                        entry.waiting = Some(body.clone());
+                    }
+                }
+            }
             if !std::mem::replace(&mut sent, true) {
                 let d = serde_json::json!({ "job": wjob, "body": body }).to_string();
                 let _ = wtx.send(SseEvent::default().event("waiting").data(d));
@@ -266,7 +309,145 @@ async fn post_job(
             e.done = Some(t.clone());
             e.at = Instant::now();
         }
+        save_attempt(&st, &req.idempotency_key);
         let _ = tx.send(terminal_event(&id, &t, false));
     });
+    if async_ack {
+        let status_url = format!("/v1/jobs/{status_job}/attempts/{status_key}");
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "attempt": status_key,
+                "status_url": status_url,
+            })),
+        )
+            .into_response();
+    }
     sse(rx)
+}
+
+async fn get_attempt(
+    Path((id, key)): Path<(String, String)>,
+    State(st): State<Arc<JobsState>>,
+) -> Response {
+    let map = match st.entries.lock() {
+        Ok(map) => map,
+        Err(err) => err.into_inner(),
+    };
+    let Some(entry) = map.get(&key) else {
+        return reject(StatusCode::NOT_FOUND, "unknown_attempt", "no such attempt");
+    };
+    if entry.job != id {
+        return reject(StatusCode::NOT_FOUND, "unknown_attempt", "no such attempt");
+    }
+    let state = if entry.lost {
+        "lost"
+    } else {
+        match &entry.done {
+            None => "running",
+            Some(Terminal::Report(report)) if report.ok => "done",
+            Some(_) => "failed",
+        }
+    };
+    let report = match &entry.done {
+        Some(Terminal::Report(report)) => serde_json::to_value(report).unwrap_or_default(),
+        _ => serde_json::Value::Null,
+    };
+    Json(serde_json::json!({
+        "state": state,
+        "report": report,
+        "waiting": entry.waiting,
+    }))
+    .into_response()
+}
+
+async fn delete_attempt(
+    Path((id, key)): Path<(String, String)>,
+    State(st): State<Arc<JobsState>>,
+) -> StatusCode {
+    st.runner.cancel(&id, &key).await;
+    StatusCode::NO_CONTENT
+}
+
+fn save_attempt(st: &JobsState, key: &str) {
+    let Some(dir) = st.dir.clone() else {
+        return;
+    };
+    let record = {
+        let map = match st.entries.lock() {
+            Ok(map) => map,
+            Err(err) => err.into_inner(),
+        };
+        let Some(entry) = map.get(key) else {
+            return;
+        };
+        let state = if entry.lost {
+            "lost"
+        } else if entry.done.is_none() {
+            "running"
+        } else {
+            "terminal"
+        };
+        serde_json::json!({
+            "job": entry.job,
+            "state": state,
+            "waiting": entry.waiting,
+            "done": match &entry.done {
+                Some(Terminal::Report(report)) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+                Some(Terminal::Error(text)) => serde_json::json!({ "error": text }),
+                None => serde_json::Value::Null,
+            },
+        })
+    };
+    let _ = write_attempt(&dir, key, &record.to_string());
+}
+
+fn write_attempt(dir: &std::path::Path, key: &str, body: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(key);
+    let tmp = dir.join(format!(".{key}.tmp"));
+    let mut file = std::fs::File::create(&tmp)?;
+    std::io::Write::write_all(&mut file, body.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn load_attempts(dir: &std::path::Path) -> Vec<(String, Entry)> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in read.flatten() {
+        let Some(name) = item.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(item.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let Some(job) = value.get("job").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let running = value.get("state").and_then(|v| v.as_str()) == Some("running");
+        out.push((
+            name,
+            Entry {
+                job: job.to_string(),
+                done: None,
+                lost: running,
+                waiting: value
+                    .get("waiting")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                at: Instant::now(),
+            },
+        ));
+    }
+    out
 }

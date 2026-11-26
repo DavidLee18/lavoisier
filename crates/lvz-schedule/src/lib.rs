@@ -37,7 +37,7 @@ mod attempt;
 mod cron;
 pub mod tools;
 
-pub use attempt::AttemptReport;
+pub use attempt::{cancel_attempt, AttemptReport};
 pub use cron::{CronError, CronSchedule};
 pub use tools::{ScheduleListTool, ScheduleRunTool, ScheduleStatusTool};
 

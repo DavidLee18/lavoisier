@@ -6,12 +6,29 @@
 //! to its verdict **inline**, the `summarize` render, and the same `report_body`. The verdict and
 //! retry decision come from the same `record`, so `retry_in`/`gave_up` match today's policy:
 //! any failure retries (a tool's `is_error` included) while `attempt <= retry_max`.
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use lvz_protocol::{enter_work_scope, AgentHandle, ToolImage};
 use lvz_tools::ToolRegistry;
 use tokio_util::sync::CancellationToken;
+
+static ATTEMPT_TOKENS: LazyLock<Mutex<HashMap<String, CancellationToken>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Cancel the in-flight attempt of `job`, if one is running.
+pub fn cancel_attempt(job: &str) -> bool {
+    let Some(token) = ATTEMPT_TOKENS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .remove(job)
+    else {
+        return false;
+    };
+    token.cancel();
+    true
+}
 
 use super::{
     finish, log_verbose, now_unix, poll_pending, run_action, ActionOutcome, FireReport,
@@ -63,6 +80,10 @@ impl ScheduleRegistry {
         }
         let started = std::time::Instant::now();
         let attempt_token = CancellationToken::new();
+        ATTEMPT_TOKENS
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(job.id.clone(), attempt_token.clone());
         let cancel_on_timeout = attempt_token.clone();
         let session = job.session.clone();
         let outcome = match tokio::time::timeout(
@@ -98,6 +119,10 @@ impl ScheduleRegistry {
             outcome.summary.as_deref(),
             outcome.images.clone(),
         );
+        ATTEMPT_TOKENS
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(&job.id);
         log_verbose(&job, &outcome, &report, started.elapsed());
         let retry_in = (!report.ok && attempt <= job.retry_max).then_some(job.retry_wait);
         Some(AttemptReport {

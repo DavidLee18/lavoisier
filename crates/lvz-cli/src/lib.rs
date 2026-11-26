@@ -1062,12 +1062,20 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
                     let timeout = std::time::Duration::from_secs(cli.jobs_timeout.unwrap_or(1800));
                     tracing::info!(jobs = schedule.len(), timeout_s = timeout.as_secs(),
                         "schedule served for an external clock (POST /v1/jobs/{{id}}); no local timer");
-                    gw_config = gw_config.with_jobs(Arc::new(jobs::ScheduleJobRunner::new(
-                        schedule.clone(),
-                        tools.clone(),
-                        agent.clone(),
-                        timeout,
-                    )));
+                    let attempts = config
+                        .memory
+                        .path
+                        .clone()
+                        .unwrap_or_else(|| std::path::PathBuf::from(".lavoisier"))
+                        .join("attempts");
+                    gw_config = gw_config
+                        .with_jobs(Arc::new(jobs::ScheduleJobRunner::new(
+                            schedule.clone(),
+                            tools.clone(),
+                            agent.clone(),
+                            timeout,
+                        )))
+                        .with_attempt_dir(attempts);
                 }
             }
             let auth = if cli.api_key.is_empty() {

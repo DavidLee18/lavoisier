@@ -93,6 +93,10 @@ impl JobRunner for ScheduleJobRunner {
             images: r.images.len(),
         })
     }
+
+    async fn cancel(&self, job: &str, _key: &str) {
+        lvz_schedule::cancel_attempt(job);
+    }
 }
 
 /// `POST /v1/admin/recover` → the process job table.
