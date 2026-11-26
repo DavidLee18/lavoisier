@@ -70,6 +70,14 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
+    /// Print the staged trace for this session and exit. Does not run a turn.
+    #[arg(long, value_name = "SESSION")]
+    trace: Option<String>,
+
+    /// How many trace records `--trace` prints. Default 20.
+    #[arg(long, default_value_t = 20)]
+    trace_last: usize,
+
     /// Which provider to use (default `xai`; overridable via `[provider]` in the config file).
     #[arg(long, value_enum, env = "LVZ_PROVIDER")]
     provider: Option<ProviderKind>,
@@ -895,6 +903,29 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
     // Install the logging collector as early as possible — right after precedence is resolved, so
     // `[log] level` counts, and before any work worth logging happens.
     init_logging(cli.log_level.as_deref(), cli.tui);
+    if let Some(session) = cli.trace.clone() {
+        let dir = config
+            .memory
+            .path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(".lavoisier"));
+        let store = lvz_agent::trace::TraceStore::open_local(dir, config.trace.keep);
+        for record in store.read(&session, cli.trace_last) {
+            println!("{record}");
+        }
+        return Ok(());
+    }
+    if config.trace.enabled {
+        let dir = config
+            .memory
+            .path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(".lavoisier"));
+        lvz_agent::trace::install(Arc::new(lvz_agent::trace::TraceStore::open_local(
+            dir,
+            config.trace.keep,
+        )));
+    }
     // Builder tasks push compile output here. Absent ⇒ no listener, and a build tool has nothing
     // to follow. The bind address is what gets handed to the builder as LVZ_BUILDLOG_ADDR.
     if let Ok(bind) = std::env::var("LVZ_BUILDLOG_BIND") {
@@ -1054,6 +1085,9 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
                 gw_config = gw_config.with_tool_maps(rooms, users);
             }
             gw_config = gw_config.with_recover(Arc::new(jobs::LeaseHook));
+            if config.trace.enabled {
+                gw_config = gw_config.with_trace(Arc::new(jobs::TraceBridge));
+            }
             if let Some(outbox) = detached_outbox.clone() {
                 gw_config = gw_config.with_outbox(outbox);
             }

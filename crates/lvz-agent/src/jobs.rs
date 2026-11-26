@@ -424,6 +424,8 @@ impl JobRuntime {
             return;
         }
         let session = row.session.clone();
+        let id_text = id.as_str().to_string();
+        let outcome = if result.is_ok() { "ok" } else { "err" };
         row.cancel.cancel();
         row.state = match result {
             Ok(output) => State::Done(output),
@@ -438,6 +440,7 @@ impl JobRuntime {
         self.finish_guard(guard);
         self.notify.notify_waiters();
         self.dispatch_ready(&session);
+        crate::trace::job_result(&session, &id_text, outcome);
     }
 
     /// Cancel one running job.
@@ -571,9 +574,14 @@ impl JobRuntime {
             return;
         }
         let session = row.session.clone();
+        let id_text = id.as_str().to_string();
+        let step = note.step;
+        let of = note.of;
+        let label = note.label.clone();
         row.progress = Some(note);
         guard.persist_session(&session);
         self.finish_guard(guard);
+        crate::trace::job_progress(&session, &id_text, step, of, &label);
     }
 
     /// The timeout stored on `id`, for tests and recovery checks.
@@ -1495,7 +1503,15 @@ pub fn reserve_job(
             "no job scope on this call".to_string(),
         ));
     };
-    global().reserve(&scope.session, tool, id, estimated_seconds, &scope.cancel)
+    let token = global().reserve(
+        &scope.session,
+        tool,
+        id.clone(),
+        estimated_seconds,
+        &scope.cancel,
+    )?;
+    crate::trace::job_accepted(&scope.session, id.as_str(), tool, estimated_seconds);
+    Ok(token)
 }
 
 /// Publish the terminal output for `id`. A second publish is ignored.

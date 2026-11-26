@@ -38,6 +38,7 @@ pub mod durable;
 pub mod job_tools;
 pub mod jobs;
 pub mod outbox;
+pub mod trace;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;

@@ -102,6 +102,15 @@ impl JobRunner for ScheduleJobRunner {
 /// `POST /v1/admin/recover` → the process job table.
 pub(crate) struct LeaseHook;
 
+/// `GET /v1/sessions/{session}/trace` over the installed trace store.
+pub(crate) struct TraceBridge;
+
+impl lvz_gw_http::TraceRead for TraceBridge {
+    fn read(&self, session: &str, last: usize) -> Vec<serde_json::Value> {
+        lvz_agent::trace::read_installed(session, last)
+    }
+}
+
 /// `GET /v1/outbox` over the agent's durable outbox.
 pub(crate) struct OutboxBridge(lvz_agent::outbox::Outbox);
 

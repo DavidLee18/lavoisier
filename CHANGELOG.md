@@ -5,6 +5,12 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 
 ## [Unreleased]
 
+### Staged trace
+
+- `[trace] enabled` defaults false. When it is on, each turn and job writes one JSON record under `<memory path>/{hex}.trace/`. The transcript file is unchanged.
+- Argument values whose keys contain `pass`, `secret`, `token`, `key`, `otp`, or `auth` are stored as `<redacted>`. Strings are capped at 512 characters. Images are stored as media type, byte length, and the first 8 hex characters of the sha256.
+- `lav --trace <session> [--trace-last N]` prints the records. `GET /v1/sessions/{session}/trace?last=N` does the same when the flag is on. The store keeps 200 records per session.
+
 ### Async scheduled attempts
 
 - `POST /v1/jobs/{id}` with `Prefer: respond-async` returns `202` and `{attempt, status_url}`. `GET /v1/jobs/{id}/attempts/{key}` answers `running`, `done`, `failed`, or `lost` without holding the connection. `DELETE` cancels that attempt's work token.
