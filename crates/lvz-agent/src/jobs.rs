@@ -155,11 +155,18 @@ struct Tables {
 }
 
 /// The in-flight table. See the module docs for who may lock it.
+type TerminalHook = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// The in-process job table. One per process, reached through [`global`].
 pub struct JobRuntime {
     inner: Mutex<Tables>,
     notify: Notify,
     queue: Mutex<Option<PersistQueue>>,
     adopt_gate: Mutex<()>,
+    /// When true, a terminal row is handed to [`JobRuntime::set_terminal_hook`] instead of
+    /// the chat turn.
+    detached: std::sync::atomic::AtomicBool,
+    hook: Mutex<Option<TerminalHook>>,
 }
 
 /// A build the process should keep watching after a restart.
@@ -192,7 +199,38 @@ impl JobRuntime {
             notify: Notify::new(),
             queue: Mutex::new(None),
             adopt_gate: Mutex::new(()),
+            detached: std::sync::atomic::AtomicBool::new(false),
+            hook: Mutex::new(None),
         }
+    }
+
+    /// Turn on detached delivery. Terminal rows go to the hook, not the waiting turn.
+    pub fn set_detached(&self, on: bool) {
+        self.detached
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Receive `session` and the completion text when a detached job finishes.
+    pub fn set_terminal_hook(&self, hook: TerminalHook) {
+        *self.hook.lock().unwrap_or_else(|err| err.into_inner()) = Some(hook);
+    }
+
+    fn dispatch_ready(&self, session: &str) {
+        if !self.detached.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let hook = self
+            .hook
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        let Some(hook) = hook else {
+            return;
+        };
+        let Some(message) = self.drain_ready(session) else {
+            return;
+        };
+        hook(session, &message.text());
     }
 
     /// Set the session directory, the `run_build` artifact directory, and the fallback timeout.
@@ -399,6 +437,7 @@ impl JobRuntime {
         guard.persist_session(&session);
         self.finish_guard(guard);
         self.notify.notify_waiters();
+        self.dispatch_ready(&session);
     }
 
     /// Cancel one running job.
@@ -585,6 +624,7 @@ impl JobRuntime {
 
     /// Drop every row for `session`. Tests use this so a shared process table stays isolated.
     pub fn clear_session(&self, session: &str) {
+        cancel_session(session);
         let mut guard = self.lock();
         guard.rows.retain(|_, row| row.session != session);
         guard.ready.remove(session);
@@ -1081,6 +1121,7 @@ fn origin_label() -> String {
     match origin() {
         Origin::Chat { .. } => "chat".to_string(),
         Origin::Schedule { .. } => "schedule".to_string(),
+        Origin::Job { .. } => "job".to_string(),
         Origin::Cli => "cli".to_string(),
     }
 }
@@ -1257,6 +1298,32 @@ pub enum UserCancel {
     },
     /// No row in this session.
     Unknown,
+}
+
+fn session_parents() -> &'static Mutex<HashMap<String, CancellationToken>> {
+    static PARENTS: OnceLock<Mutex<HashMap<String, CancellationToken>>> = OnceLock::new();
+    PARENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The token detached jobs in `session` are children of.
+///
+/// Cancelling it stops those jobs. A chat turn's own token does not.
+pub fn session_parent(session: &str) -> CancellationToken {
+    let mut map = session_parents()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    map.entry(session.to_string()).or_default().clone()
+}
+
+/// Cancel the session token and forget it. Running detached jobs observe the cancel.
+pub fn cancel_session(session: &str) {
+    if let Some(token) = session_parents()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .remove(session)
+    {
+        token.cancel();
+    }
 }
 
 /// The process-wide table. Tools and the chat loop share it.

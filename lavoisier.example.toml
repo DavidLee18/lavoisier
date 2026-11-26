@@ -78,6 +78,7 @@
 
 [jobs]
 # recover_on_signal = false
+# detached = false
 # user_tools = false
 # cancel_command = false
 # [jobs.aliases]

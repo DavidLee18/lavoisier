@@ -61,6 +61,11 @@ pub enum Origin {
         /// Schedule job id.
         job: String,
     },
+    /// A continuation turn posted when a detached job finished.
+    Job {
+        /// Session the job belonged to.
+        id: String,
+    },
     /// A local CLI turn with no remote sender.
     Cli,
 }

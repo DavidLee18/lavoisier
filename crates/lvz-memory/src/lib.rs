@@ -16,14 +16,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_agent::durable::{DurableFs, LocalFs};
 use lvz_agent::Agent;
 use lvz_protocol::{AgentError, AgentHandle, Event, Message, TurnRequest};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 /// Trim `history` in place to its most recent `max` messages (no-op if `max` is `None` or the
 /// history already fits). Shared by the bounded [`InMemoryStore`] and [`FileStore`].
@@ -249,12 +249,49 @@ impl SessionStore for FileStore {
 pub struct SessionAgent {
     agent: Arc<Agent>,
     store: Arc<dyn SessionStore>,
+    locked: bool,
+}
+
+fn session_locks() -> &'static std::sync::Mutex<HashMap<String, Arc<Semaphore>>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<Semaphore>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// One permit for `session`. The mutex is dropped before the wait.
+///
+/// `None` only if a semaphore is closed, which this map never does.
+pub async fn acquire_session(session: &str) -> Option<OwnedSemaphorePermit> {
+    let sem = {
+        let mut map = session_locks()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        map.retain(|_, sem| Arc::strong_count(sem) > 1);
+        map.entry(session.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(1)))
+            .clone()
+    };
+    match sem.acquire_owned().await {
+        Ok(permit) => Some(permit),
+        Err(_) => Arc::new(Semaphore::new(1)).acquire_owned().await.ok(),
+    }
 }
 
 impl SessionAgent {
     /// Wrap an [`Agent`] and a [`SessionStore`] so each `submit` continues a named session.
     pub fn new(agent: Arc<Agent>, store: Arc<dyn SessionStore>) -> Self {
-        Self { agent, store }
+        Self {
+            agent,
+            store,
+            locked: false,
+        }
+    }
+
+    /// Hold one permit per session for the whole turn, so two turns cannot save over each other.
+    ///
+    /// Forced on with `[jobs] detached`. Off, two overlapping turns keep today's behaviour.
+    pub fn with_turn_lock(mut self) -> Self {
+        self.locked = true;
+        self
     }
 }
 
@@ -268,6 +305,8 @@ struct Tap {
     transcript: Vec<Message>,
     answer: String,
     persisted: bool,
+    /// Held until the stream is dropped so the next turn for this session waits.
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 #[async_trait]
@@ -277,6 +316,11 @@ impl AgentHandle for SessionAgent {
         turn: TurnRequest,
     ) -> Result<BoxStream<'static, Result<Event, AgentError>>, AgentError> {
         // Seed the task with the session's prior transcript + the new user turn.
+        let permit = if self.locked {
+            acquire_session(&turn.session).await
+        } else {
+            None
+        };
         let mut transcript = self.store.load(&turn.session).await;
         transcript.push(Message::user(turn.input));
         let inner = self.agent.run_in_session_framed(
@@ -295,6 +339,7 @@ impl AgentHandle for SessionAgent {
             transcript,
             answer: String::new(),
             persisted: false,
+            _permit: permit,
         };
 
         // Forward every event unchanged; accumulate the assistant's visible text; on the
