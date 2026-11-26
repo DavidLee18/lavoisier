@@ -47,6 +47,7 @@ lvz-gw-cron.workspace = true
 lvz-schedule.workspace = true
 lvz-gw-slack.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 clap.workspace = true
 futures.workspace = true
 serde.workspace = true

@@ -72,6 +72,8 @@ pub struct GatewayConfig {
     attempt_dir: Option<std::path::PathBuf>,
     /// `GET /v1/sessions/{session}/trace`. Absent ⇒ the route is not mounted.
     trace: Option<Arc<dyn TraceRead>>,
+    /// `POST /v1/confirm`. Absent ⇒ the route is not mounted.
+    confirm: Option<Arc<dyn ConfirmExec>>,
 }
 
 impl GatewayConfig {
@@ -132,6 +134,12 @@ impl GatewayConfig {
         self.trace = Some(trace);
         self
     }
+
+    /// Mount `POST /v1/confirm`.
+    pub fn with_confirm(mut self, confirm: Arc<dyn ConfirmExec>) -> Self {
+        self.confirm = Some(confirm);
+        self
+    }
 }
 
 /// One outbox record the SSE handler can forward without knowing the job table.
@@ -157,6 +165,22 @@ pub trait OutboxRead: Send + Sync {
 pub trait TraceRead: Send + Sync {
     /// Newest `last` records for `session`.
     fn read(&self, session: &str, last: usize) -> Vec<serde_json::Value>;
+}
+
+/// Body of `POST /v1/confirm`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfirmBody {
+    /// Pending code.
+    pub code: String,
+    /// The member who reacted.
+    pub context: TurnContext,
+}
+
+/// Runs a stored call after the gate accepts the confirmer.
+#[async_trait]
+pub trait ConfirmExec: Send + Sync {
+    /// `(status, json)`. The text is present even when the outbox is off.
+    async fn confirm(&self, body: ConfirmBody) -> (u16, serde_json::Value);
 }
 
 /// Outcome of one `POST /v1/admin/recover`.
@@ -277,6 +301,7 @@ impl HttpGateway {
             recover: config.recover.clone(),
             outbox: config.outbox.clone(),
             trace: config.trace.clone(),
+            confirm: config.confirm.clone(),
         });
         let mount_recover = config.recover.is_some();
         let jobs = config.jobs.clone();
@@ -295,6 +320,9 @@ impl HttpGateway {
         }
         if state.trace.is_some() {
             routes = routes.route("/v1/sessions/{session}/trace", get(get_trace));
+        }
+        if state.confirm.is_some() {
+            routes = routes.route("/v1/confirm", post(post_confirm));
         }
         let mut protected = routes.with_state(state.clone());
         if let Some(runner) = jobs {
@@ -318,6 +346,7 @@ struct AppState {
     recover: Option<Arc<dyn LeaseRecover>>,
     outbox: Option<Arc<dyn OutboxRead>>,
     trace: Option<Arc<dyn TraceRead>>,
+    confirm: Option<Arc<dyn ConfirmExec>>,
 }
 
 #[async_trait]
@@ -673,6 +702,18 @@ struct TraceQuery {
     last: Option<usize>,
 }
 
+async fn post_confirm(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ConfirmBody>,
+) -> Response {
+    let Some(exec) = &state.confirm else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let (status, body) = exec.confirm(body).await;
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (code, Json(body)).into_response()
+}
+
 async fn get_trace(
     State(state): State<Arc<AppState>>,
     Path(session): Path<String>,
@@ -816,6 +857,20 @@ async fn send_text(socket: &mut WebSocket, payload: String) -> Result<(), axum::
 /// are tagged with an `error` event name and an `{"error": …}` payload.
 fn to_sse(item: Result<Event, AgentError>) -> SseEvent {
     match item {
+        Ok(Event::ConfirmRequired {
+            code,
+            room,
+            tool,
+            expires_s,
+        }) => SseEvent::default().event("confirm_required").data(
+            serde_json::json!({
+                "code": code,
+                "room": room,
+                "tool": tool,
+                "expires_s": expires_s,
+            })
+            .to_string(),
+        ),
         Ok(event) => SseEvent::default().data(encode_event(&event)),
         Err(e) => error_sse(&e),
     }

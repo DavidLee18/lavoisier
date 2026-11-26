@@ -111,6 +111,119 @@ impl lvz_gw_http::TraceRead for TraceBridge {
     }
 }
 
+/// `POST /v1/confirm` runs the stored call, then phrases the result.
+pub(crate) struct ConfirmBridge {
+    tools: ToolRegistry,
+    agent: Arc<dyn AgentHandle>,
+    rooms: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    users: std::collections::HashMap<String, std::collections::HashSet<String>>,
+}
+
+impl ConfirmBridge {
+    pub(crate) fn new(
+        tools: ToolRegistry,
+        agent: Arc<dyn AgentHandle>,
+        rooms: std::collections::HashMap<String, Vec<String>>,
+        users: std::collections::HashMap<String, Vec<String>>,
+    ) -> Self {
+        let to_set = |map: std::collections::HashMap<String, Vec<String>>| {
+            map.into_iter()
+                .map(|(key, names)| (key, names.into_iter().collect()))
+                .collect()
+        };
+        Self {
+            tools,
+            agent,
+            rooms: to_set(rooms),
+            users: to_set(users),
+        }
+    }
+}
+
+#[async_trait]
+impl lvz_gw_http::ConfirmExec for ConfirmBridge {
+    async fn confirm(&self, body: lvz_gw_http::ConfirmBody) -> (u16, serde_json::Value) {
+        use futures::StreamExt;
+        use lvz_protocol::{
+            enter_confirmed, enter_turn, enter_work_scope, tools_for, Event, Origin, TurnRequest,
+        };
+        use tokio_util::sync::CancellationToken;
+
+        let rooms = self.rooms.clone();
+        let users = self.users.clone();
+        let room = body.context.room.clone();
+        let sender = body.context.sender.clone();
+        let decision = lvz_agent::confirm::take_if(
+            &body.code,
+            &room,
+            &sender,
+            body.context.seq,
+            &body.context.event_id,
+            |tool| {
+                let grant = tools_for(&rooms, &users, &room, &sender);
+                lvz_protocol::tool_permitted(grant.as_deref(), tool)
+            },
+        );
+        let row = match decision {
+            lvz_agent::confirm::ConfirmDecision::Ready(row) => row,
+            lvz_agent::confirm::ConfirmDecision::Refuse(notice) => {
+                return (409, serde_json::json!({ "error": notice, "text": notice }));
+            }
+        };
+        let marker = lvz_agent::confirm::marker(&row.tool, &row.args);
+        let token = CancellationToken::new();
+        let output = enter_turn(
+            None,
+            Origin::Confirmed {
+                code: row.code.clone(),
+                confirmer: sender.clone(),
+            },
+            enter_confirmed(
+                marker,
+                enter_work_scope(
+                    &row.session,
+                    token,
+                    self.tools.invoke(&row.tool, row.args.clone()),
+                ),
+            ),
+        )
+        .await;
+        let raw = match output {
+            Ok(output) => output.content,
+            Err(err) => err.to_string(),
+        };
+        let turn = TurnRequest::new(
+            row.session.clone(),
+            format!("Explain this tool result in one short paragraph.\n{raw}"),
+        )
+        .with_allowed_tools(Vec::<String>::new())
+        .with_origin(Origin::Cli);
+        let text = match self.agent.submit(turn).await {
+            Ok(mut stream) => {
+                let mut text = String::new();
+                let mut failed = false;
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(Event::TextDelta(delta)) => text.push_str(&delta),
+                        Err(_) => {
+                            failed = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if failed || text.trim().is_empty() {
+                    raw
+                } else {
+                    text
+                }
+            }
+            Err(_) => raw,
+        };
+        (200, serde_json::json!({ "text": text, "tool": row.tool }))
+    }
+}
+
 /// `GET /v1/outbox` over the agent's durable outbox.
 pub(crate) struct OutboxBridge(lvz_agent::outbox::Outbox);
 

@@ -76,6 +76,20 @@
 # store = "file"                # "memory" (default) | "file"
 # path  = "./.lavoisier/sessions"   # required when store = "file"
 
+[confirm]
+# expiry_s = 300
+# [[confirm.rule]]
+# tool = "server_broadcast"
+# when = { action = "stop" }
+# [[confirm.rule]]
+# tool = "obs_streaming"
+# when = { action = ["stop", "toggle"] }
+# [[confirm.rule]]
+# tool = "obs_macro"
+# [[confirm.rule]]
+# tool = "server_shutdown"
+# when_live = true
+
 [trace]
 # enabled = false
 # keep = 200

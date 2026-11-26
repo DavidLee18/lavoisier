@@ -34,6 +34,7 @@
 #![warn(missing_docs)]
 
 pub mod cancel;
+pub mod confirm;
 pub mod durable;
 pub mod job_tools;
 pub mod jobs;
@@ -1527,6 +1528,16 @@ async fn run_loop(
                 ContentBlock::ToolResult {
                     tool_use_id: call.id.clone(),
                     content: format!("tool `{}` denied: {reason}", call.name),
+                    is_error: true,
+                    images: Vec::new(),
+                }
+            } else if let Some((message, event)) =
+                confirm::intercept(&session, &call.name, &args).await
+            {
+                let _ = tx.unbounded_send(Ok(event));
+                ContentBlock::ToolResult {
+                    tool_use_id: call.id.clone(),
+                    content: message,
                     is_error: true,
                     images: Vec::new(),
                 }
@@ -3207,7 +3218,7 @@ impl TurnAccumulator {
             Event::Citation { .. } => Some(event),
             // Progress notices are injected by the agent (never by a provider); forward for
             // visibility, they carry no turn state.
-            Event::Notice(_) => Some(event),
+            Event::Notice(_) | Event::ConfirmRequired { .. } => Some(event),
             Event::ToolResultImages { .. } => Some(event),
             Event::Usage(u) => {
                 self.usage = u; // providers emit one usage per turn; last wins

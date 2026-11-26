@@ -66,6 +66,13 @@ pub enum Origin {
         /// Session the job belonged to.
         id: String,
     },
+    /// A stored call running after a second user confirmed it.
+    Confirmed {
+        /// The pending-confirm code.
+        code: String,
+        /// The member who confirmed.
+        confirmer: String,
+    },
     /// A local CLI turn with no remote sender.
     Cli,
 }
