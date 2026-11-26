@@ -15,12 +15,12 @@
 #![warn(missing_docs)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
+use lvz_agent::durable::{DurableFs, LocalFs};
 use lvz_agent::Agent;
 use lvz_protocol::{AgentError, AgentHandle, Event, Message, TurnRequest};
 use tokio::sync::Mutex;
@@ -126,6 +126,7 @@ impl SessionStore for InMemoryStore {
 pub struct FileStore {
     dir: PathBuf,
     max_messages: Option<usize>,
+    fs: Arc<dyn DurableFs>,
 }
 
 impl FileStore {
@@ -134,7 +135,15 @@ impl FileStore {
         Self {
             dir: dir.into(),
             max_messages: None,
+            fs: Arc::new(LocalFs),
         }
+    }
+
+    /// Replace the filesystem. [`LocalFs`] is the default. [`lvz_agent::durable::ObjectFs`] writes
+    /// the final path directly, for a GCS FUSE mount.
+    pub fn with_fs(mut self, fs: Arc<dyn DurableFs>) -> Self {
+        self.fs = fs;
+        self
     }
 
     /// Trim each session to its most recent `max_messages` on save (`None` = unbounded).
@@ -153,50 +162,17 @@ impl FileStore {
     }
 }
 
-/// Per-process write counter, so each [`atomic_write`] temp file has a unique name even under
-/// concurrent writers (paired with the pid it is unique across processes on a shared dir too).
-static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Durably replace `path`'s contents with `bytes`: write a sibling temp file, flush it to disk, then
-/// atomically `rename` it over the target.
-///
-/// `rename(2)` is atomic on POSIX and on EFS/NFS (within one filesystem — hence a temp file in the
-/// *same* directory), so a crash mid-write can never leave a torn file, and a concurrent reader sees
-/// either the old contents or the new, never a partial mix. This is what stops a mid-write
-/// SIGKILL/OOM/task-replacement from truncating a transcript into unparseable JSON that [`load`](FileStore::load)
-/// would then read as an empty session.
-async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("session");
-    // Hidden, unique-per-write temp name in the same dir: pid + a monotonic counter.
-    let tmp = dir.join(format!(
-        ".{stem}.{}.{}.tmp",
-        std::process::id(),
-        WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-
-    // Write + flush + fsync the temp file, then swap it in. Clean up the temp file on any failure so
-    // a transient error can't litter the dir.
-    let write = async {
-        let mut f = tokio::fs::File::create(&tmp).await?;
-        f.write_all(bytes).await?;
-        f.sync_all().await?; // durable before the rename makes it visible
-        Ok::<(), std::io::Error>(())
-    };
-    if let Err(e) = write.await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(e);
+async fn write_transcript(
+    fs: Arc<dyn DurableFs>,
+    path: PathBuf,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    let joined = tokio::task::spawn_blocking(move || fs.write_atomic(&path, &bytes)).await;
+    match joined {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(err) => Err(err.to_string()),
     }
-    if let Err(e) = tokio::fs::rename(&tmp, path).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(e);
-    }
-    Ok(())
 }
 
 #[async_trait]
@@ -261,7 +237,8 @@ impl SessionStore for FileStore {
                 return;
             }
         };
-        if let Err(e) = atomic_write(&path, &bytes).await {
+        let fs = Arc::clone(&self.fs);
+        if let Err(e) = write_transcript(fs, path.clone(), bytes).await {
             tracing::error!(session = %path.display(), error = %e, "cannot write session");
         }
     }

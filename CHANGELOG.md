@@ -12,6 +12,11 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 
 The root workspace pins are `lvz-tools` 0.1.3 and `lvz-memory` 0.3.3, the same versions crates.io already serves. This stack starts from that reconcile.
 
+### Durable jobs
+
+- The job file is version 2 and still reads version 1. A write goes to a unique temp file, is fsynced, renamed, and the parent directory is fsynced, off the job-table lock. Object mounts write the final path instead. A terminal row stays until `drain_ready` delivers it. A tool that cannot survive a restart becomes `JobError::Interrupted` with the last progress step (`unknown` when none was stored). A recovered `run_build` keeps the timeout it was accepted with.
+- `[jobs] recover_on_signal` defaults false, which keeps today's boot recovery. When it is true, `POST /v1/admin/recover` with `{lease_generation}` adopts the rows. The same generation returns `already_recovered`. A different generation returns 409 `stale_lease`. `[memory] fs` defaults to `local`.
+
 ### Turn context and work errors
 
 - `TurnRequest.context` carries the gateway's trusted sender, room, event id, sequence, and raw text. `Origin` is `Chat`, `Schedule`, or `Cli`, installed as a task-local for the turn. `POST /v1/turns` accepts an optional `context` object and ignores unknown fields.

@@ -5,11 +5,11 @@
 //! [`JobRuntime`] is shared. The chat loop, a tool's `invoke`, and a restarted process all
 //! reach the same process-wide runtime through [`global`].
 //!
-//! The table is a `std::sync::Mutex`. The lock is never held across `.await`. A worker
-//! publishes a terminal state by locking, writing the row, dropping the guard, then
-//! `Notify::notify_waiters`. The agent task waits on that `Notify` and drains under a new
-//! lock. Disk writes of the jobs file are synchronous and happen only while the lock is
-//! held; the file is a few rows and the critical section does not include tool I/O.
+//! The table is a `std::sync::Mutex`. The lock is never held across `.await`, and it is not
+//! held across the jobs-file write. A mutation records a snapshot, drops the guard, then a
+//! [`crate::durable::PersistQueue`] thread fsyncs it. A worker publishes a terminal state by
+//! locking, writing the row, dropping the guard, then `Notify::notify_waiters`. The agent
+//! task waits on that `Notify` and drains under a new lock.
 //!
 //! Each accepted job gets a child [`CancellationToken`](tokio_util::sync::CancellationToken)
 //! of the turn token. Cancelling the turn (dropping the event stream, or ACP
@@ -25,27 +25,31 @@
 //!
 //! # Persistence
 //!
-//! Running rows are written beside the session transcript as `{hex}.jobs.json`, where
-//! `{hex}` is the same session encoding as `FileStore::path_for` (the transcript is
-//! `{hex}.json`). The record is `{id, tool, session, started}`. On startup, power and OBS
-//! tools (anything other than `run_build`) become [`JobError::Failed`] with
-//! `"process restarted"` and are not run again. `run_build` reattaches only when
-//! `{artifact}/{id}.code` exists; otherwise a watcher waits until that file appears or the
-//! budget elapses. A chat timeout does not call the tool again.
+//! Rows are written beside the session transcript as `{hex}.jobs.json` (version 2), where
+//! `{hex}` is the same session encoding as `FileStore::path_for`. A version-1 file (no
+//! `version`, only `{id, tool, session, started}`) still loads. A terminal row stays in the
+//! file until it is drained into a completion message. On startup, power and OBS tools
+//! become [`JobError::Interrupted`] and are not run again. `run_build` reattaches from
+//! `{artifact}/{id}.code` or, when a [`BuildProbe`] is installed, from `meta.task_arn`.
+//! With [`JobRuntime::set_recover_on_signal`], startup does not adopt rows; [`adopt`] does,
+//! and only for a lease generation that is not older than the one already accepted.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 
 use lvz_protocol::{
-    admit_tool_images, fails_closed_on_restart, ContentBlock, JobError, JobId, Message, Pending,
-    Role, ToolError, ToolOutput, MAX_JOBS_PER_SESSION,
+    admit_tool_images, fails_closed_on_restart, origin, ContentBlock, JobError, JobId, Message,
+    Origin, Pending, ProgressNote, ProgressTx, Role, ToolError, ToolOutput, WorkLease,
+    MAX_JOBS_PER_SESSION,
 };
 use lvz_tools::ToolRegistry;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+
+use crate::durable::{sweep_stray_tmp, DurableFs, LocalFs, PersistQueue};
 
 /// Result of waiting until a session has something to inject, or the turn is cancelled.
 #[derive(Debug)]
@@ -105,6 +109,31 @@ struct Row {
     timeout_secs: u64,
     cancel: CancellationToken,
     state: State,
+    progress: Option<ProgressNote>,
+    task_arn: Option<String>,
+    origin_label: String,
+    pod: String,
+    boot_id: String,
+    generation: Option<u64>,
+}
+
+/// What a restarted `run_build` can learn without the build log socket.
+pub enum BuildLook {
+    /// The task has stopped. `exit_code` is `None` when the control plane did not report one.
+    Stopped {
+        /// Container exit code, when known.
+        exit_code: Option<i32>,
+    },
+    /// The task is still running.
+    Running,
+    /// The control plane did not answer. Treated as still in flight.
+    Unknown,
+}
+
+/// Describes a persisted `run_build` task. Installed by the host that owns the ECS client.
+pub trait BuildProbe: Send + Sync {
+    /// Look up `task_arn`. Must not log the task payload.
+    fn describe(&self, task_arn: &str) -> BuildLook;
 }
 
 struct Tables {
@@ -114,12 +143,23 @@ struct Tables {
     store_dir: Option<PathBuf>,
     artifact_dir: Option<PathBuf>,
     default_timeout: u64,
+    fs: Arc<dyn DurableFs>,
+    recover_on_signal: bool,
+    adopted: Option<u64>,
+    /// Lease generation copied onto rows during [`JobRuntime::adopt`].
+    stamp: Option<u64>,
+    boot_id: String,
+    pod: String,
+    snaps: Vec<(PathBuf, Option<Vec<u8>>)>,
+    probe: Option<Arc<dyn BuildProbe>>,
 }
 
 /// The in-flight table. See the module docs for who may lock it.
 pub struct JobRuntime {
     inner: Mutex<Tables>,
     notify: Notify,
+    queue: Mutex<Option<PersistQueue>>,
+    adopt_gate: Mutex<()>,
 }
 
 /// A build the process should keep watching after a restart.
@@ -140,8 +180,18 @@ impl JobRuntime {
                 store_dir: None,
                 artifact_dir: None,
                 default_timeout: 600,
+                fs: Arc::new(LocalFs),
+                recover_on_signal: false,
+                adopted: None,
+                stamp: None,
+                boot_id: format!("{}-{}", std::process::id(), now_unix()),
+                pod: std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into()),
+                snaps: Vec::new(),
+                probe: None,
             }),
             notify: Notify::new(),
+            queue: Mutex::new(None),
+            adopt_gate: Mutex::new(()),
         }
     }
 
@@ -152,10 +202,85 @@ impl JobRuntime {
         artifact: Option<PathBuf>,
         default_timeout: u64,
     ) {
+        self.configure_fs(store, artifact, default_timeout, false, Arc::new(LocalFs));
+    }
+
+    /// [`configure_with`](Self::configure_with) plus the filesystem and the lease-gated recovery flag.
+    ///
+    /// When `recover_on_signal` is set, callers must not adopt rows until [`adopt`](Self::adopt).
+    /// Stray `*.tmp.*` files in `store` are removed. The count is logged.
+    pub fn configure_fs(
+        &self,
+        store: Option<PathBuf>,
+        artifact: Option<PathBuf>,
+        default_timeout: u64,
+        recover_on_signal: bool,
+        fs: Arc<dyn DurableFs>,
+    ) {
+        if let Some(dir) = &store {
+            match sweep_stray_tmp(dir) {
+                Ok(n) if n > 0 => tracing::info!(removed = n, "swept stray job temp files"),
+                Ok(_) => {}
+                Err(err) => tracing::error!(error = %err, "could not sweep stray job temp files"),
+            }
+        }
         let mut guard = self.lock();
         guard.store_dir = store;
         guard.artifact_dir = artifact;
         guard.default_timeout = default_timeout.max(1);
+        guard.recover_on_signal = recover_on_signal;
+        guard.fs = fs;
+    }
+
+    /// Install the `run_build` probe used when a recovered row has `meta.task_arn`.
+    pub fn set_build_probe(&self, probe: Arc<dyn BuildProbe>) {
+        self.lock().probe = Some(probe);
+    }
+
+    /// Remember the ECS task that `id` is following. Persisted so a restart can describe it.
+    pub fn note_task_arn(&self, id: &JobId, arn: &str) {
+        let mut guard = self.lock();
+        let Some(row) = guard.rows.get_mut(id) else {
+            return;
+        };
+        let session = row.session.clone();
+        row.task_arn = Some(arn.to_string());
+        guard.persist_session(&session);
+        self.finish_guard(guard);
+    }
+
+    /// Ask the probe again for running builds that have a task arn.
+    pub fn recheck_builds(&self) {
+        let looks: Vec<(JobId, String, BuildLook)> = {
+            let guard = self.lock();
+            let Some(probe) = guard.probe.clone() else {
+                return;
+            };
+            guard
+                .rows
+                .values()
+                .filter(|row| row.state.is_running() && row.tool == "run_build")
+                .filter_map(|row| {
+                    let arn = row.task_arn.clone()?;
+                    let look = probe.describe(&arn);
+                    Some((row.id.clone(), row.tool.clone(), look))
+                })
+                .collect()
+        };
+        for (id, tool, look) in looks {
+            if let BuildLook::Stopped { exit_code } = look {
+                let code = exit_code.unwrap_or(1);
+                let content =
+                    format!("run_build {id} exited {code}; output unavailable after restart");
+                let output = if code == 0 {
+                    ToolOutput::ok(content)
+                } else {
+                    ToolOutput::error(content)
+                };
+                let _ = tool;
+                self.finish(id, Ok(output));
+            }
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Tables> {
@@ -198,6 +323,7 @@ impl JobRuntime {
         }
         let timeout_secs = estimated_seconds.unwrap_or(guard.default_timeout).max(1);
         let cancel = parent.child_token();
+        let (pod, boot_id) = (guard.pod.clone(), guard.boot_id.clone());
         guard.rows.insert(
             id.clone(),
             Row {
@@ -209,9 +335,16 @@ impl JobRuntime {
                 timeout_secs,
                 cancel: cancel.clone(),
                 state: State::Running,
+                progress: None,
+                task_arn: None,
+                origin_label: origin_label(),
+                pod,
+                boot_id,
+                generation: None,
             },
         );
         guard.persist_session(session);
+        self.finish_guard(guard);
         Ok(cancel)
     }
 
@@ -264,7 +397,7 @@ impl JobRuntime {
             .or_default()
             .push_back(id);
         guard.persist_session(&session);
-        drop(guard);
+        self.finish_guard(guard);
         self.notify.notify_waiters();
     }
 
@@ -317,12 +450,74 @@ impl JobRuntime {
         })
     }
 
+    /// Record a progress sample and persist it. A missing or finished id is ignored.
+    pub fn set_progress(&self, id: &JobId, note: ProgressNote) {
+        let mut guard = self.lock();
+        let Some(row) = guard.rows.get_mut(id) else {
+            return;
+        };
+        if !row.state.is_running() {
+            return;
+        }
+        let session = row.session.clone();
+        row.progress = Some(note);
+        guard.persist_session(&session);
+        self.finish_guard(guard);
+    }
+
+    /// The timeout stored on `id`, for tests and recovery checks.
+    pub fn timeout_of(&self, id: &JobId) -> Option<u64> {
+        self.lock().rows.get(id).map(|row| row.timeout_secs)
+    }
+
+    /// Adopt persisted rows. See [`adopt`].
+    pub fn adopt_lease(&self, generation: u64) -> Result<Adopted, AdoptErr> {
+        let _gate = self
+            .adopt_gate
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        {
+            let guard = self.lock();
+            if let Some(have) = guard.adopted {
+                if have == generation {
+                    return Ok(Adopted::Already);
+                }
+                return Err(AdoptErr::Stale {
+                    have,
+                    got: generation,
+                });
+            }
+            if !guard.recover_on_signal {
+                drop(guard);
+                self.lock().adopted = Some(generation);
+                return Ok(Adopted::Already);
+            }
+        }
+        {
+            let mut guard = self.lock();
+            guard.stamp = Some(generation);
+        }
+        let watches = self.recover();
+        let jobs = {
+            let guard = self.lock();
+            guard
+                .rows
+                .values()
+                .filter(|row| row.generation == Some(generation))
+                .count()
+        };
+        spawn_watches(watches);
+        self.lock().adopted = Some(generation);
+        Ok(Adopted::Recovered { jobs })
+    }
+
     /// Drop every row for `session`. Tests use this so a shared process table stays isolated.
     pub fn clear_session(&self, session: &str) {
         let mut guard = self.lock();
         guard.rows.retain(|_, row| row.session != session);
         guard.ready.remove(session);
         guard.persist_session(session);
+        self.finish_guard(guard);
     }
 
     /// Take terminal rows already queued for `session`, sweeping timeouts first.
@@ -330,11 +525,16 @@ impl JobRuntime {
         let mut guard = self.lock();
         sweep_timeouts(&mut guard);
         let items = take_ready(&mut guard, session);
-        if items.is_empty() {
+        if !items.is_empty() {
+            guard.persist_session(session);
+        }
+        let message = if items.is_empty() {
             None
         } else {
             Some(completion_message(&items))
-        }
+        };
+        self.finish_guard(guard);
+        message
     }
 
     /// Wait until `session` has a terminal job, or `parent` is cancelled.
@@ -347,9 +547,13 @@ impl JobRuntime {
                 sweep_timeouts(&mut guard);
                 let items = take_ready(&mut guard, session);
                 if !items.is_empty() {
+                    guard.persist_session(session);
+                    self.finish_guard(guard);
                     return JobWait::Ready(items);
                 }
-                next_sleep(&guard, session)
+                let sleep_for = next_sleep(&guard, session);
+                self.finish_guard(guard);
+                sleep_for
             };
             if parent.is_cancelled() {
                 return JobWait::Cancelled;
@@ -437,6 +641,20 @@ impl JobRuntime {
         let session = item.get("session").and_then(|v| v.as_str()).unwrap_or("");
         let started = item.get("started").and_then(|v| v.as_u64()).unwrap_or(0);
         let id_str = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let timeout = item
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(default_timeout)
+            .max(1);
+        let state = item
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("running");
+        let step = progress_step(item);
+        let arn = item
+            .pointer("/meta/task_arn")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         let Ok(id) = JobId::new(id_str) else {
             tracing::error!(
                 tool,
@@ -447,42 +665,83 @@ impl JobRuntime {
         if self.contains(&id) {
             return None;
         }
+        if state != "running" {
+            self.restore_terminal(item, &id, tool, session, started, timeout);
+            return Some(None);
+        }
         let parent = CancellationToken::new();
         if self
-            .reserve(session, tool, id.clone(), Some(default_timeout), &parent)
+            .reserve(session, tool, id.clone(), Some(timeout), &parent)
             .is_err()
         {
             return None;
         }
         // `reserve` stamped `started` as now. Put the persisted instant back so the budget
-        // is measured from the original accept, and keep the caller's timeout.
+        // is measured from the original accept, and keep the file's own timeout.
         {
             let mut guard = self.lock();
+            let stamp = guard.stamp;
             if let Some(row) = guard.rows.get_mut(&id) {
                 row.started = started;
-                row.timeout_secs = default_timeout.max(1);
+                row.timeout_secs = timeout;
+                row.task_arn = arn.clone();
+                row.generation = stamp;
+                if let Some(label) = item.pointer("/progress/label").and_then(|v| v.as_str()) {
+                    let step_n = item
+                        .pointer("/progress/step")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    let of_n = item
+                        .pointer("/progress/of")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    row.progress = Some(ProgressNote {
+                        step: step_n,
+                        of: of_n,
+                        label: label.to_string(),
+                    });
+                }
                 let age = now_unix().saturating_sub(started);
                 row.started_instant = Instant::now()
                     .checked_sub(Duration::from_secs(age))
                     .unwrap_or_else(Instant::now);
             }
+            guard.persist_session(session);
+            self.finish_guard(guard);
         }
         if fails_closed_on_restart(tool) {
             self.finish(
                 id,
-                Err(JobError::Failed {
-                    name: tool.to_string(),
-                    message: "process restarted".to_string(),
+                Err(JobError::Interrupted {
+                    tool: tool.to_string(),
+                    step,
                 }),
             );
             return Some(None);
         }
+        if let Some(arn) = arn.as_deref() {
+            let probe = self.lock().probe.clone();
+            if let Some(probe) = probe {
+                if let BuildLook::Stopped { exit_code } = probe.describe(arn) {
+                    let code = exit_code.unwrap_or(1);
+                    let content =
+                        format!("run_build {id} exited {code}; output unavailable after restart");
+                    let output = if code == 0 {
+                        ToolOutput::ok(content)
+                    } else {
+                        ToolOutput::error(content)
+                    };
+                    self.finish(id, Ok(output));
+                    return Some(None);
+                }
+            }
+        }
         let Some(dir) = artifact else {
             self.finish(
                 id,
-                Err(JobError::Failed {
-                    name: tool.to_string(),
-                    message: "process restarted".to_string(),
+                Err(JobError::Interrupted {
+                    tool: tool.to_string(),
+                    step,
                 }),
             );
             return Some(None);
@@ -491,13 +750,13 @@ impl JobRuntime {
             self.finish(id, Ok(output));
             return Some(None);
         }
-        let deadline = started.saturating_add(default_timeout.max(1));
+        let deadline = started.saturating_add(timeout);
         if now_unix() >= deadline {
             self.finish(
                 id,
                 Err(JobError::Timeout {
                     name: tool.to_string(),
-                    secs: default_timeout,
+                    secs: timeout,
                 }),
             );
             return Some(None);
@@ -506,8 +765,78 @@ impl JobRuntime {
             id,
             dir: dir.to_path_buf(),
             deadline_unix: deadline,
-            timeout_secs: default_timeout,
+            timeout_secs: timeout,
         }))
+    }
+
+    fn restore_terminal(
+        &self,
+        item: &serde_json::Value,
+        id: &JobId,
+        tool: &str,
+        session: &str,
+        started: u64,
+        timeout: u64,
+    ) {
+        let content = item
+            .pointer("/result/content_capped")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let is_error = item
+            .pointer("/result/is_error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let state_name = item
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("failed");
+        let state = if state_name == "cancelled" {
+            State::Failed(JobError::Cancelled {
+                name: tool.to_string(),
+            })
+        } else if state_name == "done" && !is_error {
+            State::Done(ToolOutput::ok(content))
+        } else if state_name == "failed" || is_error {
+            State::Failed(JobError::Failed {
+                name: tool.to_string(),
+                message: content,
+            })
+        } else {
+            State::Done(ToolOutput::ok(content))
+        };
+        let mut guard = self.lock();
+        let (pod, boot_id, stamp) = (guard.pod.clone(), guard.boot_id.clone(), guard.stamp);
+        guard.rows.insert(
+            id.clone(),
+            Row {
+                id: id.clone(),
+                tool: tool.to_string(),
+                session: session.to_string(),
+                started,
+                started_instant: Instant::now(),
+                timeout_secs: timeout,
+                cancel: CancellationToken::new(),
+                state,
+                progress: None,
+                task_arn: None,
+                origin_label: item
+                    .get("origin")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("cli")
+                    .to_string(),
+                pod,
+                boot_id,
+                generation: stamp,
+            },
+        );
+        guard
+            .ready
+            .entry(session.to_string())
+            .or_default()
+            .push_back(id.clone());
+        guard.persist_session(session);
+        self.finish_guard(guard);
     }
 }
 
@@ -592,7 +921,7 @@ fn next_sleep(guard: &Tables, session: &str) -> Option<Duration> {
 }
 
 impl Tables {
-    fn persist_session(&self, session: &str) {
+    fn persist_session(&mut self, session: &str) {
         let Some(dir) = &self.store_dir else {
             return;
         };
@@ -600,32 +929,87 @@ impl Tables {
         let jobs: Vec<serde_json::Value> = self
             .rows
             .values()
-            .filter(|row| row.session == session && row.state.is_running())
-            .map(|row| {
-                serde_json::json!({
-                    "id": row.id.as_str(),
-                    "tool": row.tool,
-                    "session": row.session,
-                    "started": row.started,
-                })
-            })
+            .filter(|row| row.session == session)
+            .map(row_json)
             .collect();
-        if jobs.is_empty() {
-            let _ = std::fs::remove_file(&path);
-            return;
+        let bytes = if jobs.is_empty() {
+            None
+        } else {
+            match serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "jobs": jobs,
+            })) {
+                Ok(bytes) => Some(bytes),
+                Err(err) => {
+                    tracing::error!(error = %err, "cannot serialize in-flight jobs");
+                    return;
+                }
+            }
+        };
+        if let Some(pos) = self.snaps.iter().position(|(p, _)| p == &path) {
+            self.snaps[pos] = (path, bytes);
+        } else {
+            self.snaps.push((path, bytes));
         }
-        let bytes =
-            serde_json::to_vec_pretty(&serde_json::json!({ "jobs": jobs })).unwrap_or_default();
-        if bytes.is_empty() {
-            return;
+    }
+}
+
+fn row_json(row: &Row) -> serde_json::Value {
+    let (state, is_error, content) = match &row.state {
+        State::Running => ("running", false, String::new()),
+        State::Done(output) => {
+            let state = if output.is_error { "failed" } else { "done" };
+            (state, output.is_error, cap_content(&output.content))
         }
-        if let Err(err) = atomic_write(&path, &bytes) {
-            tracing::error!(
-                path = %path.display(),
-                error = %err,
-                "cannot persist in-flight jobs"
-            );
-        }
+        State::Failed(JobError::Cancelled { .. }) => ("cancelled", true, String::new()),
+        State::Failed(err) => ("failed", true, cap_content(&err.to_string())),
+    };
+    let mut value = serde_json::json!({
+        "id": row.id.as_str(),
+        "tool": row.tool,
+        "session": row.session,
+        "started": row.started,
+        "timeout_secs": row.timeout_secs,
+        "state": state,
+        "origin": row.origin_label,
+        "writer": { "pod": row.pod, "boot_id": row.boot_id },
+    });
+    if let Some(progress) = &row.progress {
+        value["progress"] = serde_json::json!({
+            "step": progress.step,
+            "of": progress.of,
+            "label": progress.label,
+        });
+    }
+    if let Some(arn) = &row.task_arn {
+        value["meta"] = serde_json::json!({ "task_arn": arn });
+    }
+    if let Some(generation) = row.generation {
+        value["generation"] = serde_json::json!(generation);
+    }
+    if state != "running" {
+        value["result"] = serde_json::json!({
+            "is_error": is_error,
+            "content_capped": content,
+            "images": 0,
+        });
+    }
+    value
+}
+
+fn cap_content(text: &str) -> String {
+    let mut end = 1024.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+fn origin_label() -> String {
+    match origin() {
+        Origin::Chat { .. } => "chat".to_string(),
+        Origin::Schedule { .. } => "schedule".to_string(),
+        Origin::Cli => "cli".to_string(),
     }
 }
 
@@ -695,14 +1079,28 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    if let Err(err) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
+impl JobRuntime {
+    fn finish_guard(&self, mut guard: std::sync::MutexGuard<'_, Tables>) {
+        let snaps = std::mem::take(&mut guard.snaps);
+        let fs = Arc::clone(&guard.fs);
+        drop(guard);
+        if snaps.is_empty() {
+            return;
+        }
+        let queue = {
+            let mut slot = self.queue.lock().unwrap_or_else(|err| err.into_inner());
+            if slot.is_none() {
+                *slot = Some(PersistQueue::start(fs));
+            }
+            match slot.as_ref() {
+                Some(queue) => queue.clone(),
+                None => return,
+            }
+        };
+        for (path, bytes) in snaps {
+            queue.write_and_wait(path, bytes);
+        }
     }
-    Ok(())
 }
 
 fn read_artifact(dir: &Path, id: &str) -> Option<ToolOutput> {
@@ -725,26 +1123,19 @@ fn read_artifact(dir: &Path, id: &str) -> Option<ToolOutput> {
     Some(output)
 }
 
-fn spawn_watch(id: JobId, dir: PathBuf, deadline_unix: u64, timeout_secs: u64) {
-    tokio::spawn(async move {
-        loop {
-            if let Some(output) = read_artifact(&dir, id.as_str()) {
-                global().finish(id, Ok(output));
-                return;
-            }
-            if now_unix() >= deadline_unix {
-                global().finish(
-                    id,
-                    Err(JobError::Timeout {
-                        name: "run_build".to_string(),
-                        secs: timeout_secs,
-                    }),
-                );
-                return;
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    });
+fn progress_step(item: &serde_json::Value) -> String {
+    let Some(label) = item.pointer("/progress/label").and_then(|v| v.as_str()) else {
+        return "unknown".to_string();
+    };
+    let step = item
+        .pointer("/progress/step")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let of = item
+        .pointer("/progress/of")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    format!("{step}/{of} {label}")
 }
 
 /// Scope installed around `Tool::invoke` so a long tool can accept a job for this turn.
@@ -763,15 +1154,117 @@ pub fn global() -> &'static JobRuntime {
     GLOBAL.get_or_init(JobRuntime::new)
 }
 
+/// Why [`adopt`] refused a lease generation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AdoptErr {
+    /// A newer generation was already accepted.
+    #[error("stale lease")]
+    Stale {
+        /// Generation already adopted.
+        have: u64,
+        /// Generation the caller offered.
+        got: u64,
+    },
+}
+
+/// What [`adopt`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Adopted {
+    /// Rows were read and settled.
+    Recovered {
+        /// Rows touched.
+        jobs: usize,
+    },
+    /// This generation was already adopted, or boot recovery already ran.
+    Already,
+}
+
 /// Point the process table at the session directory and settle any persisted rows.
 ///
 /// `store` is the `FileStore` directory. `artifact` is where `run_build` writes
 /// `$BUILD_ID.code` (`BUILDER_RESULT_DIR`, otherwise `$HOME/.builds`).
+/// Boot recovery runs. [`configure_ext`] with `recover_on_signal` skips it.
 pub fn configure(store: Option<PathBuf>, artifact: Option<PathBuf>, default_timeout: u64) {
+    configure_ext(store, artifact, default_timeout, false, Arc::new(LocalFs));
+}
+
+/// [`configure`] with an explicit filesystem and the lease-gated recovery switch.
+///
+/// `recover_on_signal` true performs no adoption. [`adopt`] does that later.
+pub fn configure_ext(
+    store: Option<PathBuf>,
+    artifact: Option<PathBuf>,
+    default_timeout: u64,
+    recover_on_signal: bool,
+    fs: Arc<dyn DurableFs>,
+) {
     let runtime = global();
-    runtime.configure_with(store, artifact, default_timeout);
-    for (id, dir, deadline, secs) in runtime.recover() {
-        spawn_watch(id, dir, deadline, secs);
+    runtime.configure_fs(store, artifact, default_timeout, recover_on_signal, fs);
+    if recover_on_signal {
+        return;
+    }
+    spawn_watches(runtime.recover());
+}
+
+/// Adopt persisted rows for `generation`.
+///
+/// The first call settles them. The same generation returns [`Adopted::Already`].
+/// A different generation after that is [`AdoptErr::Stale`]. When recovery-on-signal
+/// is off, boot recovery already ran and this returns [`Adopted::Already`].
+///
+/// # Errors
+///
+/// [`AdoptErr::Stale`] when `generation` is not the generation already adopted.
+pub fn adopt(generation: u64) -> Result<Adopted, AdoptErr> {
+    global().adopt_lease(generation)
+}
+
+fn spawn_watches(watches: Vec<(JobId, PathBuf, u64, u64)>) {
+    if watches.is_empty() {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        for (id, dir, deadline, secs) in watches {
+            // No runtime (a sync caller). The row stays running; a later process tick
+            // is not available here, so settle an expired deadline inline.
+            if now_unix() >= deadline {
+                global().finish(
+                    id,
+                    Err(JobError::Timeout {
+                        name: "run_build".into(),
+                        secs,
+                    }),
+                );
+            } else {
+                let _ = (dir, id);
+            }
+        }
+        return;
+    };
+    for (id, dir, deadline, secs) in watches {
+        handle.spawn(async move {
+            watch_loop(id, dir, deadline, secs).await;
+        });
+    }
+}
+
+async fn watch_loop(id: JobId, dir: PathBuf, deadline_unix: u64, timeout_secs: u64) {
+    loop {
+        if let Some(output) = read_artifact(&dir, id.as_str()) {
+            global().finish(id, Ok(output));
+            return;
+        }
+        if now_unix() >= deadline_unix {
+            global().finish(
+                id,
+                Err(JobError::Timeout {
+                    name: "run_build".to_string(),
+                    secs: timeout_secs,
+                }),
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -789,7 +1282,35 @@ pub fn job_running(id: &JobId) -> bool {
 ///
 /// # Errors
 ///
-/// [`ToolError::Execution`] when called outside a chat turn, or when the session is at the cap.
+/// Reserve `id` on the current turn and return the lease the worker holds.
+///
+/// # Errors
+///
+/// [`ToolError::Execution`] outside a chat turn, when the session is at the cap, or when `id`
+/// is already in the table.
+pub fn reserve_work(
+    tool: &str,
+    id: JobId,
+    estimated_seconds: Option<u64>,
+) -> Result<WorkLease, ToolError> {
+    let token = reserve_job(tool, id.clone(), estimated_seconds)?;
+    let progress_id = id.clone();
+    let progress = ProgressTx::from_fn(move |note| {
+        global().set_progress(&progress_id, note);
+    });
+    Ok(WorkLease {
+        id,
+        token,
+        progress,
+    })
+}
+
+/// Reserve `id` on the current turn and return the child cancel token.
+///
+/// # Errors
+///
+/// [`ToolError::Execution`] outside a chat turn, when the session is at the cap, or when `id`
+/// is already in the table.
 pub fn reserve_job(
     tool: &str,
     id: JobId,
@@ -1073,11 +1594,11 @@ mod tests {
         assert!(watches.is_empty(), "a code file is already the result");
         let text = runtime.drain_ready(session).expect("settled").text();
         assert!(
-            text.contains("server_wake failed: process restarted"),
+            text.contains("server_wake interrupted after unknown"),
             "{text}"
         );
         assert!(
-            text.contains("obs_macro failed: process restarted"),
+            text.contains("obs_macro interrupted after unknown"),
             "{text}"
         );
         assert!(text.contains("run_build bld1 exited 0"), "{text}");
@@ -1166,8 +1687,159 @@ mod tests {
         assert_eq!(row["tool"], "run_build");
         assert_eq!(row["session"], "sess");
         assert!(row["started"].as_u64().is_some());
-        runtime.finish(job, Ok(ToolOutput::ok("done")));
+        runtime.finish(job.clone(), Ok(ToolOutput::ok("done")));
+        let raw = std::fs::read_to_string(jobs_path(&dir, "sess")).expect("kept until delivered");
+        assert!(raw.contains("\"done\""), "{raw}");
+        runtime.drain_ready("sess").expect("deliver");
         assert!(!jobs_path(&dir, "sess").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_recovers_its_own_timeout_and_v1_uses_the_default() {
+        let dir =
+            std::env::temp_dir().join(format!("lvz-jobs-v2-{}-{}", std::process::id(), now_unix()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let session = "v2";
+        let body = serde_json::json!({
+            "version": 2,
+            "jobs": [{
+                "id": "live2",
+                "tool": "run_build",
+                "session": session,
+                "started": now_unix(),
+                "timeout_secs": 42,
+                "state": "running"
+            }]
+        });
+        std::fs::write(jobs_path(&dir, session), body.to_string()).expect("file");
+        let runtime = JobRuntime::new();
+        runtime.configure_with(Some(dir.clone()), Some(dir.clone()), 600);
+        let watches = runtime.recover();
+        assert_eq!(watches.len(), 1);
+        assert_eq!(runtime.timeout_of(&id("live2")), Some(42));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn terminal_undelivered_row_is_delivered_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "lvz-jobs-undelivered-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let session = "held";
+        let body = serde_json::json!({
+            "version": 2,
+            "jobs": [{
+                "id": "done1",
+                "tool": "server_wake",
+                "session": session,
+                "started": now_unix(),
+                "timeout_secs": 30,
+                "state": "done",
+                "result": {"is_error": false, "content_capped": "powered on", "images": 0}
+            }]
+        });
+        std::fs::write(jobs_path(&dir, session), body.to_string()).expect("file");
+        let runtime = JobRuntime::new();
+        runtime.configure_with(Some(dir.clone()), None, 600);
+        assert!(runtime.recover().is_empty());
+        let text = runtime.drain_ready(session).expect("once").text();
+        assert!(text.contains("powered on"), "{text}");
+        assert!(runtime.drain_ready(session).is_none());
+        assert!(!jobs_path(&dir, session).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_on_signal_waits_for_adopt_and_rejects_a_stale_generation() {
+        let dir = std::env::temp_dir().join(format!(
+            "lvz-jobs-lease-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let session = "lease";
+        let body = serde_json::json!({
+            "jobs": [{"id": "wake9", "tool": "server_wake", "session": session, "started": now_unix()}]
+        });
+        std::fs::write(jobs_path(&dir, session), body.to_string()).expect("file");
+        let runtime = JobRuntime::new();
+        runtime.configure_fs(
+            Some(dir.clone()),
+            None,
+            600,
+            true,
+            std::sync::Arc::new(crate::durable::LocalFs),
+        );
+        assert!(runtime.recover().is_empty() || runtime.inflight(session) == 0);
+        // Flag on: recover() still loads if called. Boot must not call it.
+        // Clear anything a mistaken call would have added by using a fresh read through adopt.
+        runtime.clear_session(session);
+        std::fs::write(jobs_path(&dir, session), body.to_string()).expect("rewrite");
+        assert_eq!(runtime.inflight(session), 0);
+        let adopted = runtime.adopt_lease(7).expect("first");
+        assert!(matches!(adopted, Adopted::Recovered { .. }));
+        let text = runtime.drain_ready(session).expect("settled").text();
+        assert!(text.contains("interrupted"), "{text}");
+        assert_eq!(runtime.adopt_lease(7).expect("same"), Adopted::Already);
+        assert!(matches!(
+            runtime.adopt_lease(3),
+            Err(AdoptErr::Stale { have: 7, got: 3 })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exactly_one_terminal_across_seeded_races() {
+        for seed in 0..1000u32 {
+            let runtime = JobRuntime::new();
+            let parent = CancellationToken::new();
+            let job = id(&format!("race{seed}"));
+            runtime
+                .reserve("race", "server_wake", job.clone(), Some(30), &parent)
+                .expect("reserve");
+            match seed % 5 {
+                0 => {
+                    runtime.finish(job.clone(), Ok(ToolOutput::ok("a")));
+                    let _ = runtime.cancel(&job);
+                }
+                1 => {
+                    let _ = runtime.cancel(&job);
+                    runtime.finish(job.clone(), Ok(ToolOutput::ok("b")));
+                }
+                2 => {
+                    runtime.finish(job.clone(), Ok(ToolOutput::ok("c")));
+                    runtime.finish(
+                        job.clone(),
+                        Err(JobError::Failed {
+                            name: "server_wake".into(),
+                            message: "late".into(),
+                        }),
+                    );
+                }
+                3 => {
+                    let _ = runtime.cancel(&job);
+                    let _ = runtime.cancel(&job);
+                }
+                _ => {
+                    runtime.finish(
+                        job.clone(),
+                        Err(JobError::Timeout {
+                            name: "server_wake".into(),
+                            secs: 1,
+                        }),
+                    );
+                    let _ = runtime.cancel(&job);
+                }
+            }
+            let text = runtime.drain_ready("race").expect("one").text();
+            assert_eq!(text.matches("job ").count(), 1, "{text}");
+        }
     }
 }

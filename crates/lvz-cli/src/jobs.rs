@@ -95,6 +95,28 @@ impl JobRunner for ScheduleJobRunner {
     }
 }
 
+/// `POST /v1/admin/recover` → the process job table.
+pub(crate) struct LeaseHook;
+
+impl lvz_gw_http::LeaseRecover for LeaseHook {
+    fn recover(
+        &self,
+        lease_generation: u64,
+    ) -> Result<lvz_gw_http::RecoverReport, lvz_gw_http::RecoverRefuse> {
+        match lvz_agent::jobs::adopt(lease_generation) {
+            Ok(lvz_agent::jobs::Adopted::Recovered { jobs }) => {
+                Ok(lvz_gw_http::RecoverReport::Recovered { jobs })
+            }
+            Ok(lvz_agent::jobs::Adopted::Already) => {
+                Ok(lvz_gw_http::RecoverReport::AlreadyRecovered)
+            }
+            Err(lvz_agent::jobs::AdoptErr::Stale { .. }) => {
+                Err(lvz_gw_http::RecoverRefuse::StaleLease)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
