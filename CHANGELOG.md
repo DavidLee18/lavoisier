@@ -10,6 +10,8 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 - `lvz-tools` 0.1.2 → 0.1.3 picks up the `ToolOutput.accepted` field added in `lvz-protocol` 0.1.10, so a publish no longer verifies against the old 0.1.2 sources.
 - `lvz-memory` 0.3.2 → 0.3.3 picks up the switch to `Agent::run_in_session`.
 
+The root workspace pins are `lvz-tools` 0.1.3 and `lvz-memory` 0.3.3, the same versions crates.io already serves. This stack starts from that reconcile.
+
 `lvz-tools` 0.1.2 → 0.1.3. `lvz-memory` 0.3.2 → 0.3.3.
 
 ## [0.18.16] — 2026-11-25
