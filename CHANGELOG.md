@@ -5,6 +5,10 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-26
+
+Versions: `lavoisier` 0.19.0, `lvz-protocol` 0.2.0, `lvz-agent` 0.2.0, `lvz-memory` 0.4.0, `lvz-tools` 0.2.0, `lvz-gw-http` 0.2.0, `lvz-schedule` 0.5.0. Not published from this change.
+
 ### Confirm gate
 
 - `[confirm]` with no rules leaves tool calls unchanged. A listed rule holds a chat-origin call, stores it, and emits SSE `confirm_required`. `Origin::Schedule` is exempt.
