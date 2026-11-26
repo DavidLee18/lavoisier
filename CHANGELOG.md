@@ -12,6 +12,11 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 
 The root workspace pins are `lvz-tools` 0.1.3 and `lvz-memory` 0.3.3, the same versions crates.io already serves. This stack starts from that reconcile.
 
+### Turn context and work errors
+
+- `TurnRequest.context` carries the gateway's trusted sender, room, event id, sequence, and raw text. `Origin` is `Chat`, `Schedule`, or `Cli`, installed as a task-local for the turn. `POST /v1/turns` accepts an optional `context` object and ignores unknown fields.
+- `JobError::Interrupted` and `JobError::Lost`, plus `WorkError` / `WorkLease`, are the typed contract for cancellable background work. Nothing calls them yet.
+
 `lvz-tools` 0.1.2 → 0.1.3. `lvz-memory` 0.3.2 → 0.3.3.
 
 ## [0.18.16] — 2026-11-25
