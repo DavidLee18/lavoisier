@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use axum::{
     extract::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
-        Request, State,
+        Path, Query, Request, State,
     },
     http::{
         header::{AUTHORIZATION, CONTENT_TYPE},
@@ -70,6 +70,8 @@ pub struct GatewayConfig {
     outbox: Option<Arc<dyn OutboxRead>>,
     /// Directory of persisted job attempts. Absent ⇒ the table stays in memory.
     attempt_dir: Option<std::path::PathBuf>,
+    /// `GET /v1/sessions/{session}/trace`. Absent ⇒ the route is not mounted.
+    trace: Option<Arc<dyn TraceRead>>,
 }
 
 impl GatewayConfig {
@@ -124,6 +126,12 @@ impl GatewayConfig {
         self.attempt_dir = Some(dir);
         self
     }
+
+    /// Mount `GET /v1/sessions/{session}/trace`.
+    pub fn with_trace(mut self, trace: Arc<dyn TraceRead>) -> Self {
+        self.trace = Some(trace);
+        self
+    }
 }
 
 /// One outbox record the SSE handler can forward without knowing the job table.
@@ -143,6 +151,12 @@ pub trait OutboxRead: Send + Sync {
     fn ack(&self, seq: u64);
     /// Wakes when [`since`](Self::since) may have something new.
     fn poke(&self) -> Arc<tokio::sync::Notify>;
+}
+
+/// Read side of the staged trace. The HTTP crate does not own the files.
+pub trait TraceRead: Send + Sync {
+    /// Newest `last` records for `session`.
+    fn read(&self, session: &str, last: usize) -> Vec<serde_json::Value>;
 }
 
 /// Outcome of one `POST /v1/admin/recover`.
@@ -262,6 +276,7 @@ impl HttpGateway {
             tool_policy: config.tool_policy.clone(),
             recover: config.recover.clone(),
             outbox: config.outbox.clone(),
+            trace: config.trace.clone(),
         });
         let mount_recover = config.recover.is_some();
         let jobs = config.jobs.clone();
@@ -277,6 +292,9 @@ impl HttpGateway {
             routes = routes
                 .route("/v1/outbox", get(get_outbox))
                 .route("/v1/outbox/ack", post(post_outbox_ack));
+        }
+        if state.trace.is_some() {
+            routes = routes.route("/v1/sessions/{session}/trace", get(get_trace));
         }
         let mut protected = routes.with_state(state.clone());
         if let Some(runner) = jobs {
@@ -299,6 +317,7 @@ struct AppState {
     tool_policy: ToolPolicy,
     recover: Option<Arc<dyn LeaseRecover>>,
     outbox: Option<Arc<dyn OutboxRead>>,
+    trace: Option<Arc<dyn TraceRead>>,
 }
 
 #[async_trait]
@@ -648,6 +667,23 @@ fn last_event_id(headers: &HeaderMap) -> u64 {
 }
 
 /// `GET /v1/outbox` — SSE of detached replies, resuming after `Last-Event-ID`.
+#[derive(Deserialize)]
+struct TraceQuery {
+    #[serde(default)]
+    last: Option<usize>,
+}
+
+async fn get_trace(
+    State(state): State<Arc<AppState>>,
+    Path(session): Path<String>,
+    Query(query): Query<TraceQuery>,
+) -> Response {
+    let Some(source) = &state.trace else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(source.read(&session, query.last.unwrap_or(20))).into_response()
+}
+
 async fn get_outbox(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let Some(source) = state.outbox.clone() else {
         return StatusCode::NOT_FOUND.into_response();

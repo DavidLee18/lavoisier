@@ -34,6 +34,8 @@ pub struct Config {
     pub log: LogSection,
     /// `[jobs]` — background-job recovery. Absent ⇒ boot recovery, today's behaviour.
     pub jobs: JobsSection,
+    /// `[trace]` — staged history beside the transcript. Absent ⇒ off.
+    pub trace: TraceSection,
     /// Where this config was read from, or `None` if no file was found.
     ///
     /// Recorded rather than logged at load time on purpose: `[log] level` lives *in* this file, so
@@ -201,6 +203,30 @@ pub struct AgentSection {
     pub require_edit: Option<bool>,
     pub verify_and_fix: Option<bool>,
     pub verify_cmd: Option<String>,
+}
+
+fn default_trace_keep() -> usize {
+    200
+}
+
+/// `[trace]` — staged history. Off unless `enabled` is set.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TraceSection {
+    /// Write `{hex}.trace/` records. Default false.
+    pub enabled: bool,
+    /// Records kept per session.
+    #[serde(default = "default_trace_keep")]
+    pub keep: usize,
+}
+
+impl Default for TraceSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            keep: default_trace_keep(),
+        }
+    }
 }
 
 /// `[memory]` — session-store kind and bounds.

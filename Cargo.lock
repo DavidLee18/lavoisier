@@ -1735,11 +1735,13 @@ name = "lvz-agent"
 version = "0.1.15"
 dependencies = [
  "async-trait",
+ "base64",
  "futures",
  "lvz-context",
  "lvz-protocol",
  "lvz-tools",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "tokio",
  "tokio-util",

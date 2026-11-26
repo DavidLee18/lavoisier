@@ -21,6 +21,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_agent::durable::{DurableFs, LocalFs};
+use lvz_agent::trace::TurnTrace;
 use lvz_agent::Agent;
 use lvz_protocol::{AgentError, AgentHandle, Event, Message, TurnRequest};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -307,6 +308,8 @@ struct Tap {
     persisted: bool,
     /// Held until the stream is dropped so the next turn for this session waits.
     _permit: Option<OwnedSemaphorePermit>,
+    /// Staged history. A no-op unless `[trace] enabled` installed a store.
+    trace: TurnTrace,
 }
 
 #[async_trait]
@@ -332,6 +335,12 @@ impl AgentHandle for SessionAgent {
             turn.origin.clone(),
         );
 
+        let turn_id = turn
+            .context
+            .as_ref()
+            .map(|ctx| ctx.event_id.clone())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| "turn".to_string());
         let tap = Tap {
             inner,
             store: self.store.clone(),
@@ -340,14 +349,18 @@ impl AgentHandle for SessionAgent {
             answer: String::new(),
             persisted: false,
             _permit: permit,
+            trace: TurnTrace::new(turn_id),
         };
 
         // Forward every event unchanged; accumulate the assistant's visible text; on the
         // terminal `Done`, append the assistant turn and persist the updated transcript.
         let stream = stream::unfold(tap, |mut tap| async move {
             let item = tap.inner.next().await?;
-            if let Ok(Event::TextDelta(text)) = &item {
-                tap.answer.push_str(text);
+            if let Ok(event) = &item {
+                tap.trace.observe(event);
+                if let Event::TextDelta(text) = event {
+                    tap.answer.push_str(text);
+                }
             }
             if matches!(item, Ok(Event::Done(_))) && !tap.persisted {
                 tap.transcript
@@ -355,6 +368,7 @@ impl AgentHandle for SessionAgent {
                 tap.store
                     .save(&tap.session, std::mem::take(&mut tap.transcript))
                     .await;
+                tap.trace.flush(&tap.session).await;
                 tap.persisted = true;
             }
             Some((item, tap))

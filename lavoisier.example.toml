@@ -76,6 +76,10 @@
 # store = "file"                # "memory" (default) | "file"
 # path  = "./.lavoisier/sessions"   # required when store = "file"
 
+[trace]
+# enabled = false
+# keep = 200
+
 [jobs]
 # recover_on_signal = false
 # detached = false
