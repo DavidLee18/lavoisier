@@ -12,6 +12,12 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 
 The root workspace pins are `lvz-tools` 0.1.3 and `lvz-memory` 0.3.3, the same versions crates.io already serves. This stack starts from that reconcile.
 
+### Cancel
+
+- A job row holds the cancel token the worker is given. `POST /v1/jobs/{id}` installs that token for the attempt and cancels it when the attempt times out. Direct schedule tool calls and prompt turns are `Origin::Schedule`.
+- `[jobs] user_tools` (default false) registers `jobs_list` and `job_cancel`. Cancel is limited to the caller's session. A scheduled job answers `예약 작업은 취소할 수 없습니다`. An unknown id is `JobError::Unknown`.
+- `[jobs] cancel_command` (default false) handles `<job> 취소해줘` before the model, on a chat-origin turn. `<job>` is an exact id, then a Korean alias (`빌드`, `켜기`, `부팅`, `끄기`, `종료`, `방송 시작`, `방송 중지`, `방송 종료`). A tool name does not match. Zero or several matches list the running jobs and cancel nothing. A short model turn phrases the result; if that call fails, the raw notice is the reply.
+
 ### Durable jobs
 
 - The job file is version 2 and still reads version 1. A write goes to a unique temp file, is fsynced, renamed, and the parent directory is fsynced, off the job-table lock. Object mounts write the final path instead. A terminal row stays until `drain_ready` delivers it. A tool that cannot survive a restart becomes `JobError::Interrupted` with the last progress step (`unknown` when none was stored). A recovered `run_build` keeps the timeout it was accepted with.

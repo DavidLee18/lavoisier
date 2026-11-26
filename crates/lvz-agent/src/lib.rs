@@ -33,7 +33,9 @@
 
 #![warn(missing_docs)]
 
+pub mod cancel;
 pub mod durable;
+pub mod job_tools;
 pub mod jobs;
 
 use std::collections::{HashMap, HashSet};
@@ -51,11 +53,11 @@ use lvz_context::symbols::skeleton_with_radius;
 use lvz_context::tokens::estimate_tokens;
 use lvz_context::Lang;
 use lvz_protocol::{
-    enter_turn, resolve_origin, AgentError, AgentHandle, Archetype, Capabilities, ChatRequest,
-    ContentBlock, CostWeights, DeliberationContext, Deliberator, Event, Knobs, Message, ModelTier,
-    NoopTuner, Origin, Outcome, Provider, RepoProfile, Role, ServerTool, StopReason, SystemPrompt,
-    TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, ToolChoice, ToolDecision, ToolDef,
-    ToolGate, Tuner, TurnContext, TurnRequest, Usage,
+    enter_tool_grant, enter_turn, resolve_origin, AgentError, AgentHandle, Archetype, Capabilities,
+    ChatRequest, ContentBlock, CostWeights, DeliberationContext, Deliberator, Event, Knobs,
+    Message, ModelTier, NoopTuner, Origin, Outcome, Provider, RepoProfile, Role, ServerTool,
+    StopReason, SystemPrompt, TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, ToolChoice,
+    ToolDecision, ToolDef, ToolGate, ToolGrant, Tuner, TurnContext, TurnRequest, Usage,
 };
 use lvz_tools::ToolRegistry;
 use serde_json::{json, Value};
@@ -546,6 +548,10 @@ pub struct Agent {
     /// model as an error result (never aborting the turn). Held as an `Arc<dyn ToolGate>` (the
     /// `legion`/tuner injection pattern). `None` ⇒ every tool runs, byte-identical to before.
     tool_gate: Option<Arc<dyn ToolGate>>,
+    /// When true, a chat line that matches `<job> 취소해줘` is handled before any model call.
+    cancel_command: bool,
+    /// Phrases the cancel hook accepts. Empty until [`Self::with_cancel_command`].
+    cancel_aliases: Vec<cancel::CancelAlias>,
 }
 
 impl Agent {
@@ -563,7 +569,22 @@ impl Agent {
             breaker: Arc::new(CircuitBreaker::new(1, Duration::from_secs(60))),
             repo_skeleton: Arc::new(OnceLock::new()),
             tool_gate: None,
+            cancel_command: false,
+            cancel_aliases: Vec::new(),
         }
+    }
+
+    /// Handle `<job> 취소해줘` before the model runs.
+    ///
+    /// An empty `aliases` list installs the built-in Korean table. A non-empty list replaces it.
+    pub fn with_cancel_command(mut self, aliases: Vec<cancel::CancelAlias>) -> Self {
+        self.cancel_command = true;
+        self.cancel_aliases = if aliases.is_empty() {
+            cancel::default_aliases()
+        } else {
+            aliases
+        };
+        self
     }
 
     /// Use a specific tuner (e.g. [`FixedTuner`], or an `lvz-tune` learner) instead of the
@@ -706,7 +727,13 @@ impl Agent {
         let breaker = self.breaker.clone();
         let skeleton_cell = self.repo_skeleton.clone();
         let tool_gate = self.tool_gate.clone();
+        let cancel_command = self.cancel_command;
+        let cancel_aliases = self.cancel_aliases.clone();
         let allowed_tools = allowed_tools.map(|v| v.into_iter().collect::<HashSet<String>>());
+        let grant = match &allowed_tools {
+            None => ToolGrant::All,
+            Some(set) => ToolGrant::Only(set.iter().cloned().collect()),
+        };
         let session = session.to_string();
         let origin = resolve_origin(context.as_ref(), origin);
         // Dropping the stream (the caller finished, or ACP `session/cancel` dropped it)
@@ -715,26 +742,32 @@ impl Agent {
         let cancel_task = cancel.clone();
 
         tokio::spawn(async move {
-            enter_turn(context, origin, async move {
-                run_loop(
-                    provider,
-                    tools,
-                    config,
-                    tuner,
-                    telemetry,
-                    legion,
-                    fallbacks,
-                    breaker,
-                    skeleton_cell,
-                    tool_gate,
-                    allowed_tools,
-                    history,
-                    &tx,
-                    session,
-                    cancel_task,
-                )
-                .await;
-            })
+            enter_turn(
+                context,
+                origin,
+                enter_tool_grant(grant, async move {
+                    run_loop(
+                        provider,
+                        tools,
+                        config,
+                        tuner,
+                        telemetry,
+                        legion,
+                        fallbacks,
+                        breaker,
+                        skeleton_cell,
+                        tool_gate,
+                        allowed_tools,
+                        history,
+                        &tx,
+                        session,
+                        cancel_task,
+                        cancel_command,
+                        cancel_aliases,
+                    )
+                    .await;
+                }),
+            )
             .await;
             // tx drops here, closing the stream.
         });
@@ -842,7 +875,22 @@ async fn run_loop(
     tx: &Sink,
     session: String,
     cancel: tokio_util::sync::CancellationToken,
+    cancel_command: bool,
+    cancel_aliases: Vec<cancel::CancelAlias>,
 ) {
+    if cancel_command {
+        let names = allowed_tools
+            .as_ref()
+            .map(|set| set.iter().cloned().collect::<Vec<_>>());
+        if let Some(raw) = cancel::interpret(&session, names.as_deref(), &cancel_aliases, true) {
+            let text = cancel::phrase(&provider, &config.model, &raw)
+                .await
+                .unwrap_or(raw);
+            let _ = tx.unbounded_send(Ok(Event::TextDelta(text)));
+            let _ = tx.unbounded_send(Ok(Event::Done(StopReason::EndTurn)));
+            return;
+        }
+    }
     let started = std::time::Instant::now();
     // Per-turn tool allowlist (e.g. a gateway's room/member permissions): advertise only the
     // permitted tools to the model. Enforcement is repeated at `invoke` below as defence in depth.
@@ -6306,5 +6354,56 @@ fn target() -> u32 { helper() + 10 }
             "with no cooldown the primary is re-probed every turn"
         );
         assert_eq!(fallback.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancel_command_posts_the_raw_notice_when_phrasing_fails() {
+        let _ = crate::cancel::take_cancel_records();
+        crate::jobs::global().clear_session("hook");
+        let parent = tokio_util::sync::CancellationToken::new();
+        crate::jobs::global()
+            .reserve(
+                "hook",
+                "server_wake",
+                lvz_protocol::JobId::new("wake9").expect("id"),
+                Some(30),
+                &parent,
+            )
+            .expect("reserve");
+        let provider = ErroringProvider::new();
+        let agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::new(),
+            AgentConfig::default(),
+        )
+        .with_cancel_command(Vec::new());
+        let ctx = TurnContext {
+            sender: "@a:example".into(),
+            room: "!r:example".into(),
+            raw_input: "wake9 취소해줘".into(),
+            ..TurnContext::default()
+        };
+        let events = collect(agent.run_in_session_framed(
+            vec![Message::user("wake9 취소해줘")],
+            None,
+            None,
+            "hook",
+            Some(ctx),
+            None,
+        ))
+        .await;
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("cancelled wake9"), "{text}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(!crate::jobs::job_running(
+            &lvz_protocol::JobId::new("wake9").expect("id")
+        ));
+        crate::jobs::global().clear_session("hook");
     }
 }

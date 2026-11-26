@@ -41,9 +41,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 
 use lvz_protocol::{
-    admit_tool_images, fails_closed_on_restart, origin, ContentBlock, JobError, JobId, Message,
-    Origin, Pending, ProgressNote, ProgressTx, Role, ToolError, ToolOutput, WorkLease,
-    MAX_JOBS_PER_SESSION,
+    admit_tool_images, fails_closed_on_restart, origin, tool_permitted, work_scope, ContentBlock,
+    JobError, JobId, Message, Origin, Pending, ProgressNote, ProgressTx, Role, ToolError,
+    ToolOutput, WorkLease, MAX_JOBS_PER_SESSION,
 };
 use lvz_tools::ToolRegistry;
 use tokio::sync::Notify;
@@ -419,6 +419,78 @@ impl JobRuntime {
         };
         self.finish(id.clone(), Err(JobError::Cancelled { name: tool }));
         Ok(())
+    }
+
+    /// Running jobs in `session`, oldest first.
+    pub fn list_running(&self, session: &str) -> Vec<RunningJob> {
+        let mut rows: Vec<RunningJob> = self
+            .lock()
+            .rows
+            .values()
+            .filter(|row| row.session == session && row.state.is_running())
+            .map(|row| RunningJob {
+                id: row.id.as_str().to_string(),
+                tool: row.tool.clone(),
+                age_s: now_unix().saturating_sub(row.started),
+                step: row
+                    .progress
+                    .as_ref()
+                    .map(|note| note.label.clone())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                origin: row.origin_label.clone(),
+            })
+            .collect();
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        rows
+    }
+
+    /// Cancel `id` for a person in `session`.
+    ///
+    /// A schedule-origin row is refused. A finished row is reported and left as it is.
+    /// `grant` `None` allows every tool.
+    pub fn cancel_for_user(
+        &self,
+        session: &str,
+        id: &JobId,
+        grant: Option<&[String]>,
+    ) -> UserCancel {
+        let snapshot = {
+            let guard = self.lock();
+            let Some(row) = guard.rows.get(id) else {
+                return UserCancel::Unknown;
+            };
+            if row.session != session {
+                return UserCancel::Unknown;
+            }
+            UserSnap {
+                tool: row.tool.clone(),
+                origin: row.origin_label.clone(),
+                running: row.state.is_running(),
+                text: match &row.state {
+                    State::Running => String::new(),
+                    State::Done(output) => output.content.clone(),
+                    State::Failed(err) => err.to_string(),
+                },
+            }
+        };
+        if snapshot.origin == "schedule" {
+            return UserCancel::Schedule;
+        }
+        if !tool_permitted(grant, &snapshot.tool) {
+            return UserCancel::Denied;
+        }
+        if !snapshot.running {
+            return UserCancel::Finished {
+                id: id.as_str().to_string(),
+                tool: snapshot.tool,
+                text: snapshot.text,
+            };
+        }
+        let _ = self.cancel(id);
+        UserCancel::Cancelled {
+            id: id.as_str().to_string(),
+            tool: snapshot.tool,
+        }
     }
 
     /// Fail every running job in `session` with `err` (cancel, drop, or max steps).
@@ -1138,14 +1210,53 @@ fn progress_step(item: &serde_json::Value) -> String {
     format!("{step}/{of} {label}")
 }
 
-/// Scope installed around `Tool::invoke` so a long tool can accept a job for this turn.
-struct JobScope {
-    session: String,
-    cancel: CancellationToken,
+/// One running job, without its payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningJob {
+    /// Job id.
+    pub id: String,
+    /// Tool that accepted it.
+    pub tool: String,
+    /// Seconds since accept.
+    pub age_s: u64,
+    /// Last progress label, or `unknown`.
+    pub step: String,
+    /// `chat`, `schedule`, or `cli`.
+    pub origin: String,
 }
 
-tokio::task_local! {
-    static JOB_SCOPE: JobScope;
+struct UserSnap {
+    tool: String,
+    origin: String,
+    running: bool,
+    text: String,
+}
+
+/// What a person's cancel did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserCancel {
+    /// The row was running and is now cancelled.
+    Cancelled {
+        /// Job id.
+        id: String,
+        /// Tool name.
+        tool: String,
+    },
+    /// The row belongs to the scheduler.
+    Schedule,
+    /// The sender may not use that tool.
+    Denied,
+    /// The row already had a result.
+    Finished {
+        /// Job id.
+        id: String,
+        /// Tool name.
+        tool: String,
+        /// The result text already stored.
+        text: String,
+    },
+    /// No row in this session.
+    Unknown,
 }
 
 /// The process-wide table. Tools and the chat loop share it.
@@ -1268,9 +1379,9 @@ async fn watch_loop(id: JobId, dir: PathBuf, deadline_unix: u64, timeout_secs: u
     }
 }
 
-/// `true` while a chat turn is inside `Tool::invoke`.
+/// `true` while this task has a work scope (a chat tool call or a scheduled attempt).
 pub fn in_job_scope() -> bool {
-    JOB_SCOPE.try_with(|_| ()).is_ok()
+    work_scope().is_some()
 }
 
 /// `true` while `id` is still running. A finished id is gone once the loop has injected it.
@@ -1278,15 +1389,11 @@ pub fn job_running(id: &JobId) -> bool {
     matches!(global().outcome_kind(id), Some(OutcomeKind::Running))
 }
 
-/// Accept `id` on the current turn's session.
+/// Reserve `id` on the current work scope and return the lease the worker holds.
 ///
 /// # Errors
 ///
-/// Reserve `id` on the current turn and return the lease the worker holds.
-///
-/// # Errors
-///
-/// [`ToolError::Execution`] outside a chat turn, when the session is at the cap, or when `id`
+/// [`ToolError::Execution`] outside a work scope, when the session is at the cap, or when `id`
 /// is already in the table.
 pub fn reserve_work(
     tool: &str,
@@ -1316,11 +1423,12 @@ pub fn reserve_job(
     id: JobId,
     estimated_seconds: Option<u64>,
 ) -> Result<CancellationToken, ToolError> {
-    JOB_SCOPE
-        .try_with(|scope| {
-            global().reserve(&scope.session, tool, id, estimated_seconds, &scope.cancel)
-        })
-        .map_err(|_| ToolError::Execution("no job scope on this call".to_string()))?
+    let Some(scope) = work_scope() else {
+        return Err(ToolError::Execution(
+            "no job scope on this call".to_string(),
+        ));
+    };
+    global().reserve(&scope.session, tool, id, estimated_seconds, &scope.cancel)
 }
 
 /// Publish the terminal output for `id`. A second publish is ignored.
@@ -1338,11 +1446,7 @@ pub async fn scoped_invoke<F, T>(session: &str, cancel: &CancellationToken, invo
 where
     F: std::future::Future<Output = T>,
 {
-    let scope = JobScope {
-        session: session.to_string(),
-        cancel: cancel.clone(),
-    };
-    JOB_SCOPE.scope(scope, invoke).await
+    lvz_protocol::enter_work_scope(session, cancel.clone(), invoke).await
 }
 
 /// Chat path for a legacy [`Pending`] result: reserve a job and poll `poll_with` in the background.

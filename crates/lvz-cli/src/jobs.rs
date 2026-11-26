@@ -188,7 +188,7 @@ mod tests {
         let jobs = lvz_schedule::ScheduleJob::parse_file(SCHEDULE, 0, 0).unwrap();
         let reg = Arc::new(ScheduleRegistry::new(jobs));
         let names = |c: &crate::Cli| -> Vec<String> {
-            crate::build_tool_registry(c, None, "m".into(), &[], Some(&reg))
+            crate::build_tool_registry(c, None, "m".into(), &[], Some(&reg), false)
                 .defs()
                 .into_iter()
                 .map(|d| d.name)
