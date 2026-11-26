@@ -242,6 +242,13 @@ pub struct JobsSection {
     /// When true, do not adopt persisted jobs at boot. `POST /v1/admin/recover` does it,
     /// and only for a lease generation that is not older than one already accepted.
     pub recover_on_signal: bool,
+    /// Register `jobs_list` and `job_cancel`. Off by default.
+    pub user_tools: bool,
+    /// Handle `<job> 취소해줘` in code, before the model. Off by default.
+    pub cancel_command: bool,
+    /// Phrase → `tool` or `tool:action`. Empty uses the built-in Korean table when the
+    /// command is on. A non-empty map replaces that table.
+    pub aliases: std::collections::HashMap<String, String>,
 }
 
 /// Which session store `[memory]` describes.

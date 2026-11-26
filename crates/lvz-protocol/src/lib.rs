@@ -26,6 +26,7 @@ mod message;
 mod policy;
 mod provider;
 mod retry;
+mod scope;
 mod telemetry;
 mod tool;
 mod tune;
@@ -52,6 +53,10 @@ pub use provider::{
     Capability, Negotiated, Provider, ProviderCaps, ProviderError,
 };
 pub use retry::{is_transient_status, retry_transient};
+pub use scope::{
+    enter_tool_grant, enter_work_scope, tool_grant, tool_grant_slice, work_scope, ToolGrant,
+    WorkScope,
+};
 pub use telemetry::{TaskTelemetry, TelemetrySink};
 pub use tool::{
     admit_tool_images, Pending, Tool, ToolError, ToolImage, ToolOutput, MAX_TOOL_IMAGE_BASE64,

@@ -9,8 +9,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use lvz_protocol::{AgentHandle, ToolImage};
+use lvz_protocol::{enter_work_scope, AgentHandle, ToolImage};
 use lvz_tools::ToolRegistry;
+use tokio_util::sync::CancellationToken;
 
 use super::{
     finish, log_verbose, now_unix, poll_pending, run_action, ActionOutcome, FireReport,
@@ -61,19 +62,29 @@ impl ScheduleRegistry {
             return None;
         }
         let started = std::time::Instant::now();
-        let outcome =
-            match tokio::time::timeout(timeout, self.drive(&job, tools, agent, &mut on_waiting))
-                .await
-            {
-                Ok(o) => o,
-                Err(_) => {
-                    let e = format!(
-                        "attempt did not finish within the jobs timeout ({}s)",
-                        timeout.as_secs()
-                    );
-                    finish(&job, agent, Err(e), Vec::new(), None, Vec::new()).await
-                }
-            };
+        let attempt_token = CancellationToken::new();
+        let cancel_on_timeout = attempt_token.clone();
+        let session = job.session.clone();
+        let outcome = match tokio::time::timeout(
+            timeout,
+            enter_work_scope(
+                &session,
+                attempt_token,
+                self.drive(&job, tools, agent, &mut on_waiting),
+            ),
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(_) => {
+                cancel_on_timeout.cancel();
+                let e = format!(
+                    "attempt did not finish within the jobs timeout ({}s)",
+                    timeout.as_secs()
+                );
+                finish(&job, agent, Err(e), Vec::new(), None, Vec::new()).await
+            }
+        };
         // The caller numbers the chain; align the registry's counter so `record` numbers the
         // attempt and decides the retry exactly as the in-process scheduler would.
         if let Ok(mut guard) = self.state.write() {
@@ -317,5 +328,64 @@ mod tests {
             .unwrap();
         assert!(!r.ok && r.retry_in == Some(60));
         assert!(r.body.contains("did not finish within the jobs timeout"));
+    }
+
+    struct Hold(Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait::async_trait]
+    impl Tool for Hold {
+        fn name(&self) -> &str {
+            "server_wake"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn invoke(&self, _args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+            let token = lvz_protocol::work_scope().expect("attempt scope").cancel;
+            let flag = self.0.clone();
+            tokio::spawn(async move {
+                token.cancelled().await;
+                flag.store(true, Ordering::SeqCst);
+            });
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(ToolOutput::ok("late"))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_attempt_timeout_cancels_the_work_token() {
+        let job = ScheduleJob {
+            id: "wake".into(),
+            expr: "25 10 * * 2".into(),
+            schedule: CronSchedule::parse("25 10 * * 2").unwrap(),
+            action: Action::Tool {
+                name: "server_wake".into(),
+                args: serde_json::json!({}),
+            },
+            room: None,
+            session: "wake".into(),
+            summarize: None,
+            retry_max: 0,
+            retry_wait: 1,
+        };
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(Hold(flag.clone())));
+        let reg = ScheduleRegistry::new(vec![job]);
+        let agent: Arc<dyn AgentHandle> = Arc::new(DeadAgent);
+        let report = reg
+            .run_attempt(0, 1, &tools, &agent, Duration::from_millis(50), |_| {})
+            .await
+            .unwrap();
+        assert!(!report.ok);
+        for _ in 0..20 {
+            if flag.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "the attempt token was cancelled"
+        );
     }
 }

@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
-use lvz_protocol::{AgentHandle, Event, TurnRequest, Usage};
+use lvz_protocol::{enter_turn, enter_work_scope, AgentHandle, Event, Origin, TurnRequest, Usage};
 use lvz_tools::ToolRegistry;
 use serde::Deserialize;
 use tokio::sync::Notify;
@@ -800,7 +800,19 @@ async fn run_action(
         Action::Tool { name, args } => {
             let mut accepted = None;
             let mut images = Vec::new();
-            let result = match tools.invoke(name, args.clone()).await {
+            let parent = lvz_protocol::work_scope()
+                .map(|scope| scope.cancel)
+                .unwrap_or_default();
+            let token = parent.child_token();
+            let invoked = enter_turn(
+                None,
+                Origin::Schedule {
+                    job: job.id.clone(),
+                },
+                enter_work_scope(&job.session, token, tools.invoke(name, args.clone())),
+            )
+            .await;
+            let result = match invoked {
                 Err(e) => Err(format!("tool `{name}` failed: {e}")),
                 Ok(out) if out.is_error => {
                     images = take_images(&out);
@@ -848,7 +860,10 @@ async fn run_action(
             }
         }
         Action::Prompt { text } => {
-            let turn = TurnRequest::new(job.session.clone(), text.clone());
+            let turn =
+                TurnRequest::new(job.session.clone(), text.clone()).with_origin(Origin::Schedule {
+                    job: job.id.clone(),
+                });
             let mut stream = match agent.submit(turn).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -918,7 +933,10 @@ async fn summarise(
     raw: &str,
 ) -> (Option<String>, Option<Usage>) {
     let turn = TurnRequest::new(job.session.clone(), format!("{instruction}\n\n{raw}"))
-        .with_allowed_tools(Vec::new());
+        .with_allowed_tools(Vec::new())
+        .with_origin(Origin::Schedule {
+            job: job.id.clone(),
+        });
     let mut stream = match agent.submit(turn).await {
         Ok(s) => s,
         Err(e) => {
