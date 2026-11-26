@@ -5,6 +5,12 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 
 ## [Unreleased]
 
+### Async scheduled attempts
+
+- `POST /v1/jobs/{id}` with `Prefer: respond-async` returns `202` and `{attempt, status_url}`. `GET /v1/jobs/{id}/attempts/{key}` answers `running`, `done`, `failed`, or `lost` without holding the connection. `DELETE` cancels that attempt's work token.
+- Without the header the SSE stream is unchanged.
+- When `--serve-jobs` is on, attempts are written under `<memory path>/attempts`. A `running` row read at startup is `lost`.
+
 ### Crate version bumps for crates.io
 
 - `lvz-tools` 0.1.2 → 0.1.3 picks up the `ToolOutput.accepted` field added in `lvz-protocol` 0.1.10, so a publish no longer verifies against the old 0.1.2 sources.

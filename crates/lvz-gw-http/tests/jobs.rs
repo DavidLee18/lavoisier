@@ -297,3 +297,95 @@ async fn the_route_is_absent_without_a_runner() {
     let r = post(&format!("http://{addr}"), "ok", req("a", 1)).await;
     assert_eq!(r.status(), 404);
 }
+
+#[tokio::test]
+async fn prefer_respond_async_returns_202_then_status() {
+    let (url, runner) = spawn().await;
+    let minute = slot();
+    let key = format!("bot:ok:{minute}:1");
+    let resp = reqwest::Client::new()
+        .post(format!("{url}/v1/jobs/ok"))
+        .bearer_auth("k")
+        .header("prefer", "respond-async")
+        .json(&json!({
+            "scheduled_minute": minute,
+            "idempotency_key": key,
+            "attempt": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let accepted: Value = resp.json().await.unwrap();
+    assert_eq!(accepted["attempt"], key);
+    let status_url = accepted["status_url"].as_str().unwrap();
+    let mut state = String::new();
+    for _ in 0..40 {
+        let body: Value = reqwest::Client::new()
+            .get(format!("{url}{status_url}"))
+            .bearer_auth("k")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        state = body["state"].as_str().unwrap_or("").to_string();
+        if state != "running" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(state, "failed");
+    assert!(runner.runs.load(Ordering::SeqCst) >= 1);
+}
+
+#[tokio::test]
+async fn a_running_attempt_is_lost_after_restart() {
+    let dir = std::env::temp_dir().join(format!("lav-attempts-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("bot-ok-1"),
+        r#"{"job":"ok","state":"running","waiting":null,"done":null}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("bot-ok-2"),
+        r#"{"job":"ok","state":"terminal","waiting":null,"done":{"ok":true,"body":"kept","attempt":2,"retry_in_s":null,"gave_up":false,"images":0}}"#,
+    )
+    .unwrap();
+    let runner = Arc::new(Runner {
+        runs: AtomicUsize::new(0),
+        gate: Notify::new(),
+    });
+    let cfg = GatewayConfig::default()
+        .with_api_keys(["k".to_string()])
+        .with_jobs(runner)
+        .with_attempt_dir(dir.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = HttpGateway::router_with(Arc::new(NoAgent), cfg);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let body: Value = reqwest::Client::new()
+        .get(format!("http://{addr}/v1/jobs/ok/attempts/bot-ok-1"))
+        .bearer_auth("k")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["state"], "lost");
+    let kept: Value = reqwest::Client::new()
+        .get(format!("http://{addr}/v1/jobs/ok/attempts/bot-ok-2"))
+        .bearer_auth("k")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(kept["state"], "done");
+    let _ = std::fs::remove_dir_all(&dir);
+}

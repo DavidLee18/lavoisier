@@ -68,6 +68,8 @@ pub struct GatewayConfig {
     recover: Option<Arc<dyn LeaseRecover>>,
     /// `GET /v1/outbox` and `POST /v1/outbox/ack`. Absent ⇒ the routes are not mounted.
     outbox: Option<Arc<dyn OutboxRead>>,
+    /// Directory of persisted job attempts. Absent ⇒ the table stays in memory.
+    attempt_dir: Option<std::path::PathBuf>,
 }
 
 impl GatewayConfig {
@@ -114,6 +116,12 @@ impl GatewayConfig {
     /// Mount the detached-result outbox.
     pub fn with_outbox(mut self, outbox: Arc<dyn OutboxRead>) -> Self {
         self.outbox = Some(outbox);
+        self
+    }
+
+    /// Persist job attempts under `dir`. A `running` row read at startup is `lost`.
+    pub fn with_attempt_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.attempt_dir = Some(dir);
         self
     }
 }
@@ -257,6 +265,7 @@ impl HttpGateway {
         });
         let mount_recover = config.recover.is_some();
         let jobs = config.jobs.clone();
+        let attempt_dir = config.attempt_dir.clone();
         let guard = Arc::new(Guard::new(config));
         let mut routes = Router::new()
             .route("/v1/turns", post(post_turn))
@@ -271,7 +280,7 @@ impl HttpGateway {
         }
         let mut protected = routes.with_state(state.clone());
         if let Some(runner) = jobs {
-            protected = protected.merge(jobs::router(runner));
+            protected = protected.merge(jobs::router(runner, attempt_dir));
         }
         let protected = protected.route_layer(middleware::from_fn_with_state(guard, guard_request));
         Router::new()

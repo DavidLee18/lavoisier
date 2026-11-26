@@ -81,6 +81,8 @@
 # detached = false
 # user_tools = false
 # cancel_command = false
+# --serve-jobs writes attempts under <memory path>/attempts.
+# Prefer: respond-async on POST /v1/jobs/{id} returns 202; omit it for the SSE stream.
 # [jobs.aliases]
 # "빌드" = "run_build"
 # "방송 시작" = "server_broadcast:start"
