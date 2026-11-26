@@ -51,6 +51,12 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
+(`v0.19.0`): **confirm gate, trace, detached jobs, cancel, async attempts**. `lavoisier` 0.18.16→**0.19.0**,
+`lvz-protocol` 0.1.10→**0.2.0**, `lvz-agent` 0.1.15→**0.2.0**, `lvz-memory` 0.3.3→**0.4.0**,
+`lvz-tools` 0.1.3→**0.2.0**, `lvz-gw-http` 0.1.2→**0.2.0**, `lvz-schedule` 0.4.3→**0.5.0**.
+Publish order `lvz-protocol` → `lvz-tools` → `lvz-schedule` → `lvz-gw-http` → `lvz-agent` → `lvz-memory` → `lavoisier`.
+Do not publish from the draft that introduces this note.
+Earlier changed set
 (`v0.18.15`): **live-ops summary after the cap**. `lvz-agent` (0.1.13→**0.1.14** — after
 `MAX_LIVE_OPS_ROUNDS` the loop makes one `tool_choice=none` call with no tools and accepts
 that prose; patch, so `lvz-memory`'s `^0.1.12` still resolves and it needs **no** republish)
