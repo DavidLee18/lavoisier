@@ -96,6 +96,17 @@ pub enum Event {
     },
     /// Terminal event: the turn finished for the given reason.
     Done(StopReason),
+    /// A chat tool call is waiting for a second member to confirm it.
+    ConfirmRequired {
+        /// Short code the endpoint maps to the reply it posts.
+        code: String,
+        /// Room the call came from.
+        room: String,
+        /// Tool that was not executed.
+        tool: String,
+        /// Seconds until the pending row expires.
+        expires_s: u64,
+    },
 }
 
 /// Token accounting for a turn. Cache fields are zero on providers without prompt caching.

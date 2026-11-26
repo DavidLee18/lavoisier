@@ -1130,6 +1130,7 @@ fn origin_label() -> String {
         Origin::Chat { .. } => "chat".to_string(),
         Origin::Schedule { .. } => "schedule".to_string(),
         Origin::Job { .. } => "job".to_string(),
+        Origin::Confirmed { .. } => "confirmed".to_string(),
         Origin::Cli => "cli".to_string(),
     }
 }

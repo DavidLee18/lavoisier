@@ -16,6 +16,7 @@
 
 mod agent;
 mod batch;
+mod confirm;
 mod context;
 mod deliberate;
 mod event;
@@ -34,6 +35,9 @@ mod work;
 
 pub use agent::{AgentError, AgentHandle, TurnRequest};
 pub use batch::{batch_item, BatchItem, BatchProvider, BatchTask};
+pub use confirm::{
+    confirmed_call, enter_confirmed, live_probe, set_live_probe, ConfirmedCall, LiveProbe, Liveness,
+};
 pub use context::{enter_turn, origin, resolve_origin, turn_context, Origin, TurnContext};
 pub use deliberate::{DeliberateError, Deliberation, DeliberationContext, Deliberator};
 pub use event::{CostWeights, Event, StopReason, Usage};

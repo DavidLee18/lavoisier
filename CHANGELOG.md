@@ -5,6 +5,12 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 
 ## [Unreleased]
 
+### Confirm gate
+
+- `[confirm]` with no rules leaves tool calls unchanged. A listed rule holds a chat-origin call, stores it, and emits SSE `confirm_required`. `Origin::Schedule` is exempt.
+- `POST /v1/confirm` checks the code, room, sequence, and that the confirmer is a different member who may use the tool. On success the stored call runs and a short model turn phrases the result. If that turn fails, the raw tool output is the response.
+- `when_live` treats a missing probe and `Unknown` as live. `set_live_probe` registers the probe.
+
 ### Staged trace
 
 - `[trace] enabled` defaults false. When it is on, each turn and job writes one JSON record under `<memory path>/{hex}.trace/`. The transcript file is unchanged.

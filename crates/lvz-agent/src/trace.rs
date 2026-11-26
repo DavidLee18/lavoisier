@@ -178,6 +178,18 @@ impl TurnTrace {
                 }
             }
             Event::Usage(usage) => self.stages.push(model_stage(usage)),
+            Event::ConfirmRequired {
+                code,
+                room,
+                tool,
+                expires_s,
+            } => self.stages.push(json!({
+                "t": "ConfirmRequested",
+                "code": code,
+                "room": room,
+                "tool": tool,
+                "expires_s": expires_s,
+            })),
             Event::ToolResultImages { id, name, images } => {
                 self.stages.push(image_stage(id, name, images));
             }

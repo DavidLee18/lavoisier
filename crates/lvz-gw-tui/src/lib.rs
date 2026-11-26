@@ -436,6 +436,15 @@ fn on_event(term: &mut Term, app: &mut App, ev: Event) -> io::Result<()> {
             app.flush_pending(term)?;
             scrollback::emit_notice(term, &t)?;
         }
+        Event::ConfirmRequired {
+            code,
+            tool,
+            expires_s,
+            ..
+        } => {
+            app.flush_pending(term)?;
+            scrollback::emit_notice(term, &format!("confirm {tool} · {code} · {expires_s}s"))?;
+        }
         Event::ToolResultImages { name, images, .. } => {
             app.flush_pending(term)?;
             for img in &images {

@@ -36,6 +36,8 @@ pub struct Config {
     pub jobs: JobsSection,
     /// `[trace]` — staged history beside the transcript. Absent ⇒ off.
     pub trace: TraceSection,
+    /// `[confirm]` — second-user gate. Absent or empty rules ⇒ off.
+    pub confirm: ConfirmSection,
     /// Where this config was read from, or `None` if no file was found.
     ///
     /// Recorded rather than logged at load time on purpose: `[log] level` lives *in* this file, so
@@ -207,6 +209,79 @@ pub struct AgentSection {
 
 fn default_trace_keep() -> usize {
     200
+}
+
+fn default_confirm_expiry() -> u64 {
+    300
+}
+
+/// `[confirm]` — hold listed chat tool calls for a second member.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConfirmSection {
+    /// Seconds a pending row stays valid.
+    #[serde(default = "default_confirm_expiry")]
+    pub expiry_s: u64,
+    /// One entry per `[[confirm.rule]]`.
+    #[serde(default)]
+    pub rule: Vec<ConfirmRuleToml>,
+}
+
+impl Default for ConfirmSection {
+    fn default() -> Self {
+        Self {
+            expiry_s: default_confirm_expiry(),
+            rule: Vec::new(),
+        }
+    }
+}
+
+/// One `[[confirm.rule]]`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmRuleToml {
+    /// Tool name.
+    pub tool: String,
+    /// Optional `action` filter.
+    pub when: Option<ConfirmWhen>,
+    /// Gate only while the target is live.
+    #[serde(default)]
+    pub when_live: bool,
+}
+
+/// `when = { action = "stop" }` or `when = { action = ["stop", "toggle"] }`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmWhen {
+    /// Action values that trip the gate.
+    pub action: ConfirmAction,
+}
+
+/// A single action or a list.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ConfirmAction {
+    /// One action.
+    One(String),
+    /// Several actions.
+    Many(Vec<String>),
+}
+
+impl ConfirmSection {
+    /// Rules for the agent gate.
+    pub fn rules(&self) -> Vec<lvz_agent::confirm::ConfirmRule> {
+        self.rule
+            .iter()
+            .map(|rule| lvz_agent::confirm::ConfirmRule {
+                tool: rule.tool.clone(),
+                actions: rule.when.as_ref().map(|when| match &when.action {
+                    ConfirmAction::One(action) => vec![action.clone()],
+                    ConfirmAction::Many(actions) => actions.clone(),
+                }),
+                when_live: rule.when_live,
+            })
+            .collect()
+    }
 }
 
 /// `[trace]` — staged history. Off unless `enabled` is set.

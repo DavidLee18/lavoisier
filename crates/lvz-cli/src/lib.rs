@@ -856,6 +856,11 @@ fn build_log_filter(directives: &str) -> Option<tracing_subscriber::EnvFilter> {
     }
 }
 
+/// Register the live-broadcast probe used by `[confirm]` rules with `when_live`.
+pub fn set_live_probe(probe: Arc<dyn lvz_protocol::LiveProbe>) {
+    lvz_protocol::set_live_probe(probe);
+}
+
 /// Run the full Lavoisier CLI, registering `extra_tools` into the agent alongside the built-ins.
 /// This is the entry point for a private downstream binary that wants the entire CLI — flags,
 /// config, gateways (HTTP/Matrix/Slack/cron), E2EE, persona — but with its own tools. The stock `lav`
@@ -925,6 +930,12 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             dir,
             config.trace.keep,
         )));
+    }
+    if !config.confirm.rule.is_empty() {
+        lvz_agent::confirm::configure(
+            config.confirm.rules(),
+            std::time::Duration::from_secs(config.confirm.expiry_s),
+        );
     }
     // Builder tasks push compile output here. Absent ⇒ no listener, and a build tool has nothing
     // to follow. The bind address is what gets handed to the builder as LVZ_BUILDLOG_ADDR.
@@ -1082,11 +1093,19 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             let rooms = config.gateway.matrix_room_tools.clone().unwrap_or_default();
             let users = config.gateway.matrix_user_tools.clone().unwrap_or_default();
             if !rooms.is_empty() || !users.is_empty() {
-                gw_config = gw_config.with_tool_maps(rooms, users);
+                gw_config = gw_config.with_tool_maps(rooms.clone(), users.clone());
             }
             gw_config = gw_config.with_recover(Arc::new(jobs::LeaseHook));
             if config.trace.enabled {
                 gw_config = gw_config.with_trace(Arc::new(jobs::TraceBridge));
+            }
+            if !config.confirm.rule.is_empty() {
+                gw_config = gw_config.with_confirm(Arc::new(jobs::ConfirmBridge::new(
+                    tools.clone(),
+                    agent.clone(),
+                    rooms.clone(),
+                    users.clone(),
+                )));
             }
             if let Some(outbox) = detached_outbox.clone() {
                 gw_config = gw_config.with_outbox(outbox);
@@ -2106,6 +2125,12 @@ impl Renderer {
                 eprintln!("[citation: {source}] {cited_text}")
             }
             Event::Notice(text) => eprintln!("\n[notice] {text}"),
+            Event::ConfirmRequired {
+                code,
+                tool,
+                expires_s,
+                ..
+            } => eprintln!("\n[confirm] {tool} {code} ({expires_s}s)"),
             Event::ToolResultImages { name, images, .. } => {
                 for img in images {
                     eprintln!(
