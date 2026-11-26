@@ -91,6 +91,21 @@ pub enum JobError {
         /// Operator-facing reason. Not a credential, token, or response body.
         message: String,
     },
+    /// A side-effecting job was in flight when the process stopped. It is not run again.
+    /// `step` is the last persisted progress label, or `unknown` when none was stored.
+    #[error("{tool} interrupted after {step}")]
+    Interrupted {
+        /// Tool that had accepted the work.
+        tool: String,
+        /// Last progress step, already redacted.
+        step: String,
+    },
+    /// A schedule attempt was still running when the process stopped, so its verdict is unknown.
+    #[error("{name} lost")]
+    Lost {
+        /// Job or attempt name.
+        name: String,
+    },
 }
 
 /// A job the tool has accepted and is no longer blocking the turn on.
@@ -221,6 +236,21 @@ mod tests {
             }
             .to_string(),
             "server_wake failed: process restarted"
+        );
+        assert_eq!(
+            JobError::Interrupted {
+                tool: "server_wake".into(),
+                step: "3/5 hid".into(),
+            }
+            .to_string(),
+            "server_wake interrupted after 3/5 hid"
+        );
+        assert_eq!(
+            JobError::Lost {
+                name: "wake".into()
+            }
+            .to_string(),
+            "wake lost"
         );
     }
 }

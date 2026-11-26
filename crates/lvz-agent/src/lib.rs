@@ -50,11 +50,11 @@ use lvz_context::symbols::skeleton_with_radius;
 use lvz_context::tokens::estimate_tokens;
 use lvz_context::Lang;
 use lvz_protocol::{
-    AgentError, AgentHandle, Archetype, Capabilities, ChatRequest, ContentBlock, CostWeights,
-    DeliberationContext, Deliberator, Event, Knobs, Message, ModelTier, NoopTuner, Outcome,
-    Provider, RepoProfile, Role, ServerTool, StopReason, SystemPrompt, TaskContext, TaskTelemetry,
-    TelemetrySink, ThinkingLevel, ToolChoice, ToolDecision, ToolDef, ToolGate, Tuner, TurnRequest,
-    Usage,
+    enter_turn, resolve_origin, AgentError, AgentHandle, Archetype, Capabilities, ChatRequest,
+    ContentBlock, CostWeights, DeliberationContext, Deliberator, Event, Knobs, Message, ModelTier,
+    NoopTuner, Origin, Outcome, Provider, RepoProfile, Role, ServerTool, StopReason, SystemPrompt,
+    TaskContext, TaskTelemetry, TelemetrySink, ThinkingLevel, ToolChoice, ToolDecision, ToolDef,
+    ToolGate, Tuner, TurnContext, TurnRequest, Usage,
 };
 use lvz_tools::ToolRegistry;
 use serde_json::{json, Value};
@@ -637,7 +637,7 @@ impl Agent {
         history: Vec<Message>,
         allowed_tools: Option<Vec<String>>,
     ) -> BoxStream<'static, Result<Event, AgentError>> {
-        self.run_inner(history, allowed_tools, None, "default")
+        self.run_inner(history, allowed_tools, None, "default", None, None)
     }
 
     /// Like [`run_seeded_with_tools`](Self::run_seeded_with_tools), and the job table is keyed
@@ -649,7 +649,30 @@ impl Agent {
         model_override: Option<String>,
         session: &str,
     ) -> BoxStream<'static, Result<Event, AgentError>> {
-        self.run_inner(history, allowed_tools, model_override, session)
+        self.run_in_session_framed(history, allowed_tools, model_override, session, None, None)
+    }
+
+    /// [`run_in_session`](Self::run_in_session) plus the trusted context and an explicit origin.
+    ///
+    /// `origin` `None` is derived from `context` ([`Origin::Chat`]) or becomes [`Origin::Cli`].
+    /// The values are installed as task-locals on the turn task before the loop runs.
+    pub fn run_in_session_framed(
+        &self,
+        history: Vec<Message>,
+        allowed_tools: Option<Vec<String>>,
+        model_override: Option<String>,
+        session: &str,
+        context: Option<TurnContext>,
+        origin: Option<Origin>,
+    ) -> BoxStream<'static, Result<Event, AgentError>> {
+        self.run_inner(
+            history,
+            allowed_tools,
+            model_override,
+            session,
+            context,
+            origin,
+        )
     }
 
     /// The shared implementation, additionally taking a per-turn model override
@@ -664,6 +687,8 @@ impl Agent {
         allowed_tools: Option<Vec<String>>,
         model_override: Option<String>,
         session: &str,
+        context: Option<TurnContext>,
+        origin: Option<Origin>,
     ) -> BoxStream<'static, Result<Event, AgentError>> {
         let (tx, rx) = mpsc::unbounded();
         let provider = self.provider.clone();
@@ -682,29 +707,33 @@ impl Agent {
         let tool_gate = self.tool_gate.clone();
         let allowed_tools = allowed_tools.map(|v| v.into_iter().collect::<HashSet<String>>());
         let session = session.to_string();
+        let origin = resolve_origin(context.as_ref(), origin);
         // Dropping the stream (the caller finished, or ACP `session/cancel` dropped it)
         // cancels this token. Job workers hold children of it.
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_task = cancel.clone();
 
         tokio::spawn(async move {
-            run_loop(
-                provider,
-                tools,
-                config,
-                tuner,
-                telemetry,
-                legion,
-                fallbacks,
-                breaker,
-                skeleton_cell,
-                tool_gate,
-                allowed_tools,
-                history,
-                &tx,
-                session,
-                cancel_task,
-            )
+            enter_turn(context, origin, async move {
+                run_loop(
+                    provider,
+                    tools,
+                    config,
+                    tuner,
+                    telemetry,
+                    legion,
+                    fallbacks,
+                    breaker,
+                    skeleton_cell,
+                    tool_gate,
+                    allowed_tools,
+                    history,
+                    &tx,
+                    session,
+                    cancel_task,
+                )
+                .await;
+            })
             .await;
             // tx drops here, closing the stream.
         });
@@ -744,6 +773,8 @@ impl AgentHandle for Agent {
             turn.allowed_tools,
             turn.model,
             &turn.session,
+            turn.context,
+            turn.origin,
         ))
     }
 }

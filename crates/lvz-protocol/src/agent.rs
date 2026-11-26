@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
+use crate::context::{Origin, TurnContext};
 use crate::event::Event;
 
 /// One inbound request to the agent: which session it belongs to and the user's input.
@@ -27,6 +28,14 @@ pub struct TurnRequest {
     /// suppresses cheap-model-first for the turn, so the chosen model is used throughout. Within one
     /// provider (the primary); it does not select a different provider.
     pub model: Option<String>,
+    /// Trusted caller identity, set only by a gateway from an authenticated event.
+    ///
+    /// Absent on CLI and on older clients. Gateways that do not know a sender leave this
+    /// `None`. The HTTP body field is optional, so an old caller that omits it still decodes.
+    pub context: Option<TurnContext>,
+    /// Who started this turn. `None` means [`crate::resolve_origin`] derives it from
+    /// [`TurnRequest::context`] (a chat turn) or [`Origin::Cli`].
+    pub origin: Option<Origin>,
 }
 
 impl TurnRequest {
@@ -37,7 +46,21 @@ impl TurnRequest {
             input: input.into(),
             allowed_tools: None,
             model: None,
+            context: None,
+            origin: None,
         }
+    }
+
+    /// Attach the trusted caller identity for this turn.
+    pub fn with_context(mut self, context: TurnContext) -> Self {
+        self.context = Some(context);
+        self
+    }
+
+    /// Force the origin instead of deriving it from [`TurnRequest::context`].
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.origin = Some(origin);
+        self
     }
 
     /// Restrict this turn to the given tool names (see [`TurnRequest::allowed_tools`]).
