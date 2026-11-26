@@ -98,6 +98,107 @@ impl JobRunner for ScheduleJobRunner {
 /// `POST /v1/admin/recover` → the process job table.
 pub(crate) struct LeaseHook;
 
+/// `GET /v1/outbox` over the agent's durable outbox.
+pub(crate) struct OutboxBridge(lvz_agent::outbox::Outbox);
+
+impl lvz_gw_http::OutboxRead for OutboxBridge {
+    fn since(&self, after: u64) -> Vec<lvz_gw_http::OutRecord> {
+        self.0
+            .since(after)
+            .into_iter()
+            .map(|item| lvz_gw_http::OutRecord {
+                seq: item.seq,
+                body: serde_json::json!({
+                    "seq": item.seq,
+                    "session": item.session,
+                    "kind": item.kind,
+                    "text": item.text,
+                    "images": item.images,
+                }),
+            })
+            .collect()
+    }
+
+    fn ack(&self, seq: u64) {
+        self.0.ack(seq);
+    }
+
+    fn poke(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.0.poke()
+    }
+}
+
+/// Open the outbox, and deliver each finished detached job as a continuation turn.
+///
+/// `None` when the directory cannot be created. The turn still returns early; the reply
+/// stays in the job table until a later process can write the outbox.
+pub(crate) fn arm_detached(
+    config: &crate::Config,
+    agent: std::sync::Arc<dyn lvz_protocol::AgentHandle>,
+) -> Option<std::sync::Arc<dyn lvz_gw_http::OutboxRead>> {
+    let dir = config
+        .memory
+        .path
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from(".lavoisier"));
+    let outbox = match lvz_agent::outbox::Outbox::open_local(&dir) {
+        Ok(outbox) => outbox,
+        Err(err) => {
+            tracing::error!(error = %err, "detached outbox did not open");
+            return None;
+        }
+    };
+    lvz_agent::jobs::global().set_detached(true);
+    let hook_box = outbox.clone();
+    lvz_agent::jobs::global().set_terminal_hook(std::sync::Arc::new(move |session, text| {
+        let agent = agent.clone();
+        let outbox = hook_box.clone();
+        let session = session.to_string();
+        let text = text.to_string();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                deliver(agent, outbox, session, text).await;
+            });
+        }
+    }));
+    Some(std::sync::Arc::new(OutboxBridge(outbox)))
+}
+
+async fn deliver(
+    agent: std::sync::Arc<dyn lvz_protocol::AgentHandle>,
+    outbox: lvz_agent::outbox::Outbox,
+    session: String,
+    raw: String,
+) {
+    use futures::StreamExt;
+    let turn = lvz_protocol::TurnRequest::new(session.clone(), raw.clone()).with_origin(
+        lvz_protocol::Origin::Job {
+            id: session.clone(),
+        },
+    );
+    let mut reply = String::new();
+    let mut failed = false;
+    match agent.submit(turn).await {
+        Ok(mut stream) => {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(lvz_protocol::Event::TextDelta(text)) => reply.push_str(&text),
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(_) => failed = true,
+    }
+    if failed || reply.trim().is_empty() {
+        reply = raw;
+    }
+    outbox.publish(session, reply);
+}
+
 impl lvz_gw_http::LeaseRecover for LeaseHook {
     fn recover(
         &self,
