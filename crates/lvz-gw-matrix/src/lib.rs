@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use futures::stream::StreamExt;
 use lvz_protocol::{AgentHandle, Event, Gateway, GatewayError, ToolImage, TurnRequest};
 use lvz_schedule::ScheduleRegistry;
-use lvz_tools::ToolRegistry;
+use lvz_tools::{tools_for as shared_tools_for, ToolRegistry};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
@@ -468,19 +468,8 @@ impl MatrixGateway {
     /// Scheduled jobs do not call this. A tool job dispatches through the shared registry and a
     /// prompt job carries no member identity, so both bypass the member map.
     fn tools_for(&self, room: &str, sender: &str) -> Option<Vec<String>> {
-        // A non-empty member map is an allowlist. A sender it does not name must not inherit the
-        // room's tools or the unconstrained catalogue.
-        if !self.user_tools.is_empty() && !self.user_tools.contains_key(sender) {
-            return Some(Vec::new());
-        }
-        let room_set = self.room_tools.get(room);
-        let user_set = self.user_tools.get(sender);
-        match (room_set, user_set) {
-            (None, None) => None,
-            (Some(r), None) => Some(r.iter().cloned().collect()),
-            (None, Some(u)) => Some(u.iter().cloned().collect()),
-            (Some(r), Some(u)) => Some(r.intersection(u).cloned().collect()),
-        }
+        // Shared with the HTTP gateway (`lvz_protocol::tools_for`, re-exported by lvz-tools).
+        shared_tools_for(&self.room_tools, &self.user_tools, room, sender)
     }
 
     /// Construct from the environment. Required: `MATRIX_HOMESERVER`, plus **either**

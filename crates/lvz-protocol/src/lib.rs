@@ -23,6 +23,7 @@ mod gate;
 mod gateway;
 mod job;
 mod message;
+mod policy;
 mod provider;
 mod retry;
 mod telemetry;
@@ -45,6 +46,7 @@ pub use message::{
     BuiltinTool, ChatRequest, ContentBlock, McpServer, MediaSource, Message, OutputFormat, Role,
     ServerTool, SystemPrompt, ThinkingLevel, ToolChoice, ToolDef,
 };
+pub use policy::{effective_tools, tool_permitted, tools_for};
 pub use provider::{
     builtin_tool_capability, negotiate, server_tool_capability, with_negotiated, Capabilities,
     Capability, Negotiated, Provider, ProviderCaps, ProviderError,

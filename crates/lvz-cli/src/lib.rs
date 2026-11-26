@@ -1030,6 +1030,13 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             if let Some(n) = cli.rate_limit {
                 gw_config = gw_config.with_rate_limit(n, std::time::Duration::from_secs(60));
             }
+            // Same maps the Matrix gateway uses. Always enforced on /v1/turns when configured.
+            // The jobs route is unchanged and keeps the full registry.
+            let rooms = config.gateway.matrix_room_tools.clone().unwrap_or_default();
+            let users = config.gateway.matrix_user_tools.clone().unwrap_or_default();
+            if !rooms.is_empty() || !users.is_empty() {
+                gw_config = gw_config.with_tool_maps(rooms, users);
+            }
             if cli.serve_jobs {
                 if let Some(schedule) = &schedule {
                     let timeout = std::time::Duration::from_secs(cli.jobs_timeout.unwrap_or(1800));
