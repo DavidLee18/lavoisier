@@ -61,7 +61,7 @@ pub enum JobRejection {
 }
 
 /// The verdict of one attempt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobReport {
     /// Whether the attempt succeeded.
     pub ok: bool,
@@ -434,13 +434,26 @@ fn load_attempts(dir: &std::path::Path) -> Vec<(String, Entry)> {
         let Some(job) = value.get("job").and_then(|v| v.as_str()) else {
             continue;
         };
-        let running = value.get("state").and_then(|v| v.as_str()) == Some("running");
+        let state = value.get("state").and_then(|v| v.as_str()).unwrap_or("");
+        let done = match value.get("done") {
+            Some(done) if done.get("error").and_then(|v| v.as_str()).is_some() => Some(
+                Terminal::Error(done["error"].as_str().unwrap_or("").to_string()),
+            ),
+            Some(done) if done.get("ok").is_some() => serde_json::from_value(done.clone())
+                .ok()
+                .map(Terminal::Report),
+            _ => None,
+        };
+        let lost = state == "running";
+        if !lost && done.is_none() {
+            continue;
+        }
         out.push((
             name,
             Entry {
                 job: job.to_string(),
-                done: None,
-                lost: running,
+                done,
+                lost,
                 waiting: value
                     .get("waiting")
                     .and_then(|v| v.as_str())

@@ -350,6 +350,11 @@ async fn a_running_attempt_is_lost_after_restart() {
         r#"{"job":"ok","state":"running","waiting":null,"done":null}"#,
     )
     .unwrap();
+    std::fs::write(
+        dir.join("bot-ok-2"),
+        r#"{"job":"ok","state":"terminal","waiting":null,"done":{"ok":true,"body":"kept","attempt":2,"retry_in_s":null,"gave_up":false,"images":0}}"#,
+    )
+    .unwrap();
     let runner = Arc::new(Runner {
         runs: AtomicUsize::new(0),
         gate: Notify::new(),
@@ -372,5 +377,15 @@ async fn a_running_attempt_is_lost_after_restart() {
         .await
         .unwrap();
     assert_eq!(body["state"], "lost");
+    let kept: Value = reqwest::Client::new()
+        .get(format!("http://{addr}/v1/jobs/ok/attempts/bot-ok-2"))
+        .bearer_auth("k")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(kept["state"], "done");
     let _ = std::fs::remove_dir_all(&dir);
 }
