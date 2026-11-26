@@ -18,7 +18,7 @@
 
 pub mod jobs;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,7 +45,7 @@ use axum::{
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use lvz_protocol::{
-    AgentError, AgentHandle, Event, Gateway, GatewayError, TurnContext, TurnRequest,
+    tools_for, AgentError, AgentHandle, Event, Gateway, GatewayError, TurnContext, TurnRequest,
 };
 use serde::Deserialize;
 
@@ -62,6 +62,8 @@ pub struct GatewayConfig {
     rate_limit: Option<(u32, Duration)>,
     /// Serve `POST /v1/jobs/{id}` through this runner (behind the same guard).
     jobs: Option<Arc<dyn jobs::JobRunner>>,
+    /// Room and member tool maps. Empty maps leave turns unconstrained.
+    tool_policy: ToolPolicy,
 }
 
 impl GatewayConfig {
@@ -83,6 +85,65 @@ impl GatewayConfig {
     pub fn with_jobs(mut self, runner: Arc<dyn jobs::JobRunner>) -> Self {
         self.jobs = Some(runner);
         self
+    }
+
+    /// Apply `[gateway.matrix_room_tools]` / `matrix_user_tools` to `/v1/turns`.
+    ///
+    /// Always on when either map is non-empty. A turn with `context` gets `tools_for`. A turn
+    /// without `context` gets an empty tool set. Empty maps leave the full registry. The jobs
+    /// route does not consult this policy.
+    pub fn with_tool_maps(
+        mut self,
+        rooms: HashMap<String, Vec<String>>,
+        users: HashMap<String, Vec<String>>,
+    ) -> Self {
+        self.tool_policy = ToolPolicy::from_lists(rooms, users);
+        self
+    }
+}
+
+/// The HTTP copy of the Matrix room/member tool maps.
+#[derive(Clone, Default)]
+pub struct ToolPolicy {
+    room_tools: HashMap<String, HashSet<String>>,
+    user_tools: HashMap<String, HashSet<String>>,
+}
+
+impl ToolPolicy {
+    /// Build from the TOML lists. Duplicate names collapse.
+    pub fn from_lists(
+        rooms: HashMap<String, Vec<String>>,
+        users: HashMap<String, Vec<String>>,
+    ) -> Self {
+        let to_set = |map: HashMap<String, Vec<String>>| {
+            map.into_iter()
+                .map(|(k, v)| (k, v.into_iter().collect::<HashSet<_>>()))
+                .collect()
+        };
+        Self {
+            room_tools: to_set(rooms),
+            user_tools: to_set(users),
+        }
+    }
+
+    /// `true` when at least one map names a room or a member.
+    pub fn is_configured(&self) -> bool {
+        !self.room_tools.is_empty() || !self.user_tools.is_empty()
+    }
+
+    /// Restrict `turn` when the maps are configured.
+    pub fn apply(&self, mut turn: TurnRequest) -> TurnRequest {
+        if !self.is_configured() {
+            return turn;
+        }
+        let grant = match turn.context.as_ref() {
+            Some(ctx) => tools_for(&self.room_tools, &self.user_tools, &ctx.room, &ctx.sender),
+            None => Some(Vec::new()),
+        };
+        if let Some(names) = grant {
+            turn = turn.with_allowed_tools(names);
+        }
+        turn
     }
 }
 
@@ -130,6 +191,7 @@ impl HttpGateway {
         let state = Arc::new(AppState {
             agent,
             metrics: Arc::new(Metrics::default()),
+            tool_policy: config.tool_policy.clone(),
         });
         let jobs = config.jobs.clone();
         let guard = Arc::new(Guard::new(config));
@@ -154,6 +216,7 @@ impl HttpGateway {
 struct AppState {
     agent: SharedAgent,
     metrics: Arc<Metrics>,
+    tool_policy: ToolPolicy,
 }
 
 #[async_trait]
@@ -467,7 +530,7 @@ async fn post_turn(
     State(state): State<Arc<AppState>>,
     Json(dto): Json<TurnDto>,
 ) -> Sse<BoxStream<'static, Result<SseEvent, Infallible>>> {
-    let turn = turn_from_dto(dto);
+    let turn = state.tool_policy.apply(turn_from_dto(dto));
     let body: BoxStream<'static, Result<SseEvent, Infallible>> =
         match state.agent.submit(turn).await {
             Ok(events) => instrument(events, state.metrics.clone())
@@ -510,7 +573,7 @@ async fn ws_loop(mut socket: WebSocket, state: Arc<AppState>) {
                 continue;
             }
         };
-        let turn = turn_from_dto(dto);
+        let turn = state.tool_policy.apply(turn_from_dto(dto));
         match state.agent.submit(turn).await {
             Ok(events) => {
                 let mut events = instrument(events, state.metrics.clone());
@@ -576,6 +639,8 @@ fn error_json(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
     use lvz_protocol::{StopReason, Usage};
 
     #[test]
@@ -600,6 +665,50 @@ mod tests {
         assert_eq!(ctx.room, "!r:hs");
         assert_eq!(ctx.seq, 3);
         assert_eq!(ctx.raw_input, "hi");
+    }
+
+    fn maps() -> (HashMap<String, Vec<String>>, HashMap<String, Vec<String>>) {
+        let rooms = HashMap::from([("!ops:hs".into(), vec!["read_file".into(), "shell".into()])]);
+        let users = HashMap::from([(
+            "@admin:hs".into(),
+            vec!["read_file".into(), "write_file".into()],
+        )]);
+        (rooms, users)
+    }
+
+    #[test]
+    fn tool_policy_with_context_uses_tools_for() {
+        let (rooms, users) = maps();
+        let policy = ToolPolicy::from_lists(rooms, users);
+        let ctx = TurnContext {
+            sender: "@admin:hs".into(),
+            room: "!ops:hs".into(),
+            ..TurnContext::default()
+        };
+        let turn = policy.apply(TurnRequest::new("!ops:hs", "hi").with_context(ctx));
+        let mut names = turn.allowed_tools.expect("grant");
+        names.sort();
+        assert_eq!(names, vec!["read_file".to_string()]);
+    }
+
+    #[test]
+    fn tool_policy_without_context_fails_closed_when_maps_are_set() {
+        let (rooms, users) = maps();
+        let policy = ToolPolicy::from_lists(rooms, users);
+        let turn = policy.apply(TurnRequest::new("s", "hi"));
+        assert_eq!(turn.allowed_tools, Some(Vec::new()));
+    }
+
+    #[test]
+    fn tool_policy_absent_maps_keep_the_full_registry() {
+        let policy = ToolPolicy::default();
+        let ctx = TurnContext {
+            sender: "@a:hs".into(),
+            room: "!r:hs".into(),
+            ..TurnContext::default()
+        };
+        let turn = policy.apply(TurnRequest::new("s", "hi").with_context(ctx));
+        assert!(turn.allowed_tools.is_none());
     }
 
     #[test]
