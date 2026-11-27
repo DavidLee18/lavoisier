@@ -50,6 +50,7 @@ tokio.workspace = true
 clap.workspace = true
 futures.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -59,6 +60,3 @@ tracing-subscriber.workspace = true
 # Install with it via `cargo install lavoisier --features e2ee`.
 [features]
 e2ee = ["lvz-gw-matrix/e2ee"]
-
-[dev-dependencies]
-serde_json.workspace = true

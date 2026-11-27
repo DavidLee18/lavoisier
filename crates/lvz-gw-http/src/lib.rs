@@ -66,6 +66,8 @@ pub struct GatewayConfig {
     tool_policy: ToolPolicy,
     /// `POST /v1/admin/recover`. Absent ⇒ the route is not mounted.
     recover: Option<Arc<dyn LeaseRecover>>,
+    /// `GET /v1/outbox` and `POST /v1/outbox/ack`. Absent ⇒ the routes are not mounted.
+    outbox: Option<Arc<dyn OutboxRead>>,
 }
 
 impl GatewayConfig {
@@ -108,6 +110,31 @@ impl GatewayConfig {
         self.recover = Some(hook);
         self
     }
+
+    /// Mount the detached-result outbox.
+    pub fn with_outbox(mut self, outbox: Arc<dyn OutboxRead>) -> Self {
+        self.outbox = Some(outbox);
+        self
+    }
+}
+
+/// One outbox record the SSE handler can forward without knowing the job table.
+#[derive(Debug, Clone)]
+pub struct OutRecord {
+    /// Sequence number. Also the SSE `id`.
+    pub seq: u64,
+    /// JSON body. Includes `seq`.
+    pub body: serde_json::Value,
+}
+
+/// Read side of the detached outbox. The HTTP crate does not own the files.
+pub trait OutboxRead: Send + Sync {
+    /// Records with `seq` greater than `after`.
+    fn since(&self, after: u64) -> Vec<OutRecord>;
+    /// Drop `seq`. A second call is a no-op.
+    fn ack(&self, seq: u64);
+    /// Wakes when [`since`](Self::since) may have something new.
+    fn poke(&self) -> Arc<tokio::sync::Notify>;
 }
 
 /// Outcome of one `POST /v1/admin/recover`.
@@ -226,6 +253,7 @@ impl HttpGateway {
             metrics: Arc::new(Metrics::default()),
             tool_policy: config.tool_policy.clone(),
             recover: config.recover.clone(),
+            outbox: config.outbox.clone(),
         });
         let mount_recover = config.recover.is_some();
         let jobs = config.jobs.clone();
@@ -235,6 +263,11 @@ impl HttpGateway {
             .route("/v1/ws", get(ws_upgrade));
         if mount_recover {
             routes = routes.route("/v1/admin/recover", post(post_recover));
+        }
+        if state.outbox.is_some() {
+            routes = routes
+                .route("/v1/outbox", get(get_outbox))
+                .route("/v1/outbox/ack", post(post_outbox_ack));
         }
         let mut protected = routes.with_state(state.clone());
         if let Some(runner) = jobs {
@@ -256,6 +289,7 @@ struct AppState {
     metrics: Arc<Metrics>,
     tool_policy: ToolPolicy,
     recover: Option<Arc<dyn LeaseRecover>>,
+    outbox: Option<Arc<dyn OutboxRead>>,
 }
 
 #[async_trait]
@@ -594,6 +628,64 @@ async fn post_recover(
         )
             .into_response(),
     }
+}
+
+fn last_event_id(headers: &HeaderMap) -> u64 {
+    headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+/// `GET /v1/outbox` — SSE of detached replies, resuming after `Last-Event-ID`.
+async fn get_outbox(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let Some(source) = state.outbox.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let after = last_event_id(&headers);
+    let body = futures::stream::unfold(Some((source, after)), |slot| async move {
+        let (source, mut after) = slot?;
+        loop {
+            if let Some(record) = source.since(after).into_iter().next() {
+                let id = record.seq.to_string();
+                after = record.seq;
+                let event = match SseEvent::default().id(id).json_data(record.body) {
+                    Ok(event) => event,
+                    Err(_) => SseEvent::default().comment("unencodable"),
+                };
+                return Some((Ok::<SseEvent, Infallible>(event), Some((source, after))));
+            }
+            let notify = source.poke();
+            tokio::select! {
+                _ = notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                    return Some((
+                        Ok(SseEvent::default().comment("ping")),
+                        Some((source, after)),
+                    ));
+                }
+            }
+        }
+    })
+    .boxed();
+    Sse::new(body).into_response()
+}
+
+#[derive(Deserialize)]
+struct AckDto {
+    seq: u64,
+}
+
+/// `POST /v1/outbox/ack` — drop one delivered item.
+async fn post_outbox_ack(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AckDto>,
+) -> StatusCode {
+    if let Some(source) = &state.outbox {
+        source.ack(body.seq);
+    }
+    StatusCode::NO_CONTENT
 }
 
 /// `POST /v1/turns` — run one turn and stream its events as SSE.

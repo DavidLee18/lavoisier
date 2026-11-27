@@ -29,6 +29,11 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 
 The root workspace pins are `lvz-tools` 0.1.3 and `lvz-memory` 0.3.3, the same versions crates.io already serves. This stack starts from that reconcile.
 
+### Detached turns
+
+- `[jobs] detached` defaults false. When it is on, a turn returns while jobs are still running. Those jobs are children of a per-session token, so dropping the turn does not cancel them. `[jobs] user_tools` cancel still does. The session store holds one permit per session for the whole turn, so two turns cannot save over each other.
+- A finished job starts a continuation turn. If that turn fails, the raw completion text is what gets stored. `GET /v1/outbox` streams `{seq, session, kind, text, images}` and resumes from `Last-Event-ID`. `POST /v1/outbox/ack` drops one item. Files live in `outbox/{seq}.json`.
+
 ### Cancel
 
 - A job row holds the cancel token the worker is given. `POST /v1/jobs/{id}` installs that token for the attempt and cancels it when the attempt times out. Direct schedule tool calls and prompt turns are `Origin::Schedule`.

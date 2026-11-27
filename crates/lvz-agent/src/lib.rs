@@ -37,6 +37,7 @@ pub mod cancel;
 pub mod durable;
 pub mod job_tools;
 pub mod jobs;
+pub mod outbox;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -572,6 +573,8 @@ pub struct Agent {
     /// model as an error result (never aborting the turn). Held as an `Arc<dyn ToolGate>` (the
     /// `legion`/tuner injection pattern). `None` ⇒ every tool runs, byte-identical to before.
     tool_gate: Option<Arc<dyn ToolGate>>,
+    /// When true, a finished job does not hold the turn open. Its reply is dispatched later.
+    detached: bool,
     /// When true, a chat line that matches `<job> 취소해줘` is handled before any model call.
     cancel_command: bool,
     /// Phrases the cancel hook accepts. Empty until [`Self::with_cancel_command`].
@@ -593,9 +596,18 @@ impl Agent {
             breaker: Arc::new(CircuitBreaker::new(1, Duration::from_secs(60))),
             repo_skeleton: Arc::new(OnceLock::new()),
             tool_gate: None,
+            detached: false,
             cancel_command: false,
             cancel_aliases: Vec::new(),
         }
+    }
+
+    /// Do not wait for background jobs at the end of a turn.
+    ///
+    /// Their tokens are children of the session token, so dropping this turn does not cancel them.
+    pub fn with_detached(mut self) -> Self {
+        self.detached = true;
+        self
     }
 
     /// Handle `<job> 취소해줘` before the model runs.
@@ -753,6 +765,7 @@ impl Agent {
         let tool_gate = self.tool_gate.clone();
         let cancel_command = self.cancel_command;
         let cancel_aliases = self.cancel_aliases.clone();
+        let detached = self.detached;
         let allowed_tools = allowed_tools.map(|v| v.into_iter().collect::<HashSet<String>>());
         let grant = match &allowed_tools {
             None => ToolGrant::All,
@@ -788,6 +801,7 @@ impl Agent {
                         cancel_task,
                         cancel_command,
                         cancel_aliases,
+                        detached,
                     )
                     .await;
                 }),
@@ -901,6 +915,7 @@ async fn run_loop(
     cancel: tokio_util::sync::CancellationToken,
     cancel_command: bool,
     cancel_aliases: Vec<cancel::CancelAlias>,
+    detached: bool,
 ) {
     if cancel_command {
         let names = allowed_tools
@@ -1059,16 +1074,20 @@ async fn run_loop(
     for _step in 0..config.max_steps {
         let live_ops_rounds = round_trips.saturating_sub(truncation_retries);
         if cancel.is_cancelled() {
-            jobs::global().fail_running(
-                &session,
-                lvz_protocol::JobError::Cancelled {
-                    name: "turn".into(),
-                },
-            );
+            if !detached {
+                jobs::global().fail_running(
+                    &session,
+                    lvz_protocol::JobError::Cancelled {
+                        name: "turn".into(),
+                    },
+                );
+            }
             return;
         }
-        if let Some(done) = jobs::global().drain_ready(&session) {
-            history.push(done);
+        if !detached {
+            if let Some(done) = jobs::global().drain_ready(&session) {
+                history.push(done);
+            }
         }
         if live_ops_ask && live_ops_rounds >= MAX_LIVE_OPS_ROUNDS {
             if live_ops_summary {
@@ -1456,18 +1475,21 @@ async fn run_loop(
                 }
             }
             if cancel.is_cancelled() {
-                jobs::global().fail_running(
-                    &session,
-                    lvz_protocol::JobError::Cancelled {
-                        name: "turn".into(),
-                    },
-                );
+                if !detached {
+                    jobs::global().fail_running(
+                        &session,
+                        lvz_protocol::JobError::Cancelled {
+                            name: "turn".into(),
+                        },
+                    );
+                }
                 return;
             }
             // EndTurn with a job still open waits, bounded by that job's timeout.
             // The completion is a later user message, then another model call.
             // It is not a second tool_result, and it is not injected mid-stream.
-            if jobs::global().session_busy(&session) {
+            // Detached turns return now. The job's reply is a later continuation.
+            if !detached && jobs::global().session_busy(&session) {
                 match jobs::global().wait_ready(&session, &cancel).await {
                     jobs::JobWait::Cancelled => {
                         jobs::global().fail_running(
@@ -1565,9 +1587,14 @@ async fn run_loop(
                 // Log the real run (name only — never args, file contents, or secrets) so a
                 // structured call and a prose-only claim are distinguishable in CloudWatch.
                 tracing::info!(tool = %call.name, "running structured tool call");
+                let parent = if detached {
+                    jobs::session_parent(&session)
+                } else {
+                    cancel.clone()
+                };
                 match jobs::scoped_invoke(
                     &session,
-                    &cancel,
+                    &parent,
                     invoke_forwarding(&tools, &call.name, args, tx),
                 )
                 .await
@@ -1751,14 +1778,17 @@ async fn run_loop(
     }
 
     // Ran out of steps without a final answer. Drop running jobs so a late finish
-    // cannot arrive as a second result after the turn has ended.
-    jobs::global().fail_running(
-        &session,
-        lvz_protocol::JobError::Failed {
-            name: "turn".into(),
-            message: "turn stopped at max steps".into(),
-        },
-    );
+    // cannot arrive as a second result after the turn has ended. A detached job
+    // outlives the turn and is delivered on its own.
+    if !detached {
+        jobs::global().fail_running(
+            &session,
+            lvz_protocol::JobError::Failed {
+                name: "turn".into(),
+                message: "turn stopped at max steps".into(),
+            },
+        );
+    }
     obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
     let _ = tx.unbounded_send(Ok(Event::Usage(total)));
     let _ = tx.unbounded_send(Ok(Event::Done(StopReason::Other("max_steps".into()))));
@@ -6661,5 +6691,50 @@ fn target() -> u32 { helper() + 10 }
             &lvz_protocol::JobId::new("wake9").expect("id")
         ));
         crate::jobs::global().clear_session("hook");
+    }
+
+    struct DetachJob;
+
+    #[async_trait]
+    impl Tool for DetachJob {
+        fn name(&self) -> &str {
+            "detach_job"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn invoke(&self, _args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+            let id = lvz_protocol::JobId::new("park-detach-1")
+                .map_err(|err| ToolError::Execution(err.to_string()))?;
+            let _child = jobs::reserve_job("detach_job", id.clone(), Some(60))?;
+            Ok(ToolOutput::accepted("parked", id, Some(60)))
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_turn_returns_while_the_job_keeps_running() {
+        let session = "room-detached";
+        jobs::global().clear_session(session);
+        let id = lvz_protocol::JobId::new("park-detach-1").expect("id");
+        let provider =
+            ScriptedProvider::new(vec![tool_turn("c1", "detach_job", "{}"), end_turn("done")]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(DetachJob));
+        let agent = Agent::new(provider, tools, AgentConfig::default()).with_detached();
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            collect(agent.run_in_session(vec![Message::user("go")], None, None, session)),
+        )
+        .await
+        .expect("a detached turn does not wait for the job");
+        assert!(events.iter().any(|event| matches!(event, Event::Done(_))));
+        assert!(
+            matches!(
+                jobs::global().outcome_kind(&id),
+                Some(jobs::OutcomeKind::Running)
+            ),
+            "dropping the turn must not cancel a detached job"
+        );
+        jobs::global().clear_session(session);
     }
 }

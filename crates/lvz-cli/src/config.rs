@@ -241,6 +241,9 @@ pub enum FsKind {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct JobsSection {
+    /// When true, a turn returns while jobs are still running. Their replies go to the outbox.
+    /// Off by default, which keeps the turn waiting.
+    pub detached: bool,
     /// When true, do not adopt persisted jobs at boot. `POST /v1/admin/recover` does it,
     /// and only for a lease generation that is not older than one already accepted.
     pub recover_on_signal: bool,

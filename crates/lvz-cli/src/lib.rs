@@ -1022,6 +1022,9 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
         if config.jobs.cancel_command {
             agent_core = agent_core.with_cancel_command(cancel_aliases(&config));
         }
+        if config.jobs.detached {
+            agent_core = agent_core.with_detached();
+        }
         // Interactive tool-approval gate for the TUI (Claude-Code default: read-only tools run
         // unattended, mutating tools / shells ask). Built only when the TUI is active and approval
         // isn't waived; its receiver is handed to the TUI gateway below so prompts reach the user.
@@ -1032,7 +1035,16 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             (agent_core, None)
         };
         let inner = Arc::new(agent_core);
-        let agent: Arc<dyn AgentHandle> = Arc::new(SessionAgent::new(inner, store));
+        let mut session_agent = SessionAgent::new(inner, store);
+        if config.jobs.detached {
+            session_agent = session_agent.with_turn_lock();
+        }
+        let agent: Arc<dyn AgentHandle> = Arc::new(session_agent);
+        let detached_outbox = if config.jobs.detached {
+            jobs::arm_detached(&config, agent.clone())
+        } else {
+            None
+        };
 
         let mut gateways: Vec<Arc<dyn Gateway>> = Vec::new();
 
@@ -1052,6 +1064,9 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
                 gw_config = gw_config.with_tool_maps(rooms, users);
             }
             gw_config = gw_config.with_recover(Arc::new(jobs::LeaseHook));
+            if let Some(outbox) = detached_outbox.clone() {
+                gw_config = gw_config.with_outbox(outbox);
+            }
             if cli.serve_jobs {
                 if let Some(schedule) = &schedule {
                     let timeout = std::time::Duration::from_secs(cli.jobs_timeout.unwrap_or(1800));
@@ -1246,6 +1261,9 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
         let mut agent = build_agent(provider, model, &cli, tools, legion, fallbacks);
         if config.jobs.cancel_command {
             agent = agent.with_cancel_command(cancel_aliases(&config));
+        }
+        if config.jobs.detached {
+            agent = agent.with_detached();
         }
         if cli.telemetry {
             agent = agent.with_telemetry(Arc::new(StderrTelemetry));
