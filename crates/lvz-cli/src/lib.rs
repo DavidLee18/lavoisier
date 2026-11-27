@@ -164,6 +164,13 @@ struct Cli {
     #[arg(long)]
     require_edit: bool,
 
+    /// **Opt-in** (--agent / --serve): when a round ends incomplete or at `max_tokens` with no
+    /// tool call (reasoning can spend the whole output budget first), re-ask it with the output
+    /// budget doubled, at most twice and never above 16384, instead of failing the turn. Spends
+    /// more output tokens, so it is OFF by default (`[agent] truncation_retry`).
+    #[arg(long)]
+    truncation_retry: bool,
+
     /// **Accuracy lever, opt-in** (--agent mode): verify-and-fix — when finishing, if --verify-cmd
     /// fails, feed the failure back and keep fixing (bounded) instead of shipping an incomplete
     /// change. Needs --verify-cmd; trades efficiency for completeness, so it is OFF by default.
@@ -1773,6 +1780,7 @@ fn build_agent(
     config = config.with_budget_awareness(cli.budget_awareness || converge);
     // Accuracy levers stay opt-in (efficiency-by-default): only on when explicitly requested.
     config = config.with_require_edit(cli.require_edit);
+    config = config.with_truncation_retry(cli.truncation_retry);
     config = config.with_verify_and_fix(cli.verify_and_fix);
     if let Some(tb) = cli.thinking_budget {
         config = config.with_forced_thinking(tb.into());

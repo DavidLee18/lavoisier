@@ -196,6 +196,8 @@ pub struct AgentSection {
     pub persona: Option<PathBuf>,
     pub system: Option<String>,
     pub require_edit: Option<bool>,
+    /// Re-ask a round that ended truncated with no tool call (see `--truncation-retry`).
+    pub truncation_retry: Option<bool>,
     pub verify_and_fix: Option<bool>,
     pub verify_cmd: Option<String>,
 }
@@ -398,6 +400,7 @@ impl Config {
         // Boolean accuracy levers: the file can turn them on; an explicit `--flag` also turns
         // them on, so OR is the correct merge (neither can force-disable the other).
         cli.require_edit |= self.agent.require_edit.unwrap_or(false);
+        cli.truncation_retry |= self.agent.truncation_retry.unwrap_or(false);
         cli.verify_and_fix |= self.agent.verify_and_fix.unwrap_or(false);
 
         // [gateway]
@@ -528,6 +531,7 @@ mod tests {
             [agent]
             compact_after = 50000
             require_edit = true
+            truncation_retry = true
 
             [memory]
             store = "file"
@@ -543,6 +547,7 @@ mod tests {
         assert_eq!(cfg.provider.provider, Some(ProviderKind::Anthropic));
         assert_eq!(cfg.agent.compact_after, Some(50000));
         assert_eq!(cfg.agent.require_edit, Some(true));
+        assert_eq!(cfg.agent.truncation_retry, Some(true));
         assert_eq!(cfg.memory.store, Some(StoreKind::File));
         assert_eq!(
             cfg.gateway.api_keys.as_deref(),

@@ -5,6 +5,20 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 
 ## [Unreleased]
 
+### Truncated rounds with no tool call (HOLD APPLY)
+
+- The error for a round that ends `incomplete` or at `max_tokens` with no tool call now names
+  the stop, the output budget sent, and the output tokens the provider reported. The old prefix
+  `response incomplete (hit max_output_tokens) with no tool call` is kept, so existing matchers
+  still match. With no usage reported it adds `the stream may have ended early`, so a spent
+  budget and a cut stream no longer read the same.
+- New, off by default: `--truncation-retry` / `[agent] truncation_retry = true`. Such a round is
+  asked again with its output budget doubled, at most twice per turn and never above 16384. The
+  truncated prose is dropped. A re-asked round still counts as the first live-ops round, so it
+  keeps `tool_choice = required`. Engines before this release refuse the key
+  (`deny_unknown_fields`): set it only with an image built from this change.
+- No change when the flag is off apart from the error text. CLI default `max_tokens` stays 2048.
+
 ### Crate version bumps for crates.io
 
 - `lvz-tools` 0.1.2 → 0.1.3 picks up the `ToolOutput.accepted` field added in `lvz-protocol` 0.1.10, so a publish no longer verifies against the old 0.1.2 sources.
