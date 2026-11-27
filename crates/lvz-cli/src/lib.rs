@@ -165,9 +165,12 @@ struct Cli {
     require_edit: bool,
 
     /// **Opt-in** (--agent / --serve): when a round ends incomplete or at `max_tokens` with no
-    /// tool call (reasoning can spend the whole output budget first), re-ask it with the output
-    /// budget doubled, at most twice and never above 16384, instead of failing the turn. Spends
-    /// more output tokens, so it is OFF by default (`[agent] truncation_retry`).
+    /// tool call, re-ask it with the output budget doubled, at most twice and never above 16384,
+    /// instead of failing the turn. On xai-responses / grok-4.3, max_output_tokens caps visible
+    /// output only (reasoning and function-call tokens do not count). Usage.output_tokens is the
+    /// provider total including reasoning, so tokens used can exceed the budget without the cap
+    /// being spent. response.incomplete can also come from max_time_limit or max_prompt_tokens.
+    /// Spends more output tokens, so it is OFF by default (`[agent] truncation_retry`).
     #[arg(long)]
     truncation_retry: bool,
 

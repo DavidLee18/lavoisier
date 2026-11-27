@@ -276,8 +276,11 @@ pub struct AgentConfig {
     /// **Truncation retry** (`--truncation-retry`, `[agent] truncation_retry`): when a round ends
     /// incomplete or at `max_tokens` with **no** tool call, re-ask the same round with its output
     /// budget doubled (capped at `TRUNCATION_RETRY_CEILING`, at most `MAX_TRUNCATION_RETRIES`
-    /// times per turn) instead of failing the turn. Reasoning tokens count against the output
-    /// budget on reasoning models, so a long think can use it all before any function call.
+    /// times per turn) instead of failing the turn. On `xai-responses` / grok-4.3,
+    /// `max_output_tokens` caps visible output only (reasoning and function-call tokens do not
+    /// count), and `Usage.output_tokens` is the provider total including reasoning, so tokens
+    /// used can exceed the budget without the cap being spent. `response.incomplete` can also
+    /// come from `max_time_limit` or `max_prompt_tokens`.
     /// **Off by default**: it spends more output tokens.
     pub truncation_retry: bool,
 }
@@ -1980,15 +1983,19 @@ fn is_tool_wire_event(event: &Event) -> bool {
 
 /// A round that ended incomplete or at `max_tokens`. Its `Display` is the error text the gateway
 /// sends. It keeps the old prefix (`response incomplete (hit max_output_tokens)`) for log and
-/// notice matchers, then names the budget and the tokens used, so a spent budget (output tokens
-/// near the budget) reads differently from a stream that ended early (no usage reported).
+/// notice matchers, then names the stop, the output budget sent, and the provider's output-token
+/// total. On `xai-responses` / grok-4.3, `max_output_tokens` caps visible output only (reasoning
+/// and function-call tokens do not count). That total includes reasoning, so tokens used can
+/// exceed the budget without the cap being spent. `response.incomplete` can also come from
+/// `max_time_limit` or `max_prompt_tokens`. No usage reported means the stream may have ended early.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TruncatedRound {
     /// `max_tokens`, `incomplete`, or the provider's other stop label.
     stop: String,
-    /// The output budget sent for the round.
+    /// The output budget sent for the round (`max_output_tokens` on `xai-responses`).
     output_budget: u32,
-    /// Output tokens the provider reported for the round (reasoning included), `0` if none.
+    /// Provider total output tokens for the round, including reasoning, `0` if none were reported.
+    /// On `xai-responses` this can exceed `output_budget` without the visible cap being spent.
     output_tokens: u64,
 }
 
