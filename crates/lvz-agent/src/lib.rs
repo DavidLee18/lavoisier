@@ -115,6 +115,13 @@ const MAX_TOOL_CLAIM_NUDGES: usize = MAX_EDIT_NUDGES;
 /// reached the loop makes one more call with no tools, to summarise.
 const MAX_LIVE_OPS_ROUNDS: u32 = 3;
 
+/// Most times one turn re-asks a round that ended incomplete or at `max_tokens` with no tool
+/// call ([`AgentConfig::truncation_retry`]). Each retry doubles the round's output budget.
+const MAX_TRUNCATION_RETRIES: u32 = 2;
+
+/// The output budget a truncation retry never raises a round above.
+const TRUNCATION_RETRY_CEILING: u32 = 16_384;
+
 /// User turn appended once the live-ops cap is reached. The following request advertises
 /// no tools.
 const LIVE_OPS_SUMMARY_NUDGE: &str =
@@ -266,6 +273,16 @@ pub struct AgentConfig {
     /// A tool the chosen provider does not declare is **refused** at negotiation rather than
     /// dropped, so asking for `x_search` on Anthropic fails loudly instead of quietly doing nothing.
     pub server_tools: Vec<ServerTool>,
+    /// **Truncation retry** (`--truncation-retry`, `[agent] truncation_retry`): when a round ends
+    /// incomplete or at `max_tokens` with **no** tool call, re-ask the same round with its output
+    /// budget doubled (capped at `TRUNCATION_RETRY_CEILING`, at most `MAX_TRUNCATION_RETRIES`
+    /// times per turn) instead of failing the turn. On `xai-responses` / grok-4.3,
+    /// `max_output_tokens` caps visible output only (reasoning and function-call tokens do not
+    /// count), and `Usage.output_tokens` is the provider total including reasoning, so tokens
+    /// used can exceed the budget without the cap being spent. `response.incomplete` can also
+    /// come from `max_time_limit` or `max_prompt_tokens`.
+    /// **Off by default**: it spends more output tokens.
+    pub truncation_retry: bool,
 }
 
 /// Above this fraction of dependency context removed, the estimate-based radius counterfactual
@@ -302,6 +319,7 @@ impl Default for AgentConfig {
             cost_weights: CostWeights::default(),
             radius_reexploration_risk: 0.5,
             server_tools: Vec::new(),
+            truncation_retry: false,
         }
     }
 }
@@ -379,6 +397,12 @@ impl AgentConfig {
     /// Enable the no-edit completion guard (don't let an edit task finish with zero file changes).
     pub fn with_require_edit(mut self, on: bool) -> Self {
         self.require_edit = on;
+        self
+    }
+
+    /// Enable the truncation retry (see [`AgentConfig::truncation_retry`]).
+    pub fn with_truncation_retry(mut self, on: bool) -> Self {
+        self.truncation_retry = on;
         self
     }
 
@@ -947,7 +971,13 @@ async fn run_loop(
     let mut model_cursor = breaker.first_available(fallbacks.len());
 
     let mut live_ops_summary = false;
+    // Truncation retry state: the output budget for the next round, and how many truncated
+    // rounds were re-asked. A re-asked round does not count as a live-ops round, so the
+    // first-round `required` tool choice and the live-ops cap see the same round again.
+    let mut round_budget = config.max_tokens;
+    let mut truncation_retries: u32 = 0;
     for _step in 0..config.max_steps {
+        let live_ops_rounds = round_trips.saturating_sub(truncation_retries);
         if cancel.is_cancelled() {
             jobs::global().fail_running(
                 &session,
@@ -960,7 +990,7 @@ async fn run_loop(
         if let Some(done) = jobs::global().drain_ready(&session) {
             history.push(done);
         }
-        if live_ops_ask && round_trips >= MAX_LIVE_OPS_ROUNDS {
+        if live_ops_ask && live_ops_rounds >= MAX_LIVE_OPS_ROUNDS {
             if live_ops_summary {
                 if !jobs::global().session_busy(&session) {
                     tracing::warn!(
@@ -1028,7 +1058,7 @@ async fn run_loop(
             Some(ToolChoice::None)
         } else if advertised.is_empty() {
             None
-        } else if live_ops_ask && round_trips == 0 {
+        } else if live_ops_ask && live_ops_rounds == 0 {
             Some(ToolChoice::Required)
         } else {
             Some(ToolChoice::Auto)
@@ -1063,6 +1093,7 @@ async fn run_loop(
                 task_thinking,
                 this_tool_choice.clone(),
             );
+            req.max_tokens = round_budget;
             if live_ops_summary {
                 req.tools.clear();
                 req.server_tools.clear();
@@ -1206,13 +1237,15 @@ async fn run_loop(
 
         if live_ops_summary {
             if is_truncated_stop(&turn.stop) {
+                let truncated = TruncatedRound::of(&turn, round_budget);
                 tracing::warn!(
+                    stop = truncated.stop.as_str(),
+                    output_budget = truncated.output_budget,
+                    output_tokens = truncated.output_tokens,
                     "live-ops summary ended incomplete or at max_tokens; not accepting it"
                 );
                 obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
-                let _ = tx.unbounded_send(Err(AgentError::Provider(
-                    "response incomplete (hit max_output_tokens) with no tool call".into(),
-                )));
+                let _ = tx.unbounded_send(Err(AgentError::Provider(truncated.to_string())));
                 return;
             }
             if !turn.tool_calls.is_empty() {
@@ -1252,13 +1285,34 @@ async fn run_loop(
             // Incomplete / max-token prose is not an answer. Drop the held text so the room
             // never sees the ramble.
             if truncated {
+                let truncated = TruncatedRound::of(&turn, round_budget);
+                if let Some(next) = next_truncation_budget(
+                    config.truncation_retry,
+                    truncation_retries,
+                    round_budget,
+                ) {
+                    tracing::warn!(
+                        stop = truncated.stop.as_str(),
+                        output_budget = truncated.output_budget,
+                        output_tokens = truncated.output_tokens,
+                        next_budget = next,
+                        retry = truncation_retries + 1,
+                        "turn ended incomplete or at max_tokens with no tool call; re-asking with a larger output budget"
+                    );
+                    truncation_retries += 1;
+                    round_budget = next;
+                    // `held` is per round: the truncated prose is dropped, never shown.
+                    continue;
+                }
                 tracing::warn!(
+                    stop = truncated.stop.as_str(),
+                    output_budget = truncated.output_budget,
+                    output_tokens = truncated.output_tokens,
+                    retries = truncation_retries,
                     "turn ended incomplete or at max_tokens with no tool call; not accepting as the answer"
                 );
                 obs.record(&total, round_trips, false, max_result_bytes, &radius_traces);
-                let _ = tx.unbounded_send(Err(AgentError::Provider(
-                    "response incomplete (hit max_output_tokens) with no tool call".into(),
-                )));
+                let _ = tx.unbounded_send(Err(AgentError::Provider(truncated.to_string())));
                 return;
             }
             // False-tool-claim guard: Grok (and similar) often *write* that they checked a file
@@ -1925,6 +1979,64 @@ fn is_tool_wire_event(event: &Event) -> bool {
             | Event::ServerToolResult { .. }
             | Event::ToolResultImages { .. }
     )
+}
+
+/// A round that ended incomplete or at `max_tokens`. Its `Display` is the error text the gateway
+/// sends. It keeps the old prefix (`response incomplete (hit max_output_tokens)`) for log and
+/// notice matchers, then names the stop, the output budget sent, and the provider's output-token
+/// total. On `xai-responses` / grok-4.3, `max_output_tokens` caps visible output only (reasoning
+/// and function-call tokens do not count). That total includes reasoning, so tokens used can
+/// exceed the budget without the cap being spent. `response.incomplete` can also come from
+/// `max_time_limit` or `max_prompt_tokens`. No usage reported means the stream may have ended early.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TruncatedRound {
+    /// `max_tokens`, `incomplete`, or the provider's other stop label.
+    stop: String,
+    /// The output budget sent for the round (`max_output_tokens` on `xai-responses`).
+    output_budget: u32,
+    /// Provider total output tokens for the round, including reasoning, `0` if none were reported.
+    /// On `xai-responses` this can exceed `output_budget` without the visible cap being spent.
+    output_tokens: u64,
+}
+
+impl TruncatedRound {
+    fn of(turn: &TurnAccumulator, output_budget: u32) -> Self {
+        let stop = match &turn.stop {
+            Some(StopReason::MaxTokens) => "max_tokens".to_string(),
+            Some(StopReason::Other(s)) => s.clone(),
+            Some(other) => format!("{other:?}"),
+            None => "none".to_string(),
+        };
+        Self {
+            stop,
+            output_budget,
+            output_tokens: turn.usage.output_tokens,
+        }
+    }
+}
+
+impl std::fmt::Display for TruncatedRound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "response incomplete (hit max_output_tokens) with no tool call: stop={}, \
+             output budget {} tokens, {} output tokens used",
+            self.stop, self.output_budget, self.output_tokens
+        )?;
+        if self.output_tokens == 0 {
+            f.write_str("; no usage reported, the stream may have ended early")?;
+        }
+        Ok(())
+    }
+}
+
+/// The output budget for a truncation retry, or `None` when the retry is off, used up, or the
+/// budget is already at [`TRUNCATION_RETRY_CEILING`].
+fn next_truncation_budget(enabled: bool, retries: u32, budget: u32) -> Option<u32> {
+    if !enabled || retries >= MAX_TRUNCATION_RETRIES || budget >= TRUNCATION_RETRY_CEILING {
+        return None;
+    }
+    Some(budget.saturating_mul(2).clamp(1, TRUNCATION_RETRY_CEILING))
 }
 
 fn is_truncated_stop(stop: &Option<StopReason>) -> bool {
@@ -4633,6 +4745,150 @@ mod tests {
             "the truncated ramble must not be the answer: {events:?}"
         );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn truncated_round(output_tokens: u64) -> Vec<Event> {
+        vec![
+            Event::Thinking("long think".into()),
+            Event::TextDelta("RAMBLE".into()),
+            Event::Usage(Usage {
+                input_tokens: 10,
+                output_tokens,
+                ..Default::default()
+            }),
+            Event::Done(StopReason::Other("incomplete".into())),
+        ]
+    }
+
+    async fn first_error(
+        mut s: BoxStream<'static, Result<Event, AgentError>>,
+    ) -> (Vec<Event>, Option<String>) {
+        let mut events = Vec::new();
+        let mut err = None;
+        while let Some(e) = s.next().await {
+            match e {
+                Ok(ev) => events.push(ev),
+                Err(e) => {
+                    err.get_or_insert(e.to_string());
+                }
+            }
+        }
+        (events, err)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn truncated_error_names_the_budget_and_tokens_used() {
+        let provider = ScriptedProvider::new(vec![truncated_round(2048)]);
+        let config = AgentConfig {
+            max_tokens: 2048,
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(provider.clone(), registry_with_server_state(), config);
+        let (_, err) = first_error(agent.run("check atx_state of singil")).await;
+        let err = err.unwrap_or_default();
+        assert!(
+            err.contains("response incomplete (hit max_output_tokens) with no tool call"),
+            "{err}"
+        );
+        assert!(err.contains("stop=incomplete"), "{err}");
+        assert!(err.contains("output budget 2048 tokens"), "{err}");
+        assert!(err.contains("2048 output tokens used"), "{err}");
+        assert!(!err.contains("ended early"), "{err}");
+        // Off by default: exactly one call, no retry.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn truncated_error_without_usage_says_the_stream_may_have_ended_early() {
+        let provider = ScriptedProvider::new(vec![vec![Event::Done(StopReason::Other(
+            "incomplete".into(),
+        ))]]);
+        let agent = Agent::new(
+            provider.clone(),
+            registry_with_server_state(),
+            AgentConfig::default(),
+        );
+        let (_, err) = first_error(agent.run("check atx_state of singil")).await;
+        let err = err.unwrap_or_default();
+        assert!(err.contains("0 output tokens used"), "{err}");
+        assert!(err.contains("the stream may have ended early"), "{err}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn truncation_retry_doubles_the_budget_and_keeps_required() {
+        let provider = ScriptedProvider::new(vec![
+            truncated_round(2048),
+            tool_turn("c1", "server_state", "{}"),
+            end_turn("켜져 있습니다."),
+        ]);
+        let config = AgentConfig {
+            max_tokens: 2048,
+            ..AgentConfig::default().with_truncation_retry(true)
+        };
+        let agent = Agent::new(provider.clone(), registry_with_server_state(), config);
+        let (events, err) = first_error(agent.run("신길동 PC 상태 알려줘")).await;
+        assert_eq!(err, None, "{events:?}");
+        let reqs = provider.requests.lock().unwrap().clone();
+        let budgets: Vec<u32> = reqs.iter().map(|r| r.max_tokens).collect();
+        assert_eq!(budgets, vec![2048, 4096, 4096]);
+        let choices = provider.tool_choices.lock().unwrap().clone();
+        assert_eq!(
+            choices,
+            vec![
+                Some(ToolChoice::Required),
+                Some(ToolChoice::Required),
+                Some(ToolChoice::Auto)
+            ],
+            "the re-asked round is still the first live-ops round"
+        );
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::TextDelta(t) if t.contains("RAMBLE"))));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::TextDelta(t) if t.contains("켜져"))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn truncation_retry_is_bounded() {
+        let provider = ScriptedProvider::new(vec![
+            truncated_round(2048),
+            truncated_round(4096),
+            truncated_round(8192),
+            end_turn("never reached"),
+        ]);
+        let config = AgentConfig {
+            max_tokens: 2048,
+            ..AgentConfig::default().with_truncation_retry(true)
+        };
+        let agent = Agent::new(provider.clone(), registry_with_server_state(), config);
+        let (events, err) = first_error(agent.run("check atx_state of singil")).await;
+        let err = err.unwrap_or_default();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert!(err.contains("output budget 8192 tokens"), "{err}");
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::TextDelta(t) if t.contains("RAMBLE"))));
+    }
+
+    #[test]
+    fn next_truncation_budget_is_off_bounded_and_capped() {
+        assert_eq!(next_truncation_budget(false, 0, 2048), None);
+        assert_eq!(next_truncation_budget(true, 0, 2048), Some(4096));
+        assert_eq!(next_truncation_budget(true, 1, 4096), Some(8192));
+        assert_eq!(
+            next_truncation_budget(true, MAX_TRUNCATION_RETRIES, 4096),
+            None
+        );
+        assert_eq!(
+            next_truncation_budget(true, 0, 12_000),
+            Some(TRUNCATION_RETRY_CEILING)
+        );
+        assert_eq!(
+            next_truncation_budget(true, 0, TRUNCATION_RETRY_CEILING),
+            None
+        );
+        assert_eq!(next_truncation_budget(true, 0, 0), Some(1));
     }
 
     #[tokio::test]
