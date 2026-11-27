@@ -44,7 +44,9 @@ use axum::{
     Json, Router,
 };
 use futures::stream::{self, BoxStream, StreamExt};
-use lvz_protocol::{AgentError, AgentHandle, Event, Gateway, GatewayError, TurnRequest};
+use lvz_protocol::{
+    AgentError, AgentHandle, Event, Gateway, GatewayError, TurnContext, TurnRequest,
+};
 use serde::Deserialize;
 
 /// The shared agent, as every handler sees it.
@@ -423,11 +425,25 @@ impl MetricTap {
 }
 
 /// Inbound turn payload. `session` defaults so a single-session client can omit it.
+///
+/// `context` is optional. An older caller that does not send it still decodes, and unknown
+/// fields on the object are ignored (`TurnDto` does not deny them).
 #[derive(Deserialize)]
 struct TurnDto {
     #[serde(default = "default_session")]
     session: String,
     input: String,
+    /// Trusted caller identity. Set by the Matrix endpoint; absent for a plain CLI client.
+    #[serde(default)]
+    context: Option<TurnContext>,
+}
+
+fn turn_from_dto(dto: TurnDto) -> TurnRequest {
+    let mut turn = TurnRequest::new(dto.session, dto.input);
+    if let Some(ctx) = dto.context {
+        turn = turn.with_context(ctx);
+    }
+    turn
 }
 
 fn default_session() -> String {
@@ -451,7 +467,7 @@ async fn post_turn(
     State(state): State<Arc<AppState>>,
     Json(dto): Json<TurnDto>,
 ) -> Sse<BoxStream<'static, Result<SseEvent, Infallible>>> {
-    let turn = TurnRequest::new(dto.session, dto.input);
+    let turn = turn_from_dto(dto);
     let body: BoxStream<'static, Result<SseEvent, Infallible>> =
         match state.agent.submit(turn).await {
             Ok(events) => instrument(events, state.metrics.clone())
@@ -494,7 +510,7 @@ async fn ws_loop(mut socket: WebSocket, state: Arc<AppState>) {
                 continue;
             }
         };
-        let turn = TurnRequest::new(dto.session, dto.input);
+        let turn = turn_from_dto(dto);
         match state.agent.submit(turn).await {
             Ok(events) => {
                 let mut events = instrument(events, state.metrics.clone());
@@ -567,6 +583,23 @@ mod tests {
         let dto: TurnDto = serde_json::from_str(r#"{"input":"hi"}"#).unwrap();
         assert_eq!(dto.session, "default");
         assert_eq!(dto.input, "hi");
+        assert!(dto.context.is_none());
+        let turn = turn_from_dto(dto);
+        assert!(turn.context.is_none());
+    }
+
+    #[test]
+    fn turn_dto_keeps_context_and_ignores_unknown_fields() {
+        let dto: TurnDto = serde_json::from_str(
+            r#"{"input":"hi","extra":1,"context":{"sender":"@a:hs","event_id":"$e","room":"!r:hs","seq":3,"origin_ts_ms":9,"raw_input":"hi","future":true}}"#,
+        )
+        .unwrap();
+        let turn = turn_from_dto(dto);
+        let ctx = turn.context.expect("context");
+        assert_eq!(ctx.sender, "@a:hs");
+        assert_eq!(ctx.room, "!r:hs");
+        assert_eq!(ctx.seq, 3);
+        assert_eq!(ctx.raw_input, "hi");
     }
 
     #[test]

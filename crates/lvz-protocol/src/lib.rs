@@ -16,6 +16,7 @@
 
 mod agent;
 mod batch;
+mod context;
 mod deliberate;
 mod event;
 mod gate;
@@ -27,9 +28,11 @@ mod retry;
 mod telemetry;
 mod tool;
 mod tune;
+mod work;
 
 pub use agent::{AgentError, AgentHandle, TurnRequest};
 pub use batch::{batch_item, BatchItem, BatchProvider, BatchTask};
+pub use context::{enter_turn, origin, resolve_origin, turn_context, Origin, TurnContext};
 pub use deliberate::{DeliberateError, Deliberation, DeliberationContext, Deliberator};
 pub use event::{CostWeights, Event, StopReason, Usage};
 pub use gate::{ToolDecision, ToolGate};
@@ -52,6 +55,7 @@ pub use tool::{
     admit_tool_images, Pending, Tool, ToolError, ToolImage, ToolOutput, MAX_TOOL_IMAGE_BASE64,
 };
 pub use tune::{Archetype, Knobs, ModelTier, NoopTuner, Outcome, RepoProfile, TaskContext, Tuner};
+pub use work::{EcsFault, HidFault, ProgressNote, ProgressTx, WorkError, WorkLease};
 
 #[cfg(test)]
 mod tests {
