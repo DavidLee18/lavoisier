@@ -51,6 +51,13 @@ help@crates.io.)
 Note: publishing is **public and effectively permanent** (a version can be yanked but not deleted).
 Bump only the crates whose source actually changed (and any crate that depends on a bumped crate, so its
 version requirement still resolves); leave the rest at their published version. Latest changed set
+(`v0.18.17`): **truncated rounds with no tool call**. `lvz-agent` (0.1.15→**0.1.16**) and
+`lavoisier` (0.18.16→**0.18.17**). Publish order `lvz-agent` → `lavoisier`. The other crates stay
+put (`lvz-memory`'s `^0.1.15` still accepts 0.1.16, so it needs no republish). The GitHub release
+is triggered only by `git push origin v0.18.17`, after the crates publish. A macOS arm64 "not
+acquired" cancel is retried by `.github/workflows/release-retry.yml` (or can be re-run by hand).
+Raising `timeout-minutes` does not help. Do not tag from this note until the draft is merged.
+Earlier changed set
 (`v0.18.15`): **live-ops summary after the cap**. `lvz-agent` (0.1.13→**0.1.14** — after
 `MAX_LIVE_OPS_ROUNDS` the loop makes one `tool_choice=none` call with no tools and accepts
 that prose; patch, so `lvz-memory`'s `^0.1.12` still resolves and it needs **no** republish)

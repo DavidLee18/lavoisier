@@ -5,6 +5,8 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 
 ## [Unreleased]
 
+## [0.18.17] — 2026-11-28
+
 ### Truncated rounds with no tool call (HOLD APPLY)
 
 - The error for a round that ends `incomplete` or at `max_tokens` with no tool call now names
@@ -21,13 +23,10 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
   keeps `tool_choice = required`. Engines before this release refuse the key
   (`deny_unknown_fields`): set it only with an image built from this change.
 - No change when the flag is off apart from the error text. CLI default `max_tokens` stays 2048.
+- GitHub release retries when a hosted macOS arm64 runner is not acquired (see
+  `.github/workflows/release-retry.yml`).
 
-### Crate version bumps for crates.io
-
-- `lvz-tools` 0.1.2 → 0.1.3 picks up the `ToolOutput.accepted` field added in `lvz-protocol` 0.1.10, so a publish no longer verifies against the old 0.1.2 sources.
-- `lvz-memory` 0.3.2 → 0.3.3 picks up the switch to `Agent::run_in_session`.
-
-`lvz-tools` 0.1.2 → 0.1.3. `lvz-memory` 0.3.2 → 0.3.3.
+`lavoisier` 0.18.16 → 0.18.17. `lvz-agent` 0.1.15 → 0.1.16. Not tagged in this change.
 
 ## [0.18.16] — 2026-11-25
 
@@ -50,6 +49,13 @@ Notable changes to Lavoisier. Older release notes are in the git history and in
 - The table is one `Mutex`. It is not held across `.await`. The cap check and the insert
   share that critical section. A row is removed once its terminal value has been copied
   into the user message, so a finished id does not stay in the map.
+
+### Crate version bumps for crates.io
+
+- `lvz-tools` 0.1.2 → 0.1.3 picks up the `ToolOutput.accepted` field added in `lvz-protocol` 0.1.10, so a publish no longer verifies against the old 0.1.2 sources.
+- `lvz-memory` 0.3.2 → 0.3.3 picks up the switch to `Agent::run_in_session`.
+
+`lvz-tools` 0.1.2 → 0.1.3. `lvz-memory` 0.3.2 → 0.3.3.
 
 `lavoisier` 0.18.15 → 0.18.16. `lvz-protocol` 0.1.9 → 0.1.10. `lvz-agent` 0.1.14 → 0.1.15.
 Not tagged in this change. HOLD APPLY.

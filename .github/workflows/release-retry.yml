@@ -1,0 +1,107 @@
+name: release-retry
+
+# Retries a completed `release` run when a GitHub-hosted macOS arm64 runner was never acquired.
+# Read from the default branch (`workflow_run`). A real `cargo build` or upload failure has no
+# matching annotation, so it is left alone. `timeout-minutes` on release.yml does not help: that
+# limit applies only after a runner starts. At most two reruns (`run_attempt` < 3).
+# `gh run rerun --failed` reuses the Linux artifacts that already succeeded.
+
+on:
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+  # Check-run annotations are the Checks API, not the Actions jobs API.
+  checks: read
+
+jobs:
+  retry-unacquired:
+    name: retry unacquired hosted runner
+    if: >-
+      (github.event.workflow_run.conclusion == 'failure' ||
+       github.event.workflow_run.conclusion == 'cancelled') &&
+      github.event.workflow_run.run_attempt < 3
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Rerun failed jobs only when a hosted runner was not acquired
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          UNACQUIRED: The job was not acquired by Runner of type hosted even after multiple attempts
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$CONCLUSION" in
+            failure|cancelled) ;;
+            *)
+              echo "run conclusion is ${CONCLUSION}; not retrying"
+              exit 0
+              ;;
+          esac
+          case "$RUN_ATTEMPT" in
+            ''|*[!0-9]*)
+              echo "run_attempt is not a number; not retrying"
+              exit 0
+              ;;
+          esac
+          if [ "$RUN_ATTEMPT" -ge 3 ]; then
+            echo "run_attempt ${RUN_ATTEMPT} is not < 3; not retrying"
+            exit 0
+          fi
+          case "$RUN_ID" in
+            ''|*[!0-9]*)
+              echo "RUN_ID is not numeric; not retrying"
+              exit 0
+              ;;
+          esac
+          case "$GH_REPO" in
+            ''|*' '*|*'..'*|*/*/*) echo "GH_REPO is not owner/name; not retrying"; exit 0 ;;
+            */*) ;;
+            *) echo "GH_REPO is not owner/name; not retrying"; exit 0 ;;
+          esac
+
+          # Command substitution, not a process substitution: a failed jobs request must
+          # fail this step. An empty id list means "do not retry", which is the wrong
+          # outcome for an API error.
+          cancelled_raw=$(
+            gh api --paginate "repos/${GH_REPO}/actions/runs/${RUN_ID}/jobs?per_page=100" \
+              --jq '.jobs[] | select(.conclusion == "cancelled") | .id'
+          )
+          cancelled_ids=()
+          if [ -n "$cancelled_raw" ]; then
+            mapfile -t cancelled_ids <<< "$cancelled_raw"
+          fi
+          if [ "${#cancelled_ids[@]}" -eq 0 ]; then
+            echo "no cancelled jobs; not retrying a real build or upload failure"
+            exit 0
+          fi
+
+          found=0
+          for id in "${cancelled_ids[@]}"; do
+            case "$id" in
+              ''|*[!0-9]*)
+                echo "skipping non-numeric job id"
+                continue
+                ;;
+            esac
+            annotations=$(gh api --paginate "repos/${GH_REPO}/check-runs/${id}/annotations?per_page=100")
+            if jq -e --arg needle "$UNACQUIRED" \
+              'map(select((.message // "") | contains($needle))) | length > 0' \
+              <<<"$annotations" >/dev/null; then
+              echo "cancelled job ${id} was not acquired by a hosted runner"
+              found=1
+              break
+            fi
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "no cancelled job carries the unacquired-runner annotation; not retrying"
+            exit 0
+          fi
+
+          gh run rerun "$RUN_ID" --failed

@@ -26,6 +26,7 @@ jobs:
           # macos-15 is the GitHub-hosted Apple Silicon (M1) image.
           # macos-14 was retired on 2 Nov 2026; requesting it fails as
           # 'macos-14-arm64-us-default' is not supported.
+          # An unacquired macos-15 runner is retried by release-retry.yml; timeout-minutes does not apply before a runner starts.
           - { os: macos-15,        target: aarch64-apple-darwin }
           - { os: ubuntu-22.04,    target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
