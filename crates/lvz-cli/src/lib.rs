@@ -1014,10 +1014,14 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
             model.clone(),
             &extra_tools,
             schedule.as_ref(),
+            config.jobs.user_tools,
         );
         // Captured before `build_agent` consumes `model` — the TUI footer shows this label.
         let model_label = model.clone();
-        let agent_core = build_agent(provider, model, &cli, tools.clone(), legion, fallbacks);
+        let mut agent_core = build_agent(provider, model, &cli, tools.clone(), legion, fallbacks);
+        if config.jobs.cancel_command {
+            agent_core = agent_core.with_cancel_command(cancel_aliases(&config));
+        }
         // Interactive tool-approval gate for the TUI (Claude-Code default: read-only tools run
         // unattended, mutating tools / shells ask). Built only when the TUI is active and approval
         // isn't waived; its receiver is handed to the TUI gateway below so prompts reach the user.
@@ -1231,8 +1235,18 @@ async fn run(extra_tools: Vec<Arc<dyn Tool>>) -> Result<(), Box<dyn std::error::
     let mut renderer = Renderer::new();
 
     if cli.agent {
-        let tools = build_tool_registry(&cli, batch_provider, model.clone(), &extra_tools, None);
+        let tools = build_tool_registry(
+            &cli,
+            batch_provider,
+            model.clone(),
+            &extra_tools,
+            None,
+            config.jobs.user_tools,
+        );
         let mut agent = build_agent(provider, model, &cli, tools, legion, fallbacks);
+        if config.jobs.cancel_command {
+            agent = agent.with_cancel_command(cancel_aliases(&config));
+        }
         if cli.telemetry {
             agent = agent.with_telemetry(Arc::new(StderrTelemetry));
         }
@@ -1704,12 +1718,28 @@ fn build_legion(
 /// also be handed to the Matrix gateway's scheduler — a scheduled `tool` job then dispatches
 /// through the identical tool instances the model uses, with no second construction to drift.
 /// [`ToolRegistry`] is a vector of `Arc`s, so the clone is cheap.
+fn cancel_aliases(config: &Config) -> Vec<lvz_agent::cancel::CancelAlias> {
+    config
+        .jobs
+        .aliases
+        .iter()
+        .map(|(phrase, spec)| {
+            let tool = spec.split_once(':').map(|(tool, _)| tool).unwrap_or(spec);
+            lvz_agent::cancel::CancelAlias {
+                phrase: phrase.clone(),
+                tool: tool.to_string(),
+            }
+        })
+        .collect()
+}
+
 fn build_tool_registry(
     cli: &Cli,
     batch_provider: Option<Arc<dyn BatchProvider>>,
     editor_model: String,
     extra_tools: &[Arc<dyn Tool>],
     schedule: Option<&Arc<ScheduleRegistry>>,
+    job_user_tools: bool,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::with_builtins();
     // `batch_edit` fan-out tool: on by default (Lavoisier is cost-first), registered whenever the
@@ -1732,6 +1762,10 @@ fn build_tool_registry(
         if !cli.serve_jobs {
             registry.register(Arc::new(ScheduleRunTool::new(schedule.clone())));
         }
+    }
+    if job_user_tools {
+        registry.register(Arc::new(lvz_agent::job_tools::JobsListTool));
+        registry.register(Arc::new(lvz_agent::job_tools::JobCancelTool));
     }
     // Caller-provided tools (e.g. a private downstream binary via `run_with`/`main_with`). Last, so
     // a downstream tool can deliberately shadow a built-in (last registration wins).
