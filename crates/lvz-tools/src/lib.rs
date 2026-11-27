@@ -23,6 +23,7 @@ pub use context::{
     EditAnchoredTool, EditFilesTool, OutlineFileTool, OutlineFilesTool, ReadAnchoredTool,
     StrReplaceTool,
 };
+pub use lvz_protocol::{effective_tools, tool_permitted, tools_for};
 pub use search::FindReferencesTool;
 
 /// A name-indexed set of tools. Exposes [`ToolDef`]s for the model and dispatches calls by

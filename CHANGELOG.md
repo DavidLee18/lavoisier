@@ -34,6 +34,11 @@ The root workspace pins are `lvz-tools` 0.1.3 and `lvz-memory` 0.3.3, the same v
 - `TurnRequest.context` carries the gateway's trusted sender, room, event id, sequence, and raw text. `Origin` is `Chat`, `Schedule`, or `Cli`, installed as a task-local for the turn. `POST /v1/turns` accepts an optional `context` object and ignores unknown fields.
 - `JobError::Interrupted` and `JobError::Lost`, plus `WorkError` / `WorkLease`, are the typed contract for cancellable background work. Nothing calls them yet.
 
+### HTTP tool policy
+
+- `tools_for` / `effective_tools` live in `lvz-protocol` and are re-exported by `lvz-tools`. The Matrix gateway and `POST /v1/turns` call that one function. The HTTP gateway does not depend on `lvz-tools`, so it does not pull the context engine in.
+- When `[gateway.matrix_room_tools]` or `matrix_user_tools` is non-empty, `/v1/turns` always applies them. A turn with `context` gets that grant. A turn without `context` gets no tools. Empty maps leave the full registry. `POST /v1/jobs/{id}` is unchanged.
+
 `lvz-tools` 0.1.2 → 0.1.3. `lvz-memory` 0.3.2 → 0.3.3.
 
 ## [0.18.16] — 2026-11-25
