@@ -33,6 +33,7 @@
 
 #![warn(missing_docs)]
 
+pub mod durable;
 pub mod jobs;
 
 use std::collections::{HashMap, HashSet};

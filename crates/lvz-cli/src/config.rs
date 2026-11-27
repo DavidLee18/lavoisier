@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use lvz_agent::durable::{DurableFs, LocalFs, ObjectFs};
 use lvz_memory::{FileStore, InMemoryStore, SessionStore};
 use lvz_protocol::ServerTool;
 use serde::Deserialize;
@@ -31,6 +32,8 @@ pub struct Config {
     pub legion: LegionSection,
     pub mcp: McpSection,
     pub log: LogSection,
+    /// `[jobs]` — background-job recovery. Absent ⇒ boot recovery, today's behaviour.
+    pub jobs: JobsSection,
     /// Where this config was read from, or `None` if no file was found.
     ///
     /// Recorded rather than logged at load time on purpose: `[log] level` lives *in* this file, so
@@ -214,10 +217,33 @@ pub struct MemorySection {
     pub store: Option<StoreKind>,
     /// Directory for the `file` store.
     pub path: Option<PathBuf>,
+    /// `local` (default) fsyncs a temp file and renames it. `object` writes the final path
+    /// and fsyncs, for a GCS FUSE mount where rename is copy-plus-delete.
+    pub fs: FsKind,
     /// Cap each session to its most recent N messages.
     pub max_messages: Option<usize>,
     /// Keep at most N sessions (LRU eviction); in-memory store only.
     pub max_sessions: Option<usize>,
+}
+
+/// How `[memory] fs` replaces a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FsKind {
+    /// Temp file, fsync, rename, fsync the directory.
+    #[default]
+    Local,
+    /// Write the final path and fsync. For object stores mounted via FUSE.
+    Object,
+}
+
+/// `[jobs]` — recovery of in-flight background work. Every flag defaults off.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JobsSection {
+    /// When true, do not adopt persisted jobs at boot. `POST /v1/admin/recover` does it,
+    /// and only for a lease generation that is not older than one already accepted.
+    pub recover_on_signal: bool,
 }
 
 /// Which session store `[memory]` describes.
@@ -467,8 +493,14 @@ impl Config {
                     self.memory.path.clone().ok_or_else(|| {
                         "memory.store = \"file\" requires memory.path".to_string()
                     })?;
+                let fs: Arc<dyn DurableFs> = match self.memory.fs {
+                    FsKind::Object => Arc::new(ObjectFs),
+                    FsKind::Local => Arc::new(LocalFs),
+                };
                 Ok(Arc::new(
-                    FileStore::new(dir).with_max_messages(self.memory.max_messages),
+                    FileStore::new(dir)
+                        .with_max_messages(self.memory.max_messages)
+                        .with_fs(fs),
                 ))
             }
         }
